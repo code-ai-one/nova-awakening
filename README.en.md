@@ -28,6 +28,18 @@ Nova is an engineering project focused on **Chinese-native programming, native c
 纯净版系统/    ← System modules: runtime, native software stack engineering
 ```
 
+## Publish Boundary
+
+- The GitHub release surface of this repository is intentionally limited to formal root files, `原生编译器/`, and `纯净版系统/`
+- Local experiment directories, bootstrap helper directories, process notes, and temporary artifacts are kept out of the GitHub release surface by default
+- The final native compiler binary that passes fixed-point bootstrap verification will be managed as a separate versioned release artifact instead of being kept long-term inside the source release surface
+
+## Current Release Status
+
+- **Native Compiler**: this repository currently publishes source code and fixed-point evolution status; the authoritative native compiler seed will be identified by later versioned release artifacts
+- **Pure System**: this repository currently publishes the system source tree, not a formal system image
+- **Image Status**: as of the current version, `纯净版系统/` has not yet been stably compiled by the current authoritative native compiler into a formally releasable system image, so no system image download is provided in this repository yet
+
 ## Core Value
 
 - **Chinese-Native Development**: Reducing semantic friction in Chinese-context expression, learning, and collaboration

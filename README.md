@@ -98,6 +98,21 @@ python3 自举入口.nova
 - [ ] 去 Rust 种子（词法/语法/后端 Nova 重写）
 - [ ] 纯净版系统闭环
 
+## ☕ 赞助
+
+如果 Nova 对你有帮助，欢迎赞助支持开发：
+
+**加密货币**（冷钱包，安全收款）：
+
+| 链 | 地址 |
+|-----|------|
+| BTC | `1GBy4btiex2AvYrcXGEtr9gsSWwPZ1z4ho` |
+| ETH / USDT (ERC20) / BNB (BEP20) / MATIC | `0x13a0E27B6C0b363144686126Dd9e6d68AA32225A` |
+| TRX / USDT (TRC20) | `TVdzMZEgbTLm4hx5dpZ13uhxbVYVMDwsnS` |
+| SOL | `EjDz1JYf2a348j2vDsxaE5k417hnGTtyeYZ6Npc9V4qG` |
+
+**Open Collective**: [opencollective.com/nova-awakening](https://opencollective.com/nova-awakening)
+
 ## 💬 联系
 
 - GitHub Issues: [提交问题](https://github.com/code-ai-one/nova-awakening/issues)

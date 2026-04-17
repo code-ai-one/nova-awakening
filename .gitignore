@@ -32,3 +32,13 @@ __pycache__/
 .*_nova_files_tmp.txt
 .*_nova_dir_tmp.txt
 _manifest.txt.bak*
+
+# 密钥与敏感文件
+*.key
+*.pem
+*.p12
+*.asc
+钱包/
+密钥/
+运营/
+编译空间/

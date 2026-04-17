@@ -1,0 +1,120 @@
+name: Nova CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  # ─── 文件完整性检查 ───
+  integrity:
+    name: 文件完整性检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查许可证文件存在
+        run: |
+          echo "=== 检查许可证文件 ==="
+          for f in LICENSE NOTICE LICENSE_木兰公共版 README.md README.en.md CONTRIBUTING.md SECURITY.md; do
+            if [ -f "$f" ]; then
+              echo "✓ $f 存在 ($(wc -c < "$f") 字节)"
+            else
+              echo "✗ $f 缺失!" && exit 1
+            fi
+          done
+
+      - name: 检查许可证名称一致性
+        run: |
+          echo "=== 检查 Nova-CSL 1.1 全局一致性 ==="
+          files="LICENSE NOTICE README.md README.en.md LICENSE_木兰公共版 CONTRIBUTING.md"
+          for f in $files; do
+            if grep -q "Nova-CSL" "$f"; then
+              echo "✓ $f 包含 Nova-CSL 引用"
+            else
+              echo "⚠ $f 未包含 Nova-CSL 引用（可能正常）"
+            fi
+          done
+          # 确保没有旧的 BSL 命名残留
+          if grep -rl "Nova-BSL" LICENSE NOTICE README.md 2>/dev/null; then
+            echo "✗ 发现 Nova-BSL 旧命名残留!" && exit 1
+          fi
+          echo "✓ 无旧命名残留"
+
+      - name: 检查无敏感信息泄露
+        run: |
+          echo "=== 检查敏感信息 ==="
+          if grep -rn "ghp_\|github_pat_\|sk-\|api_key\|password\s*=" \
+            --include="*.nova" --include="*.md" --include="*.sh" \
+            . 2>/dev/null | grep -v ".github/workflows"; then
+            echo "✗ 发现可能的敏感信息泄露!" && exit 1
+          fi
+          echo "✓ 未发现敏感信息"
+
+  # ─── 源码结构检查 ───
+  structure:
+    name: 源码结构检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查编译器模块结构
+        run: |
+          echo "=== 检查编译器核心模块 ==="
+          modules=(
+            "原生编译器/Nova.nova"
+            "原生编译器/_manifest.txt"
+          )
+          for m in "${modules[@]}"; do
+            if [ -f "$m" ]; then
+              echo "✓ $m"
+            else
+              echo "✗ $m 缺失!" && exit 1
+            fi
+          done
+
+      - name: 统计源码规模
+        run: |
+          echo "=== 源码统计 ==="
+          nova_count=$(find . -name "*.nova" | wc -l)
+          echo "Nova 源文件数: $nova_count"
+          total_lines=$(find . -name "*.nova" -exec cat {} + 2>/dev/null | wc -l)
+          echo "Nova 总行数: $total_lines"
+          echo ""
+          echo "--- 目录分布 ---"
+          echo "原生编译器: $(find 原生编译器 -name '*.nova' 2>/dev/null | wc -l) 个文件"
+          echo "纯净版系统: $(find 纯净版系统 -name '*.nova' 2>/dev/null | wc -l) 个文件"
+
+      - name: 检查 manifest 一致性
+        run: |
+          echo "=== 检查 _manifest.txt ==="
+          if [ -f "原生编译器/_manifest.txt" ]; then
+            echo "✓ manifest 存在"
+            echo "manifest 文件数: $(wc -l < 原生编译器/_manifest.txt)"
+          fi
+
+  # ─── PR 贡献者合规检查 ───
+  contributor-check:
+    name: 贡献者合规检查
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 PR 描述
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "$PR_BODY" ]; then
+            echo "⚠ PR 描述为空，建议添加变更说明"
+          else
+            echo "✓ PR 包含描述"
+          fi
+
+      - name: 检查修改范围
+        run: |
+          echo "=== 本次 PR 修改的文件 ==="
+          gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || echo "(无法获取 diff)"
+        env:
+          GH_TOKEN: ${{ github.token }}

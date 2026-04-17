@@ -1,54 +1,108 @@
+NOTICE
+
+Nova Native Chinese Compiler & Pure System
 Nova 原生中文编译器 · 纯净版系统
-版权所有 (C) 2024-2032 nova觉醒 · 保留所有权利
 
-═══════════════════════════════════════════════════
-  Nova 商业源码许可证 (Nova-CSL 1.1)
-  自定义许可证 + 反翻译/反重构条款 + 6年转换期
-═══════════════════════════════════════════════════
+Copyright (C) 2024-present nova觉醒 (nova-awakening)
+All rights reserved.
+版权所有 (C) 2024至今 nova觉醒 · 保留所有权利
 
-【非商业 · 免费使用】
+=========================================================================
+  SPDX-License-Identifier: LicenseRef-Nova-CSL-1.1
+  License: Nova Commercial Source License v1.1 (Nova-CSL 1.1)
+  License Type: Custom / Proprietary with Source-Available Terms
+=========================================================================
 
-在转换日期之前，本作品仅依据 Nova 商业源码许可证
-(Nova-CSL 1.1) 授予使用权：
+1. LICENSE SUMMARY / 许可证摘要
 
-1. Nova 商业源码许可证 (Nova-CSL 1.1)
-   - 详见 LICENSE 文件
-   - 非商业免费 · 商用需书面授权
-   - 2032年4月18日后转换为开源许可发布
-   - 包含反翻译/反重构/反AI规避条款
+   This software is licensed under the Nova Commercial Source License
+   v1.1 ("Nova-CSL 1.1"), a custom proprietary license with
+   source-available terms. This is NOT an OSI-approved open-source
+   license. The full license text is in the LICENSE file at the root
+   of this repository.
 
-2. LICENSE_木兰公共版 文件
-   - 仅为转换日期后可选用的木兰公共许可证文本
-   - 在转换日期之前不构成独立、并行或替代授权
+   本软件依据 Nova 商业源码许可证第1.1版（"Nova-CSL 1.1"）授权，
+   该许可证为自定义专有许可证，附带源码可用条款。本许可证不是
+   OSI 批准的开源许可证。完整许可证文本见本仓库根目录 LICENSE 文件。
 
-非商业许可范围：
-✅ 个人学习、研究、教学
-✅ 非商业开源项目
-✅ 学术论文引用与复现
-❌ 任何形式的商业使用（见下方）
+2. KEY TERMS / 核心条款
 
-【商业授权 · 未授权不得商用】
+   (a) Non-Commercial Use: Permitted without charge for personal
+       study, research, teaching, and qualifying non-commercial
+       open-source projects, subject to license conditions.
+       非商业使用：个人学习、研究、教学及符合条件的非商业开源
+       项目可免费使用，须遵守许可条件。
 
-商业使用包括但不限于：
-❌ 嵌入商业产品或服务
-❌ SaaS/云服务商业化部署
-❌ 企业内部生产环境使用
-❌ 商业培训/咨询/外包
-❌ 以盈利为目的的二次分发
-❌ 翻译为其他语言后商业使用
-❌ 基于本作品架构/算法的重构商业实现
-❌ 使用AI工具基于本作品生成的商业代码
+   (b) Commercial Use: Requires prior written commercial
+       authorization from the copyright holder. "Commercial use"
+       includes enterprise evaluation, PoC, pre-sales demonstration,
+       SaaS deployment, and all other uses described in LICENSE §1.
+       商业使用：须事先取得版权持有人书面商业授权。"商业使用"
+       包括企业评估、概念验证、售前演示、SaaS 部署及 LICENSE
+       第1条所述的所有其他使用。
 
-商业授权联系：通过 GitHub Issues 标注 [商业授权]
+   (c) Anti-Circumvention: Translation to other languages, AI-based
+       code generation, surface modifications, and architectural
+       reimplementation based on this work are considered derivative
+       works and subject to the same restrictions. See LICENSE §5.
+       反规避：翻译为其他语言、AI 代码生成、表面修改及基于本
+       作品的架构重实现均视为衍生作品，受相同限制。见 LICENSE 第5条。
 
-【转换日期】
+   (d) Conversion Date: On April 18, 2032, this software converts
+       to open-source licensing. Users may then choose between
+       AGPL-3.0 and MulanPubL-2.0. See LICENSE §6.
+       转换日期：2032年4月18日起，本软件转换为开源许可发布。
+       届时使用者可在 AGPL-3.0 与 MulanPubL-2.0 中任选其一。
+       见 LICENSE 第6条。
 
-2032年4月18日起，本作品转换为开源许可发布。
-届时使用者可在 AGPL-3.0 与木兰公共许可证 第2版中任选其一。
-届时商用仍须遵守所选开源许可证要求，或购买商业授权。
+   (e) Sublicensing Prohibited: Rights granted under this license
+       may not be sublicensed, transferred, or assigned without
+       prior written consent. See LICENSE §10.
+       禁止再许可：本许可证授予的权利不得再许可、转让或让渡，
+       除非事先取得书面同意。见 LICENSE 第10条。
 
-═══════════════════════════════════════════════════
+3. LICENSE FILES IN THIS REPOSITORY / 本仓库许可证文件
 
-本作品受中华人民共和国著作权法保护。
-本作品受《伯尔尼公约》成员国版权法保护。
+   LICENSE              Nova-CSL 1.1 full text (controlling document)
+                        Nova-CSL 1.1 完整文本（效力优先文件）
+
+   LICENSE_木兰公共版    MulanPubL-2.0 official text (reference only;
+                        applicable only after the Conversion Date)
+                        木兰公共许可证第2版官方文本（仅供参考；
+                        仅在转换日期后适用）
+
+   NOTICE               This file / 本文件
+
+4. THIRD-PARTY COMPONENTS / 第三方组件
+
+   This software does not incorporate or bundle any third-party
+   components requiring separate attribution at this time.
+   本软件目前未包含或捆绑任何需要单独署名的第三方组件。
+
+5. COMMERCIAL LICENSING / 商业授权
+
+   For commercial licensing inquiries, contact the copyright holder
+   via GitHub Issues tagged [商业授权].
+   商业授权咨询请通过 GitHub Issues 标注 [商业授权] 联系版权持有人。
+
+6. LEGAL PROTECTION / 法律保护
+
+   This work is protected under:
+   - Copyright Law of the People's Republic of China (primary)
+   - Berne Convention for the Protection of Literary and Artistic Works
+   - Agreement on Trade-Related Aspects of Intellectual Property
+     Rights (TRIPS)
+   - WIPO Copyright Treaty (WCT)
+   - Applicable copyright laws of the user's jurisdiction
+
+   本作品受以下法律保护：
+   - 中华人民共和国著作权法（首要适用）
+   - 《保护文学和艺术作品伯尔尼公约》
+   - 《与贸易有关的知识产权协定》(TRIPS)
+   - 《世界知识产权组织版权条约》(WCT)
+   - 使用者所在国/地区适用的版权法律
+
+=========================================================================
+The copyright holder reserves all rights not expressly granted herein.
 作者保留所有未在本声明中明确授予的权利。
+=========================================================================

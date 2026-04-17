@@ -1,0 +1,112 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+导入("./文档事件.nova")
+
+// §6 Slot分配
+
+结构 HTMLSlot元素 {
+    节点,    // u64 节点*
+    名称,    // u64 name属性 (""=默认slot)
+    // 分配的节点
+    分配节点,    // u64 节点*数组
+    分配数,
+    分配容量,
+}
+
+函数 Slot_创建(名称) {
+    定义 s = 堆_分配(HTMLSlot元素)
+    s.节点 = 0; s.名称 = 如果(名称 != 0, 字符串_复制(名称), "")
+    s.分配容量 = 32
+    s.分配节点 = 堆_分配_数组(32 * 8)
+    s.分配数 = 0
+    返回 s
+}
+
+// Slot分配算法
+函数 Slot_分配(shadowRoot) {
+    如果 (shadowRoot == 0) { 返回 }
+    定义 宿主 = shadowRoot.宿主
+    如果 (宿主 == 0) { 返回 }
+
+    // 清除所有slot的旧分配
+    // ... 遍历shadowRoot中的所有<slot>元素
+
+    // 遍历宿主的子节点(light DOM children)
+    // 对每个子节点:
+    //   如果有slot属性 → 找到name匹配的<slot>
+    //   如果没有slot属性 → 分配到默认slot (name="")
+    //   找不到匹配 → 不显示
+
+    // 触发slotchange事件
+}
+
+// slot.assigned节点s({flatten: true})
+函数 Slot_assigned节点s(slot, flatten) {
+    如果 (slot == 0) { 返回 0 }
+    如果 (!flatten) {
+        // 直接返回分配的节点
+        返回 slot.分配节点
+    }
+    // flatten: 如果分配节点中有<slot>, 递归展开
+    返回 slot.分配节点
+}
+
+// slot.assigned元素s()
+函数 Slot_assigned元素s(slot) {
+    如果 (slot == 0) { 返回 0 }
+    // 只返回元素类型的分配节点(过滤Text等)
+    返回 0
+}
+
+// slot.assign(节点s...) — manual slot assignment
+函数 Slot_assign(slot, 节点s, 数量) {
+    如果 (slot == 0 || 节点s == 0) { 返回 }
+    slot.分配数 = 0
+    定义 可变 i = 0
+    当 (i < 数量 && i < slot.分配容量) {
+        内存_写64(slot.分配节点 + i * 8, 内存_读64(节点s + i * 8))
+        slot.分配数 = slot.分配数 + 1
+        i = i + 1
+    }
+    // 触发slotchange事件
+    Slot_触发slotchange(slot)
+}
+
+函数 Slot_触发slotchange(slot) {
+    如果 (slot == 0 || slot.节点 == 0) { 返回 }
+    定义 evt = 事件_创建2("slotchange", 真, 假)
+    // dispatch到slot元素
+}
+
+// §7 <template>元素
+
+结构 HTMLTemplate元素 {
+    节点,    // u64 节点*
+    content,    // u64 DocumentFragment* (惰性DOM)
+}
+
+函数 Template_创建() {
+    定义 t = 堆_分配(HTMLTemplate元素)
+    t.节点 = 0
+    t.content = 0    // DocumentFragment, 解析HTML时填充
+    返回 t
+}
+
+// template.content → DocumentFragment
+函数 Template_getContent(t) {
+    如果 (t == 0) { 返回 0 }
+    如果 (t.content == 0) {
+        // 惰性创建空DocumentFragment
+        t.content = 堆_分配(8)    // DocumentFragment容器
+    }
+    返回 t.content
+}
+
+// 克隆template内容
+函数 Template_clone(t, deep) {
+    如果 (t == 0 || t.content == 0) { 返回 0 }
+    // document.import节点(template.content, true)
+    // 深度克隆DocumentFragment
+    返回 0
+}

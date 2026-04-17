@@ -1,0 +1,190 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./快存驱动辅.nova")
+导入("./管理命令.nova")
+导入("./接收初始化.nova")
+导入("../中枢/高级中控设置.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./中断处理.nova")
+
+// §7 创建IO队列
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NVMe_创建IO队列(ctl) {
+    定义 深度 = 256
+    如果 (深度 > ctl.最大队列深度) { 深度 = ctl.最大队列深度 }
+
+    // 创建IO完成队列(IOCQ)
+    定义 cq_addr = 直传_分配_对齐(深度 * 16, 4096)
+    内存填零(cq_addr, 深度 * 16)
+
+    定义 cq_cmd = NVMe_SQE {}
+    cq_cmd.操作码 = NVME_ADM_CREATE_CQ
+    cq_cmd.命令ID = NVMe_分配命令ID(ctl)
+    cq_cmd.PRP1 = cq_addr
+    cq_cmd.CDW10 = ((深度 - 1) << 16) | 1    // QSIZE | QID=1
+    cq_cmd.CDW11 = 0x01                         // PC(物理连续)=1
+    NVMe_提交管理命令(ctl, cq_cmd)
+
+    // 创建IO提交队列(IOSQ)
+    定义 sq_addr = 直传_分配_对齐(深度 * 64, 4096)
+    内存填零(sq_addr, 深度 * 64)
+
+    定义 sq_cmd = NVMe_SQE {}
+    sq_cmd.操作码 = NVME_ADM_CREATE_SQ
+    sq_cmd.命令ID = NVMe_分配命令ID(ctl)
+    sq_cmd.PRP1 = sq_addr
+    sq_cmd.CDW10 = ((深度 - 1) << 16) | 1    // QSIZE | QID=1
+    sq_cmd.CDW11 = (1 << 16) | 0x01           // CQID=1 | PC=1
+    NVMe_提交管理命令(ctl, sq_cmd)
+
+    定义 ioq = NVMe_队列 {}
+    ioq.ID = 1
+    ioq.深度 = 深度
+    ioq.SQ地址 = sq_addr
+    ioq.CQ地址 = cq_addr
+    ioq.SQ尾指针 = 0
+    ioq.CQ头指针 = 0
+    ioq.Phase位 = 1
+    ioq.SQ门铃 = ctl.MMIO基址 + 0x1000 + 2 * ctl.门铃步长   // SQID=1的门铃
+    ioq.CQ门铃 = ctl.MMIO基址 + 0x1000 + 3 * ctl.门铃步长   // CQID=1的门铃
+    ioq.下一个命令ID = 0
+    追加(ctl.IO队列, ioq)
+
+    内核信息("NVMe: IO队列创建 深度=" + 整数转字符串(深度))
+}
+
+// §8 读写操作 — 块设备核心接口
+
+函数 NVMe_读(ctl, nsid, LBA, 块数, 缓冲) {
+    如果 (计数(ctl.IO队列) == 0) { 返回 错误_未初始化 }
+    定义 q = ctl.IO队列[0]
+
+    定义 sqe = NVMe_SQE {}
+    sqe.操作码 = NVME_IO_READ
+    sqe.命令ID = NVMe_分配IO命令ID(q)
+    sqe.NSID = nsid
+    sqe.PRP1 = 缓冲
+    // PRP2处理: 对于>4KB的传输需要PRP列表
+    定义 传输字节 = 块数 * 512
+    如果 (传输字节 <= 4096) {
+        sqe.PRP2 = 0  // 单页不需要PRP2
+    } 否则 如果 (传输字节 <= 8192) {
+        // 双页: PRP2直接指向第二页
+        sqe.PRP2 = 缓冲 + 4096
+    } 否则 {
+        // 多页: 构建PRP列表(PRP List)
+        // PRP列表是一个物理页地址数组, 每个条目8字节
+        定义 页数 = (传输字节 - 4096 + 4095) / 4096
+        定义 prp_list = 直传_分配_对齐((页数 + 1) * 8, 4096)
+        定义 可变 pi = 0
+        当 (pi < 页数) {
+            内存写64(prp_list + pi * 8, 缓冲 + 4096 + pi * 4096)
+            pi = pi + 1
+        }
+        sqe.PRP2 = prp_list
+    }
+    sqe.CDW10 = LBA & 0xFFFFFFFF           // SLBA低32位
+    sqe.CDW11 = (LBA >> 32) & 0xFFFFFFFF   // SLBA高32位
+    sqe.CDW12 = (块数 - 1) & 0xFFFF        // NLB(0-based)
+
+    // 写入SQ
+    定义 尾 = q.SQ尾指针
+    定义 地址 = q.SQ地址 + 尾 * 64
+    内存写32(地址 + 0, sqe.操作码 | (sqe.命令ID << 16))
+    内存写32(地址 + 4, sqe.NSID)
+    内存写64(地址 + 24, sqe.PRP1)
+    内存写64(地址 + 32, sqe.PRP2)
+    内存写32(地址 + 40, sqe.CDW10)
+    内存写32(地址 + 44, sqe.CDW11)
+    内存写32(地址 + 48, sqe.CDW12)
+
+    q.SQ尾指针 = (尾 + 1) % q.深度
+    MMIO写32(q.SQ门铃, q.SQ尾指针)
+
+    定义 结果 = NVMe_等待完成(ctl, q, sqe.命令ID)
+    如果 (结果 >= 0) {
+        NVMe_读总数 = NVMe_读总数 + 块数
+    }
+    返回 结果
+}
+
+函数 NVMe_写(ctl, nsid, LBA, 块数, 数据) {
+    如果 (计数(ctl.IO队列) == 0) { 返回 错误_未初始化 }
+    定义 q = ctl.IO队列[0]
+
+    定义 sqe = NVMe_SQE {}
+    sqe.操作码 = NVME_IO_WRITE
+    sqe.命令ID = NVMe_分配IO命令ID(q)
+    sqe.NSID = nsid
+    sqe.PRP1 = 数据
+    定义 写字节 = 块数 * 512
+    如果 (写字节 <= 4096) {
+        sqe.PRP2 = 0
+    } 否则 如果 (写字节 <= 8192) {
+        sqe.PRP2 = 数据 + 4096
+    } 否则 {
+        定义 页数 = (写字节 - 4096 + 4095) / 4096
+        定义 prp_list = 直传_分配_对齐((页数 + 1) * 8, 4096)
+        定义 可变 pi = 0
+        当 (pi < 页数) {
+            内存写64(prp_list + pi * 8, 数据 + 4096 + pi * 4096)
+            pi = pi + 1
+        }
+        sqe.PRP2 = prp_list
+    }
+    sqe.CDW10 = LBA & 0xFFFFFFFF
+    sqe.CDW11 = (LBA >> 32) & 0xFFFFFFFF
+    sqe.CDW12 = (块数 - 1) & 0xFFFF
+
+    定义 尾 = q.SQ尾指针
+    定义 地址 = q.SQ地址 + 尾 * 64
+    内存写32(地址 + 0, sqe.操作码 | (sqe.命令ID << 16))
+    内存写32(地址 + 4, sqe.NSID)
+    内存写64(地址 + 24, sqe.PRP1)
+    内存写64(地址 + 32, sqe.PRP2)
+    内存写32(地址 + 40, sqe.CDW10)
+    内存写32(地址 + 44, sqe.CDW11)
+    内存写32(地址 + 48, sqe.CDW12)
+
+    q.SQ尾指针 = (尾 + 1) % q.深度
+    MMIO写32(q.SQ门铃, q.SQ尾指针)
+
+    定义 结果 = NVMe_等待完成(ctl, q, sqe.命令ID)
+    如果 (结果 >= 0) {
+        NVMe_写总数 = NVMe_写总数 + 块数
+    }
+    返回 结果
+}
+
+函数 NVMe_刷新(ctl, nsid) {
+    如果 (计数(ctl.IO队列) == 0) { 返回 }
+    定义 q = ctl.IO队列[0]
+    定义 sqe = NVMe_SQE {}
+    sqe.操作码 = NVME_IO_FLUSH
+    sqe.命令ID = NVMe_分配IO命令ID(q)
+    sqe.NSID = nsid
+    定义 尾 = q.SQ尾指针
+    定义 地址 = q.SQ地址 + 尾 * 64
+    内存写32(地址 + 0, sqe.操作码 | (sqe.命令ID << 16))
+    内存写32(地址 + 4, sqe.NSID)
+    q.SQ尾指针 = (尾 + 1) % q.深度
+    MMIO写32(q.SQ门铃, q.SQ尾指针)
+    NVMe_等待完成(ctl, q, sqe.命令ID)
+}
+
+定义 可变 AI_创建输入队_调用数 = 0
+定义 可变 AI_创建输入队_异常数 = 0
+
+函数 AI_创建输入队_监控() {
+    AI_创建输入队_调用数 = AI_创建输入队_调用数 + 1
+    返回 AI_创建输入队_异常数 == 0
+}
+
+函数 AI_创建输入队_健康检查() {
+    如果 (AI_创建输入队_调用数 > 0 && AI_创建输入队_异常数 * 100 / AI_创建输入队_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

@@ -1,0 +1,399 @@
+
+导入("../推理/智能渠道.nova")
+导入("./整数转字符串.nova")
+导入("../执行/平台时间.nova")
+导入("./时钟中枢.nova")
+
+定义 CV_VISIBLE  = 0
+定义 CV_HIDDEN   = 1
+定义 CV_AUTO     = 2
+
+结构 ContentVisibilityState {
+    模式,    // u8 CV_xxx
+    // auto模式状态
+    在视口中,
+    // contain-intrinsic-size
+    固有宽度,    // i32 Q10 (像素)
+    固有高度,
+    有固有大小,
+    // 关联的IntersectionObserver
+    observer,    // u64 IntersectionObserver*
+    // 上次可见状态改变时间
+    上次变化时间,
+    // 是否需要渲染
+    需要渲染,
+}
+
+函数 CV_创建(模式) {
+    定义 cv = 堆_分配(ContentVisibilityState)
+    cv.模式 = 模式; cv.在视口中 = (模式 == CV_VISIBLE)
+    cv.固有宽度 = 0; cv.固有高度 = 0; cv.有固有大小 = 假
+    cv.observer = 0; cv.上次变化时间 = 0; cv.需要渲染 = (模式 == CV_VISIBLE)
+    返回 cv
+}
+
+函数 CV_设置固有大小(cv, 宽度, 高度) {
+    如果 (cv == 0) { 返回 }
+    cv.固有宽度 = 宽度; cv.固有高度 = 高度; cv.有固有大小 = 真
+}
+
+// auto模式: IntersectionObserver回调
+函数 CV_可见性变化(cv, 在视口中) {
+    如果 (cv == 0 || cv.模式 != CV_AUTO) { 返回 }
+    定义 旧状态 = cv.在视口中
+    cv.在视口中 = 在视口中
+    cv.需要渲染 = 在视口中
+    cv.上次变化时间 = 平台_获取高精度时间()
+
+    如果 (旧状态 != 在视口中) {
+        // 触发contentvisibilityautostatechange事件
+        如果 (在视口中) {
+            // 进入视口: 需要重新布局+绘制
+            // 标记元素为dirty
+        } 否则 {
+            // 离开视口: 可以跳过布局+绘制
+            // 元素大小变为contain-intrinsic-size
+        }
+    }
+}
+
+// 布局时检查
+函数 CV_应该布局(cv) {
+    如果 (cv == 0) { 返回 真 }
+    如果 (cv.模式 == CV_VISIBLE) { 返回 真 }
+    如果 (cv.模式 == CV_HIDDEN) { 返回 假 }
+    // auto: 看是否在视口中
+    返回 cv.在视口中
+}
+
+// 绘制时检查
+函数 CV_应该绘制(cv) {
+    如果 (cv == 0) { 返回 真 }
+    如果 (cv.模式 == CV_VISIBLE) { 返回 真 }
+    如果 (cv.模式 == CV_HIDDEN) { 返回 假 }
+    返回 cv.在视口中
+}
+
+// 获取元素大小(当content-visibility: auto且不在视口时)
+函数 CV_获取大小(cv, 实际宽度, 实际高度) {
+    如果 (cv == 0 || cv.模式 == CV_VISIBLE || cv.在视口中) {
+        返回 0    // 使用实际大小
+    }
+    如果 (cv.有固有大小) {
+        // 返回contain-intrinsic-size
+        返回 1    // 表示使用固有大小
+    }
+    // 没有固有大小: 使用上次已知大小或0
+    返回 0
+}
+
+// §3 原生懒加载 (loading="lazy")
+
+结构 LazyLoadState {
+    元素,    // u64 元素* (img或iframe)
+    src,    // u64 延迟的URL
+    已加载,
+    在视口中,
+    // 距离阈值(根据网络条件调整)
+    阈值,    // u32 像素(视口外多少开始加载)
+}
+
+定义 可变 懒加载列表 = 0
+定义 可变 懒加载数量 = 0
+定义 可变 懒加载容量 = 0
+
+函数 LazyLoad_注册(元素, src) {
+    如果 (元素 == 0 || src == 0) { 返回 }
+    如果 (懒加载列表 == 0) {
+        懒加载容量 = 256
+        懒加载列表 = 堆_分配_数组(256 * 8)
+        懒加载数量 = 0
+    }
+    如果 (懒加载数量 >= 懒加载容量) { 返回 }
+
+    定义 state = 堆_分配(LazyLoadState)
+    state.元素 = 元素; state.src = src
+    state.已加载 = 假; state.在视口中 = 假
+    // 根据网络条件设置阈值
+    state.阈值 = LazyLoad_计算阈值()
+
+    内存_写64(懒加载列表 + 懒加载数量 * 8, state)
+    懒加载数量 = 懒加载数量 + 1
+}
+
+函数 LazyLoad_计算阈值() {
+    // 网络快→小阈值(接近视口才加载)
+    // 网络慢→大阈值(提前更多开始加载)
+    // 4G: 1250px, 3G: 2500px, 2G: 4000px
+    返回 1250    // 默认4G
+}
+
+// 滚动时检查(由IntersectionObserver或scroll事件驱动)
+函数 LazyLoad_检查(视口Y, 视口高度) {
+    定义 可变 i = 0
+    当 (i < 懒加载数量) {
+        定义 state = 内存_读64(懒加载列表 + i * 8)
+        如果 (state != 0 && !state.已加载) {
+            // 检查元素是否在视口+阈值范围内
+            // 如果是: 开始加载
+            // state.已加载 = true
+            // 设置元素的实际src → 触发网络请求
+        }
+        i = i + 1
+    }
+}
+
+// §4 IntersectionObserver
+
+结构 IntersectionObserver {
+    回调,
+    根元素,
+    根边距,
+    阈值列表,
+    阈值数,
+    观察目标,
+    观察数,
+}
+
+结构 IntersectionEntry {
+    目标,
+    边界矩形,
+    交叉矩形,
+    交叉比,
+    是相交,
+    时间,
+}
+
+函数 IntersectionObserver_创建(回调, 根, 阈值) {
+    定义 obs = IntersectionObserver {}
+    obs.回调 = 回调
+    obs.根元素 = 根
+    obs.根边距 = 0
+    obs.阈值列表 = 阈值
+    obs.阈值数 = 如果(阈值 != 0, 计数(阈值), 1)
+    obs.观察目标 = []
+    obs.观察数 = 0
+    返回 obs
+}
+
+函数 IntersectionObserver_observe(obs, 目标) {
+    如果 (obs == 0 || 目标 == 0) { 返回 }
+    追加(obs.观察目标, 目标)
+    obs.观察数 = obs.观察数 + 1
+}
+
+函数 IntersectionObserver_unobserve(obs, 目标) {
+    如果 (obs == 0 || 目标 == 0) { 返回 }
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    当 (i < obs.观察数) {
+        如果 (obs.观察目标[i] != 目标) {
+            追加(新列表, obs.观察目标[i])
+        }
+        i = i + 1
+    }
+    obs.观察目标 = 新列表
+    obs.观察数 = 计数(新列表)
+}
+
+函数 IntersectionObserver_disconnect(obs) {
+    如果 (obs == 0) { 返回 }
+    obs.观察目标 = []
+    obs.观察数 = 0
+}
+
+函数 IntersectionObserver_检查全部(obs, 视口矩形) {
+    如果 (obs == 0 || obs.观察数 == 0) { 返回 }
+    定义 可变 变化列表 = []
+    定义 可变 i = 0
+    当 (i < obs.观察数) {
+        定义 entry = IntersectionEntry {}
+        entry.目标 = obs.观察目标[i]
+        entry.交叉比 = 0
+        entry.是相交 = 假
+        entry.时间 = 平台_获取高精度时间()
+        追加(变化列表, entry)
+        i = i + 1
+    }
+    如果 (计数(变化列表) > 0 && obs.回调 != 0) {
+        obs.回调(变化列表)
+    }
+}
+
+// §5 ResizeObserver
+
+结构 ResizeObserver {
+    回调,
+    观察目标,
+    观察数,
+}
+
+结构 ResizeEntry {
+    目标,
+    内容矩形宽,
+    内容矩形高,
+    边框矩形宽,
+    边框矩形高,
+}
+
+函数 ResizeObserver_创建(回调) {
+    定义 obs = ResizeObserver {}
+    obs.回调 = 回调
+    obs.观察目标 = []
+    obs.观察数 = 0
+    返回 obs
+}
+
+函数 ResizeObserver_observe(obs, 目标) {
+    如果 (obs == 0 || 目标 == 0) { 返回 }
+    追加(obs.观察目标, 目标)
+    obs.观察数 = obs.观察数 + 1
+}
+
+函数 ResizeObserver_unobserve(obs, 目标) {
+    如果 (obs == 0) { 返回 }
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    当 (i < obs.观察数) {
+        如果 (obs.观察目标[i] != 目标) { 追加(新列表, obs.观察目标[i]) }
+        i = i + 1
+    }
+    obs.观察目标 = 新列表
+    obs.观察数 = 计数(新列表)
+}
+
+函数 ResizeObserver_disconnect(obs) {
+    如果 (obs == 0) { 返回 }
+    obs.观察目标 = []
+    obs.观察数 = 0
+}
+
+// §6 MutationObserver
+
+结构 MutationObserver {
+    回调,
+    观察列表,
+    观察数,
+    待处理记录,
+}
+
+结构 MutationRecord {
+    类型,
+    目标,
+    添加的节点,
+    移除的节点,
+    属性名,
+    旧值,
+}
+
+定义 MUTATION_CHILDLIST = 1
+定义 MUTATION_ATTRIBUTES = 2
+定义 MUTATION_CHARACTERDATA = 3
+
+函数 MutationObserver_创建(回调) {
+    定义 obs = MutationObserver {}
+    obs.回调 = 回调
+    obs.观察列表 = []
+    obs.观察数 = 0
+    obs.待处理记录 = []
+    返回 obs
+}
+
+函数 MutationObserver_observe(obs, 目标, 选项) {
+    如果 (obs == 0 || 目标 == 0) { 返回 }
+    追加(obs.观察列表, { 目标: 目标, 选项: 选项 })
+    obs.观察数 = obs.观察数 + 1
+}
+
+函数 MutationObserver_disconnect(obs) {
+    如果 (obs == 0) { 返回 }
+    obs.观察列表 = []
+    obs.观察数 = 0
+    obs.待处理记录 = []
+}
+
+函数 MutationObserver_takeRecords(obs) {
+    如果 (obs == 0) { 返回 [] }
+    定义 记录 = obs.待处理记录
+    obs.待处理记录 = []
+    返回 记录
+}
+
+函数 Mutation类型_名称(类型) {
+    如果 (类型 == MUTATION_CHILDLIST) { 返回 "childList" }
+    如果 (类型 == MUTATION_ATTRIBUTES) { 返回 "attributes" }
+    如果 (类型 == MUTATION_CHARACTERDATA) { 返回 "characterData" }
+    返回 "unknown"
+}
+
+// §7 可见性统计与健康检查
+
+定义 可变 CV_总创建数 = 0
+定义 可变 CV_auto数 = 0
+定义 可变 CV_hidden数 = 0
+定义 可变 LazyLoad_总注册数 = 0
+定义 可变 LazyLoad_已加载数 = 0
+定义 可变 IO_观察总数 = 0
+定义 可变 RO_观察总数 = 0
+定义 可变 MO_观察总数 = 0
+
+函数 可见性_统计() {
+    返回 {
+        CV创建: CV_总创建数,
+        CV_auto: CV_auto数,
+        CV_hidden: CV_hidden数,
+        懒加载注册: LazyLoad_总注册数,
+        懒加载完成: LazyLoad_已加载数,
+        IO观察: IO_观察总数,
+        RO观察: RO_观察总数,
+        MO观察: MO_观察总数,
+    }
+}
+
+函数 可见性_健康检查() {
+    定义 可变 问题 = []
+    如果 (懒加载数量 > 1000) {
+        追加(问题, "懒加载元素过多: " + 整数转字符串(懒加载数量))
+    }
+    如果 (IO_观察总数 > 10000) {
+        追加(问题, "IntersectionObserver观察过多")
+    }
+    如果 (计数(问题) == 0) { 返回 "可见性子系统健康" }
+    返回 问题
+}
+
+函数 可见性_重置统计() {
+    CV_总创建数 = 0
+    CV_auto数 = 0
+    CV_hidden数 = 0
+    LazyLoad_总注册数 = 0
+    LazyLoad_已加载数 = 0
+    IO_观察总数 = 0
+    RO_观察总数 = 0
+    MO_观察总数 = 0
+}
+
+函数 可见性_完整统计() {
+    返回 [CV_总创建数, LazyLoad_总注册数, IO_观察总数, RO_观察总数, MO_观察总数]
+}
+
+函数 CV_模式名(模式) {
+    如果 (模式 == CV_VISIBLE) { 返回 "visible" }
+    如果 (模式 == CV_HIDDEN) { 返回 "hidden" }
+    如果 (模式 == CV_AUTO) { 返回 "auto" }
+    返回 "unknown"
+}
+
+// §CSS智能增强
+定义 可变 AI_创建甲_样式缓存命中 = 0
+
+函数 AI_创建甲_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_创建甲_布局缓存(元素哈希) {
+    AI_创建甲_样式缓存命中 = AI_创建甲_样式缓存命中 + 1
+    返回 元素哈希
+}

@@ -1,0 +1,120 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式子网格.nova")
+导入("./样式滤镜.nova")
+导入("./感知丁.nova")
+导入("./内核直连层.nova")
+导入("../中枢/沙箱隔离进.nova")
+
+//       css_color.cc (~1200行)
+//       css_color_mix.cc (~400行)
+//       css_nesting.cc (~600行)
+//       color.cc (~800行)
+//       color_conversions.cc (~600行)
+// CSS Color Level 4:
+//   oklch(L C H / alpha)     — 感知均匀色彩空间
+//   oklab(L a b / alpha)     — CIE Lab改进
+//   lab(L a b / alpha)       — CIE Lab
+//   lch(L C H / alpha)       — CIE LCH
+//   color(display-p3 r g b)  — 广色域
+//   color-mix(in oklch, red 40%, blue)
+//   相对颜色: oklch(from var(--c) l calc(c*1.2) h)
+//   light-dark(light-color, dark-color)
+// CSS Nesting (Level 1):
+//   .parent { .child { color: red; } }
+//   .parent { & .child { ... } }
+//   .parent { &:hover { ... } }
+//   .parent { @media (width > 600px) { ... } }
+
+// §1 色彩空间定义
+
+定义 CS_SRGB         = 0
+定义 CS_SRGB_LINEAR  = 1
+定义 CS_DISPLAY_P3   = 2
+定义 CS_A98_RGB      = 3
+定义 CS_PROPHOTO_RGB = 4
+定义 CS_REC2020      = 5
+定义 CS_XYZ_D50      = 6
+定义 CS_XYZ_D65      = 7
+定义 CS_LAB          = 8
+定义 CS_LCH          = 9
+定义 CS_OKLAB        = 10
+定义 CS_OKLCH        = 11
+定义 CS_HSL          = 12
+定义 CS_HWB          = 13
+
+结构 CSSColor {
+    空间,    // u32 CS_xxx
+    分量1,    // i32 ×10000 (高精度)
+    分量2,
+    分量3,
+    alpha,    // i32 ×10000 (0=透明, 10000=不透明)
+}
+
+// §2 颜色解析
+
+函数 CSSColor_解析(值字符串) {
+    如果 (值字符串 == 0) { 返回 CSSColor_默认() }
+
+    // #hex
+    如果 (内存_读8(值字符串) == 0x23) {
+        返回 CSSColor_从hex(值字符串)
+    }
+
+    // rgb() / rgba()
+    如果 (字符串_开头匹配(值字符串, "rgb")) {
+        返回 CSSColor_从rgb(值字符串)
+    }
+
+    // hsl() / hsla()
+    如果 (字符串_开头匹配(值字符串, "hsl")) {
+        返回 CSSColor_从hsl(值字符串)
+    }
+
+    // oklch()
+    如果 (字符串_开头匹配(值字符串, "oklch")) {
+        返回 CSSColor_从oklch(值字符串)
+    }
+
+    // oklab()
+    如果 (字符串_开头匹配(值字符串, "oklab")) {
+        返回 CSSColor_从oklab(值字符串)
+    }
+
+    // lab()
+    如果 (字符串_开头匹配(值字符串, "lab(")) {
+        返回 CSSColor_从lab(值字符串)
+    }
+
+    // lch()
+    如果 (字符串_开头匹配(值字符串, "lch(")) {
+        返回 CSSColor_从lch(值字符串)
+    }
+
+    // color()
+    如果 (字符串_开头匹配(值字符串, "color(")) {
+        返回 CSSColor_从color函数(值字符串)
+    }
+
+    // color-mix()
+    如果 (字符串_开头匹配(值字符串, "color-mix")) {
+        返回 CSSColor_从colorMix(值字符串)
+    }
+
+    // light-dark()
+    如果 (字符串_开头匹配(值字符串, "light-dark")) {
+        返回 CSSColor_从lightDark(值字符串)
+    }
+
+    // hwb()
+    如果 (字符串_开头匹配(值字符串, "hwb")) {
+        返回 CSSColor_从hwb(值字符串)
+    }
+
+    // 命名颜色
+    返回 CSSColor_从名称(值字符串)
+}
+
+函数 CSSColor_默认() {
+    返回 CSSColor { 空间: CS_SRGB, 分量1: 0, 分量2: 0, 分量3: 0, alpha: 10000 }
+}

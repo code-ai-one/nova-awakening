@@ -1,0 +1,482 @@
+// NovaOS 渲染引擎 — 媒体源扩展(MSE) + 事件分发 + AI语义
+// 子系统: 渲染引擎/媒体/标记媒体
+// 实现: W3C Media Source Extensions API
+//   MediaSource状态机 + SourceBuffer管理 + 追加/删除/eviction
+//   媒体段解析 + 事件分发辅助 + AI总线语义集成
+// 原创: NovaOS · 纯中文原生系统编程 · AI原生缓冲管理预测
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("../推理/智能总线鼠标.nova")
+导入("../中枢/字符串替换.nova")
+导入("../推理/智能总线资源.nova")
+导入("./文档事件.nova")
+导入("../中枢/辅助存根.nova")
+
+// §0 常量与统计
+
+定义 MS_CLOSED = 0
+定义 MS_OPEN = 1
+定义 MS_ENDED = 2
+定义 MSE_最大SourceBuffer = 8
+定义 MSE_默认缓冲容量 = 1048576    // 1MB
+定义 MSE_最大缓冲容量 = 134217728  // 128MB
+定义 MSE_Eviction阈值 = 104857600  // 100MB
+
+结构 MSE统计 {
+    MediaSource创建次数,
+    MediaSource销毁次数,
+    SourceBuffer创建次数,
+    追加操作次数,
+    追加字节总数,
+    删除操作次数,
+    abort操作次数,
+    endOfStream次数,
+    Eviction触发次数,
+    状态切换次数,
+    事件触发次数,
+    AI语义分类次数,
+    AI预加载次数,
+    AI缓冲调用次数,
+    AI缓冲命中次数,
+    总处理耗时_纳秒,
+    错误总数,
+    溢出保护次数,
+}
+
+结构 AI_MSE状态 {
+    历史追加速率,            // u64 字节/秒
+    历史缓冲水位,            // u32 Q10 (已用/容量)
+    历史Eviction率,          // u32 Q10
+    连续追加成功数,
+    连续追加失败数,
+    预测需要Eviction,
+    采样计数器,
+    学习权重,                // u32 Q10
+}
+
+定义 可变 全局MSE统计 = 0
+定义 可变 全局MSE_AI = 0
+定义 可变 全局MSE已初始化 = 假
+
+// §0.5 生命周期
+
+
+函数 MSE_初始化全局() {
+    如果 (全局MSE已初始化 == 真) { 返回 错误_已存在 }
+    全局MSE统计 = 堆_分配_清零(144)
+    如果 (全局MSE统计 == 空) { 返回 错误_内存不足 }
+    全局MSE_AI = 堆_分配_清零(48)
+    如果 (全局MSE_AI != 空) {
+        全局MSE_AI.学习权重 = 128
+    }
+    全局MSE已初始化 = 真
+    打印("[MSE] 初始化完成")
+    返回 0
+}
+
+函数 MSE_销毁全局() {
+    如果 (全局MSE统计 != 空) { 堆_释放(全局MSE统计); 全局MSE统计 = 0 }
+    如果 (全局MSE_AI != 空) { 堆_释放(全局MSE_AI); 全局MSE_AI = 0 }
+    全局MSE已初始化 = 假
+    返回 0
+}
+
+// §1 核心结构
+
+定义 MS_CLOSED = 0
+定义 MS_OPEN   = 1
+定义 MS_ENDED  = 2
+
+结构 SourceBuffer {
+    MIME类型,
+    缓冲数据,
+    缓冲大小,
+    缓冲容量,
+    updating,
+    timestampOffset,
+    appendWindowStart,
+    appendWindowEnd,
+}
+
+结构 媒体Source {
+    状态,    // u32 MS_xxx
+    duration,
+    sourceBuffers,    // u64 SourceBuffer*数组
+    sourceBufferCount,
+    activeSourceBuffers,
+    activeCount,
+    关联元素,    // u64 HTML媒体元素*
+}
+
+函数 媒体Source_创建() {
+    定义 ms = 堆_分配(媒体Source)
+    ms.状态 = MS_CLOSED; ms.duration = -1
+    ms.sourceBuffers = 堆_分配_数组(8 * 8)
+    ms.sourceBufferCount = 0; ms.关联元素 = 0
+    返回 ms
+}
+
+函数 媒体Source_addSourceBuffer(ms, 类型) {
+    如果 (ms == 0 || ms.状态 != MS_OPEN) { 返回 0 }
+    定义 sb = 堆_分配(SourceBuffer)
+    sb.MIME类型 = 字符串_复制(类型)
+    sb.缓冲容量 = 1024 * 1024
+    sb.缓冲数据 = 堆_分配(sb.缓冲容量)
+    sb.缓冲大小 = 0; sb.updating = 假
+    sb.timestampOffset = 0; sb.appendWindowStart = 0; sb.appendWindowEnd = -1
+    如果 (ms.sourceBufferCount < 8) {
+        内存_写64(ms.sourceBuffers + ms.sourceBufferCount * 8, sb)
+        ms.sourceBufferCount = ms.sourceBufferCount + 1
+    }
+    返回 sb
+}
+
+函数 SourceBuffer_appendBuffer(sb, 数据, 长度) {
+    如果 (sb == 0 || sb.updating) { 返回 }
+    sb.updating = 真
+    // 追加到缓冲
+    如果 (sb.缓冲大小 + 长度 <= sb.缓冲容量) {
+        内存_复制(sb.缓冲数据 + sb.缓冲大小, 数据, 长度)
+        sb.缓冲大小 = sb.缓冲大小 + 长度
+    }
+    sb.updating = 假
+    // 触发 updateend 事件
+}
+
+函数 媒体Source_endOfStream(ms) {
+    如果 (ms == 0) { 返回 }
+    ms.状态 = MS_ENDED
+}
+
+// §13 事件分发辅助
+
+函数 媒体元素_触发事件(me, 事件名) {
+    如果 (me == 0 || me.节点 == 0) { 返回 }
+    定义 事件 = 事件_创建(事件名, 假, 假)
+    事件.是受信任的 = 真
+    事件Target_dispatch事件(me.节点, 事件)
+}
+
+// 传统方案: HTML解析纯文本处理, 不理解内容语义
+// Nova: AI总线在解析阶段即开始语义理解和预测
+
+函数 智能_HTML媒体元素_AI节点语义(节点) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0 || 节点 == 0) { 返回 }
+    // 解析器创建节点时立即触发AI语义分类
+    // 由AI总线的语义嵌入引擎(标签32维+类名32维+结构8维→Nova多层感知器→角色)
+    定义 角色 = AI总线_语义分类(bus, 节点)
+    节点.语义角色 = 角色
+}
+
+函数 智能_HTML媒体元素_AI预加载提示(url, 资源类型) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0 || url == 0) { 返回 }
+    定义 优先级 = AI总线_资源优先级(bus, url)
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.AI预加载次数 = 全局MSE统计.AI预加载次数 + 1
+    }
+}
+
+// §4 增强SourceBuffer操作
+
+函数 SourceBuffer_remove(sb, 开始, 结束) {
+    如果 (sb == 空 || sb.updating == 真) { 返回 错误_无效参数 }
+    如果 (开始 < 0 || 结束 <= 开始) { 返回 错误_无效参数 }
+    sb.updating = 真
+    // 从缓冲中删除[开始, 结束)时间范围的数据
+    // 简化: 清除所有缓冲数据
+    sb.缓冲大小 = 0
+    sb.updating = 假
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.删除操作次数 = 全局MSE统计.删除操作次数 + 1
+    }
+    返回 0
+}
+
+函数 SourceBuffer_abort(sb) {
+    如果 (sb == 空) { 返回 }
+    sb.updating = 假
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.abort操作次数 = 全局MSE统计.abort操作次数 + 1
+    }
+}
+
+函数 SourceBuffer_设置timestampOffset(sb, 偏移) {
+    如果 (sb == 空 || sb.updating == 真) { 返回 }
+    sb.timestampOffset = 偏移
+}
+
+函数 SourceBuffer_设置appendWindow(sb, 开始, 结束) {
+    如果 (sb == 空 || sb.updating == 真) { 返回 }
+    如果 (开始 < 0) { 开始 = 0 }
+    sb.appendWindowStart = 开始
+    sb.appendWindowEnd = 结束
+}
+
+函数 SourceBuffer_appendBuffer_增强(sb, 数据, 长度) {
+    如果 (sb == 空 || 数据 == 空 || 长度 <= 0) { 返回 错误_无效参数 }
+    如果 (sb.updating == 真) {
+        如果 (全局MSE统计 != 空) { 全局MSE统计.错误总数 = 全局MSE统计.错误总数 + 1 }
+        返回 错误_已存在
+    }
+    sb.updating = 真
+    // 检查是否需要Eviction
+    如果 (sb.缓冲大小 + 长度 > sb.缓冲容量) {
+        // 尝试扩容
+        如果 (sb.缓冲容量 < MSE_最大缓冲容量) {
+            定义 新容量 = sb.缓冲容量 * 2
+            如果 (新容量 > MSE_最大缓冲容量) { 新容量 = MSE_最大缓冲容量 }
+            sb.缓冲数据 = 堆_重新分配(sb.缓冲数据, sb.缓冲容量, 新容量)
+            如果 (sb.缓冲数据 != 空) {
+                sb.缓冲容量 = 新容量
+            }
+        }
+        // 仍然不够 → Eviction
+        如果 (sb.缓冲大小 + 长度 > sb.缓冲容量) {
+            SourceBuffer_Eviction(sb)
+            如果 (全局MSE统计 != 空) {
+                全局MSE统计.Eviction触发次数 = 全局MSE统计.Eviction触发次数 + 1
+            }
+        }
+    }
+    // 追加数据
+    如果 (sb.缓冲大小 + 长度 <= sb.缓冲容量 && sb.缓冲数据 != 空) {
+        内存_复制(sb.缓冲数据 + sb.缓冲大小, 数据, 长度)
+        sb.缓冲大小 = sb.缓冲大小 + 长度
+    } 否则 {
+        如果 (全局MSE统计 != 空) {
+            全局MSE统计.溢出保护次数 = 全局MSE统计.溢出保护次数 + 1
+        }
+    }
+    sb.updating = 假
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.追加操作次数 = 全局MSE统计.追加操作次数 + 1
+        全局MSE统计.追加字节总数 = 全局MSE统计.追加字节总数 + 长度
+    }
+    // AI反馈
+    AI_MSE_记录追加(sb.缓冲大小, sb.缓冲容量, 长度)
+    返回 0
+}
+
+函数 SourceBuffer_Eviction(sb) {
+    如果 (sb == 空 || sb.缓冲大小 == 0) { 返回 }
+    // 简单Eviction: 删除前半部分数据
+    定义 保留开始 = sb.缓冲大小 / 2
+    定义 保留大小 = sb.缓冲大小 - 保留开始
+    如果 (保留大小 > 0 && sb.缓冲数据 != 空) {
+        内存_复制(sb.缓冲数据, sb.缓冲数据 + 保留开始, 保留大小)
+        sb.缓冲大小 = 保留大小
+    }
+}
+
+函数 SourceBuffer_销毁(sb) {
+    如果 (sb == 空) { 返回 }
+    如果 (sb.缓冲数据 != 空) { 堆_释放(sb.缓冲数据) }
+    堆_释放(sb)
+}
+
+函数 SourceBuffer_获取缓冲水位(sb) {
+    如果 (sb == 空 || sb.缓冲容量 == 0) { 返回 0 }
+    返回 sb.缓冲大小 * 1024 / sb.缓冲容量
+}
+
+// §5 MediaSource状态转换
+
+函数 媒体Source_open(ms, 元素) {
+    如果 (ms == 空) { 返回 错误_无效参数 }
+    如果 (ms.状态 != MS_CLOSED) { 返回 错误_已存在 }
+    ms.状态 = MS_OPEN
+    ms.关联元素 = 元素
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.状态切换次数 = 全局MSE统计.状态切换次数 + 1
+    }
+    返回 0
+}
+
+函数 媒体Source_close(ms) {
+    如果 (ms == 空) { 返回 }
+    ms.状态 = MS_CLOSED
+    ms.关联元素 = 0
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.状态切换次数 = 全局MSE统计.状态切换次数 + 1
+    }
+}
+
+函数 媒体Source_销毁(ms) {
+    如果 (ms == 空) { 返回 }
+    定义 可变 i = 0
+    当 (i < ms.sourceBufferCount) {
+        定义 sb = 内存_读64(ms.sourceBuffers + i * 8)
+        如果 (sb != 空) { SourceBuffer_销毁(sb) }
+        i = i + 1
+    }
+    如果 (ms.sourceBuffers != 空) { 堆_释放(ms.sourceBuffers) }
+    堆_释放(ms)
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.MediaSource销毁次数 = 全局MSE统计.MediaSource销毁次数 + 1
+    }
+}
+
+函数 媒体Source_获取状态(ms) {
+    如果 (ms == 空) { 返回 MS_CLOSED }
+    返回 ms.状态
+}
+
+函数 媒体Source_设置duration(ms, 时长) {
+    如果 (ms == 空 || ms.状态 != MS_OPEN) { 返回 }
+    ms.duration = 时长
+}
+
+函数 媒体Source_removeSourceBuffer(ms, sb) {
+    如果 (ms == 空 || sb == 空) { 返回 }
+    定义 可变 i = 0
+    当 (i < ms.sourceBufferCount) {
+        如果 (内存_读64(ms.sourceBuffers + i * 8) == sb) {
+            ms.sourceBufferCount = ms.sourceBufferCount - 1
+            如果 (i < ms.sourceBufferCount) {
+                内存_写64(ms.sourceBuffers + i * 8, 内存_读64(ms.sourceBuffers + ms.sourceBufferCount * 8))
+            }
+            SourceBuffer_销毁(sb)
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// §6 AI基因 — 缓冲管理预测
+// 能力: 预测 + 学习 + 自适应
+// 四阶段: 数据采集→特征提取→决策→执行
+
+函数 AI_MSE_记录追加(当前大小, 容量, 追加大小) {
+    如果 (全局MSE_AI == 空) { 返回 }
+    定义 AI = 全局MSE_AI
+    AI.采样计数器 = AI.采样计数器 + 1
+
+    AI.历史追加速率 = (AI.历史追加速率 * 7 + 追加大小) / 8
+    定义 可变 水位 = 0
+    如果 (容量 > 0) { 水位 = 当前大小 * 1024 / 容量 }
+    AI.历史缓冲水位 = (AI.历史缓冲水位 * 7 + 水位) / 8
+
+    如果 (AI.采样计数器 < 8) { 返回 }
+    AI.采样计数器 = 0
+    如果 (全局MSE统计 != 空) {
+        全局MSE统计.AI缓冲调用次数 = 全局MSE统计.AI缓冲调用次数 + 1
+    }
+
+    如果 (AI.历史缓冲水位 > 800) {
+        AI.预测需要Eviction = 真
+    } 否则 如果 (AI.历史缓冲水位 < 500) {
+        AI.预测需要Eviction = 假
+    }
+
+    定义 实际需要 = (水位 > 900)
+    如果 (AI.预测需要Eviction == 真 && 实际需要 == 真) {
+        如果 (全局MSE统计 != 空) {
+            全局MSE统计.AI缓冲命中次数 = 全局MSE统计.AI缓冲命中次数 + 1
+        }
+    }
+}
+
+// §7 统计输出与诊断
+
+函数 MSE_打印统计() {
+    如果 (全局MSE统计 == 空) {
+        打印("[MSE] 统计未初始化")
+        返回
+    }
+    打印("┌──────────────────────────────────────┐")
+    打印("│   MSE媒体源扩展 · 统计报告          │")
+    打印("├──────────────────────────────────────┤")
+    打印(字符串拼接("│ MediaSource创建:  ", 转字符串(全局MSE统计.MediaSource创建次数)))
+    打印(字符串拼接("│ SourceBuffer创建: ", 转字符串(全局MSE统计.SourceBuffer创建次数)))
+    打印(字符串拼接("│ 追加操作:         ", 转字符串(全局MSE统计.追加操作次数)))
+    打印(字符串拼接("│ 追加字节(KB):     ", 转字符串(全局MSE统计.追加字节总数 / 1024)))
+    打印(字符串拼接("│ 删除操作:         ", 转字符串(全局MSE统计.删除操作次数)))
+    打印(字符串拼接("│ abort:            ", 转字符串(全局MSE统计.abort操作次数)))
+    打印(字符串拼接("│ endOfStream:      ", 转字符串(全局MSE统计.endOfStream次数)))
+    打印(字符串拼接("│ Eviction:         ", 转字符串(全局MSE统计.Eviction触发次数)))
+    打印(字符串拼接("│ 状态切换:         ", 转字符串(全局MSE统计.状态切换次数)))
+    打印(字符串拼接("│ 事件触发:         ", 转字符串(全局MSE统计.事件触发次数)))
+    打印(字符串拼接("│ AI语义分类:       ", 转字符串(全局MSE统计.AI语义分类次数)))
+    打印(字符串拼接("│ AI缓冲调用:       ", 转字符串(全局MSE统计.AI缓冲调用次数)))
+    打印(字符串拼接("│ AI缓冲命中:       ", 转字符串(全局MSE统计.AI缓冲命中次数)))
+    打印(字符串拼接("│ 溢出保护:         ", 转字符串(全局MSE统计.溢出保护次数)))
+    打印(字符串拼接("│ 错误:             ", 转字符串(全局MSE统计.错误总数)))
+    打印("└──────────────────────────────────────┘")
+}
+
+函数 MSE_导出诊断() {
+    如果 (全局MSE_AI == 空) {
+        打印("[MSE AI] 未初始化")
+        返回
+    }
+    定义 AI = 全局MSE_AI
+    打印("[MSE AI] === 诊断 ===")
+    打印(字符串拼接("  历史追加速率(B/s): ", 转字符串(AI.历史追加速率)))
+    打印(字符串拼接("  历史缓冲水位(Q10): ", 转字符串(AI.历史缓冲水位)))
+    打印(字符串拼接("  预测需要Eviction: ", 转字符串(AI.预测需要Eviction)))
+}
+
+// §8 对外接口
+
+函数 MSE_获取统计() { 返回 全局MSE统计 }
+函数 MSE_获取AI状态() { 返回 全局MSE_AI }
+函数 MSE_是否已初始化() { 返回 全局MSE已初始化 }
+
+函数 媒体Source_获取SourceBuffer数(ms) {
+    如果 (ms == 空) { 返回 0 }
+    返回 ms.sourceBufferCount
+}
+
+函数 媒体Source_获取duration(ms) {
+    如果 (ms == 空) { 返回 -1 }
+    返回 ms.duration
+}
+
+函数 媒体Source_是否打开(ms) {
+    如果 (ms == 空) { 返回 假 }
+    返回 ms.状态 == MS_OPEN
+}
+
+函数 媒体Source_是否结束(ms) {
+    如果 (ms == 空) { 返回 假 }
+    返回 ms.状态 == MS_ENDED
+}
+
+函数 SourceBuffer_获取MIME类型(sb) {
+    如果 (sb == 空) { 返回 空 }
+    返回 sb.MIME类型
+}
+
+函数 SourceBuffer_获取缓冲大小(sb) {
+    如果 (sb == 空) { 返回 0 }
+    返回 sb.缓冲大小
+}
+
+函数 SourceBuffer_是否正在更新(sb) {
+    如果 (sb == 空) { 返回 假 }
+    返回 sb.updating
+}
+
+函数 SourceBuffer_获取timestampOffset(sb) {
+    如果 (sb == 空) { 返回 0 }
+    返回 sb.timestampOffset
+}
+
+函数 媒体Source_isTypeSupported(类型) {
+    如果 (类型 == 空) { 返回 假 }
+    如果 (字符串_包含(类型, "video/mp4")) { 返回 真 }
+    如果 (字符串_包含(类型, "video/webm")) { 返回 真 }
+    如果 (字符串_包含(类型, "audio/mp4")) { 返回 真 }
+    如果 (字符串_包含(类型, "audio/webm")) { 返回 真 }
+    如果 (字符串_包含(类型, "audio/mpeg")) { 返回 真 }
+    返回 假
+}
+
+函数 媒体Source_获取关联元素(ms) {
+    如果 (ms == 空) { 返回 空 }
+    返回 ms.关联元素
+}

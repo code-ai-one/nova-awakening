@@ -1,0 +1,106 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./地址解析辅.nova")
+
+// NovaOS · HTTP客户端 — 云端模型接口通信 + RESTful请求
+// 支持GET/POST/PUT/DELETE + 序列序列化 + 流式响应
+// §1 HTTP请求构造: 方法/URL/头部/正文
+// §2 HTTP响应解析: 状态码/头部/正文
+// §3 序列序列化/反序列化(版)
+// §4 云端AI 接口适配器: Nova智能/Anthropic/本地模型统一接口
+// §5 连接池 + 重试 + 超时
+
+// §1 HTTP请求
+
+定义 HTTP_GET = 0
+定义 HTTP_POST = 1
+定义 HTTP_PUT = 2
+定义 HTTP_DELETE = 3
+定义 HTTP_PATCH = 4
+
+定义 HTTP_版本 = "HTTP/1.1"
+定义 HTTP_默认超时 = 30000    // 30秒
+定义 HTTP_最大重试 = 3
+定义 HTTP_最大头部 = 32
+定义 HTTP_最大正文 = 1048576  // 1MB
+
+结构 HTTP头部 {
+    名称,
+    值,
+}
+
+结构 HTTP请求 {
+    方法,
+    URL,
+    主机,
+    路径,
+    端口,
+    头部列表,    // [] HTTP头部数组
+    正文,
+    超时_ms,
+    使用安全,
+}
+
+结构 HTTP响应 {
+    状态码,
+    状态文本,
+    头部列表,    // []
+    正文,
+    正文长度,
+    耗时_ms,
+    成功,
+}
+
+定义 可变 HTTP_请求总数 = 0
+定义 可变 HTTP_成功总数 = 0
+定义 可变 HTTP_失败总数 = 0
+定义 可变 HTTP_总耗时 = 0
+
+函数 HTTP_创建请求(方法, URL) {
+    定义 req = HTTP请求 {}
+    req.方法 = 方法
+    req.URL = URL
+    req.头部列表 = []
+    req.正文 = ""
+    req.超时_ms = HTTP_默认超时
+    req.使用安全 = 假
+
+    // 解析URL → 主机/路径/端口
+    定义 解析结果 = URL_解析(URL)
+    req.主机 = 解析结果[0]
+    req.路径 = 解析结果[1]
+    req.端口 = 解析结果[2]
+    如果 (解析结果[3] == 1) { req.使用安全 = 真 }
+
+    // 默认头部
+    HTTP_添加头部(req, "Host", req.主机)
+    HTTP_添加头部(req, "User-智能体", "NovaOS/1.0")
+    HTTP_添加头部(req, "Accept", "*/*")
+    HTTP_添加头部(req, "Connection", "keep-alive")
+
+    返回 req
+}
+
+函数 HTTP_添加头部(req, 名称, 值, 附加) {
+    如果 (计数(req.头部列表) >= HTTP_最大头部) { 返回 }
+    定义 h = HTTP头部 {}
+    h.名称 = 名称
+    h.值 = 值
+    追加(req.头部列表, h)
+}
+
+函数 HTTP_设正文(req, 正文, 内容类型) {
+    req.正文 = 正文
+    HTTP_添加头部(req, "Content-Type", 内容类型)
+    HTTP_添加头部(req, "Content-Length", 整数转字符串(字符串长度(正文)))
+}
+
+函数 HTTP_设序列正文(req, json字符串) {
+    HTTP_设正文(req, json字符串, "application/json")
+}
+
+函数 HTTP_设授权(req, 令牌) {
+    HTTP_添加头部(req, "Authorization", "Bearer " + 令牌)
+}

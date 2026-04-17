@@ -1,0 +1,241 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./生成窗口元.nova")
+导入("../中枢/硬链接.nova")
+导入("./桌面元素甲.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §2 桌面Nova元素生成
+
+外部 系统时间_获取秒
+外部 读取毫秒
+
+函数 Nova原生桌面_补零(n) {
+    如果 (n < 10) { 返回 "0" + 整数转字符串(n) }
+    返回 整数转字符串(n)
+}
+
+函数 Nova原生桌面_格式化时钟文本() {
+    定义 可变 秒 = 系统时间_获取秒()
+    如果 (秒 <= 0) {
+        秒 = 读取毫秒() / 1000
+    }
+    定义 时 = (秒 % 86400) / 3600
+    定义 分 = (秒 % 3600) / 60
+    返回 Nova原生桌面_补零(时) + ":" + Nova原生桌面_补零(分)
+}
+
+函数 Nova原生桌面_格式化运行时文本() {
+    定义 运行毫秒 = 读取毫秒()
+    定义 总秒 = 运行毫秒 / 1000
+    定义 时 = 总秒 / 3600
+    定义 分 = (总秒 % 3600) / 60
+    定义 秒余 = 总秒 % 60
+    如果 (时 > 0) {
+        返回 "up " + Nova原生桌面_补零(时) + "h " + Nova原生桌面_补零(分) + "m"
+    }
+    如果 (分 > 0) {
+        返回 "up " + Nova原生桌面_补零(分) + "m " + Nova原生桌面_补零(秒余) + "s"
+    }
+    返回 "up " + Nova原生桌面_补零(秒余) + "s"
+}
+
+函数 Nova原生桌面_构建桌面NML() {
+    定义 可变 html = "<!DOCTYPE html><html><head>"
+    html = html + "<meta charset='UTF-8'>"
+    html = html + "<title>NovaOS Desktop</title>"
+    html = html + "<style>" + 桌面.主题CSS + "</style>"
+    html = html + "</head><body class='nova-desktop'>"
+
+    定义 可变 壳前台文本 = 桌面.壳输入提示
+    如果 (字符串长度(桌面.壳输入缓冲) > 0) {
+        壳前台文本 = "> " + 桌面.壳输入缓冲
+    } 否则 如果 (字符串长度(桌面.壳最后输入) > 0) {
+        壳前台文本 = 桌面.壳最后输入
+    }
+    定义 壳结果文本 = 桌面.壳最后结果
+    如果 (字符串长度(壳结果文本) == 0) {
+        壳结果文本 = "系统主壳前台就绪"
+    }
+    定义 系统时钟文本 = Nova原生桌面_格式化时钟文本()
+    定义 运行时文本 = Nova原生桌面_格式化运行时文本()
+
+    // 壁纸层
+    html = html + "<div id='wallpaper' class='wallpaper-layer'></div>"
+    html = html + Nova原生桌面_生成桌面工作区NML_新版()
+
+    // 桌面图标层
+    html = html + "<div id='icons' class='icon-layer'>"
+    html = html + Nova原生桌面_生成图标NML()
+    html = html + "</div>"
+
+    // 窗口层
+    html = html + "<div id='windows' class='window-layer'>"
+    定义 可变 i = 0
+    当 (i < 计数(桌面.窗口列表)) {
+        如果 (桌面.窗口列表[i].可见) {
+            html = html + Nova原生桌面_生成窗口NML(桌面.窗口列表[i])
+        }
+        i = i + 1
+    }
+    html = html + "</div>"
+
+    // 通知层
+    html = html + "<div id='notifications' class='notification-layer'></div>"
+
+    // 系统栏(顶部)
+    html = html + "<div id='sysbar' class='system-bar'>"
+    html = html + "  <div class='sysbar-left'><span class='sysbar-brand-mark'>N</span><span>NovaOS Workspace</span></div>"
+    html = html + "  <div class='sysbar-center'>"
+    html = html + "    <div class='sysbar-omnibox'><span class='sysbar-omnibox-text'>" + Nova原生桌面_转义HTML文本(Nova原生桌面_截断文本(壳前台文本, 96)) + "</span><span class='sysbar-omnibox-meta'>" + Nova原生桌面_转义HTML文本(Nova原生桌面_截断文本(壳结果文本, 52)) + "</span></div>"
+    html = html + "  </div>"
+    html = html + "  <span class='sysbar-right'>"
+    html = html + "    <span class='sysbar-item sysbar-live' id='core'>Core " + Nova原生桌面_转义HTML文本(桌面.核心状态) + "</span>"
+    html = html + "    <span class='sysbar-item' id='vision'>Vision " + Nova原生桌面_转义HTML文本(桌面.视觉状态) + "</span>"
+    html = html + "    <span class='sysbar-item' id='voice'>Voice " + Nova原生桌面_转义HTML文本(桌面.声音状态) + "</span>"
+    html = html + "    <span class='sysbar-item' id='avatar'>Avatar " + Nova原生桌面_转义HTML文本(桌面.形象状态) + "</span>"
+    html = html + "    <span class='sysbar-item' id='clock'>" + Nova原生桌面_转义HTML文本(系统时钟文本) + "</span>"
+    html = html + "  </span>"
+    html = html + "</div>"
+
+    // 任务栏(底部)
+    html = html + "<div id='taNova缓冲ar' class='taNova缓冲ar'>"
+    html = html + "  <div class='taNova缓冲ar-launcher' id='launcher'>Nova 终端</div>"
+    html = html + "  <div class='taNova缓冲ar-apps' id='taNova缓冲ar-apps'>"
+    html = html + Nova原生桌面_生成任务栏NML()
+    html = html + "  </div>"
+    html = html + "  <div class='taNova缓冲ar-tray' id='taNova缓冲ar-tray'><span class='tray-pill'>core " + Nova原生桌面_转义HTML文本(桌面.核心状态) + "</span><span class='tray-pill'>vision " + Nova原生桌面_转义HTML文本(桌面.视觉状态) + "</span><span class='tray-pill'>voice " + Nova原生桌面_转义HTML文本(桌面.声音状态) + "</span><span class='tray-pill'>avatar " + Nova原生桌面_转义HTML文本(桌面.形象状态) + "</span><span class='tray-pill'>" + Nova原生桌面_转义HTML文本(运行时文本) + "</span><span class='tray-pill'>" + Nova原生桌面_转义HTML文本(Nova原生桌面_截断文本(桌面.壳最后动作, 16)) + "</span></div>"
+    html = html + "</div>"
+
+    html = html + "</body></html>"
+
+    // 用DOM解析引擎解析
+    定义 文档 = DOM_解析NML(html, "nova://desktop")
+    返回 文档
+}
+
+函数 Nova原生桌面_生成桌面CSS() {
+    定义 可变 css = ""
+    css = css + "*{margin:0;padding:0;box-sizing:border-box;}"
+    css = css + "body{overflow:hidden;font-family:'Nova Sans',system-ui,sans-serif;}"
+
+    css = css + ".nova-desktop{width:100vw;height:100vh;background:#0f0a1e;color:#f0e6ff;}"
+    css = css + ".tray-pill{color:#c084fc;background:rgba(88,28,135,0.35);border:1px solid rgba(168,85,247,0.2);border-radius:999px;padding:4px 8px;font-size:11px;}"
+    css = css + ".wallpaper-layer{position:fixed;top:0;left:0;right:0;bottom:0;z-index:0;"
+    css = css + "background:radial-gradient(ellipse at 18% 12%,rgba(88,28,135,0.4),transparent 40%),"
+    css = css + "radial-gradient(ellipse at 82% 14%,rgba(168,85,247,0.2),transparent 35%),"
+    css = css + "radial-gradient(ellipse at 50% 80%,rgba(251,191,36,0.1),transparent 30%),"
+    css = css + "linear-gradient(145deg,#0f0a1e 0%,#1a0f2e 40%,#0d0b1a 100%);}"
+
+    css = css + ".icon-layer{position:fixed;top:78px;left:0;right:0;bottom:110px;z-index:1;}"
+    css = css + ".desktop-icon{display:flex;flex-direction:column;align-items:center;width:92px;height:108px;"
+    css = css + "position:absolute;cursor:pointer;border-radius:20px;padding:12px 8px;"
+    css = css + "background:linear-gradient(180deg,rgba(88,28,135,0.35),rgba(30,15,60,0.5));"
+    css = css + "border:1px solid rgba(168,85,247,0.25);backdrop-filter:blur(18px);"
+    css = css + "box-shadow:0 18px 34px rgba(88,28,135,0.2);transition:all 0.3s ease;}"
+    css = css + ".desktop-icon:hover{background:linear-gradient(180deg,rgba(168,85,247,0.4),rgba(88,28,135,0.5));"
+    css = css + "border-color:rgba(168,85,247,0.55);box-shadow:0 22px 38px rgba(168,85,247,0.3),0 0 20px rgba(168,85,247,0.15);"
+    css = css + "transform:translateY(-2px);}"
+    css = css + ".desktop-icon .icon-img{width:48px;height:48px;border-radius:14px;display:flex;"
+    css = css + "align-items:center;justify-content:center;margin-bottom:4px;overflow:hidden;"
+    css = css + "box-shadow:0 8px 18px rgba(88,28,135,0.3);}"
+    css = css + ".desktop-icon .icon-img img{width:100%;height:100%;object-fit:cover;}"
+    css = css + ".desktop-icon .icon-name{font-size:12px;color:#d8b4fe;text-align:center;font-weight:700;text-shadow:0 1px 4px rgba(0,0,0,0.5);}"
+
+    // 系统栏(紫金毛玻璃)
+    css = css + ".system-bar{position:fixed;top:18px;left:20px;right:20px;height:48px;z-index:100;"
+    css = css + "background:linear-gradient(180deg,rgba(30,15,60,0.7),rgba(15,10,30,0.75));backdrop-filter:blur(26px);"
+    css = css + "display:flex;align-items:center;justify-content:space-between;padding:0 16px 0 18px;font-size:12px;"
+    css = css + "border:1px solid rgba(168,85,247,0.2);border-radius:20px;"
+    css = css + "box-shadow:0 18px 44px rgba(88,28,135,0.25),inset 0 1px 0 rgba(168,85,247,0.1);}"
+    css = css + ".sysbar-left{font-weight:700;color:#d8b4fe;display:flex;align-items:center;gap:10px;}"
+    css = css + ".sysbar-brand-mark{color:#fbbf24;}"
+    css = css + ".sysbar-center{flex:1;display:flex;justify-content:center;padding:0 18px;}"
+    css = css + ".sysbar-omnibox{min-width:480px;max-width:780px;width:100%;height:32px;border-radius:999px;"
+    css = css + "background:rgba(88,28,135,0.3);border:1px solid rgba(168,85,247,0.2);"
+    css = css + "display:flex;align-items:center;justify-content:flex-start;color:#c084fc;padding:0 16px;"
+    css = css + "overflow:hidden;white-space:nowrap;box-shadow:inset 0 1px 0 rgba(168,85,247,0.1);}"
+    css = css + ".sysbar-omnibox-text{color:#d8b4fe;}"
+    css = css + ".sysbar-omnibox-meta{color:#a78bfa;margin-left:8px;font-size:11px;}"
+    css = css + ".sysbar-right{display:flex;gap:10px;align-items:center;}"
+    css = css + ".sysbar-item{color:#c084fc;padding:6px 10px;border-radius:999px;background:rgba(88,28,135,0.35);border:1px solid rgba(168,85,247,0.2);font-weight:600;}"
+    css = css + ".sysbar-item.sysbar-live{color:#fbbf24;border-color:rgba(251,191,36,0.3);}"
+
+    // 任务栏(紫金毛玻璃)
+    css = css + ".taNova缓冲ar{position:fixed;bottom:18px;left:20px;right:20px;height:64px;z-index:100;"
+    css = css + "background:linear-gradient(180deg,rgba(30,15,60,0.7),rgba(15,10,30,0.75));backdrop-filter:blur(28px);"
+    css = css + "display:flex;align-items:center;padding:0 12px;gap:10px;"
+    css = css + "border:1px solid rgba(168,85,247,0.2);border-radius:24px;"
+    css = css + "box-shadow:0 22px 46px rgba(88,28,135,0.25),inset 0 1px 0 rgba(168,85,247,0.1);}"
+    css = css + ".taNova缓冲ar-launcher{min-width:118px;height:44px;border-radius:16px;"
+    css = css + "background:linear-gradient(135deg,rgba(168,85,247,0.5),rgba(88,28,135,0.6),rgba(251,191,36,0.2));"
+    css = css + "display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px;"
+    css = css + "color:#f0e6ff;font-weight:800;border:1px solid rgba(168,85,247,0.35);"
+    css = css + "box-shadow:0 12px 24px rgba(88,28,135,0.3);}"
+    css = css + ".taNova缓冲ar-apps{flex:1;display:flex;gap:10px;padding:0 4px;align-items:center;}"
+    css = css + ".taNova缓冲ar-app{min-width:52px;height:44px;border-radius:16px;display:flex;"
+    css = css + "align-items:center;justify-content:center;cursor:pointer;font-size:16px;"
+    css = css + "background:rgba(88,28,135,0.3);border:1px solid rgba(168,85,247,0.15);"
+    css = css + "color:#d8b4fe;transition:all 0.2s ease;}"
+    css = css + ".taNova缓冲ar-app:hover{background:rgba(168,85,247,0.4);border-color:rgba(168,85,247,0.4);}"
+    css = css + ".taNova缓冲ar-app.active{background:linear-gradient(135deg,rgba(168,85,247,0.45),rgba(88,28,135,0.5));"
+    css = css + "border-color:rgba(168,85,247,0.5);box-shadow:0 0 16px rgba(168,85,247,0.25);}"
+
+    // 窗口(紫金毛玻璃)
+    css = css + ".window-layer{position:fixed;top:78px;left:0;right:0;bottom:110px;z-index:10;}"
+    css = css + ".nova-window{position:absolute;border-radius:14px;overflow:hidden;"
+    css = css + "background:linear-gradient(180deg,rgba(25,12,50,0.82),rgba(15,10,30,0.88));"
+    css = css + "border:1px solid rgba(168,85,247,0.18);"
+    css = css + "box-shadow:0 30px 70px rgba(88,28,135,0.3);display:flex;flex-direction:column;backdrop-filter:blur(26px);}"
+    css = css + ".nova-window.focused{border-color:rgba(168,85,247,0.5);"
+    css = css + "box-shadow:0 34px 80px rgba(88,28,135,0.35),0 0 0 1px rgba(168,85,247,0.3),0 0 40px rgba(168,85,247,0.1);}"
+    css = css + ".window-titlebar{height:48px;background:linear-gradient(180deg,rgba(40,20,75,0.7),rgba(25,12,50,0.6));display:flex;"
+    css = css + "align-items:center;padding:0 12px;cursor:grab;user-select:none;}"
+    css = css + ".window-titlebar .title{flex:1;font-size:13px;color:#d8b4fe;font-weight:700;}"
+    css = css + ".window-controls{display:flex;gap:8px;}"
+    css = css + ".window-btn{width:12px;height:12px;border-radius:50%;cursor:pointer;}"
+    css = css + ".window-btn.close{background:#ef4444;}"
+    css = css + ".window-btn.minimize{background:#f59e0b;}"
+    css = css + ".window-btn.maximize{background:#22c55e;}"
+    css = css + ".window-content{flex:1;overflow:auto;background:linear-gradient(180deg,rgba(15,10,30,0.9),rgba(10,6,20,0.95));}"
+    css = css + ".window-page-终端{padding:16px;display:flex;flex-direction:column;gap:8px;color:#c084fc;}"
+    css = css + ".window-page-url{font-size:12px;color:#5d7ea6;word-break:break-all;}"
+    css = css + ".window-page-title{font-size:18px;font-weight:600;color:#10233f;}"
+    css = css + ".window-page-status{font-size:12px;color:#6e829c;}"
+    css = css + ".window-终端-actions{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px 0;}"
+    css = css + ".window-终端-actions a{padding:6px 10px;border-radius:10px;background:rgba(255,255,255,0.78);border:1px solid rgba(226,232,240,0.92);color:#173b68;text-decoration:none;font-size:12px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.96);}"
+    css = css + ".window-page-终端 .nova-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:6px;}"
+    css = css + ".window-page-终端 .nova-panel{padding:14px;background:linear-gradient(180deg,rgba(255,255,255,0.84),rgba(244,247,251,0.74));border:1px solid rgba(226,232,240,0.92);border-radius:14px;box-shadow:0 16px 36px rgba(148,163,184,0.14);}"
+    css = css + ".window-page-终端 .nova-panel h2{margin:0 0 8px 0;color:#17304d;font-size:16px;}"
+    css = css + ".window-page-终端 .nova-panel p{margin:0 0 8px 0;color:#586d88;line-height:1.5;}"
+    css = css + ".window-page-终端 .nova-panel ul{margin:0;padding-left:18px;color:#395169;}"
+    css = css + ".window-page-终端 .nova-panel li{margin-bottom:6px;}"
+    css = css + ".window-page-终端 .nova-input{margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.8);border:1px solid rgba(226,232,240,0.92);color:#17304d;}"
+    css = css + ".window-page-终端 .nova-bar{height:8px;border-radius:999px;background:rgba(148,163,184,0.18);margin-top:10px;overflow:hidden;}"
+    css = css + ".window-page-终端 .nova-bar span{display:block;height:8px;border-radius:999px;background:linear-gradient(90deg,#60a5fa,#93c5fd,#2dd4bf);}"
+
+    // 通知(紫金主题)
+    css = css + ".notification-layer{position:fixed;top:84px;right:20px;z-index:200;}"
+    css = css + ".notification{width:320px;padding:12px 16px;margin-bottom:8px;border-radius:14px;"
+    css = css + "background:linear-gradient(180deg,rgba(40,20,75,0.8),rgba(25,12,50,0.85));backdrop-filter:blur(16px);"
+    css = css + "border:1px solid rgba(168,85,247,0.25);color:#d8b4fe;"
+    css = css + "box-shadow:0 18px 36px rgba(88,28,135,0.25),0 0 20px rgba(168,85,247,0.08);}"
+
+    css = css + Nova原生桌面_生成桌面新版覆盖CSS()
+    返回 css
+}
+
+定义 可变 AI_桌面元素生_热节点缓存 = 0
+
+函数 AI_桌面元素生_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { AI_桌面元素生_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 AI_桌面元素生_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}

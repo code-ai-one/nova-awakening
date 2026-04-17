@@ -1,0 +1,229 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./链表后继.nova")
+导入("./实时调度.nova")
+导入("./时钟中枢.nova")
+
+//   1. SCHED_DEADLINE: 基于截止时间的实时调度(EDF算法)
+//   2. 三参数模型: runtime/deadline/period
+//   3. EDF: Earliest Deadline First — 截止时间最近的优先
+//   4. CBS: Constant Bandwidth Server — 带宽预留
+//   5. 优先级: DEADLINE > RT(FIFO/RR) > Nova公平调度
+//   6. 用于: 音视频处理/工业控制/精确定时任务
+
+结构 DL参数 {
+    runtime_ns,    // u64 每个周期内可执行的时间
+    deadline_ns,    // u64 截止时间(相对于周期开始)
+    period_ns,    // u64 周期(周期性任务)
+    当前runtime,    // u64 当前周期已用的runtime
+    当前deadline,    // u64 当前绝对截止时间
+    超额,    // u8 是否超过runtime限制(被限流)
+}
+
+结构 DL运行队列 {
+    任务列表,    // [] 按deadline排序
+    任务数,
+    总带宽,    // u64 所有DL任务的总带宽(runtime/period)
+}
+
+定义 可变 dl_rq = 空
+定义 可变 dl_调度次数 = 0
+
+// 初始化
+
+函数 DL调度器_初始化() {
+    dl_rq = DL运行队列 {}
+    dl_rq.任务列表 = []
+    dl_rq.任务数 = 0
+    dl_rq.总带宽 = 0
+    内核信息("SCHED_DEADLINE: 初始化 (EDF+CBS)")
+}
+
+// 入队 
+// 按截止时间排序插入(EDF)
+
+函数 DL_入队(任务, 参数) {
+    // 按deadline排序插入
+    定义 可变 插入位 = 计数(dl_rq.任务列表)
+    定义 可变 i = 0
+    当 (i < 计数(dl_rq.任务列表)) {
+        定义 现有 = dl_rq.任务列表[i]
+        如果 (参数.当前deadline < 现有[1].当前deadline) {
+            插入位 = i
+            中断
+        }
+        i = i + 1
+    }
+    // 按deadline排序插入(EDF: 最早deadline在前)
+    定义 新项 = [任务, 参数]
+    如果 (插入位 < 计数(dl_rq.任务列表)) {
+        // 在插入位之前的所有项后移(通过先追加再交换实现)
+        追加(dl_rq.任务列表, 新项)
+        // 将新项从尾部移到正确位置
+        定义 可变 j = 计数(dl_rq.任务列表) - 1
+        当 (j > 插入位) {
+            定义 临时 = dl_rq.任务列表[j - 1]
+            设置(dl_rq.任务列表, j - 1, dl_rq.任务列表[j])
+            设置(dl_rq.任务列表, j, 临时)
+            j = j - 1
+        }
+    } 否则 {
+        追加(dl_rq.任务列表, 新项)
+    }
+    dl_rq.任务数 = dl_rq.任务数 + 1
+}
+
+函数 DL_出队(任务) {
+    定义 可变 i = 0
+    当 (i < 计数(dl_rq.任务列表)) {
+        如果 (dl_rq.任务列表[i][0] == 任务) {
+            链表_删除(dl_rq.任务列表, i)
+            dl_rq.任务数 = dl_rq.任务数 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// 选择下一个DL任务 
+// EDF: 选择deadline最近的
+
+函数 DL_选择下一个() {
+    如果 (dl_rq.任务数 == 0) { 返回 空 }
+    // 找deadline最小的(已排序则取第一个)
+    定义 可变 最佳 = 0
+    定义 可变 最早deadline = dl_rq.任务列表[0][1].当前deadline
+    定义 可变 i = 1
+    当 (i < 计数(dl_rq.任务列表)) {
+        定义 dl = dl_rq.任务列表[i][1].当前deadline
+        如果 (dl < 最早deadline && dl_rq.任务列表[i][1].超额 == 0) {
+            最早deadline = dl
+            最佳 = i
+        }
+        i = i + 1
+    }
+    // 检查是否被限流
+    如果 (dl_rq.任务列表[最佳][1].超额 != 0) { 返回 空 }
+    dl_调度次数 = dl_调度次数 + 1
+    返回 dl_rq.任务列表[最佳][0]
+}
+
+// tick处理 
+// 记账runtime, 超额时限流
+
+函数 DL_tick(当前任务) {
+    如果 (当前任务 == 空) { 返回 }
+    // 查找对应DL参数
+    定义 可变 i = 0
+    当 (i < 计数(dl_rq.任务列表)) {
+        如果 (dl_rq.任务列表[i][0] == 当前任务) {
+            定义 参数 = dl_rq.任务列表[i][1]
+            参数.当前runtime = 参数.当前runtime + 1000000  // +1ms
+            // 超过runtime限制: 限流
+            如果 (参数.当前runtime >= 参数.runtime_ns) {
+                参数.超额 = 1
+                进程_设置需要调度(当前任务)
+            }
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// 周期更新 
+// 新周期开始时补充runtime
+
+函数 DL_补充() {
+    定义 当前时间 = 读取纳秒()
+    定义 可变 i = 0
+    当 (i < 计数(dl_rq.任务列表)) {
+        定义 参数 = dl_rq.任务列表[i][1]
+        如果 (当前时间 >= 参数.当前deadline) {
+            // 新周期: 补充runtime, 推进deadline
+            参数.当前runtime = 0
+            参数.当前deadline = 参数.当前deadline + 参数.period_ns
+            参数.超额 = 0
+        }
+        i = i + 1
+    }
+}
+
+// 带宽检查 
+// 确保总DL带宽不超过CPU容量
+
+函数 DL_检查带宽(新runtime, 新period) {
+    如果 (新period <= 0) { 返回 假 }
+    定义 新带宽 = 新runtime * 1000 / 新period  // 千分比
+    定义 总 = dl_rq.总带宽 + 新带宽
+    返回 总 <= 950   // 不超过95% CPU (留5%给非DL任务)
+}
+
+函数 DL_有任务() { 返回 dl_rq.任务数 > 0 }
+函数 DL_统计() { 返回 [dl_调度次数, dl_rq.任务数, dl_rq.总带宽] }
+
+// DL参数创建与验证
+
+函数 DL参数_创建(runtime_ns, deadline_ns, period_ns) {
+    定义 p = DL参数 {}
+    p.runtime_ns = runtime_ns
+    p.deadline_ns = deadline_ns
+    p.period_ns = period_ns
+    p.当前runtime = 0
+    p.当前deadline = 读取纳秒() + deadline_ns
+    p.超额 = 0
+    返回 p
+}
+
+函数 DL参数_验证(runtime, deadline, period) {
+    // runtime <= deadline <= period
+    如果 (runtime <= 0) { 返回 假 }
+    如果 (deadline <= 0) { 返回 假 }
+    如果 (period <= 0) { 返回 假 }
+    如果 (runtime > deadline) { 返回 假 }
+    如果 (deadline > period) { 返回 假 }
+    返回 真
+}
+
+// DL任务截止时间查询
+
+函数 DL_最近截止时间() {
+    如果 (dl_rq.任务数 == 0) { 返回 0 }
+    定义 可变 最小 = dl_rq.任务列表[0][1].当前deadline
+    定义 可变 i = 1
+    当 (i < 计数(dl_rq.任务列表)) {
+        定义 dl = dl_rq.任务列表[i][1].当前deadline
+        如果 (dl < 最小) { 最小 = dl }
+        i = i + 1
+    }
+    返回 最小
+}
+
+函数 DL_超额任务数() {
+    定义 可变 计 = 0
+    定义 可变 i = 0
+    当 (i < 计数(dl_rq.任务列表)) {
+        如果 (dl_rq.任务列表[i][1].超额 != 0) { 计 = 计 + 1 }
+        i = i + 1
+    }
+    返回 计
+}
+
+函数 DL_完整统计() {
+    返回 [dl_调度次数, dl_rq.任务数, dl_rq.总带宽, DL_超额任务数()]
+}
+
+定义 可变 AI_截止期调甲_负载窗口 = []
+
+函数 AI_截止期调甲_负载预测(当前负载) {
+    追加(AI_截止期调甲_负载窗口, 当前负载)
+    如果 (计数(AI_截止期调甲_负载窗口) > 20) { 列表_移除(AI_截止期调甲_负载窗口, 0) }
+    如果 (计数(AI_截止期调甲_负载窗口) < 3) { 返回 当前负载 }
+    定义 n = 计数(AI_截止期调甲_负载窗口)
+    定义 趋势 = AI_截止期调甲_负载窗口[n-1] - AI_截止期调甲_负载窗口[n-3]
+    返回 当前负载 + 趋势
+}
+
+函数 AI_截止期调甲_迁移建议(源CPU负载, 目标CPU负载) {
+    如果 (源CPU负载 > 目标CPU负载 * 2) { 返回 真 }
+    返回 假
+}

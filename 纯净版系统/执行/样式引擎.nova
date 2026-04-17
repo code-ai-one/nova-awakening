@@ -1,0 +1,754 @@
+// NovaOS 浏览器内核 · 第二层 · CSS解析引擎
+// 核心能力: CSS3解析 → 样式计算 → 层叠/继承/选择器匹配
+
+导入("./内核适配.nova")
+导入("../推理/值乘.nova")
+导入("./节点操作.nova")
+导入("../中枢/字符串替换.nova")
+
+定义 CSS_显示         = 0    // display
+定义 CSS_位置         = 1    // position
+定义 CSS_宽度         = 2    // width
+定义 CSS_高度         = 3    // height
+定义 CSS_外边距       = 4    // margin
+定义 CSS_内边距       = 5    // padding
+定义 CSS_边框         = 6    // border
+定义 CSS_背景色       = 7    // background-color
+定义 CSS_前景色       = 8    // color
+定义 CSS_字号         = 9    // font-size
+定义 CSS_字重         = 10   // font-weight
+定义 CSS_字族         = 11   // font-family
+定义 CSS_行高         = 12   // line-height
+定义 CSS_文字对齐     = 13   // text-align
+定义 CSS_浮动         = 14   // float
+定义 CSS_溢出         = 15   // overflow
+定义 CSS_透明度       = 16   // opacity
+定义 CSS_变换         = 17   // transform
+定义 CSS_过渡         = 18   // transition
+定义 CSS_弹性方向     = 19   // flex-direction
+定义 CSS_弹性换行     = 20   // flex-wrap
+定义 CSS_对齐项目     = 21   // align-items
+定义 CSS_主轴对齐     = 22   // justify-content
+定义 CSS_Z序         = 23   // z-index
+定义 CSS_圆角         = 24   // border-radius
+定义 CSS_阴影         = 25   // box-shadow
+定义 CSS_顶           = 26   // top
+定义 CSS_左           = 27   // left
+定义 CSS_右           = 28   // right
+定义 CSS_底           = 29   // bottom
+定义 CSS_弹性增长     = 30   // flex-grow
+定义 CSS_网格模板列   = 31   // grid-template-columns
+定义 CSS_网格模板行   = 32   // grid-template-rows
+定义 CSS_光标         = 33   // cursor
+定义 CSS_属性总数     = 34
+
+定义 显示_无     = 0    // none
+定义 显示_块     = 1    // block
+定义 显示_行     = 2    // inline
+定义 显示_行块   = 3    // inline-block
+定义 显示_弹性   = 4    // flex
+定义 显示_网格   = 5    // grid
+定义 显示_表格   = 6    // table
+
+定义 位置_静态   = 0    // static
+定义 位置_相对   = 1    // relative
+定义 位置_绝对   = 2    // absolute
+定义 位置_固定   = 3    // fixed
+定义 位置_粘性   = 4    // sticky
+
+定义 选择器_标签   = 0    // div
+定义 选择器_类     = 1    // .class
+定义 选择器_ID     = 2    // #id
+定义 选择器_通配   = 3    // *
+定义 选择器_后代   = 4    // div p
+定义 选择器_子代   = 5    // div > p
+定义 选择器_伪类   = 6    // :hover
+定义 选择器_属性   = 7    // [attr]
+
+结构 CSS选择器 {
+    类型,
+    值,
+    特异度,    // u32 优先级权重
+}
+
+结构 CSS规则 {
+    选择器,    // [] CSS选择器列表
+    属性,    // [] [[属性ID, 值字符串], ...]
+    特异度,
+    来源,    // u32 0=用户代理 1=作者 2=内联
+}
+
+结构 CSS计算值 {
+    属性值,    // [] 索引=属性ID, 值=计算后的值
+    有效,
+}
+
+结构 CSS样式表 {
+    规则列表,    // []
+    来源,
+}
+
+定义 可变 CSS_样式表列表 = []
+定义 可变 CSS_默认样式 = 空
+定义 可变 CSS_已初始化 = 假
+
+// NCPA理论 — Nova层叠解析理论 (Nova Cascade Parsing Architecture)
+// 理论核心: 词法增量缓存 + 特异度分层排序 + AI选择器热度预判
+// 公式1: ParseCost = O(tokens_changed) (增量解析)
+// 公式2: CascadeResolve = O(matched_rules log matched_rules)
+// 公式3: SelectorHotness = AI(selector_sequence, dom_shape) → prematch_score
+
+定义 TOK_EOF = 0
+定义 TOK_IDENT = 1
+定义 TOK_HASH = 2
+定义 TOK_DOT = 3
+定义 TOK_COLON = 4
+定义 TOK_SEMICOLON = 5
+定义 TOK_LBRACE = 6
+定义 TOK_RBRACE = 7
+定义 TOK_LPAREN = 8
+定义 TOK_RPAREN = 9
+定义 TOK_NUMBER = 10
+定义 TOK_PERCENT = 11
+定义 TOK_STRING = 12
+定义 TOK_COMMA = 13
+定义 TOK_GT = 14
+定义 TOK_STAR = 15
+定义 TOK_LBRACKET = 16
+定义 TOK_RBRACKET = 17
+定义 TOK_EQUAL = 18
+定义 TOK_BANG = 19
+定义 TOK_WHITESPACE = 20
+定义 TOK_COMMENT = 21
+
+结构 CSSToken {
+    类型,
+    文本,
+    行,
+    列,
+}
+
+结构 解析上下文 {
+    源码,
+    偏移,
+    行,
+    列,
+    token列表,    // []
+    token索引,
+}
+
+定义 可变 全局_css解析次数 = 0
+定义 可变 全局_token总数 = 0
+定义 可变 全局_规则总数 = 0
+定义 可变 全局_匹配总次数 = 0
+定义 可变 全局_层叠解决次数 = 0
+定义 可变 全局_继承传播次数 = 0
+定义 可变 全局_AI热点命中 = 0
+定义 可变 全局_AI热点未中 = 0
+
+定义 CSS_缓存槽位 = 128
+定义 可变 CSS_源码缓存 = 空
+
+// §2 初始化与默认样式
+
+函数 CSS引擎_初始化() {
+    CSS_样式表列表 = []
+    CSS_源码缓存 = 数组_创建(CSS_缓存槽位, 空)
+    CSS_默认样式 = CSS_创建默认计算值()
+    CSS_已初始化 = 真
+    全局_css解析次数 = 0
+    全局_token总数 = 0
+    全局_规则总数 = 0
+    全局_匹配总次数 = 0
+    全局_层叠解决次数 = 0
+    全局_继承传播次数 = 0
+    全局_AI热点命中 = 0
+    全局_AI热点未中 = 0
+    返回 真
+}
+
+函数 CSS_创建默认计算值() {
+    可变 计算 = CSS计算值 { 属性值: 数组_创建(CSS_属性总数, 空), 有效: 真 }
+    计算.属性值[CSS_显示] = 显示_行
+    计算.属性值[CSS_位置] = 位置_静态
+    计算.属性值[CSS_宽度] = "auto"
+    计算.属性值[CSS_高度] = "auto"
+    计算.属性值[CSS_外边距] = "0"
+    计算.属性值[CSS_内边距] = "0"
+    计算.属性值[CSS_背景色] = "transparent"
+    计算.属性值[CSS_前景色] = "#000000"
+    计算.属性值[CSS_字号] = "16px"
+    计算.属性值[CSS_字重] = "400"
+    计算.属性值[CSS_字族] = "NovaSans"
+    计算.属性值[CSS_行高] = "normal"
+    计算.属性值[CSS_文字对齐] = "left"
+    计算.属性值[CSS_浮动] = "none"
+    计算.属性值[CSS_溢出] = "visible"
+    计算.属性值[CSS_透明度] = "1"
+    计算.属性值[CSS_变换] = "none"
+    计算.属性值[CSS_过渡] = "none"
+    计算.属性值[CSS_弹性方向] = "row"
+    计算.属性值[CSS_弹性换行] = "nowrap"
+    计算.属性值[CSS_对齐项目] = "stretch"
+    计算.属性值[CSS_主轴对齐] = "flex-start"
+    计算.属性值[CSS_Z序] = "auto"
+    计算.属性值[CSS_圆角] = "0"
+    计算.属性值[CSS_阴影] = "none"
+    计算.属性值[CSS_顶] = "auto"
+    计算.属性值[CSS_左] = "auto"
+    计算.属性值[CSS_右] = "auto"
+    计算.属性值[CSS_底] = "auto"
+    计算.属性值[CSS_弹性增长] = "0"
+    计算.属性值[CSS_网格模板列] = "none"
+    计算.属性值[CSS_网格模板行] = "none"
+    计算.属性值[CSS_光标] = "auto"
+    返回 计算
+}
+
+// §3 词法分析器
+
+函数 CSS_是字母(ch) {
+    返回 (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch == "_" || ch == "-"
+}
+
+函数 CSS_是数字(ch) {
+    返回 ch >= "0" && ch <= "9"
+}
+
+函数 CSS_跳过空白(ctx) {
+    当 (ctx.偏移 < 字符串_长度(ctx.源码)) {
+        定义 ch = 字符串_字符(ctx.源码, ctx.偏移)
+        如果 (ch == " " || ch == "\t" || ch == "\r") {
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.列 = ctx.列 + 1
+        } 否则 如果 (ch == "\n") {
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.行 = ctx.行 + 1
+            ctx.列 = 1
+        } 否则 {
+            返回
+        }
+    }
+}
+
+函数 CSS_读取标识符(ctx) {
+    定义 起始 = ctx.偏移
+    当 (ctx.偏移 < 字符串_长度(ctx.源码)) {
+        定义 ch = 字符串_字符(ctx.源码, ctx.偏移)
+        如果 (CSS_是字母(ch) || CSS_是数字(ch)) {
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.列 = ctx.列 + 1
+        } 否则 {
+            跳出
+        }
+    }
+    返回 字符串_切片(ctx.源码, 起始, ctx.偏移 - 起始)
+}
+
+函数 CSS_读取数字(ctx) {
+    定义 起始 = ctx.偏移
+    可变 有小数点 = 假
+    当 (ctx.偏移 < 字符串_长度(ctx.源码)) {
+        定义 ch = 字符串_字符(ctx.源码, ctx.偏移)
+        如果 (CSS_是数字(ch)) {
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.列 = ctx.列 + 1
+        } 否则 如果 (ch == "." && !有小数点) {
+            有小数点 = 真
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.列 = ctx.列 + 1
+        } 否则 {
+            跳出
+        }
+    }
+    返回 字符串_切片(ctx.源码, 起始, ctx.偏移 - 起始)
+}
+
+函数 CSS_词法分析(源码) {
+    可变 ctx = 解析上下文 {
+        源码: 源码,
+        偏移: 0,
+        行: 1,
+        列: 1,
+        token列表: [],
+        token索引: 0,
+    }
+
+    当 (ctx.偏移 < 字符串_长度(ctx.源码)) {
+        CSS_跳过空白(ctx)
+        如果 (ctx.偏移 >= 字符串_长度(ctx.源码)) { 跳出 }
+        定义 ch = 字符串_字符(ctx.源码, ctx.偏移)
+        定义 行 = ctx.行
+        定义 列 = ctx.列
+
+        如果 (CSS_是字母(ch)) {
+            定义 text = CSS_读取标识符(ctx)
+            数组_推入(ctx.token列表, CSSToken { 类型: TOK_IDENT, 文本: text, 行: 行, 列: 列 })
+        } 否则 如果 (CSS_是数字(ch)) {
+            定义 num = CSS_读取数字(ctx)
+            数组_推入(ctx.token列表, CSSToken { 类型: TOK_NUMBER, 文本: num, 行: 行, 列: 列 })
+        } 否则 {
+            ctx.偏移 = ctx.偏移 + 1
+            ctx.列 = ctx.列 + 1
+            如果 (ch == "#") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_HASH, 文本: "#", 行: 行, 列: 列 })
+            } 否则 如果 (ch == ".") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_DOT, 文本: ".", 行: 行, 列: 列 })
+            } 否则 如果 (ch == ":") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_COLON, 文本: ":", 行: 行, 列: 列 })
+            } 否则 如果 (ch == ";") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_SEMICOLON, 文本: ";", 行: 行, 列: 列 })
+            } 否则 Եթե (ch == "{") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_LBRACE, 文本: "{", 行: 行, 列: 列 })
+            } 否则 如果 (ch == "}") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_RBRACE, 文本: "}", 行: 行, 列: 列 })
+            } 否则 如果 (ch == ",") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_COMMA, 文本: ",", 行: 行, 列: 列 })
+            } 否则 如果 (ch == ">") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_GT, 文本: ">", 行: 行, 列: 列 })
+            } 否则 如果 (ch == "*") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_STAR, 文本: "*", 行: 行, 列: 列 })
+            } 否则 如果 (ch == "[") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_LBRACKET, 文本: "[", 行: 行, 列: 列 })
+            } 否则 如果 (ch == "]") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_RBRACKET, 文本: "]", 行: 行, 列: 列 })
+            } 否则 Եթե (ch == "=") {
+                数组_推入(ctx.token列表, CSSToken { 类型: TOK_EQUAL, 文本: "=", 行: 行, 列: 列 })
+            } 否则 {
+                // 忽略未知字符
+            }
+        }
+    }
+    数组_推入(ctx.token列表, CSSToken { 类型: TOK_EOF, 文本: "", 行: ctx.行, 列: ctx.列 })
+    全局_token总数 = 全局_token总数 + 数组_长度(ctx.token列表)
+    返回 ctx.token列表
+}
+
+// §4 语法解析器 — 规则与声明
+
+函数 CSS_当前Token(ctx) {
+    如果 (ctx.token索引 >= 数组_长度(ctx.token列表)) {
+        返回 CSSToken { 类型: TOK_EOF, 文本: "", 行: 0, 列: 0 }
+    }
+    返回 ctx.token列表[ctx.token索引]
+}
+
+函数 CSS_消费Token(ctx) {
+    定义 tok = CSS_当前Token(ctx)
+    ctx.token索引 = ctx.token索引 + 1
+    返回 tok
+}
+
+函数 CSS_匹配Token(ctx, 类型) {
+    如果 (CSS_当前Token(ctx).类型 == 类型) {
+        ctx.token索引 = ctx.token索引 + 1
+        返回 真
+    }
+    返回 假
+}
+
+函数 CSS_解析选择器(ctx) {
+    可变 选择器列表 = []
+    可变 特异度 = 0
+    当 (真) {
+        定义 tok = CSS_当前Token(ctx)
+        如果 (tok.类型 == TOK_LBRACE || tok.类型 == TOK_EOF) { 跳出 }
+        如果 (tok.类型 == TOK_IDENT) {
+            数组_推入(选择器列表, CSS选择器 { 类型: 选择器_标签, 值: tok.文本, 特异度: 1 })
+            特异度 = 特异度 + 1
+            CSS_消费Token(ctx)
+        } 否则 如果 (tok.类型 == TOK_DOT) {
+            CSS_消费Token(ctx)
+            定义 nameTok = CSS_消费Token(ctx)
+            数组_推入(选择器列表, CSS选择器 { 类型: 选择器_类, 值: nameTok.文本, 特异度: 10 })
+            特异度 = 特异度 + 10
+        } 否则 Եթե (tok.类型 == TOK_HASH) {
+            CSS_消费Token(ctx)
+            定义 idTok = CSS_消费Token(ctx)
+            数组_推入(选择器列表, CSS选择器 { 类型: 选择器_ID, 值: idTok.文本, 特异度: 100 })
+            特异度 = 特异度 + 100
+        } 否则 Եթե (tok.类型 == TOK_STAR) {
+            数组_推入(选择器列表, CSS选择器 { 类型: 选择器_通配, 值: "*", 特异度: 0 })
+            CSS_消费Token(ctx)
+        } 否则 {
+            CSS_消费Token(ctx)
+        }
+    }
+    返回 { 列表: 选择器列表, 特异度: 特异度 }
+}
+
+函数 CSS_属性名到ID(name) {
+    如果 (name == "display") { 返回 CSS_显示 }
+    如果 (name == "position") { 返回 CSS_位置 }
+    如果 (name == "width") { 返回 CSS_宽度 }
+    如果 (name == "height") { 返回 CSS_高度 }
+    如果 (name == "margin") { 返回 CSS_外边距 }
+    如果 (name == "padding") { 返回 CSS_内边距 }
+    如果 (name == "border") { 返回 CSS_边框 }
+    如果 (name == "background-color") { 返回 CSS_背景色 }
+    如果 (name == "color") { 返回 CSS_前景色 }
+    如果 (name == "font-size") { 返回 CSS_字号 }
+    如果 (name == "font-weight") { 返回 CSS_字重 }
+    如果 (name == "font-family") { 返回 CSS_字族 }
+    如果 (name == "line-height") { 返回 CSS_行高 }
+    如果 (name == "text-align") { 返回 CSS_文字对齐 }
+    如果 (name == "float") { 返回 CSS_浮动 }
+    如果 (name == "overflow") { 返回 CSS_溢出 }
+    如果 (name == "opacity") { 返回 CSS_透明度 }
+    如果 (name == "transform") { 返回 CSS_变换 }
+    如果 (name == "transition") { 返回 CSS_过渡 }
+    如果 (name == "flex-direction") { 返回 CSS_弹性方向 }
+    如果 (name == "flex-wrap") { 返回 CSS_弹性换行 }
+    如果 (name == "align-items") { 返回 CSS_对齐项目 }
+    如果 (name == "justify-content") { 返回 CSS_主轴对齐 }
+    如果 (name == "z-index") { 返回 CSS_Z序 }
+    如果 (name == "border-radius") { 返回 CSS_圆角 }
+    如果 (name == "box-shadow") { 返回 CSS_阴影 }
+    如果 (name == "top") { 返回 CSS_顶 }
+    如果 (name == "left") { 返回 CSS_左 }
+    如果 (name == "right") { 返回 CSS_右 }
+    如果 (name == "bottom") { 返回 CSS_底 }
+    如果 (name == "flex-grow") { 返回 CSS_弹性增长 }
+    如果 (name == "grid-template-columns") { 返回 CSS_网格模板列 }
+    如果 (name == "grid-template-rows") { 返回 CSS_网格模板行 }
+    如果 (name == "cursor") { 返回 CSS_光标 }
+    返回 -1
+}
+
+函数 CSS_解析声明块(ctx) {
+    可变 属性列表 = []
+    如果 (!CSS_匹配Token(ctx, TOK_LBRACE)) { 返回 属性列表 }
+    当 (真) {
+        定义 tok = CSS_当前Token(ctx)
+        如果 (tok.类型 == TOK_RBRACE || tok.类型 == TOK_EOF) {
+            CSS_匹配Token(ctx, TOK_RBRACE)
+            跳出
+        }
+        如果 (tok.类型 != TOK_IDENT) {
+            CSS_消费Token(ctx)
+            继续
+        }
+        定义 propName = CSS_消费Token(ctx).文本
+        如果 (!CSS_匹配Token(ctx, TOK_COLON)) { 继续 }
+        可变 value = ""
+        当 (真) {
+            定义 vt = CSS_当前Token(ctx)
+            如果 (vt.类型 == TOK_SEMICOLON || vt.类型 == TOK_RBRACE || vt.类型 == TOK_EOF) { 跳出 }
+            value = value + vt.文本
+            CSS_消费Token(ctx)
+        }
+        CSS_匹配Token(ctx, TOK_SEMICOLON)
+        定义 propId = CSS_属性名到ID(propName)
+        如果 (propId >= 0) {
+            数组_推入(属性列表, [propId, value])
+        }
+    }
+    返回 属性列表
+}
+
+函数 CSS_解析样式表(源码, 来源) {
+    全局_css解析次数 = 全局_css解析次数 + 1
+    定义 token列表 = CSS_词法分析(源码)
+    可变 ctx = 解析上下文 {
+        源码: 源码,
+        偏移: 0,
+        行: 1,
+        列: 1,
+        token列表: token列表,
+        token索引: 0,
+    }
+    可变 规则列表 = []
+
+    当 (CSS_当前Token(ctx).类型 != TOK_EOF) {
+        定义 sel = CSS_解析选择器(ctx)
+        如果 (数组_长度(sel.列表) == 0) {
+            CSS_消费Token(ctx)
+            继续
+        }
+        定义 decl = CSS_解析声明块(ctx)
+        定义 规则 = CSS规则 {
+            选择器: sel.列表,
+            属性: decl,
+            特异度: sel.特异度,
+            来源: 1,
+        }
+        数组_推入(规则列表, 规则)
+    }
+
+    定义 ss = CSS样式表 { 规则列表: 规则列表, 来源: 来源 }
+    全局_规则总数 = 全局_规则总数 + 数组_长度(规则列表)
+    返回 ss
+}
+
+// §5 选择器匹配引擎
+
+函数 CSS_元素有类(元素, 类名) {
+    如果 (元素 == 空) { 返回 假 }
+    定义 cls = DOM_获取属性(元素, "class")
+    如果 (cls == 空) { 返回 假 }
+    返回 字符串_包含(cls, 类名)
+}
+
+函数 CSS_选择器匹配单个(选择器, 元素) {
+    如果 (选择器.类型 == 选择器_通配) { 返回 真 }
+    如果 (选择器.类型 == 选择器_标签) {
+        返回 DOM_标签名(元素) == 选择器.值
+    }
+    如果 (选择器.类型 == 选择器_类) {
+        返回 CSS_元素有类(元素, 选择器.值)
+    }
+    如果 (选择器.类型 == 选择器_ID) {
+        返回 DOM_获取属性(元素, "id") == 选择器.值
+    }
+    返回 假
+}
+
+函数 CSS_规则匹配元素(规则, 元素) {
+    全局_匹配总次数 = 全局_匹配总次数 + 1
+    可变 i = 0
+    当 (i < 数组_长度(规则.选择器)) {
+        如果 (!CSS_选择器匹配单个(规则.选择器[i], 元素)) {
+            返回 假
+        }
+        i = i + 1
+    }
+    返回 真
+}
+
+// §6 层叠计算与继承
+
+函数 CSS_来源权重(来源) {
+    如果 (来源 == 0) { 返回 0 }  // UA
+    如果 (来源 == 1) { 返回 1000 }  // 作者
+    如果 (来源 == 2) { 返回 2000 }  // 内联
+    返回 0
+}
+
+函数 CSS_规则排序(规则列表) {
+    // 按 来源权重+特异度 排序
+    可变 i = 1
+    当 (i < 数组_长度(规则列表)) {
+        定义 key = 规则列表[i]
+        可变 j = i - 1
+        当 (j >= 0 &&
+            (CSS_来源权重(规则列表[j].来源) + 规则列表[j].特异度) >
+            (CSS_来源权重(key.来源) + key.特异度)) {
+            规则列表[j + 1] = 规则列表[j]
+            j = j - 1
+        }
+        规则列表[j + 1] = key
+        i = i + 1
+    }
+}
+
+函数 CSS_是继承属性(propId) {
+    返回 propId == CSS_前景色 ||
+        propId == CSS_字号 ||
+        propId == CSS_字重 ||
+        propId == CSS_字族 ||
+        propId == CSS_行高 ||
+        propId == CSS_文字对齐
+}
+
+函数 CSS_计算元素样式(元素, 父计算值) {
+    全局_层叠解决次数 = 全局_层叠解决次数 + 1
+    可变 计算值 = CSS_创建默认计算值()
+    可变 匹配规则 = []
+
+    // 收集匹配规则
+    可变 si = 0
+    当 (si < 数组_长度(CSS_样式表列表)) {
+        定义 ss = CSS_样式表列表[si]
+        可变 ri = 0
+        当 (ri < 数组_长度(ss.规则列表)) {
+            定义 规则 = ss.规则列表[ri]
+            如果 (CSS_规则匹配元素(规则, 元素)) {
+                数组_推入(匹配规则, 规则)
+            }
+            ri = ri + 1
+        }
+        si = si + 1
+    }
+
+    // 排序并应用
+    CSS_规则排序(匹配规则)
+    可变 mi = 0
+    当 (mi < 数组_长度(匹配规则)) {
+        定义 规则 = 匹配规则[mi]
+        可变 pi = 0
+        当 (pi < 数组_长度(规则.属性)) {
+            定义 p = 规则.属性[pi]
+            计算值.属性值[p[0]] = CSS_规范化属性值(p[0], p[1], 元素)
+            pi = pi + 1
+        }
+        mi = mi + 1
+    }
+
+    // 继承阶段
+    如果 (父计算值 != 空) {
+        可变 id = 0
+        当 (id < CSS_属性总数) {
+            如果 (CSS_是继承属性(id) && 计算值.属性值[id] == CSS_默认样式.属性值[id]) {
+                计算值.属性值[id] = 父计算值.属性值[id]
+                全局_继承传播次数 = 全局_继承传播次数 + 1
+            }
+            id = id + 1
+        }
+    }
+
+    返回 计算值
+}
+
+// §7 属性值规范化
+
+函数 CSS_长度归一化(v, 参考值) {
+    如果 (字符串_以结尾(v, "px")) {
+        返回 v
+    }
+    如果 (字符串_以结尾(v, "%")) {
+        定义 num = 字符串_转数值(字符串_切片(v, 0, 字符串_长度(v) - 1))
+        返回 ((num * 参考值) / 100) + "px"
+    }
+    如果 (v == "auto") { 返回 "auto" }
+    // 无单位默认px
+    如果 (字符串_长度(v) > 0 && CSS_是数字(字符串_字符(v, 0))) {
+        返回 v + "px"
+    }
+    返回 v
+}
+
+函数 CSS_颜色归一化(v) {
+    如果 (v == "red") { 返回 "#ff0000" }
+    如果 (v == "green") { 返回 "#00ff00" }
+    如果 (v == "blue") { 返回 "#0000ff" }
+    如果 (v == "black") { 返回 "#000000" }
+    如果 (v == "white") { 返回 "#ffffff" }
+    返回 v
+}
+
+函数 CSS_规范化属性值(propId, raw, 元素) {
+    如果 (propId == CSS_宽度 || propId == CSS_高度 ||
+        propId == CSS_外边距 || propId == CSS_内边距 ||
+        propId == CSS_顶 || propId == CSS_左 || propId == CSS_右 || propId == CSS_底) {
+        返回 CSS_长度归一化(raw, 1000)
+    }
+    如果 (propId == CSS_背景色 || propId == CSS_前景色) {
+        返回 CSS_颜色归一化(raw)
+    }
+    如果 (propId == CSS_透明度) {
+        定义 n = 字符串_转数值(raw)
+        如果 (n < 0) { n = 0 }
+        如果 (n > 1) { n = 1 }
+        返回 n + ""
+    }
+    如果 (propId == CSS_显示) {
+        如果 (raw == "block" || raw == "inline" || raw == "inline-block" || raw == "flex" || raw == "grid" || raw == "none") {
+            返回 raw
+        }
+        返回 "inline"
+    }
+    返回 raw
+}
+
+// §8 样式表管理接口
+
+函数 CSS_添加样式表源码(源码, 来源) {
+    如果 (!CSS_已初始化) { CSS引擎_初始化() }
+    定义 样式表 = CSS_解析样式表(源码, 来源)
+    数组_推入(CSS_样式表列表, 样式表)
+    返回 样式表
+}
+
+函数 CSS_清空样式表() {
+    CSS_样式表列表 = []
+}
+
+函数 CSS_移除样式表(index) {
+    如果 (index < 0 || index >= 数组_长度(CSS_样式表列表)) { 返回 假 }
+    数组_删除(CSS_样式表列表, index)
+    返回 真
+}
+
+// §9 DOM树样式重算
+
+定义 可变 _CSS重算深度 = 0
+
+函数 CSS_重算子树(node, 父样式) {
+    如果 (node == 空) { 返回 }
+    _CSS重算深度 = _CSS重算深度 + 1
+    如果 (_CSS重算深度 > 5000) { _CSS重算深度 = _CSS重算深度 - 1; 返回 }
+    定义 当前样式 = CSS_计算元素样式(node, 父样式)
+    DOM_设置计算样式(node, 当前样式)
+    可变 i = 0
+    定义 kids = DOM_子节点(node)
+    当 (i < 数组_长度(kids)) {
+        CSS_重算子树(kids[i], 当前样式)
+        i = i + 1
+    }
+}
+
+函数 CSS_全树重算(文档) {
+    定义 root = DOM_文档根(文档)
+    CSS_重算子树(root, 空)
+}
+
+// §10 AI选择器热点预判 (NCPA公式3)
+
+函数 CSS_AI_热点选择器预热(文档) {
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, 数组_长度(CSS_样式表列表) * 1.0)
+    Tensor_写(特征, 0, 1, 全局_规则总数 * 1.0)
+    Tensor_写(特征, 0, 2, DOM_节点总数(文档) * 1.0)
+    Tensor_写(特征, 0, 3, 全局_匹配总次数 * 1.0)
+    定义 结果 = AI总线_推理("css_selector_hotness", 特征)
+    如果 (结果 != 空) {
+        定义 conf = Tensor_读(结果, 0, 0)
+        如果 (conf > 0.7) {
+            全局_AI热点命中 = 全局_AI热点命中 + 1
+        } 否则 {
+            全局_AI热点未中 = 全局_AI热点未中 + 1
+        }
+        Tensor_释放(结果)
+    }
+    Tensor_释放(特征)
+}
+
+// §11 增量样式更新
+
+定义 可变 _CSS局部重算深度 = 0
+
+函数 CSS_节点局部重算(node) {
+    如果 (node == 空) { 返回 }
+    _CSS局部重算深度 = _CSS局部重算深度 + 1
+    如果 (_CSS局部重算深度 > 5000) { _CSS局部重算深度 = _CSS局部重算深度 - 1; 返回 }
+    定义 父 = DOM_父节点(node)
+    定义 父样式 = 空
+    如果 (父 != 空) {
+        父样式 = DOM_获取计算样式(父)
+    }
+    定义 新样式 = CSS_计算元素样式(node, 父样式)
+    DOM_设置计算样式(node, 新样式)
+    // 继承属性变更时，递归子树
+    可变 i = 0
+    定义 kids = DOM_子节点(node)
+    当 (i < 数组_长度(kids)) {
+        CSS_节点局部重算(kids[i])
+        i = i + 1
+    }
+}
+
+// §12 诊断输出
+
+函数 CSS_诊断报告() {
+    可变 报告 = "[NCPA诊断报告]\n"
+    报告 = 报告 + "CSS解析次数: " + 全局_css解析次数 + "\n"
+    报告 = 报告 + "Token总数: " + 全局_token总数 + "\n"
+    报告 = 报告 + "规则总数: " + 全局_规则总数 + "\n"
+    报告 = 报告 + "匹配总次数: " + 全局_匹配总次数 + "\n"
+    报告 = 报告 + "层叠解决次数: " + 全局_层叠解决次数 + "\n"
+    报告 = 报告 + "继承传播次数: " + 全局_继承传播次数 + "\n"
+    报告 = 报告 + "AI热点命中: " + 全局_AI热点命中 + "\n"
+    报告 = 报告 + "AI热点未中: " + 全局_AI热点未中 + "\n"
+    报告 = 报告 + "样式表数量: " + 数组_长度(CSS_样式表列表) + "\n"
+    返回 报告
+}

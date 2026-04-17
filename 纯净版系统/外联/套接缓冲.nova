@@ -1,0 +1,226 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/字符串替换.nova")
+导入("./分配地址客.nova")
+导入("./网缓分配.nova")
+
+// NovaOS Socket缓冲 (Nova网络缓冲) — 早期版
+// ★ 已废弃: 权威版本在 Nova网络缓冲.nova (305行完整实现)
+// ★ 此文件仅保留结构定义, 所有函数已重命名加_v1后缀避免冲突
+//   1. Nova网络缓冲是网络栈的核心数据结构 — 每个网络包一个Nova缓冲
+//   2. 头部空间预留: 各层协议头向前push, 不需要复制数据
+//   3. data/tail/end指针: 数据区管理(push/pull/put/trim)
+//   4. 协议头偏移: mac_header/network_header/transport_header
+//   5. 引用计数: Nova缓冲可在多个地方共享(clone)
+
+结构 Nova网络缓冲 {
+    // 数据区指针
+    data,    // u64 当前数据起始(向前push时减小)
+    tail,    // u64 当前数据末尾(向后put时增大)
+    end,    // u64 分配的缓冲区末尾
+    head,    // u64 分配的缓冲区起始
+
+    // 长度
+    len,    // u32 总数据长度 (含分片)
+    data_len,    // u32 分片数据长度 (非线性区)
+
+    // 协议头偏移 (相对于head的偏移)
+    mac_header,    // u32 L2以太网头偏移
+    network_header,    // u32 L3 IP头偏移
+    transport_header,    // u32 L4 传控/数报头偏移
+
+    // 元数据
+    protocol,    // u16 ETH_P_IP(0x0800) / ETH_P_ARP(0x0806)
+    pkt_type,    // u8 PACKET_HOST/BROADCAST/MULTICAST/OTHERHOST
+    ip_summed,    // u8 校验和状态
+
+    // 关联
+    dev,    // u64 收到/发出的网络设备
+    sk,    // u64 关联的socket
+    dst,    // u64 路由缓存
+
+    // 引用计数
+    users,    // u32 引用计数
+
+    // 缓冲区
+    buf,    // u64 实际分配的缓冲区指针
+}
+
+定义 PACKET_HOST      = 0    // 发给本机
+定义 PACKET_BROADCAST = 1    // 广播
+定义 PACKET_MULTICAST = 2    // 多播
+定义 PACKET_OTHERHOST = 3    // 发给其他主机(混杂模式)
+
+定义 ETH_P_IP   = 0x0800
+定义 ETH_P_ARP  = 0x0806
+定义 ETH_P_IPV6 = 0x86DD
+
+定义 CHECKSUM_NONE     = 0    // 未计算
+定义 CHECKSUM_PARTIAL  = 1    // 部分计算(硬件卸载)
+定义 CHECKSUM_COMPLETE = 2    // 已完成
+
+定义 Nova缓冲_HEADROOM = 128      // 以太网头(14)+IP头(20)+传控头(60)+余量
+
+// 分配和释放 
+
+函数 Nova缓冲_创建_v1(大小) {
+    定义 总大小 = Nova缓冲_HEADROOM + 大小
+    定义 buf = 缓冲区(总大小)
+    如果 (buf == 空) { 返回 空 }
+
+    定义 Nova缓冲 = Nova网络缓冲 {}
+    Nova缓冲.buf = buf
+    Nova缓冲.head = 0
+    Nova缓冲.data = Nova缓冲_HEADROOM    // 预留headroom
+    Nova缓冲.tail = Nova缓冲_HEADROOM    // tail = data (空包)
+    Nova缓冲.end = 总大小
+    Nova缓冲.len = 0
+    Nova缓冲.data_len = 0
+    Nova缓冲.mac_header = 0
+    Nova缓冲.network_header = 0
+    Nova缓冲.transport_header = 0
+    Nova缓冲.protocol = 0
+    Nova缓冲.pkt_type = PACKET_HOST
+    Nova缓冲.ip_summed = CHECKSUM_NONE
+    Nova缓冲.dev = 空
+    Nova缓冲.sk = 空
+    Nova缓冲.dst = 空
+    Nova缓冲.users = 1
+    返回 Nova缓冲
+}
+
+函数 Nova缓冲_释放_v1(Nova缓冲) {
+    如果 (Nova缓冲 == 空) { 返回 }
+    Nova缓冲.users = Nova缓冲.users - 1
+    如果 (Nova缓冲.users <= 0) {
+        // 释放缓冲区
+    }
+}
+
+函数 Nova缓冲_克隆_v1(Nova缓冲) {
+    // clone: 共享数据, 独立Nova缓冲头
+    Nova缓冲.users = Nova缓冲.users + 1
+    返回 Nova缓冲
+}
+
+// 数据操作 
+
+函数 Nova缓冲_push_v1(Nova缓冲, 长度) {
+    // 向前扩展data指针(添加协议头)
+    Nova缓冲.data = Nova缓冲.data - 长度
+    Nova缓冲.len = Nova缓冲.len + 长度
+    返回 Nova缓冲.buf + Nova缓冲.data   // 返回新data起始地址
+}
+
+函数 Nova缓冲_pull_v1(Nova缓冲, 长度) {
+    // 向后收缩data指针(剥离协议头)
+    Nova缓冲.data = Nova缓冲.data + 长度
+    Nova缓冲.len = Nova缓冲.len - 长度
+    返回 Nova缓冲.buf + Nova缓冲.data
+}
+
+函数 Nova缓冲_put_v1(Nova缓冲, 长度) {
+    // 向后扩展tail指针(添加数据)
+    定义 旧tail = Nova缓冲.tail
+    Nova缓冲.tail = Nova缓冲.tail + 长度
+    Nova缓冲.len = Nova缓冲.len + 长度
+    返回 Nova缓冲.buf + 旧tail    // 返回新数据写入位置
+}
+
+函数 Nova缓冲_trim_v1(Nova缓冲, 新长度) {
+    // 截断到指定长度
+    Nova缓冲.len = 新长度
+    Nova缓冲.tail = Nova缓冲.data + 新长度
+}
+
+函数 Nova缓冲_reserve_v1(Nova缓冲, 长度) {
+    // 增加headroom (在put数据前调用)
+    Nova缓冲.data = Nova缓冲.data + 长度
+    Nova缓冲.tail = Nova缓冲.tail + 长度
+}
+
+// 协议头访问 
+
+函数 Nova缓冲_设置mac头_v1(Nova缓冲)    { Nova缓冲.mac_header = Nova缓冲.data }
+函数 Nova缓冲_设置网络头_v1(Nova缓冲)   { Nova缓冲.network_header = Nova缓冲.data }
+函数 Nova缓冲_设置传输头_v1(Nova缓冲)   { Nova缓冲.transport_header = Nova缓冲.data }
+
+函数 Nova缓冲_mac头(Nova缓冲)        { 返回 Nova缓冲.buf + Nova缓冲.mac_header }
+函数 Nova缓冲_网络头(Nova缓冲)       { 返回 Nova缓冲.buf + Nova缓冲.network_header }
+函数 Nova缓冲_传输头(Nova缓冲)       { 返回 Nova缓冲.buf + Nova缓冲.transport_header }
+
+函数 Nova缓冲_数据_v1(Nova缓冲)         { 返回 Nova缓冲.buf + Nova缓冲.data }
+函数 Nova缓冲_长度_v1(Nova缓冲)         { 返回 Nova缓冲.len }
+函数 Nova缓冲_headroom_v1(Nova缓冲)     { 返回 Nova缓冲.data - Nova缓冲.head }
+函数 Nova缓冲_tailroom_v1(Nova缓冲)     { 返回 Nova缓冲.end - Nova缓冲.tail }
+
+函数 Nova缓冲_协议_v1(Nova缓冲)         { 返回 Nova缓冲.protocol }
+函数 Nova缓冲_设置协议_v1(Nova缓冲, p)  { Nova缓冲.protocol = p }
+函数 Nova缓冲_设备_v1(Nova缓冲)         { 返回 Nova缓冲.dev }
+函数 Nova缓冲_设置设备_v1(Nova缓冲, d)  { Nova缓冲.dev = d }
+
+// 数据复制 
+
+函数 Nova缓冲_放入数据_v1(Nova缓冲, 数据, 长度) {
+    定义 dst = Nova缓冲_put(Nova缓冲, 长度)
+    内存复制(dst, 数据, 长度)
+}
+
+函数 Nova缓冲_读取数据_v1(Nova缓冲, 目标, 偏移, 长度) {
+    内存复制(目标, Nova缓冲.buf + Nova缓冲.data + 偏移, 长度)
+}
+
+// Nova缓冲辅助查询 (v1)
+
+函数 Nova缓冲_线性长度_v1(Nova缓冲) {
+    返回 Nova缓冲.len - Nova缓冲.data_len
+}
+
+函数 Nova缓冲_是线性_v1(Nova缓冲) {
+    返回 Nova缓冲.data_len == 0
+}
+
+函数 Nova缓冲_包类型名(类型) {
+    如果 (类型 == PACKET_HOST) { 返回 "HOST" }
+    如果 (类型 == PACKET_BROADCAST) { 返回 "BROADCAST" }
+    如果 (类型 == PACKET_MULTICAST) { 返回 "MULTICAST" }
+    如果 (类型 == PACKET_OTHERHOST) { 返回 "OTHERHOST" }
+    返回 "UNKNOWN"
+}
+
+函数 Nova缓冲_协议名(协议) {
+    如果 (协议 == ETH_P_IP) { 返回 "IPv4" }
+    如果 (协议 == ETH_P_ARP) { 返回 "ARP" }
+    如果 (协议 == ETH_P_IPV6) { 返回 "IPv6" }
+    返回 "0x" + 整数转十六进制(协议)
+}
+
+函数 Nova缓冲_校验和名(状态) {
+    如果 (状态 == CHECKSUM_NONE) { 返回 "NONE" }
+    如果 (状态 == CHECKSUM_PARTIAL) { 返回 "PARTIAL" }
+    如果 (状态 == CHECKSUM_COMPLETE) { 返回 "COMPLETE" }
+    返回 "UNKNOWN"
+}
+
+
+函数 Socket缓冲_完整统计() {
+    返回 [Nova缓冲_分配总数, Nova缓冲_释放总数]
+}
+
+定义 可变 AI_套接缓冲_带宽估计 = 0
+定义 可变 AI_套接缓冲_丢包窗口 = []
+
+函数 AI_套接缓冲_带宽预测(发送字节, 耗时毫秒) {
+    如果 (耗时毫秒 == 0) { 返回 AI_套接缓冲_带宽估计 }
+    定义 当前 = 发送字节 * 1000 / 耗时毫秒
+    AI_套接缓冲_带宽估计 = AI_套接缓冲_带宽估计 * 700 / 1000 + 当前 * 300 / 1000
+    返回 AI_套接缓冲_带宽估计
+}
+
+函数 AI_套接缓冲_拥塞建议(丢包率) {
+    追加(AI_套接缓冲_丢包窗口, 丢包率)
+    如果 (计数(AI_套接缓冲_丢包窗口) > 10) { 列表_移除(AI_套接缓冲_丢包窗口, 0) }
+    如果 (丢包率 > 50) { 返回 "减半窗口" }
+    如果 (丢包率 < 5) { 返回 "增大窗口" }
+    返回 "保持"
+}

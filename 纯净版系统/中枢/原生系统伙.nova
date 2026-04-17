@@ -1,0 +1,90 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+
+//   1. zone分区: 直传(<16MB) / NORMAL / HIGHMEM — 不同硬件需求走不同区
+//   2. 每zone每阶按迁移类型分离空闲链表 — 减少碎片(Linux 2.6.24+)
+//   3. per-CPU页缓存(PCP) — 单页分配免锁快速路径(Linux 2.5.45+)
+//   4. 三级水位线(min/low/high) — 控制直接回收/kswapd唤醒时机
+//   5. 伙伴合并时迁移类型感知 — 避免不可移动页污染可移动区
+//   6. 页块(pageblock)粒度迁移类型标记 — 2^(MAX_ORDER-1)页为一组
+//   7. 分配回退链: UNMOVABLE→RECLAIMABLE→MOVABLE — 紧急时跨类型借用
+
+// 常量定义
+
+定义 最大阶 = 10               // MAX_PAGE_ORDER: 2^10=1024页=4MB
+// 页大小 定义在 核心/公共/类型定义.nova
+定义 页大小位移 = 12           // PAGE_SHIFT
+定义 页块阶 = 9                // pageblock_order = MAX_ORDER-1
+定义 页块页数 = 512            // 2^9 = 512页 = 2MB (一个页块)
+
+// Nova的GFP标志是一个多字段位掩码: zone选择 + 行为修饰 + 回收策略
+定义 GFP_KERNEL     = 0x0CC0   // __GFP_RECLAIM | __GFP_IO | __GFP_FS
+定义 GFP_ATOMIC     = 0x0200   // __GFP_HIGH (可用应急储备)
+定义 GFP_NOIO       = 0x0040   // 不做I/O回收
+定义 GFP_NOFS       = 0x00C0   // 不做FS回收
+定义 GFP_USER       = 0x0DC0   // GFP_KERNEL | __GFP_HARDWALL
+定义 GFP_HIGHUSER   = 0x0DC2   // GFP_USER | __GFP_HIGHMEM
+定义 GFP_直传        = 0x0001   // zone选择: 直传区
+定义 GFP_HIGHMEM    = 0x0002   // zone选择: 高端内存区
+定义 GFP_直传32      = 0x0004   // zone选择: 直传32区
+定义 __GFP_ZERO     = 0x0100   // 清零
+定义 __GFP_NOWARN   = 0x0200   // 失败不告警
+定义 __GFP_NORETRY  = 0x1000   // 失败不重试
+定义 __GFP_COMP     = 0x4000   // 组合页(huge page)
+定义 __GFP_MOVABLE  = 0x0008   // 可移动分配
+定义 __GFP_RECLAIMABLE = 0x0010 // 可回收分配
+定义 __GFP_HIGH     = 0x0020   // 高优先级(可用应急储备)
+
+定义 ZONE_直传     = 0    // <16MB, ISA 直传
+定义 ZONE_直传32   = 1    // <4GB, PCI 直传
+定义 ZONE_NORMAL  = 2    // 直接映射的普通内存
+定义 ZONE_HIGHMEM = 3    // >896MB (仅32位, 64位无此zone)
+定义 ZONE_MOVABLE = 4    // 可迁移zone(内存热插拔)
+定义 最大ZONE数   = 5
+
+// 关键洞察: 不可移动页(内核数据)和可移动页(用户数据)混合导致碎片
+定义 MIGRATE_UNMOVABLE   = 0   // 内核Nova块缓存/页表等不可移动
+定义 MIGRATE_MOVABLE     = 1   // 用户页/页缓存可迁移
+定义 MIGRATE_RECLAIMABLE = 2   // 可回收(Nova路径缓存/Nova文件节点 cache)
+定义 MIGRATE_PCPTYPES    = 3   // PCP缓存只含前3种
+定义 MIGRATE_HIGHATOMIC  = 3   // 高优先级原子分配储备
+定义 MIGRATE_TYPES       = 4   // 总类型数
+
+定义 WMARK_MIN  = 0    // 绝对最低,低于此拒绝非原子分配
+定义 WMARK_LOW  = 1    // kswapd唤醒阈值
+定义 WMARK_HIGH = 2    // kswapd停止回收阈值
+定义 NR_WMARK   = 3
+
+// 当首选迁移类型无空闲块时,按此顺序尝试其他类型
+定义 可变 回退链 = [
+    [MIGRATE_RECLAIMABLE, MIGRATE_MOVABLE],      // UNMOVABLE的回退
+    [MIGRATE_RECLAIMABLE, MIGRATE_UNMOVABLE],     // MOVABLE的回退
+    [MIGRATE_UNMOVABLE, MIGRATE_MOVABLE],         // RECLAIMABLE的回退
+    []                                             // HIGHATOMIC无回退
+]
+
+// 空闲区域结构 
+
+结构 空闲区域 {
+    空闲链表,    // 数组<链表, MIGRATE_TYPES> 按迁移类型分离
+    空闲数,    // u64 nr_free: 本阶总空闲块数
+}
+
+// per-CPU页缓存 
+// 热缓存=最近释放的页(可能在L1/L2 cache中)
+
+结构 PCP缓存 {
+    计数,    // u32 当前缓存页数
+    高水位,    // u32 超过此值归还给伙伴系统
+    批量,    // u32 每次批量取/还的页数
+    链表,    // 数组<链表, MIGRATE_PCPTYPES> 按迁移类型分离
+    锁,    // 自旋锁
+}
+
+// zone结构 
+// 每个zone独立管理: 自己的空闲链表 + 水位线 + 统计 + 锁
+
+结构 内存zone {
+    名称,
+    类型,
+}

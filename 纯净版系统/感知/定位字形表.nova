@@ -1,0 +1,200 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./真字体字体.nova")
+导入("./内核直连层.nova")
+导入("./文字绘制最.nova")
+
+// §4 loca + glyf 表 — 字形轮廓数据
+
+结构 GlyphOutline {
+    轮廓数,
+    xMin,
+    yMin,
+    xMax,
+    yMax,
+    // 点数据
+    点数,
+    x坐标,    // u64 i16* 数组
+    y坐标,    // u64 i16* 数组
+    标志,    // u64 u8* 数组
+    轮廓结束点,    // u64 u16* 数组 (每个轮廓的最后一个点索引)
+}
+
+
+函数 TrueType_获取字形偏移(font, glyphID) {
+    如果 (font.loca_偏移 == 0 || glyphID >= font.字形总数) { 返回 0 }
+    定义 d = font.数据 + font.loca_偏移
+
+    如果 (font.loca格式 == 0) {
+        // short格式: 偏移/2, 16位
+        返回 读16(d, glyphID * 2) * 2
+    } 否则 {
+        // long格式: 完整偏移, 32位
+        返回 读32(d, glyphID * 4)
+    }
+}
+
+函数 TrueType_获取字形大小(font, glyphID) {
+    定义 off1 = TrueType_获取字形偏移(font, glyphID)
+    定义 off2 = TrueType_获取字形偏移(font, glyphID + 1)
+    返回 off2 - off1
+}
+
+函数 TrueType_解析字形(font, glyphID) {
+    定义 offset = TrueType_获取字形偏移(font, glyphID)
+    定义 size = TrueType_获取字形大小(font, glyphID)
+    如果 (size == 0) { 返回 0 }  // 空字形(如空格)
+
+    定义 d = font.数据 + font.glyf_偏移 + offset
+    如果 (size < 10) { 返回 0 }
+    定义 outline = 堆_分配(GlyphOutline)
+
+    outline.轮廓数 = 读i16(d, 0)
+    outline.xMin = 读i16(d, 2)
+    outline.yMin = 读i16(d, 4)
+    outline.xMax = 读i16(d, 6)
+    outline.yMax = 读i16(d, 8)
+
+    如果 (outline.轮廓数 < 0) {
+        // 复合字形: 由多个简单字形组合
+        TrueType_解析复合字形(font, outline, d + 10)
+        返回 outline
+    }
+
+    // 简单字形
+    定义 numContours = outline.轮廓数
+    定义 可变 pos = 10
+
+    // 轮廓结束点数组
+    outline.轮廓结束点 = 堆_分配(numContours * 2)
+    定义 可变 i = 0
+    当 (i < numContours) {
+        定义 endPt = 读16(d, pos)
+        内存_写16(outline.轮廓结束点 + i * 2, endPt)
+        pos = pos + 2
+        i = i + 1
+    }
+
+    // 总点数 = 最后一个轮廓的结束点 + 1
+    定义 numPoints = 读16(d, 10 + (numContours - 1) * 2) + 1
+    outline.点数 = numPoints
+
+    // 跳过指令
+    定义 instrLen = 读16(d, pos)
+    pos = pos + 2 + instrLen
+
+    // 解析标志
+    outline.标志 = 堆_分配(numPoints)
+    i = 0
+    当 (i < numPoints) {
+        定义 flag = 内存_读8(d + pos)
+        pos = pos + 1
+        内存_写8(outline.标志 + i, flag)
+        i = i + 1
+        // repeat标志
+        如果 (flag & 8) {
+            定义 repeatCount = 内存_读8(d + pos)
+            pos = pos + 1
+            定义 可变 j = 0
+            当 (j < repeatCount && i < numPoints) {
+                内存_写8(outline.标志 + i, flag)
+                i = i + 1
+                j = j + 1
+            }
+        }
+    }
+
+    // 解析X坐标
+    outline.x坐标 = 堆_分配(numPoints * 2)
+    定义 可变 xVal = 0
+    i = 0
+    当 (i < numPoints) {
+        定义 flag = 内存_读8(outline.标志 + i)
+        如果 (flag & 2) {
+            // x是1字节
+            定义 dx = 内存_读8(d + pos)
+            pos = pos + 1
+            如果 (flag & 16) { xVal = xVal + dx }
+            否则 { xVal = xVal - dx }
+        } 否则 {
+            如果 (!(flag & 16)) {
+                // x是2字节有符号
+                xVal = xVal + 读i16(d, pos)
+                pos = pos + 2
+            }
+            // else: x不变
+        }
+        内存_写16(outline.x坐标 + i * 2, xVal & 0xFFFF)
+        i = i + 1
+    }
+
+    // 解析Y坐标
+    outline.y坐标 = 堆_分配(numPoints * 2)
+    定义 可变 yVal = 0
+    i = 0
+    当 (i < numPoints) {
+        定义 flag = 内存_读8(outline.标志 + i)
+        如果 (flag & 4) {
+            定义 dy = 内存_读8(d + pos)
+            pos = pos + 1
+            如果 (flag & 32) { yVal = yVal + dy }
+            否则 { yVal = yVal - dy }
+        } 否则 {
+            如果 (!(flag & 32)) {
+                yVal = yVal + 读i16(d, pos)
+                pos = pos + 2
+            }
+        }
+        内存_写16(outline.y坐标 + i * 2, yVal & 0xFFFF)
+        i = i + 1
+    }
+
+    返回 outline
+}
+
+函数 TrueType_解析复合字形(font, outline, d) {
+    // 复合字形由多个组件字形构成
+    // 每个组件: flags(2) + glyphIndex(2) + transform(变长)
+    定义 可变 pos = 0
+    定义 可变 有更多 = 真
+
+    当 (有更多) {
+        定义 flags = 读16(d, pos); pos = pos + 2
+        定义 compGlyphID = 读16(d, pos); pos = pos + 2
+
+        // 偏移
+        定义 可变 dx = 0
+        定义 可变 dy = 0
+        如果 (flags & 1) {  // ARG_1_AND_2_ARE_WORDS
+            dx = 读i16(d, pos); pos = pos + 2
+            dy = 读i16(d, pos); pos = pos + 2
+        } 否则 {
+            dx = 内存_读8(d + pos); pos = pos + 1
+            dy = 内存_读8(d + pos); pos = pos + 1
+            如果 (dx > 127) { dx = dx - 256 }
+            如果 (dy > 127) { dy = dy - 256 }
+        }
+
+        // 跳过变换矩阵
+        如果 (flags & 8) { pos = pos + 2 }          // WE_HAVE_A_SCALE
+        否则 如果 (flags & 64) { pos = pos + 4 }    // WE_HAVE_AN_X_AND_Y_SCALE
+        否则 如果 (flags & 128) { pos = pos + 8 }   // WE_HAVE_A_TWO_BY_TWO
+
+        有更多 = (flags & 32) != 0    // MORE_COMPONENTS
+    }
+}
+
+定义 可变 AI_定位字形表_热点函数 = []
+
+函数 AI_定位字形表_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_定位字形表_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_定位字形表_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

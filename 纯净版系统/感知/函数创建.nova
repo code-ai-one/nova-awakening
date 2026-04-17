@@ -1,0 +1,137 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+//       css_animations.cc (~2000行)
+//       css_transitions.cc (~1000行)
+//       animation.cc (~1500行)
+//       keyframe_effect.cc (~800行)
+//       timing.cc 
+//       css_keyframes_rule.cc (~300行)
+// CSS动画三大机制:
+//   1. CSS Transitions: 属性变化时自动过渡
+//   2. CSS Animations: @keyframes定义的关键帧动画
+//   3. Web Animations 接口: JS控制的动画
+// 动画管线:
+//   样式变化检测 → 创建Animation → 每帧: 计算时间进度 → 插值 → 应用样式 → 布局/绘制
+
+
+// §1 时间函数 (Timing Function / Easing)
+// CSS transition-timing-function / animation-timing-function
+
+定义 缓动_线性          = 0
+定义 缓动_ease          = 1     // Nova三次方-bezier(0.25, 0.1, 0.25, 1.0)
+定义 缓动_ease_in       = 2     // Nova三次方-bezier(0.42, 0, 1.0, 1.0)
+定义 缓动_ease_out      = 3     // Nova三次方-bezier(0, 0, 0.58, 1.0)
+定义 缓动_ease_in_out   = 4     // Nova三次方-bezier(0.42, 0, 0.58, 1.0)
+定义 缓动_step_start    = 5     // steps(1, jump-start)
+定义 缓动_step_end      = 6     // steps(1, jump-end)
+定义 缓动_自定义贝塞尔 = 7     // Nova三次方-bezier(x1, y1, x2, y2)
+定义 缓动_自定义步进   = 8     // steps(n, ...)
+
+结构 TimingFunction {
+    类型,    // u32 缓动_xxx
+    // Nova三次方-bezier参数 (×10000)
+    x1,
+    y1,
+    x2,
+    y2,
+    // steps参数
+    步数,
+    步位置,    // u32 0=jump-start 1=jump-end 2=jump-none 3=jump-both
+}
+
+函数 TimingFunction_创建(类型) {
+    定义 tf = 堆_分配(TimingFunction)
+    tf.类型 = 类型
+    // 预设贝塞尔参数
+    如果 (类型 == 缓动_ease) {
+        tf.x1 = 2500; tf.y1 = 1000; tf.x2 = 2500; tf.y2 = 10000
+    } 否则 如果 (类型 == 缓动_ease_in) {
+        tf.x1 = 4200; tf.y1 = 0; tf.x2 = 10000; tf.y2 = 10000
+    } 否则 如果 (类型 == 缓动_ease_out) {
+        tf.x1 = 0; tf.y1 = 0; tf.x2 = 5800; tf.y2 = 10000
+    } 否则 如果 (类型 == 缓动_ease_in_out) {
+        tf.x1 = 4200; tf.y1 = 0; tf.x2 = 5800; tf.y2 = 10000
+    }
+    tf.步数 = 1
+    tf.步位置 = 1
+    返回 tf
+}
+
+函数 TimingFunction_求值(tf, t) {
+    // 输入t: 0-10000 (0.0-1.0)
+    // 输出: 0-10000 (缓动后的进度)
+    如果 (tf.类型 == 缓动_线性) { 返回 t }
+
+    如果 (tf.类型 == 缓动_自定义步进 || tf.类型 == 缓动_step_start || tf.类型 == 缓动_step_end) {
+        返回 TimingFunction_步进求值(tf, t)
+    }
+
+    // 三次贝塞尔求值
+    返回 Nova三次方Bezier_求值(tf.x1, tf.y1, tf.x2, tf.y2, t)
+}
+
+函数 Nova三次方Bezier_求值(x1, y1, x2, y2, t) {
+    // 三次贝塞尔曲线: B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+    // P0=(0,0) P1=(x1,y1) P2=(x2,y2) P3=(1,1)
+    // 输入是x轴的t值(时间进度),需要先求出参数t,再算y值
+    // 用牛顿法/二分法求解 x(t) = input_t 的参数t
+
+    定义 可变 参数t = t    // 初始猜测
+
+    // 牛顿迭代(5次通常足够)
+    定义 可变 迭代 = 0
+    当 (迭代 < 8) {
+        定义 当前x = Nova三次方Bezier_x(x1, x2, 参数t)
+        定义 误差 = 当前x - t
+        如果 (误差 > -50 && 误差 < 50) { 跳出 }    // 精度足够
+
+        定义 导数 = Nova三次方Bezier_dx(x1, x2, 参数t)
+        如果 (导数 == 0) { 跳出 }
+        参数t = 参数t - 误差 * 10000 / 导数
+        如果 (参数t < 0) { 参数t = 0 }
+        如果 (参数t > 10000) { 参数t = 10000 }
+        迭代 = 迭代 + 1
+    }
+
+    // 用参数t计算y值
+    返回 Nova三次方Bezier_y(y1, y2, 参数t)
+}
+
+函数 Nova三次方Bezier_x(x1, x2, t) {
+    // x(t) = 3(1-t)²t·x1 + 3(1-t)t²·x2 + t³
+    // t范围0-10000
+    定义 t2 = t * t / 10000
+    定义 t3 = t2 * t / 10000
+    定义 mt = 10000 - t
+    定义 mt2 = mt * mt / 10000
+    返回 3 * mt2 * t / 10000 * x1 / 10000 + 3 * mt * t2 / 10000 * x2 / 10000 + t3
+}
+
+函数 Nova三次方Bezier_y(y1, y2, t) {
+    定义 t2 = t * t / 10000
+    定义 t3 = t2 * t / 10000
+    定义 mt = 10000 - t
+    定义 mt2 = mt * mt / 10000
+    返回 3 * mt2 * t / 10000 * y1 / 10000 + 3 * mt * t2 / 10000 * y2 / 10000 + t3
+}
+
+函数 Nova三次方Bezier_dx(x1, x2, t) {
+    // x'(t) = 3(1-t)²·x1 + 6(1-t)t·(x2-x1) + 3t²·(1-x2)
+    定义 mt = 10000 - t
+    返回 3 * mt * mt / 10000 * x1 / 10000
+         + 6 * mt * t / 10000 * (x2 - x1) / 10000
+         + 3 * t * t / 10000 * (10000 - x2) / 10000
+}
+
+函数 TimingFunction_步进求值(tf, t) {
+    如果 (tf.步数 == 0) { 返回 t }
+    定义 步大小 = 10000 / tf.步数
+    定义 当前步 = t / 步大小
+    如果 (tf.步位置 == 0) {
+        // jump-start: 在步开始时跳
+        返回 (当前步 + 1) * 步大小
+    }
+    // jump-end(默认): 在步结束时跳
+    返回 当前步 * 步大小
+}

@@ -1,0 +1,142 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("./接收初始化.nova")
+导入("../中枢/高级中控设置.nova")
+导入("./图处枚举.nova")
+导入("./快存驱动辅.nova")
+导入("./管理命令.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./中断处理.nova")
+导入("./创建输入队.nova")
+
+// §3 全局状态
+
+定义 可变 NVMe控制器列表 = []
+定义 可变 NVMe_读总数 = 0
+定义 可变 NVMe_写总数 = 0
+定义 可变 NVMe_已初始化 = 假
+
+// §4 初始化
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NVMe_初始化() {
+    NVMe控制器列表 = []
+    内核信息("NVMe: 扫描NVMe控制器...")
+
+    // PCI类代码: 0x0108 = Mass 存储 → NVM Express
+    定义 可变 总线 = 0
+    当 (总线 < 256) {
+        定义 可变 设备号 = 0
+        当 (设备号 < 32) {
+            定义 可变 功能号 = 0
+            当 (功能号 < 8) {
+                定义 vid_did = PCI_配置读32(总线, 设备号, 功能号, 0x00)
+                如果 (vid_did == 0xFFFFFFFF || vid_did == 0) {
+                    功能号 = 功能号 + 1
+                    继续
+                }
+                定义 类信息 = PCI_配置读32(总线, 设备号, 功能号, 0x08)
+                定义 类代码 = (类信息 >> 24) & 0xFF
+                定义 子类 = (类信息 >> 16) & 0xFF
+                定义 接口 = (类信息 >> 8) & 0xFF
+
+                如果 (类代码 == 0x01 && 子类 == 0x08 && 接口 == 0x02) {
+                    定义 vid = vid_did & 0xFFFF
+                    定义 did = (vid_did >> 16) & 0xFFFF
+                    内核信息("NVMe: 发现控制器 " + 整数转十六进制(vid) + ":" + 整数转十六进制(did) +
+                             " @PCI " + 整数转字符串(总线) + ":" + 整数转字符串(设备号))
+
+                    // 使能Bus Master + Memory Space
+                    定义 cmd = PCI_配置读32(总线, 设备号, 功能号, 0x04)
+                    PCI_配置写32(总线, 设备号, 功能号, 0x04, cmd | 0x06)
+
+                    // BAR0 = MMIO基地址
+                    定义 bar0 = PCI_读BAR(总线, 设备号, 功能号, 0)
+                    NVMe_初始化控制器(bar0)
+                }
+                功能号 = 功能号 + 1
+            }
+            设备号 = 设备号 + 1
+        }
+        总线 = 总线 + 1
+    }
+
+    NVMe_已初始化 = 真
+    内核信息("NVMe: 初始化完成 控制器=" + 整数转字符串(计数(NVMe控制器列表)))
+}
+
+函数 NVMe_初始化控制器(bar0) {
+    如果 (bar0 == 0) { 返回 }
+
+    定义 ctl = NVMe控制器 {}
+    ctl.MMIO基址 = bar0
+    ctl.IO队列 = []
+    ctl.命名空间 = []
+
+    // 1. 读取能力寄存器(64位)
+    定义 cap_lo = MMIO读32(bar0 + NVME_CAP)
+    定义 cap_hi = MMIO读32(bar0 + NVME_CAP + 4)
+    ctl.最大队列深度 = (cap_lo & 0xFFFF) + 1
+    ctl.门铃步长 = 4 << ((cap_hi >> 0) & 0xF)
+
+    定义 vs = MMIO读32(bar0 + NVME_VS)
+    ctl.版本 = vs
+    内核信息("NVMe: 版本=" + 整数转字符串((vs >> 16) & 0xFFFF) + "." +
+             整数转字符串((vs >> 8) & 0xFF) +
+             " 最大队列=" + 整数转字符串(ctl.最大队列深度) +
+             " 门铃步长=" + 整数转字符串(ctl.门铃步长))
+
+    // 2. 禁用控制器
+    定义 cc = MMIO读32(bar0 + NVME_CC)
+    MMIO写32(bar0 + NVME_CC, cc & ~NVME_CC_EN)
+    NVMe_等待禁用(bar0)
+
+    // 3. 创建管理队列
+    定义 aq_depth = 32
+    如果 (aq_depth > ctl.最大队列深度) { aq_depth = ctl.最大队列深度 }
+
+    ctl.管理队列 = NVMe_队列 {}
+    ctl.管理队列.ID = 0
+    ctl.管理队列.深度 = aq_depth
+    ctl.管理队列.SQ地址 = 直传_分配_对齐(aq_depth * 64, 4096)  // SQE=64B
+    ctl.管理队列.CQ地址 = 直传_分配_对齐(aq_depth * 16, 4096)  // CQE=16B
+    ctl.管理队列.SQ尾指针 = 0
+    ctl.管理队列.CQ头指针 = 0
+    ctl.管理队列.Phase位 = 1
+    ctl.管理队列.SQ门铃 = bar0 + 0x1000
+    ctl.管理队列.CQ门铃 = bar0 + 0x1000 + ctl.门铃步长
+    ctl.管理队列.下一个命令ID = 0
+    内存填零(ctl.管理队列.SQ地址, aq_depth * 64)
+    内存填零(ctl.管理队列.CQ地址, aq_depth * 16)
+
+    // 4. 设置AQA寄存器
+    MMIO写32(bar0 + NVME_AQA, ((aq_depth - 1) << 16) | (aq_depth - 1))
+    // 设置ASQ/ACQ地址
+    MMIO写32(bar0 + NVME_ASQ, ctl.管理队列.SQ地址 & 0xFFFFFFFF)
+    MMIO写32(bar0 + NVME_ASQ + 4, (ctl.管理队列.SQ地址 >> 32) & 0xFFFFFFFF)
+    MMIO写32(bar0 + NVME_ACQ, ctl.管理队列.CQ地址 & 0xFFFFFFFF)
+    MMIO写32(bar0 + NVME_ACQ + 4, (ctl.管理队列.CQ地址 >> 32) & 0xFFFFFFFF)
+
+    // 5. 使能控制器
+    定义 new_cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_IOSQES | NVME_CC_IOCQES
+    new_cc = new_cc | (0 << NVME_CC_MPS_SHIFT)  // MPS=0 → 4KB页
+    MMIO写32(bar0 + NVME_CC, new_cc)
+
+    如果 (!NVMe_等待就绪(bar0)) {
+        内核警告("NVMe: 控制器使能超时")
+        返回
+    }
+
+    // 6. Identify Controller
+    NVMe_识别控制器(ctl)
+
+    // 7. 创建IO队列
+    NVMe_创建IO队列(ctl)
+
+    // 8. 识别命名空间
+    NVMe_识别命名空间(ctl)
+
+    ctl.已初始化 = 真
+    追加(NVMe控制器列表, ctl)
+}

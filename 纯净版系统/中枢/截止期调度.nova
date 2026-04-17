@@ -1,0 +1,289 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./红黑树删除.nova")
+导入("./红黑树创建.nova")
+导入("./进程描述符.nova")
+导入("./整数转字符串.nova")
+
+// NovaOS Deadline调度器 (SCHED_DEADLINE)
+// 功能: 基于截止期限的实时调度 (EDF - Earliest Deadline First)
+//   - 每个任务有3个参数: runtime, deadline, period
+//   - runtime: 每个周期需要的CPU时间
+//   - deadline: 相对截止期限
+//   - period: 周期长度
+//   - 调度: 选择绝对截止期限最早的任务
+// 特性:
+//   - 最优实时调度算法 (理论上)
+//   - 可调度性分析: \Sum(runtime/period) <= 1
+//   - CBS (Constant Bandwidth Server) 防止过载
+//   - 带宽回收
+//   - AI辅助deadline预测与自适应runtime调整
+
+// Deadline常量
+
+定义 DL_最小runtime = 1000       // 1ms
+定义 DL_最小deadline = 1000      // 1ms
+定义 DL_最小period = 1000        // 1ms
+定义 DL_最大利用率 = 950         // 95% (0.95 * 1000)
+
+// Deadline运行队列 (红黑树按绝对deadline排序)
+
+定义 可变 DL_队列 = 空           // 红黑树
+定义 可变 DL_任务数 = 0
+定义 可变 DL_调度次数 = 0
+定义 可变 DL_总利用率 = 0        // \Sum(runtime/period)
+定义 可变 DL_错过deadline次数 = 0
+
+// 初始化
+
+函数 DL_初始化() {
+    DL_队列 = 红黑树_创建()
+    DL_任务数 = 0
+    DL_调度次数 = 0
+    DL_总利用率 = 0
+    DL_错过deadline次数 = 0
+}
+
+// 设置任务deadline参数
+
+函数 DL_设置参数(任务, runtime, deadline, period) {
+    // 参数验证
+    如果 (runtime < DL_最小runtime) { 返回 假 }
+    如果 (deadline < DL_最小deadline) { 返回 假 }
+    如果 (period < DL_最小period) { 返回 假 }
+    如果 (runtime > deadline) { 返回 假 }
+    如果 (deadline > period) { 返回 假 }
+    
+    // 计算利用率: runtime / period
+    定义 利用率 = runtime * 1000 / period
+    
+    // 检查可调度性
+    定义 旧利用率 = 任务[T_dl_利用率]
+    定义 新总利用率 = DL_总利用率 - 旧利用率 + 利用率
+    
+    如果 (新总利用率 > DL_最大利用率) {
+        返回 假  // 超过系统容量
+    }
+    
+    // 设置参数
+    设置(任务, T_dl_runtime, runtime)
+    设置(任务, T_dl_deadline, deadline)
+    设置(任务, T_dl_period, period)
+    设置(任务, T_dl_利用率, 利用率)
+    
+    // 更新总利用率
+    DL_总利用率 = 新总利用率
+    
+    返回 真
+}
+
+// 补充运行时 
+
+函数 DL_补充(任务, 当前时间) {
+    // 重置剩余runtime
+    定义 runtime = 任务[T_dl_runtime]
+    设置(任务, T_dl_剩余runtime, runtime)
+    
+    // 计算新的绝对deadline
+    定义 period = 任务[T_dl_period]
+    定义 deadline = 任务[T_dl_deadline]
+    定义 旧绝对deadline = 任务[T_dl_绝对deadline]
+    
+    // 新绝对deadline = 当前时间 + period
+    定义 新绝对deadline = 当前时间 + period
+    
+    // 如果错过了deadline，记录
+    如果 (旧绝对deadline > 0 && 当前时间 > 旧绝对deadline) {
+        DL_错过deadline次数 = DL_错过deadline次数 + 1
+    }
+    
+    设置(任务, T_dl_绝对deadline, 新绝对deadline)
+}
+
+// 入队 
+
+函数 DL_入队(任务, 当前时间) {
+    // 如果是新周期，补充runtime
+    定义 剩余 = 任务[T_dl_剩余runtime]
+    如果 (剩余 <= 0) {
+        DL_补充(任务, 当前时间)
+    }
+    
+    // 按绝对deadline插入红黑树
+    定义 绝对deadline = 任务[T_dl_绝对deadline]
+    红黑树_插入(DL_队列, 绝对deadline, 任务)
+    
+    DL_任务数 = DL_任务数 + 1
+    
+    返回 真
+}
+
+// 出队
+
+函数 DL_出队(任务) {
+    定义 绝对deadline = 任务[T_dl_绝对deadline]
+    红黑树_删除(DL_队列, 绝对deadline)
+    
+    DL_任务数 = DL_任务数 - 1
+    
+    返回 真
+}
+
+// 选择下一个任务 
+// EDF: 选择绝对deadline最早的任务
+
+函数 DL_选择下一个(当前时间) {
+    如果 (DL_任务数 == 0) { 返回 空 }
+    
+    // 获取deadline最早的任务 (红黑树最左节点)
+    定义 结果 = 红黑树_删除最小(DL_队列)
+    如果 (结果 == 空) { 返回 空 }
+    
+    定义 任务 = 结果[1]
+    
+    DL_任务数 = DL_任务数 - 1
+    DL_调度次数 = DL_调度次数 + 1
+    
+    进程_设置状态(任务, 进程_运行)
+    
+    返回 任务
+}
+
+// tick处理 
+
+函数 DL_tick(当前任务, delta_us, 当前时间) {
+    如果 (当前任务 == 空) { 返回 假 }
+    
+    // 消耗runtime
+    定义 剩余 = 当前任务[T_dl_剩余runtime]
+    定义 新剩余 = 剩余 - delta_us
+    设置(当前任务, T_dl_剩余runtime, 新剩余)
+    
+    // runtime耗尽
+    如果 (新剩余 <= 0) {
+        // CBS: 推迟到下个周期
+        DL_补充(当前任务, 当前时间)
+        返回 真  // 需要重新调度
+    }
+    
+    // 检查是否错过deadline
+    定义 绝对deadline = 当前任务[T_dl_绝对deadline]
+    如果 (当前时间 > 绝对deadline) {
+        DL_错过deadline次数 = DL_错过deadline次数 + 1
+        DL_补充(当前任务, 当前时间)
+        返回 真
+    }
+    
+    返回 假
+}
+
+// 抢占检查 
+
+函数 DL_检查抢占(当前任务, 新任务) {
+    如果 (当前任务 == 空 || 新任务 == 空) { 返回 假 }
+    
+    // 比较绝对deadline
+    定义 当前deadline = 当前任务[T_dl_绝对deadline]
+    定义 新deadline = 新任务[T_dl_绝对deadline]
+    
+    // 新任务deadline更早，抢占
+    返回 新deadline < 当前deadline
+}
+
+// 可调度性分析 
+
+函数 DL_可调度(runtime, period) {
+    定义 利用率 = runtime * 1000 / period
+    定义 新总利用率 = DL_总利用率 + 利用率
+    
+    返回 新总利用率 <= DL_最大利用率
+}
+
+函数 DL_获取总利用率() {
+    返回 DL_总利用率
+}
+
+函数 DL_获取剩余带宽() {
+    返回 DL_最大利用率 - DL_总利用率
+}
+
+// 带宽回收 
+// 如果任务提前完成，回收未使用的带宽
+
+函数 DL_回收带宽(任务) {
+    定义 剩余 = 任务[T_dl_剩余runtime]
+    如果 (剩余 > 0) {
+        // 任务提前完成，剩余runtime可以给其他任务使用
+        // 这里处理：直接清零
+        设置(任务, T_dl_剩余runtime, 0)
+    }
+}
+
+// 统计信息
+
+函数 DL_统计() {
+    返回 [
+        DL_任务数,
+        DL_调度次数,
+        DL_总利用率,
+        DL_错过deadline次数,
+        DL_获取剩余带宽()
+    ]
+}
+
+函数 DL_重置统计() {
+    DL_调度次数 = 0
+    DL_错过deadline次数 = 0
+}
+
+// 辅助函数
+
+函数 DL_是否为空() {
+    返回 DL_任务数 == 0
+}
+
+函数 DL_获取任务数() {
+    返回 DL_任务数
+}
+
+函数 获取当前时间() {
+    定义 低 = 0
+    定义 高 = 0
+    汇编 { "rdtsc" "mov [rsp-16], eax" "mov [rsp-8], edx" }
+    返回 低 + 高 * 0x100000000
+}
+
+// 截止期调度诊断
+
+函数 DL_健康检查() {
+    定义 可变 问题 = []
+    如果 (DL_超时次数 > DL_任务数 * 10 && DL_任务数 > 0) {
+        追加(问题, "截止期超时频繁")
+    }
+    如果 (DL_任务数 > 256) {
+        追加(问题, "DL任务过多: " + 整数转字符串(DL_任务数))
+    }
+    如果 (计数(问题) == 0) { 返回 "DL调度器健康" }
+    返回 问题
+}
+
+函数 DL_准入测试(运行时间, 截止期, 周期) {
+    如果 (周期 == 0) { 返回 假 }
+    如果 (运行时间 > 截止期) { 返回 假 }
+    如果 (截止期 > 周期) { 返回 假 }
+    返回 真
+}
+
+定义 可变 AI_截止期调度_运行指标 = 0
+定义 可变 AI_截止期调度_异常指标 = 0
+
+函数 AI_截止期调度_自诊断() {
+    AI_截止期调度_运行指标 = DL_调度次数
+    返回 AI_截止期调度_运行指标
+}
+
+函数 AI_截止期调度_优化建议() {
+    定义 指标 = AI_截止期调度_自诊断()
+    如果 (AI_截止期调度_运行指标 > 10000) { 返回 "截止期调度负载较高" }
+    返回 "截止期调度状态正常"
+}

@@ -1,0 +1,214 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/链表后继.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. 每个地址族(AF_INET/AF_UNIX等)注册一个net_proto_family
+//   2. sock_create时按domain查找对应的协议族→调用create
+//   3. proto_register: 传输层协议注册(传控/数报/RAW)
+//   4. 协议族最大值NPROTO=AF_MAX(~46)
+
+// AF_UNSPEC 定义在 网络/核心/Socket层.nova
+// AF_UNIX 定义在 网络/核心/Socket层.nova
+// AF_LOCAL 定义在 网络/核心/Socket层.nova
+// AF_INET 定义在 网络/核心/Socket层.nova
+// AF_INET6 定义在 网络/核心/Socket层.nova
+// AF_NETLINK 定义在 网络/核心/Socket层.nova
+// AF_PACKET 定义在 网络/核心/Socket层.nova
+定义 NPROTO      = 46    // 最大协议族数
+
+结构 协议族 {
+    family,    // u32 AF_*
+    create,    // u64 创建socket的回调
+    owner,    // u64 所属模块
+}
+
+结构 传输协议 {
+    名称,    // 字符串 "传控" / "数报" / "RAW"
+    close,
+    connect,
+    accept,
+    sendmsg,
+    recvmsg,
+    bind,
+    listen,
+    shutdown,
+    setsockopt,
+    getsockopt,
+    obj_size,    // u32 sock结构体大小(用于Nova块缓存分配)
+    sockets_allocated,    // u32 已分配的socket数
+}
+
+定义 可变 协议族表 = []
+定义 可变 传输协议表 = []
+
+// 协议族注册/注销 
+
+函数 协议族_注册(域, 创建函数) {
+    // 检查是否已注册
+    如果 (协议族_查找(域) != 空) {
+        返回 错误_已存在
+    }
+    定义 pf = 协议族 {}
+    pf.family = 域
+    pf.create = 创建函数
+    pf.owner = 0
+    追加(协议族表, pf)
+    内核信息("协议族注册: AF_" + AF_名称(域))
+    返回 成功
+}
+
+函数 协议族_注销(域) {
+    定义 可变 i = 0
+    当 (i < 计数(协议族表)) {
+        如果 (协议族表[i].family == 域) {
+            链表_删除(协议族表, i)
+            返回 成功
+        }
+        i = i + 1
+    }
+    返回 错误_不存在
+}
+
+函数 协议族_查找(域) {
+    定义 可变 i = 0
+    当 (i < 计数(协议族表)) {
+        如果 (协议族表[i].family == 域) { 返回 协议族表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+// 传输层协议注册 
+
+函数 传输协议_注册(协议) {
+    追加(传输协议表, 协议)
+    内核信息("传输协议注册: " + 协议.名称)
+    返回 成功
+}
+
+函数 传输协议_查找(名称) {
+    定义 可变 i = 0
+    当 (i < 计数(传输协议表)) {
+        如果 (传输协议表[i].名称 == 名称) { 返回 传输协议表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+// sock_create: 创建socket 
+// 由sys_socket调用
+
+函数 sock_创建(域, 类型, 协议) {
+    定义 pf = 协议族_查找(域)
+    如果 (pf == 空) { 返回 空 }
+    如果 (pf.create == 空) { 返回 空 }
+    返回 pf.create(域, 类型, 协议)
+}
+
+// 内置协议族初始化
+
+函数 网络协议_初始化全部() {
+    协议族_注册(AF_INET, inet_创建socket)
+    协议族_注册(AF_UNIX, unix_创建socket)
+    // AF_INET6, AF_NETLINK, AF_PACKET等后续注册
+    内核信息数值("协议族初始化完成, 已注册", 计数(协议族表))
+}
+
+// 辅助
+
+函数 AF_名称(域) {
+    如果 (域 == AF_UNSPEC) { 返回 "UNSPEC" }
+    如果 (域 == AF_UNIX)   { 返回 "UNIX" }
+    如果 (域 == AF_INET)   { 返回 "INET" }
+    如果 (域 == AF_INET6)  { 返回 "INET6" }
+    如果 (域 == AF_NETLINK) { 返回 "NETLINK" }
+    如果 (域 == AF_PACKET) { 返回 "PACKET" }
+    返回 整数转字符串(域)
+}
+
+函数 socket_域(sock) {
+    如果 (sock == 空) { 返回 0 }
+    返回 sock.域
+}
+
+函数 socket_类型(sock) {
+    如果 (sock == 空) { 返回 0 }
+    返回 sock.类型
+}
+
+函数 socket_操作表(sock) {
+    如果 (sock == 空) { 返回 空 }
+    返回 sock.操作表
+}
+
+函数 socket_文件_创建(sock, 标志) {
+    如果 (sock == 空) { 返回 空 }
+    返回 { 类型: "套接字", 套接字: sock, 标志: 标志, 错误码: 0, 已关闭: 假 }
+}
+
+// socket类型常量 
+
+// SOCK_STREAM 定义在 网络/核心/Socket层.nova
+// SOCK_DGRAM 定义在 网络/核心/Socket层.nova
+// SOCK_RAW 定义在 网络/核心/Socket层.nova
+// SOCK_SEQPACKET 定义在 网络/核心/Socket层.nova
+
+函数 SOCK_类型名(类型) {
+    如果 (类型 == SOCK_STREAM)    { 返回 "STREAM" }
+    如果 (类型 == SOCK_DGRAM)     { 返回 "DGRAM" }
+    如果 (类型 == SOCK_RAW)       { 返回 "RAW" }
+    如果 (类型 == SOCK_SEQPACKET) { 返回 "SEQPACKET" }
+    返回 整数转字符串(类型)
+}
+
+// 协议族/传输协议列举
+
+函数 协议族_列举() {
+    定义 可变 i = 0
+    当 (i < 计数(协议族表)) {
+        内核信息("  AF_" + AF_名称(协议族表[i].family))
+        i = i + 1
+    }
+}
+
+函数 传输协议_列举() {
+    定义 可变 i = 0
+    当 (i < 计数(传输协议表)) {
+        内核信息("  " + 传输协议表[i].名称 +
+                 " sockets=" + 整数转字符串(传输协议表[i].sockets_allocated))
+        i = i + 1
+    }
+}
+
+函数 协议族_统计() {
+    返回 [计数(协议族表), 计数(传输协议表)]
+}
+
+
+函数 协议族_完整统计() {
+    返回 [计数(协议族表), 计数(传输协议表)]
+}
+
+定义 可变 AI_协议族注册_热文件表 = []
+
+函数 AI_协议族注册_访问模式(路径) {
+    定义 可变 i = 0
+    当 (i < 计数(AI_协议族注册_热文件表)) {
+        如果 (AI_协议族注册_热文件表[i].路径 == 路径) {
+            AI_协议族注册_热文件表[i].频率 = AI_协议族注册_热文件表[i].频率 + 1
+            返回 AI_协议族注册_热文件表[i].频率
+        }
+        i = i + 1
+    }
+    如果 (计数(AI_协议族注册_热文件表) < 128) {
+        追加(AI_协议族注册_热文件表, { 路径: 路径, 频率: 1 })
+    }
+    返回 1
+}
+
+函数 AI_协议族注册_预读建议(文件大小, 已读偏移) {
+    如果 (已读偏移 > 文件大小 * 80 / 100) { 返回 0 }
+    返回 32768
+}

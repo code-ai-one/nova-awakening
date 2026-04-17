@@ -1,0 +1,111 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./文档节点.nova")
+
+// §4 Page Visibility 接口 — 页面可见性
+// document.visibilityState / document.hidden
+// document.add事件Listener('visibilitychange', ...)
+
+定义 VIS_VISIBLE  = 0
+定义 VIS_HIDDEN   = 1
+
+定义 可变 页面可见性 = VIS_VISIBLE
+
+函数 PageVisibility_是否可见() {
+    返回 页面可见性 == VIS_VISIBLE
+}
+
+函数 PageVisibility_获取状态() {
+    如果 (页面可见性 == VIS_VISIBLE) { 返回 "visible" }
+    返回 "hidden"
+}
+
+函数 PageVisibility_设置(新状态) {
+    定义 旧状态 = 页面可见性
+    页面可见性 = 新状态
+    如果 (旧状态 != 新状态) {
+        // 触发visibilitychange事件
+        // 如果变为hidden: 释放wake lock
+        如果 (新状态 == VIS_HIDDEN) {
+            定义 可变 i = 0
+            当 (i < 活跃WakeLock数量) {
+                定义 s = 内存_读64(活跃WakeLock列表 + i * 8)
+                如果 (s != 0) { WakeLockSentinel_release(s) }
+                i = i + 1
+            }
+        }
+    }
+}
+
+// §5 BroadcastChannel — 同源标签页间通信
+// const bc = new BroadcastChannel('my-channel')
+// bc.postMessage(data)
+// bc.onmessage = (e) => { ... }
+
+结构 BroadcastChannel {
+    名称,    // u64 频道名
+    已关闭,
+    onmessage,
+    onmessageerror,
+}
+
+结构 BCRegistry {
+    频道列表,    // u64 BroadcastChannel*数组
+    频道数量,
+    频道容量,
+}
+
+定义 可变 全局BC注册表 = 0
+
+函数 BCRegistry_获取() {
+    如果 (全局BC注册表 == 0) {
+        全局BC注册表 = 堆_分配(BCRegistry)
+        全局BC注册表.频道容量 = 64
+        全局BC注册表.频道列表 = 堆_分配_数组(64 * 8)
+        全局BC注册表.频道数量 = 0
+    }
+    返回 全局BC注册表
+}
+
+函数 BroadcastChannel_创建(名称) {
+    定义 bc = 堆_分配(BroadcastChannel)
+    bc.名称 = 字符串_复制(名称)
+    bc.已关闭 = 假
+    bc.onmessage = 0; bc.onmessageerror = 0
+
+    定义 reg = BCRegistry_获取()
+    如果 (reg.频道数量 < reg.频道容量) {
+        内存_写64(reg.频道列表 + reg.频道数量 * 8, bc)
+        reg.频道数量 = reg.频道数量 + 1
+    }
+
+    返回 bc
+}
+
+函数 BroadcastChannel_postMessage(bc, 数据) {
+    如果 (bc == 0 || bc.已关闭) { 返回 }
+
+    // 克隆数据(结构化克隆)
+    // 发送给同名的所有其他BroadcastChannel(不包括自己)
+    定义 reg = BCRegistry_获取()
+    定义 可变 i = 0
+    当 (i < reg.频道数量) {
+        定义 其他 = 内存_读64(reg.频道列表 + i * 8)
+        如果 (其他 != 0 && 其他 != bc && !其他.已关闭) {
+            如果 (字符串_相等(其他.名称, bc.名称)) {
+                // 触发其他频道的message事件
+                如果 (其他.onmessage != 0) {
+                    // 异步排入任务队列
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 BroadcastChannel_close(bc) {
+    如果 (bc == 0) { 返回 }
+    bc.已关闭 = 真
+}

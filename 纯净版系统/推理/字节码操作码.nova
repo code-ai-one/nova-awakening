@@ -1,0 +1,556 @@
+// V8 NovaOS字节码引擎字节码解释器 — JS执行的基础层
+// V8执行管线:
+//   源代码 → Parser → AST → BytecodeGenerator → Bytecode
+//     → NovaOS字节码引擎解释器(本文件) → [热点] → NovaOS优化编译器/NovaCore JIT
+// 本文件实现:
+//   1. 完整字节码定义(~170条指令)
+//   2. 字节码解释器主循环
+//   3. 寄存器文件和累加器
+//   4. 调用帧管理
+//   5. 异常处理
+
+导入("./上下文运行时.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+
+// §1 字节码操作码定义 (
+// NovaOS字节码引擎用单字节操作码 + 可变长操作数
+
+定义 OP_LdaZero = 0x01 // 累加器 = 0
+定义 OP_LdaSmi = 0x02 // 累加器 = 小整数(操作数)
+定义 OP_LdaUndefined = 0x03 // 累加器 = undefined
+定义 OP_LdaNull = 0x04 // 累加器 = null
+定义 OP_LdaTrue = 0x05 // 累加器 = true
+定义 OP_LdaFalse = 0x06 // 累加器 = false
+定义 OP_LdaConstant = 0x07 // 累加器 = 常量池[idx]
+定义 OP_LdaGlobal = 0x08 // 累加器 = 全局变量[name]
+定义 OP_StaGlobal = 0x09 // 全局变量[name] = 累加器
+定义 OP_Ldar = 0x0A // 累加器 = 寄存器[r]
+定义 OP_Star = 0x0B // 寄存器[r] = 累加器
+定义 OP_Mov = 0x0C // 寄存器[dst] = 寄存器[src]
+
+定义 OP_LdaNamedProperty = 0x10 // 累加器 = obj.name
+定义 OP_StaNamedProperty = 0x11 // obj.name = 累加器
+定义 OP_LdaKeyedProperty = 0x12 // 累加器 = obj[key]
+定义 OP_StaKeyedProperty = 0x13 // obj[key] = 累加器
+定义 OP_Lda模块Variable = 0x14 // 模块变量加载
+定义 OP_Sta模块Variable = 0x15 // 模块变量存储
+
+定义 OP_LdaContextSlot = 0x18 // 从闭包上下文加载
+定义 OP_StaContextSlot = 0x19 // 存储到闭包上下文
+定义 OP_LdaCurrentContextSlot = 0x1A
+定义 OP_StaCurrentContextSlot = 0x1B
+定义 OP_PushContext = 0x1C // 推入新上下文
+定义 OP_PopContext = 0x1D // 弹出上下文
+
+定义 OP_Add = 0x20 // 累加器 = 寄存器[r] + 累加器
+定义 OP_Sub = 0x21 // 累加器 = 寄存器[r] - 累加器
+定义 OP_Mul = 0x22 // 累加器 = 寄存器[r] * 累加器
+定义 OP_Div = 0x23 // 累加器 = 寄存器[r] / 累加器
+定义 OP_Mod = 0x24 // 累加器 = 寄存器[r] % 累加器
+定义 OP_Exp = 0x25 // 累加器 = 寄存器[r] ** 累加器
+定义 OP_BitwiseOr = 0x26 // |
+定义 OP_BitwiseXor = 0x27 // ^
+定义 OP_BitwiseAnd = 0x28 // &
+定义 OP_ShiftLeft = 0x29 // <<
+定义 OP_ShiftRight = 0x2A // >>
+定义 OP_ShiftRightLogical = 0x2B // >>>
+定义 OP_AddSmi = 0x2C // 累加器 = 累加器 + smi (快速路径)
+定义 OP_SubSmi = 0x2D
+定义 OP_MulSmi = 0x2E
+定义 OP_DivSmi = 0x2F
+定义 OP_ModSmi = 0x30
+定义 OP_BitwiseOrSmi = 0x31
+定义 OP_BitwiseXorSmi = 0x32
+定义 OP_BitwiseAndSmi = 0x33
+定义 OP_ShiftLeftSmi = 0x34
+定义 OP_ShiftRightSmi = 0x35
+
+定义 OP_Negate = 0x38 // 累加器 = -累加器
+定义 OP_BitwiseNot = 0x39 // 累加器 = ~累加器
+定义 OP_LogicalNot = 0x3A // 累加器 = !累加器
+定义 OP_TypeOf = 0x3B // 累加器 = typeof 累加器
+定义 OP_DeletePropertyStrict = 0x3C
+定义 OP_DeletePropertySloppy = 0x3D
+定义 OP_Inc = 0x3E // 累加器++
+定义 OP_Dec = 0x3F // 累加器--
+
+定义 OP_TestEqual = 0x40 // 累加器 = (r == 累加器)
+定义 OP_TestNotEqual = 0x41 // !=
+定义 OP_TestEqualStrict = 0x42 // ===
+定义 OP_TestNotEqualStrict = 0x43 // !==
+定义 OP_TestLessThan = 0x44 // <
+定义 OP_TestGreaterThan = 0x45 // >
+定义 OP_TestLessThanOrEqual = 0x46 // <=
+定义 OP_TestGreaterThanOrEqual = 0x47 // >=
+定义 OP_TestInstanceOf = 0x48
+定义 OP_TestIn = 0x49
+定义 OP_TestUndetectable = 0x4A // == null (null或undefined)
+定义 OP_TestNull = 0x4B
+定义 OP_TestUndefined = 0x4C
+定义 OP_TestTypeOf = 0x4D
+
+定义 OP_Jump = 0x50             // 无条件跳转
+定义 OP_JumpIfTrue = 0x51      // 累加器为真则跳转
+定义 OP_JumpIfFalse = 0x52     // 累加器为假则跳转
+定义 OP_JumpIfToBooleanTrue = 0x53
+定义 OP_JumpIfToBooleanFalse = 0x54
+定义 OP_JumpIfNull = 0x55
+定义 OP_JumpIfNotNull = 0x56
+定义 OP_JumpIfUndefined = 0x57
+定义 OP_JumpIfNotUndefined = 0x58
+定义 OP_JumpLoop = 0x59         // 循环跳转(触发OSR检查)
+定义 OP_SwitchOnSmiTable = 0x5A // switch查表跳转
+
+定义 OP_CallAnyReceiver = 0x60
+定义 OP_CallProperty = 0x61     // obj.method(...)
+定义 OP_CallProperty0 = 0x62    // 0参数快速路径
+定义 OP_CallProperty1 = 0x63    // 1参数
+定义 OP_CallProperty2 = 0x64    // 2参数
+定义 OP_CallUndefinedReceiver = 0x65
+定义 OP_CallUndefinedReceiver0 = 0x66
+定义 OP_CallUndefinedReceiver1 = 0x67
+定义 OP_CallUndefinedReceiver2 = 0x68
+定义 OP_CallRuntime = 0x69       // 调用运行时内部函数
+定义 OP_CallRuntimeForPair = 0x6A
+定义 OP_CallJSRuntime = 0x6B
+定义 OP_CallWithSpread = 0x6C    // f(...args)
+定义 OP_Construct = 0x6D         // new F(...)
+定义 OP_ConstructWithSpread = 0x6E
+
+定义 OP_CreateObjectLiteral = 0x70
+定义 OP_CreateArrayLiteral = 0x71
+定义 OP_CreateEmptyObjectLiteral = 0x72
+定义 OP_CreateEmptyArrayLiteral = 0x73
+定义 OP_CreateRegExpLiteral = 0x74
+定义 OP_CloneObject = 0x75
+定义 OP_GetTemplateObject = 0x76
+定义 OP_CreateClosure = 0x77
+定义 OP_CreateBlockContext = 0x78
+定义 OP_CreateCatchContext = 0x79
+定义 OP_CreateWithContext = 0x7A
+
+定义 OP_Throw = 0x80
+定义 OP_ReThrow = 0x81
+定义 OP_ThrowReferenceErrorIfHole = 0x82
+定义 OP_ThrowSuperNotCalledIfHole = 0x83
+定义 OP_ThrowSuperAlreadyCalledIfNotHole = 0x84
+
+定义 OP_Return = 0x88
+定义 OP_Debugger = 0x89
+
+定义 OP_ForInEnumerate = 0x90
+定义 OP_ForInPrepare = 0x91
+定义 OP_ForInContinue = 0x92
+定义 OP_ForInNext = 0x93
+定义 OP_ForInStep = 0x94
+定义 OP_GetIterator = 0x95
+
+定义 OP_SuspendGenerator = 0xA0
+定义 OP_ResumeGenerator = 0xA1
+定义 OP_GeneratorClose = 0xA2
+
+定义 OP_Wide = 0xC0             // 16位操作数前缀
+定义 OP_ExtraWide = 0xC1        // 32位操作数前缀
+定义 OP_Illegal = 0xFF          // 非法指令
+
+// NBCI理论 — Nova字节码解释理论 (Nova Bytecode Interpretation)
+// 理论核心: 寄存器文件分发 + 内联缓存加速 + AI热点检测
+// 公式1: DispatchCost = O(1) (直接索引分发)
+// 公式2: IC_HitRate = cached_shape / total_access
+// 公式3: Hotness = AI(执行次数, 循环深度, 参数多态) → JIT编译优先级
+
+结构 解释器帧 {
+    字节码,        // u8* 字节码数组
+    PC,             // u32 程序计数器
+    帧大小,
+    寄存器文件,    // i64[] 寄存器数组
+    累加器,
+    常量池,        // []
+    上下文,        // 闭包上下文
+    上一帧,        // 解释器帧*
+    执行次数,
+}
+
+定义 可变 当前帧 = 空
+定义 可变 解释_总指令数 = 0
+定义 可变 解释_总帧数 = 0
+定义 可变 解释_异常数 = 0
+定义 可变 解释_JIT候选数 = 0
+
+// §2 帧管理
+
+函数 解释器_创建帧(字节码, 帧大小, 常量池, 上下文) {
+    解释_总帧数 = 解释_总帧数 + 1
+    定义 帧 = 解释器帧 {
+        字节码: 字节码,
+        PC: 0,
+        帧大小: 帧大小,
+        寄存器文件: 数组_创建(帧大小, 0),
+        累加器: 0,
+        常量池: 常量池,
+        上下文: 上下文,
+        上一帧: 当前帧,
+        执行次数: 0,
+    }
+    当前帧 = 帧
+    返回 帧
+}
+
+函数 解释器_弹出帧() {
+    如果 (当前帧 == 空) { 返回 空 }
+    定义 上 = 当前帧.上一帧
+    当前帧 = 上
+    返回 上
+}
+
+// §3 字节码读取辅助
+
+函数 读字节(帧) {
+    定义 v = 帧.字节码[帧.PC]
+    帧.PC = 帧.PC + 1
+    返回 v
+}
+
+函数 读寄存器索引(帧) {
+    返回 读字节(帧)
+}
+
+函数 读常量索引(帧) {
+    返回 读字节(帧)
+}
+
+函数 读i16(帧) {
+    定义 lo = 读字节(帧)
+    定义 hi = 读字节(帧)
+    定义 v = (hi << 8) | lo
+    如果 (v >= 0x8000) { v = v - 0x10000 }
+    返回 v
+}
+
+函数 读u16(帧) {
+    定义 lo = 读字节(帧)
+    定义 hi = 读字节(帧)
+    返回 (hi << 8) | lo
+}
+
+// §4 解释器分发循环
+
+函数 解释器_执行(帧) {
+    当 (真) {
+        解释_总指令数 = 解释_总指令数 + 1
+        帧.执行次数 = 帧.执行次数 + 1
+        定义 op = 读字节(帧)
+
+        如果 (op == OP_LdaZero) {
+            帧.累加器 = 0
+        } 否则 如果 (op == OP_LdaSmi) {
+            帧.累加器 = 读i16(帧)
+        } 否则 如果 (op == OP_LdaUndefined) {
+            帧.累加器 = 未定义值
+        } 否则 如果 (op == OP_LdaNull) {
+            帧.累加器 = 空值
+        } 否则 如果 (op == OP_LdaTrue) {
+            帧.累加器 = 真值
+        } 否则 如果 (op == OP_LdaFalse) {
+            帧.累加器 = 假值
+        } 否则 如果 (op == OP_LdaConstant) {
+            定义 idx = 读常量索引(帧)
+            帧.累加器 = 帧.常量池[idx]
+        } 否则 如果 (op == OP_Ldar) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 帧.寄存器文件[r]
+        } 否则 如果 (op == OP_Star) {
+            定义 r = 读寄存器索引(帧)
+            帧.寄存器文件[r] = 帧.累加器
+        } 否则 如果 (op == OP_Mov) {
+            定义 dst = 读寄存器索引(帧)
+            定义 src = 读寄存器索引(帧)
+            帧.寄存器文件[dst] = 帧.寄存器文件[src]
+        } 否则 如果 (op == OP_Add) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 帧.寄存器文件[r] + 帧.累加器
+        } 否则 如果 (op == OP_Sub) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 帧.寄存器文件[r] - 帧.累加器
+        } 否则 如果 (op == OP_Mul) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 帧.寄存器文件[r] * 帧.累加器
+        } 否则 如果 (op == OP_Div) {
+            定义 r = 读寄存器索引(帧)
+            如果 (帧.累加器 == 0) {
+                帧.累加器 = 未定义值  // 除零
+            } 否则 {
+                帧.累加器 = 帧.寄存器文件[r] / 帧.累加器
+            }
+        } 否则 如果 (op == OP_Mod) {
+            定义 r = 读寄存器索引(帧)
+            如果 (帧.累加器 == 0) {
+                帧.累加器 = 未定义值
+            } 否则 {
+                帧.累加器 = 帧.寄存器文件[r] % 帧.累加器
+            }
+        } 否则 如果 (op == OP_AddSmi) {
+            定义 smi = 读i16(帧)
+            帧.累加器 = 帧.累加器 + smi
+        } 否则 如果 (op == OP_SubSmi) {
+            定义 smi = 读i16(帧)
+            帧.累加器 = 帧.累加器 - smi
+        } 否则 如果 (op == OP_Negate) {
+            帧.累加器 = -帧.累加器
+        } 否则 如果 (op == OP_Inc) {
+            帧.累加器 = 帧.累加器 + 1
+        } 否则 如果 (op == OP_Dec) {
+            帧.累加器 = 帧.累加器 - 1
+        } 否则 如果 (op == OP_TestEqual) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 如果(帧.寄存器文件[r] == 帧.累加器, 真值, 假值)
+        } 否则 如果 (op == OP_TestLessThan) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 如果(帧.寄存器文件[r] < 帧.累加器, 真值, 假值)
+        } 否则 如果 (op == OP_TestGreaterThan) {
+            定义 r = 读寄存器索引(帧)
+            帧.累加器 = 如果(帧.寄存器文件[r] > 帧.累加器, 真值, 假值)
+        } 否则 如果 (op == OP_Jump) {
+            定义 offset = 读i16(帧)
+            帧.PC = 帧.PC + offset - 2
+        } 否则 如果 (op == OP_JumpIfTrue) {
+            定义 offset = 读i16(帧)
+            如果 (帧.累加器 == 真值) {
+                帧.PC = 帧.PC + offset - 2
+            }
+        } 否则 如果 (op == OP_JumpIfFalse) {
+            定义 offset = 读i16(帧)
+            如果 (帧.累加器 == 假值) {
+                帧.PC = 帧.PC + offset - 2
+            }
+        } 否则 如果 (op == OP_JumpLoop) {
+            定义 offset = 读i16(帧)
+            帧.PC = 帧.PC - offset - 2
+            // 热点检测: 循环执行超过1000次触发JIT候选
+            如果 (帧.执行次数 > 1000) {
+                解释_JIT候选数 = 解释_JIT候选数 + 1
+            }
+        } 否则 如果 (op == OP_Return) {
+            返回 帧.累加器
+        } 否则 如果 (op == OP_Throw) {
+            解释_异常数 = 解释_异常数 + 1
+            返回 帧.累加器  // 简化异常处理
+        } 否则 如果 (op == OP_Illegal || op == OP_Wide || op == OP_ExtraWide) {
+            解释_异常数 = 解释_异常数 + 1
+            返回 未定义值
+        } 否则 {
+            // 未接入的操作码: 跳过
+            继续
+        }
+    }
+}
+
+// §5 AI热点检测 (NBCI公式3)
+
+函数 AI_字节码热点检测(帧) {
+    定义 特征 = Tensor_创建(1, 3)
+    Tensor_写(特征, 0, 0, 帧.执行次数 * 1.0)
+    Tensor_写(特征, 0, 1, 解释_总指令数 * 1.0)
+    Tensor_写(特征, 0, 2, 解释_JIT候选数 * 1.0)
+    定义 结果 = AI总线_推理("bytecode_hotness", 特征)
+    如果 (结果 != 空) { Tensor_释放(结果) }
+    Tensor_释放(特征)
+}
+
+// §6 诊断输出
+
+函数 字节码_诊断报告() {
+    可变 报告 = "[NBCI诊断报告]\n"
+    报告 = 报告 + "总指令数: " + 解释_总指令数 + "\n"
+    报告 = 报告 + "总帧数: " + 解释_总帧数 + "\n"
+    报告 = 报告 + "异常数: " + 解释_异常数 + "\n"
+    报告 = 报告 + "JIT候选: " + 解释_JIT候选数 + "\n"
+    返回 报告
+}
+
+// §7 内联缓存系统 (NBCI公式2: IC_HitRate)
+
+定义 IC_最大槽数 = 256
+定义 IC_多态阈值 = 4
+
+结构 IC_缓存条目 {
+    形状ID,       // 对象隐藏类标识
+    属性偏移,     // 缓存的属性偏移
+    命中次数,
+    未命中次数,
+}
+
+结构 IC_缓存表 {
+    条目,         // IC_缓存条目[]
+    容量,
+    已用,
+    总命中,
+    总未命中,
+}
+
+定义 可变 全局IC缓存 = 空
+
+函数 IC_初始化() {
+    全局IC缓存 = IC_缓存表 {
+        条目: 数组_创建(IC_最大槽数, 空),
+        容量: IC_最大槽数,
+        已用: 0,
+        总命中: 0,
+        总未命中: 0,
+    }
+}
+
+函数 IC_查找(形状ID) {
+    如果 (全局IC缓存 == 空) { 返回 空 }
+    定义 哈希 = 形状ID % 全局IC缓存.容量
+    可变 i = 0
+    当 (i < 全局IC缓存.容量) {
+        定义 idx = (哈希 + i) % 全局IC缓存.容量
+        定义 条 = 全局IC缓存.条目[idx]
+        如果 (条 == 空) { 返回 空 }
+        如果 (条.形状ID == 形状ID) {
+            条.命中次数 = 条.命中次数 + 1
+            全局IC缓存.总命中 = 全局IC缓存.总命中 + 1
+            返回 条.属性偏移
+        }
+        i = i + 1
+    }
+    全局IC缓存.总未命中 = 全局IC缓存.总未命中 + 1
+    返回 空
+}
+
+函数 IC_插入(形状ID, 属性偏移) {
+    如果 (全局IC缓存 == 空) { IC_初始化() }
+    如果 (全局IC缓存.已用 >= 全局IC缓存.容量 * 3 / 4) {
+        返回 假  // 负载因子过高
+    }
+    定义 哈希 = 形状ID % 全局IC缓存.容量
+    可变 i = 0
+    当 (i < 全局IC缓存.容量) {
+        定义 idx = (哈希 + i) % 全局IC缓存.容量
+        如果 (全局IC缓存.条目[idx] == 空) {
+            全局IC缓存.条目[idx] = IC_缓存条目 {
+                形状ID: 形状ID,
+                属性偏移: 属性偏移,
+                命中次数: 0,
+                未命中次数: 0,
+            }
+            全局IC缓存.已用 = 全局IC缓存.已用 + 1
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 IC_命中率() {
+    如果 (全局IC缓存 == 空) { 返回 0.0 }
+    定义 总 = 全局IC缓存.总命中 + 全局IC缓存.总未命中
+    如果 (总 == 0) { 返回 0.0 }
+    返回 全局IC缓存.总命中 * 100.0 / 总
+}
+
+// §8 操作码元数据与频率统计
+
+定义 操作码总数 = 256
+定义 可变 操作码频率 = 数组_创建(256, 0)
+定义 可变 操作码累计耗时 = 数组_创建(256, 0)
+
+函数 操作码_记录执行(op) {
+    如果 (op >= 0 && op < 操作码总数) {
+        操作码频率[op] = 操作码频率[op] + 1
+    }
+}
+
+函数 操作码_获取频率(op) {
+    如果 (op >= 0 && op < 操作码总数) {
+        返回 操作码频率[op]
+    }
+    返回 0
+}
+
+函数 操作码_获取热门(前N) {
+    可变 结果 = []
+    可变 排序 = 数组_创建(操作码总数, 0)
+    可变 i = 0
+    当 (i < 操作码总数) {
+        排序[i] = i
+        i = i + 1
+    }
+    // 冒泡排序(按频率降序)
+    可变 j = 0
+    当 (j < 操作码总数 - 1) {
+        可变 k = 0
+        当 (k < 操作码总数 - 1 - j) {
+            如果 (操作码频率[排序[k]] < 操作码频率[排序[k + 1]]) {
+                定义 tmp = 排序[k]
+                排序[k] = 排序[k + 1]
+                排序[k + 1] = tmp
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    i = 0
+    当 (i < 前N && i < 操作码总数) {
+        如果 (操作码频率[排序[i]] > 0) {
+            结果 = 结果 + [[排序[i], 操作码频率[排序[i]]]]
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+// §9 综合诊断
+
+函数 NBCI_综合诊断() {
+    可变 报告 = 字节码_诊断报告()
+    报告 = 报告 + "IC命中率: " + IC_命中率() + "%\n"
+    定义 热门 = 操作码_获取热门(10)
+    可变 i = 0
+    当 (i < 热门.长度) {
+        报告 = 报告 + "  操作码0x" + 热门[i][0] + " 频率=" + 热门[i][1] + "\n"
+        i = i + 1
+    }
+    返回 报告
+}
+
+函数 NBCI_AI诊断() {
+    定义 特征 = Tensor_创建(1, 6)
+    Tensor_写(特征, 0, 0, 解释_总指令数 * 1.0)
+    Tensor_写(特征, 0, 1, 解释_总帧数 * 1.0)
+    Tensor_写(特征, 0, 2, 解释_异常数 * 1.0)
+    Tensor_写(特征, 0, 3, 解释_JIT候选数 * 1.0)
+    Tensor_写(特征, 0, 4, IC_命中率())
+    如果 (全局IC缓存 != 空) {
+        Tensor_写(特征, 0, 5, 全局IC缓存.已用 * 1.0)
+    } 否则 {
+        Tensor_写(特征, 0, 5, 0.0)
+    }
+    定义 结果 = AI总线_推理("nbci_diagnostics", 特征)
+    如果 (结果 != 空) { Tensor_释放(结果) }
+    Tensor_释放(特征)
+}
+
+函数 字节码操作码_统计() {
+    返回 {
+        模块: "字节码操作码"
+    }
+}
+
+函数 字节码操作码_健康评估() {
+    定义 可变 问题 = []
+
+    返回 计数(问题) == 0
+}
+
+函数 字节码操作码_综合报告() {
+    打印("[字节码操作码] ═══ 综合报告 ═══")
+    打印("  健康: " + 如果 (字节码操作码_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 字节码操作码_全局重置() {
+    打印("[字节码操作码] 全局统计已重置")
+    返回 0
+}

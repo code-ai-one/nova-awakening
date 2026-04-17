@@ -1,0 +1,108 @@
+
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// NovaOS原生弹性盒布局引擎
+// Nova布局引擎设计:
+//   实现CSS弹性盒布局的完整算法链路
+//   遵循Nova标准 CSS 弹性ible Box 布局 模块规范:
+// §9.1 初始设置: 收集flex items, 确定可用空间
+// §9.2 行确定: single-line vs multi-line (flex-wrap)
+// §9.3 主轴尺寸: flex-basis → 弹性调整(grow/shrink)
+// §9.4 交叉轴尺寸: align-items / align-self
+// §9.5 主轴对齐: justify-content
+// §9.6 交叉轴对齐: align-content (多行)
+// §9.7 可见性折叠: visibility:collapse
+// 属性:
+// 容器: display:flex, flex-direction, flex-wrap, justify-content,
+// align-items, align-content, gap
+// 项目: order, flex-grow, flex-shrink, flex-basis, align-self
+// 【Nova特色】AI布局预测:
+// AI总线预测flex容器的最终尺寸, 减少多次布局迭代
+
+// §1 弹性常量
+
+定义 FLEX_DIR_ROW = 0
+定义 FLEX_DIR_ROW_REVERSE = 1
+定义 FLEX_DIR_COLUMN = 2
+定义 FLEX_DIR_COLUMN_REVERSE = 3
+
+定义 FLEX_WRAP_NOWRAP = 0
+定义 FLEX_WRAP_WRAP = 1
+定义 FLEX_WRAP_WRAP_REVERSE = 2
+
+定义 JUSTIFY_FLEX_START = 0
+定义 JUSTIFY_FLEX_END = 1
+定义 JUSTIFY_CENTER = 2
+定义 JUSTIFY_SPACE_BETWEEN = 3
+定义 JUSTIFY_SPACE_AROUND = 4
+定义 JUSTIFY_SPACE_EVENLY = 5
+
+定义 ALIGN_STRETCH = 0
+定义 ALIGN_FLEX_START = 1
+定义 ALIGN_FLEX_END = 2
+定义 ALIGN_CENTER = 3
+定义 ALIGN_BASELINE = 4
+定义 ALIGN_AUTO = 5 // align-self: auto → 继承align-items
+
+// §2 弹性容器和项目结构
+
+结构 弹性Container {
+ 方向,    // u8 FLEX_DIR_xxx
+ 换行,    // u8 FLEX_WRAP_xxx
+ 主轴对齐,    // u8 JUSTIFY_xxx
+ 交叉轴对齐,    // u8 ALIGN_xxx (align-items)
+ 多行对齐,    // u8 ALIGN_xxx (align-content)
+ // 间距
+ 行间距,    // i32 row-gap (Q10)
+ 列间距,    // i32 column-gap (Q10)
+ // 可用空间
+ 可用主轴,    // i32 Q10 (容器主轴尺寸)
+ 可用交叉轴,    // i32 Q10 (容器交叉轴尺寸)
+ // 项目列表
+ 项目,    // u64 弹性Item*数组
+ 项目数,
+ // 行列表
+ 行,    // u64 弹性Line*数组
+ 行数,
+}
+
+结构 弹性Item {
+ 布局对象,    // u64 布局Object*
+ // flex属性
+ flex_grow,    // i32 Q10 (默认0)
+ flex_shrink,    // i32 Q10 (默认1024 = 1.0)
+ flex_basis,    // i32 Q10 (-1=auto)
+ order,    // i32 排序(默认0)
+ align_self,    // u8 ALIGN_xxx
+ // 计算中间值
+ 外部主轴尺寸,    // i32 Q10 (含margin)
+ 外部交叉轴尺寸,
+ 主轴尺寸,    // i32 Q10 (content-box)
+ 交叉轴尺寸,
+ 基准尺寸,    // i32 flex-basis解析后
+ 假设主尺寸,    // i32 弹性调整前
+ // margin
+ 主轴margin前,
+ 主轴margin后,
+ 交叉margin前,
+ 交叉margin后,
+ // 最终位置
+ 主轴位置,
+ 交叉轴位置,
+ // 是否冻结(弹性调整中)
+ 已冻结,
+ 是auto_margin,
+}
+
+结构 弹性Line {
+ 起始索引,
+ 结束索引,    // u32 不含
+ 主轴已用,    // i32 Q10
+ 交叉轴尺寸,    // i32 Q10 (行的交叉轴高度)
+ 交叉轴位置,    // i32 Q10
+ // 弹性调整
+ 剩余空间,
+ 总grow,
+ 总shrink,
+}

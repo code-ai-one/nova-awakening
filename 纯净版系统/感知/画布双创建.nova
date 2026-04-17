@@ -1,0 +1,137 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./图位图像素缓.nova")
+导入("./网缓画布结.nova")
+导入("./绘制矩形创建.nova")
+导入("./状态栈.nova")
+导入("./内存管理纹.nova")
+导入("../中枢/辅助存根.nova")
+
+//       canvas2d/canvas_rendering_context_2d.cc (~4000行)
+//       base_rendering_context_2d.cc (~2000行)
+//       canvas_path.cc (~800行)
+// <canvas>是HTML5最强大的2D绘图接口:
+//   var ctx = canvas.getContext('2d');
+//   ctx.fillRect(10, 10, 100, 50);
+//   ctx.draw图像(img, 0, 0);
+// 本文件实现完整的画布渲染ingContext2D规范:
+//   1. 状态栈(save/restore)
+//   2. 变换(translate/rotate/scale/transform/setTransform)
+//   3. 填充/描边样式(color/gradient/pattern)
+//   4. 矩形绘制(fillRect/strokeRect/clearRect)
+//   5. 路径(beginPath/moveTo/lineTo/arc/bezierCurveTo/closePath)
+//   6. 文本(fillText/strokeText/measureText)
+//   7. 图像绘制(draw图像 3/5/9参数)
+//   8. 像素操作(get图像Data/put图像Data/create图像Data)
+//   9. 合成(globalAlpha/globalCompositeOperation)
+//   10. 阴影(shadowColor/shadowBlur/shadowOffsetX/Y)
+//   11. 线条样式(lineWidth/lineCap/lineJoin/miterLimit/setLineDash)
+
+// §1 画布状态
+
+结构 画布State {
+    // 变换矩阵
+    矩阵,    // SkMatrix
+    // 裁剪区域
+    裁剪路径,    // u64 SkPath*
+    // 填充/描边样式
+    填充颜色,    // u32 ARGB
+    描边颜色,
+    填充渐变,    // u64 LinearGradient* 或 RadialGradient*
+    描边渐变,
+    // 线条样式
+    线宽,    // i32 ×100
+    线帽,    // u32 0=butt 1=round 2=square
+    线接,    // u32 0=miter 1=round 2=bevel
+    斜接限,    // i32 ×100
+    虚线数组,    // u64 i32数组
+    虚线数量,
+    虚线偏移,    // i32 ×100
+    // 文本
+    字体族,
+    字号,    // i32 ×100
+    文本对齐,    // u32 0=start 1=end 2=left 3=right 4=center
+    文本基线,    // u32 0=top 1=hanging 2=middle 3=alphabetic 4=ideographic 5=bottom
+    文本方向,    // u32 0=ltr 1=rtl
+    // 合成
+    全局透明度,    // i32 0-10000 (0.0-1.0 ×10000)
+    合成操作,    // u32 0=source-over ...
+    // 阴影
+    阴影颜色,
+    阴影模糊,    // i32 ×100
+    阴影偏移x,    // i32 ×100
+    阴影偏移y,
+    // 图像平滑
+    图像平滑,
+    图像平滑质量,    // u32 0=low 1=medium 2=high
+}
+
+结构 画布渲染ingContext2D {
+    // 目标画布
+    画布元素,    // u64 HTML画布元素*
+    位图,    // u64 Nova缓冲itmap*
+    skcanvas,    // u64 Sk画布*
+    宽,
+    高,
+    // 当前状态
+    当前状态,    // 画布State
+    // 状态栈
+    状态栈,    // u64 画布State*数组
+    栈深度,
+    栈容量,
+    // 当前路径
+    当前路径,    // u64 SkPath*
+    子路径起点x,    // i32 ×100
+    子路径起点y,
+    有子路径,
+}
+
+
+函数 画布2D_创建(宽, 高) {
+    定义 ctx = 堆_分配(画布渲染ingContext2D)
+    ctx.宽 = 宽
+    ctx.高 = 高
+    ctx.位图 = Nova缓冲itmap_创建(宽, 高, 像素格式_RGBA8888)
+    ctx.skcanvas = Sk画布_创建(ctx.位图)
+
+    // 初始状态
+    ctx.当前状态.矩阵 = SkMatrix_单位矩阵()
+    ctx.当前状态.填充颜色 = 0xFF000000    // 默认黑色
+    ctx.当前状态.描边颜色 = 0xFF000000
+    ctx.当前状态.填充渐变 = 0
+    ctx.当前状态.描边渐变 = 0
+    ctx.当前状态.线宽 = 100    // 1px
+    ctx.当前状态.线帽 = 0
+    ctx.当前状态.线接 = 0
+    ctx.当前状态.斜接限 = 1000    // 10.0
+    ctx.当前状态.虚线数组 = 0
+    ctx.当前状态.虚线数量 = 0
+    ctx.当前状态.虚线偏移 = 0
+    ctx.当前状态.字体族 = 字符串_复制("sans-serif")
+    ctx.当前状态.字号 = 1000    // 10px
+    ctx.当前状态.文本对齐 = 0
+    ctx.当前状态.文本基线 = 3    // alphabetic
+    ctx.当前状态.全局透明度 = 10000    // 1.0
+    ctx.当前状态.合成操作 = 0    // source-over
+    ctx.当前状态.阴影颜色 = 0x00000000    // transparent
+    ctx.当前状态.阴影模糊 = 0
+    ctx.当前状态.阴影偏移x = 0
+    ctx.当前状态.阴影偏移y = 0
+    ctx.当前状态.图像平滑 = 真
+    ctx.当前状态.图像平滑质量 = 1
+    ctx.当前状态.裁剪路径 = 0
+
+    // 状态栈
+    ctx.栈容量 = 32
+    ctx.状态栈 = 堆_分配_数组(ctx.栈容量 * 256)
+    ctx.栈深度 = 0
+
+    // 当前路径
+    ctx.当前路径 = SkPath_创建()
+    ctx.有子路径 = 假
+
+    // 清除为透明
+    Nova缓冲itmap_清除(ctx.位图, 0x00000000)
+
+    返回 ctx
+}

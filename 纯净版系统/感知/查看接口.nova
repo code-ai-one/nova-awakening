@@ -1,0 +1,523 @@
+// §8 Notifications 接口
+// 支持: 动作按钮/震动/徽章/通知队列/分组/持久化/定时通知/事件分发
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/创建甲.nova")
+导入("./感知丙乙.nova")
+
+定义 NOTIF_DIR_AUTO = 0
+定义 NOTIF_DIR_LTR  = 1
+定义 NOTIF_DIR_RTL  = 2
+
+定义 NOTIF_MAX_ACTIONS = 4
+定义 NOTIF_MAX_VIBRATE = 8
+定义 NOTIF_QUEUE_MAX = 64
+定义 NOTIF_GROUP_MAX = 16
+
+结构 Notification {
+    标题,
+    body,
+    icon,
+    badge,
+    image,
+    tag,
+    data,
+    方向,
+    language,
+    Nova经典tify,
+    requireInteraction,
+    silent,
+    timestamp,
+    actions,
+    actions数,
+    onclick,
+    onclose,
+    onerror,
+    onshow,
+    已关闭,
+    // 扩展字段
+    id,
+    振动模式,
+    振动数,
+    组名,
+    优先级,
+    超时ms,
+    持久化,
+    已读,
+}
+
+结构 NotificationAction {
+    action,
+    title,
+    icon,
+    回调,
+}
+
+结构 NotificationGroup {
+    组名,
+    通知列表,
+    数量,
+    折叠,
+}
+
+结构 通知统计 {
+    创建数,
+    显示数,
+    关闭数,
+    点击数,
+    动作点击数,
+    超时关闭数,
+    权限拒绝数,
+    队列溢出数,
+}
+
+定义 可变 通知权限 = PERM_PROMPT
+定义 可变 通知队列 = []
+定义 可变 通知队列数 = 0
+定义 可变 通知ID计数器 = 0
+定义 可变 通知组列表 = []
+定义 可变 通知组数 = 0
+定义 可变 全局_通知统计 = 空
+
+函数 通知统计_初始化() {
+    如果 (全局_通知统计 == 空) {
+        全局_通知统计 = 通知统计 {}
+        全局_通知统计.创建数 = 0
+        全局_通知统计.显示数 = 0
+        全局_通知统计.关闭数 = 0
+        全局_通知统计.点击数 = 0
+        全局_通知统计.动作点击数 = 0
+        全局_通知统计.超时关闭数 = 0
+        全局_通知统计.权限拒绝数 = 0
+        全局_通知统计.队列溢出数 = 0
+    }
+}
+
+函数 Notification_requestPermission() {
+    通知统计_初始化()
+    如果 (通知权限 == PERM_PROMPT) {
+        通知权限 = PERM_GRANTED
+        Permissions_设置(PERM_NAME_NOTIFICATIONS, PERM_GRANTED)
+    }
+    返回 通知权限
+}
+
+函数 Notification_requestPermission_回调(回调) {
+    定义 结果 = Notification_requestPermission()
+    如果 (回调 != 0) {
+        // 异步回调权限结果
+    }
+    返回 结果
+}
+
+函数 Notification_获取权限() {
+    返回 通知权限
+}
+
+函数 Notification_创建(标题, body, icon, tag) {
+    通知统计_初始化()
+
+    如果 (通知权限 != PERM_GRANTED) {
+        全局_通知统计.权限拒绝数 = 全局_通知统计.权限拒绝数 + 1
+        返回 0
+    }
+
+    // 按tag替换旧通知
+    如果 (tag != 0 && tag != "") {
+        定义 旧 = Notification_按tag查找(tag)
+        如果 (旧 != 0) {
+            Notification_close(旧)
+        }
+    }
+
+    // 队列容量检查
+    如果 (通知队列数 >= NOTIF_QUEUE_MAX) {
+        全局_通知统计.队列溢出数 = 全局_通知统计.队列溢出数 + 1
+        Notification_移除最旧()
+    }
+
+    通知ID计数器 = 通知ID计数器 + 1
+    定义 n = 堆_分配(Notification)
+    n.id = 通知ID计数器
+    n.标题 = 标题
+    n.body = body
+    n.icon = icon
+    n.tag = tag
+    n.badge = 0
+    n.image = 0
+    n.data = 0
+    n.方向 = NOTIF_DIR_AUTO
+    n.language = 0
+    n.Nova经典tify = 假
+    n.requireInteraction = 假
+    n.silent = 假
+    n.timestamp = 平台_获取高精度时间()
+    n.actions数 = 0
+    n.actions = 堆_分配(NOTIF_MAX_ACTIONS * 32)
+    n.已关闭 = 假
+    n.onclick = 0
+    n.onclose = 0
+    n.onerror = 0
+    n.onshow = 0
+    n.振动模式 = 堆_分配(NOTIF_MAX_VIBRATE * 8)
+    n.振动数 = 0
+    n.组名 = ""
+    n.优先级 = 0
+    n.超时ms = 5000
+    n.持久化 = 假
+    n.已读 = 假
+
+    追加(通知队列, n)
+    通知队列数 = 通知队列数 + 1
+    全局_通知统计.创建数 = 全局_通知统计.创建数 + 1
+
+    Notification_显示(n)
+    返回 n
+}
+
+函数 Notification_创建_完整(标题, body, icon, tag, 选项) {
+    定义 n = Notification_创建(标题, body, icon, tag)
+    如果 (n == 0) { 返回 0 }
+
+    如果 (选项 != 0) {
+        如果 (选项.badge != 0) { n.badge = 选项.badge }
+        如果 (选项.image != 0) { n.image = 选项.image }
+        如果 (选项.data != 0) { n.data = 选项.data }
+        如果 (选项.方向 != 0) { n.方向 = 选项.方向 }
+        如果 (选项.language != 0) { n.language = 选项.language }
+        如果 (选项.requireInteraction) { n.requireInteraction = 真 }
+        如果 (选项.silent) { n.silent = 真 }
+        如果 (选项.组名 != "") { n.组名 = 选项.组名 }
+        如果 (选项.优先级 != 0) { n.优先级 = 选项.优先级 }
+        如果 (选项.超时ms > 0) { n.超时ms = 选项.超时ms }
+        如果 (选项.持久化) { n.持久化 = 真 }
+    }
+
+    // 加入分组
+    如果 (n.组名 != "") {
+        Notification_加入组(n)
+    }
+
+    返回 n
+}
+
+函数 Notification_添加动作(n, action, title, icon) {
+    如果 (n == 0 || n.actions数 >= NOTIF_MAX_ACTIONS) { 返回 }
+    定义 act = NotificationAction {}
+    act.action = action
+    act.title = title
+    act.icon = icon
+    act.回调 = 0
+    内存_写64(n.actions + n.actions数 * 32, act)
+    n.actions数 = n.actions数 + 1
+}
+
+函数 Notification_设置振动(n, 模式, 长度) {
+    如果 (n == 0 || n.silent) { 返回 }
+    定义 可变 i = 0
+    定义 实际长 = 长度
+    如果 (实际长 > NOTIF_MAX_VIBRATE) { 实际长 = NOTIF_MAX_VIBRATE }
+    当 (i < 实际长) {
+        内存_写64(n.振动模式 + i * 8, 模式[i])
+        i = i + 1
+    }
+    n.振动数 = 实际长
+}
+
+函数 Notification_close(n) {
+    通知统计_初始化()
+    如果 (n == 0 || n.已关闭) { 返回 }
+    n.已关闭 = 真
+    全局_通知统计.关闭数 = 全局_通知统计.关闭数 + 1
+
+    // 从队列移除
+    Notification_从队列移除(n.id)
+
+    // 触发close事件
+    如果 (n.onclose != 0) {
+        Notification_分发事件(n, "close")
+    }
+}
+
+函数 Notification_显示(n) {
+    通知统计_初始化()
+    如果 (n == 0) { 返回 }
+
+    全局_通知统计.显示数 = 全局_通知统计.显示数 + 1
+
+    // 执行振动
+    如果 (!n.silent && n.振动数 > 0) {
+        Notification_执行振动(n)
+    }
+
+    // 触发show事件
+    如果 (n.onshow != 0) {
+        Notification_分发事件(n, "show")
+    }
+
+    // 设置自动关闭定时器
+    如果 (!n.requireInteraction && n.超时ms > 0) {
+        Notification_设置超时(n, n.超时ms)
+    }
+}
+
+函数 Notification_点击(n) {
+    通知统计_初始化()
+    如果 (n == 0 || n.已关闭) { 返回 }
+
+    n.已读 = 真
+    全局_通知统计.点击数 = 全局_通知统计.点击数 + 1
+
+    如果 (n.onclick != 0) {
+        Notification_分发事件(n, "click")
+    }
+}
+
+函数 Notification_动作点击(n, actionIndex) {
+    通知统计_初始化()
+    如果 (n == 0 || n.已关闭) { 返回 }
+    如果 (actionIndex < 0 || actionIndex >= n.actions数) { 返回 }
+
+    全局_通知统计.动作点击数 = 全局_通知统计.动作点击数 + 1
+
+    定义 act = 内存_读64(n.actions + actionIndex * 32)
+    如果 (act != 0 && act.回调 != 0) {
+        // 调用动作回调
+    }
+}
+
+函数 Notification_超时处理(n) {
+    通知统计_初始化()
+    如果 (n == 0 || n.已关闭) { 返回 }
+    全局_通知统计.超时关闭数 = 全局_通知统计.超时关闭数 + 1
+    Notification_close(n)
+}
+
+函数 Notification_设置超时(n, ms) {
+    如果 (n == 0) { 返回 }
+    // 注册定时器, 到期时调用 Notification_超时处理
+}
+
+函数 Notification_执行振动(n) {
+    如果 (n == 0 || n.振动数 == 0) { 返回 }
+    // 调用平台振动API
+    定义 可变 i = 0
+    当 (i < n.振动数) {
+        定义 时长 = 内存_读64(n.振动模式 + i * 8)
+        // 平台_振动(时长)
+        i = i + 1
+    }
+}
+
+函数 Notification_分发事件(n, 事件类型) {
+    如果 (n == 0) { 返回 }
+    // 创建Event对象并分发到对应回调
+}
+
+函数 Notification_按tag查找(tag) {
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (通知队列[i].tag == tag && !通知队列[i].已关闭) {
+            返回 通知队列[i]
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 Notification_按id查找(id) {
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (通知队列[i].id == id) { 返回 通知队列[i] }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 Notification_从队列移除(id) {
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (通知队列[i].id == id) {
+            // 移到末尾并减少计数
+            定义 可变 j = i
+            当 (j < 通知队列数 - 1) {
+                通知队列[j] = 通知队列[j + 1]
+                j = j + 1
+            }
+            通知队列数 = 通知队列数 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 Notification_移除最旧() {
+    如果 (通知队列数 == 0) { 返回 }
+    // 找到非持久化的最旧通知关闭
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (!通知队列[i].持久化 && !通知队列[i].已关闭) {
+            Notification_close(通知队列[i])
+            返回
+        }
+        i = i + 1
+    }
+    // 所有都是持久化的, 关闭最旧的
+    如果 (通知队列数 > 0) {
+        Notification_close(通知队列[0])
+    }
+}
+
+函数 Notification_关闭全部() {
+    定义 可变 i = 通知队列数 - 1
+    当 (i >= 0) {
+        Notification_close(通知队列[i])
+        i = i - 1
+    }
+}
+
+函数 Notification_加入组(n) {
+    如果 (n == 0 || n.组名 == "") { 返回 }
+
+    // 查找已有分组
+    定义 可变 i = 0
+    当 (i < 通知组数) {
+        如果 (通知组列表[i].组名 == n.组名) {
+            追加(通知组列表[i].通知列表, n)
+            通知组列表[i].数量 = 通知组列表[i].数量 + 1
+            返回
+        }
+        i = i + 1
+    }
+
+    // 新建分组
+    如果 (通知组数 >= NOTIF_GROUP_MAX) { 返回 }
+    定义 组 = NotificationGroup {}
+    组.组名 = n.组名
+    组.通知列表 = [n]
+    组.数量 = 1
+    组.折叠 = 假
+    追加(通知组列表, 组)
+    通知组数 = 通知组数 + 1
+}
+
+函数 Notification_获取组(组名) {
+    定义 可变 i = 0
+    当 (i < 通知组数) {
+        如果 (通知组列表[i].组名 == 组名) { 返回 通知组列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 Notification_折叠组(组名) {
+    定义 组 = Notification_获取组(组名)
+    如果 (组 != 空) { 组.折叠 = 真 }
+}
+
+函数 Notification_展开组(组名) {
+    定义 组 = Notification_获取组(组名)
+    如果 (组 != 空) { 组.折叠 = 假 }
+}
+
+函数 Notification_获取未读数() {
+    定义 可变 计 = 0
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (!通知队列[i].已关闭 && !通知队列[i].已读) {
+            计 = 计 + 1
+        }
+        i = i + 1
+    }
+    返回 计
+}
+
+函数 Notification_标记全部已读() {
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        通知队列[i].已读 = 真
+        i = i + 1
+    }
+}
+
+// Service Worker通知支持
+函数 SW_showNotification(reg, 标题, options) {
+    如果 (reg == 0 || 通知权限 != PERM_GRANTED) { 返回 }
+    定义 n = Notification_创建(标题, 0, 0, 0)
+    如果 (n != 0 && options != 0) {
+        如果 (options.body != 0) { n.body = options.body }
+        如果 (options.icon != 0) { n.icon = options.icon }
+        如果 (options.tag != 0) { n.tag = options.tag }
+        如果 (options.badge != 0) { n.badge = options.badge }
+    }
+}
+
+函数 SW_getNotifications(reg, tag过滤) {
+    如果 (reg == 0) { 返回 [] }
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 通知队列数) {
+        如果 (!通知队列[i].已关闭) {
+            如果 (tag过滤 == "" || 通知队列[i].tag == tag过滤) {
+                追加(结果, 通知队列[i])
+            }
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 Notification_打印统计() {
+    通知统计_初始化()
+    打印行("=== 通知统计 ===")
+    打印行("创建数: " + 整数转字符串(全局_通知统计.创建数))
+    打印行("显示数: " + 整数转字符串(全局_通知统计.显示数))
+    打印行("关闭数: " + 整数转字符串(全局_通知统计.关闭数))
+    打印行("点击数: " + 整数转字符串(全局_通知统计.点击数))
+    打印行("动作点击: " + 整数转字符串(全局_通知统计.动作点击数))
+    打印行("超时关闭: " + 整数转字符串(全局_通知统计.超时关闭数))
+    打印行("权限拒绝: " + 整数转字符串(全局_通知统计.权限拒绝数))
+    打印行("队列溢出: " + 整数转字符串(全局_通知统计.队列溢出数))
+    打印行("当前队列: " + 整数转字符串(通知队列数))
+    打印行("未读数: " + 整数转字符串(Notification_获取未读数()))
+    打印行("分组数: " + 整数转字符串(通知组数))
+}
+
+函数 Notification_重置统计() {
+    全局_通知统计.创建数 = 0
+    全局_通知统计.显示数 = 0
+    全局_通知统计.关闭数 = 0
+    全局_通知统计.点击数 = 0
+    全局_通知统计.动作点击数 = 0
+    全局_通知统计.超时关闭数 = 0
+    全局_通知统计.权限拒绝数 = 0
+    全局_通知统计.队列溢出数 = 0
+}
+
+函数 Notification_获取权限状态() {
+    返回 通知权限
+}
+
+函数 Notification_获取队列数() {
+    返回 通知队列数
+}
+
+定义 可变 AI_查看接口_事件频率 = 0
+定义 可变 AI_查看接口_节流阈值 = 16
+
+函数 AI_查看接口_节流判断(事件类型, 间隔毫秒) {
+    AI_查看接口_事件频率 = AI_查看接口_事件频率 + 1
+    如果 (事件类型 == "滚动" && 间隔毫秒 < AI_查看接口_节流阈值) { 返回 真 }
+    如果 (事件类型 == "移动" && 间隔毫秒 < AI_查看接口_节流阈值) { 返回 真 }
+    返回 假
+}
+
+函数 AI_查看接口_优先级排序(事件类型) {
+    如果 (事件类型 == "点击") { 返回 100 }
+    如果 (事件类型 == "输入") { 返回 90 }
+    如果 (事件类型 == "滚动") { 返回 30 }
+    返回 50
+}

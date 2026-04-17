@@ -1,0 +1,4 @@
+kernel_root	/home/cch/视频/新觉醒/原生编译器
+manifest_source	/home/cch/视频/新觉醒/原生编译器/_manifest.txt
+runtime_seed_source	/home/cch/视频/新觉醒/原生编译器/编译器/前端入口_运行时种子.nova
+stage0_root	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器

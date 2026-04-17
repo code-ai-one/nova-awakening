@@ -1,0 +1,319 @@
+// Nova 版 mini Lexer — 对齐 backend_seed.rs::Lexer
+// Token 表示为列表: [类型标签, 值]
+// 类型标签(与Rust Token枚举对齐):
+//   1=Func 2=Define 3=Mutable 4=Return 5=If 6=Else 7=While 8=Import
+//   9=True 10=False 11=Null 12=Struct 13=Build 14=Break 15=Continue
+//   16=Match 17=Default 18=Try 19=Catch 20=Throw 21=ForEach
+//   22=PlusEq 23=MinusEq 24=Tilde
+//   30=Int 31=Float 32=Str 33=Ident
+//   40=Plus 41=Minus 42=Star 43=Slash 44=Percent
+//   50=Eq 51=EqEq 52=NotEq 53=Lt 54=Gt 55=LtEq 56=GtEq
+//   60=And 61=Or 62=Not 63=BitAnd 64=BitOr 65=BitXor 66=Shl 67=Shr
+//   70=LParen 71=RParen 72=LBrace 73=RBrace 74=LBracket 75=RBracket
+//   76=Comma 77=Dot 78=Colon 79=Semi
+//   99=Eof
+
+定义 T_Func = 1
+定义 T_Define = 2
+定义 T_Mutable = 3
+定义 T_Return = 4
+定义 T_If = 5
+定义 T_Else = 6
+定义 T_While = 7
+定义 T_Import = 8
+定义 T_True = 9
+定义 T_False = 10
+定义 T_Null = 11
+定义 T_Struct = 12
+定义 T_Build = 13
+定义 T_Break = 14
+定义 T_Continue = 15
+定义 T_Int = 30
+定义 T_Float = 31
+定义 T_Str = 32
+定义 T_Ident = 33
+定义 T_Plus = 40
+定义 T_Minus = 41
+定义 T_Star = 42
+定义 T_Slash = 43
+定义 T_Percent = 44
+定义 T_Eq = 50
+定义 T_EqEq = 51
+定义 T_NotEq = 52
+定义 T_Lt = 53
+定义 T_Gt = 54
+定义 T_LtEq = 55
+定义 T_GtEq = 56
+定义 T_And = 60
+定义 T_Or = 61
+定义 T_Not = 62
+定义 T_BitAnd = 63
+定义 T_BitOr = 64
+定义 T_BitXor = 65
+定义 T_Shl = 66
+定义 T_Shr = 67
+定义 T_LParen = 70
+定义 T_RParen = 71
+定义 T_LBrace = 72
+定义 T_RBrace = 73
+定义 T_LBracket = 74
+定义 T_RBracket = 75
+定义 T_Comma = 76
+定义 T_Dot = 77
+定义 T_Colon = 78
+定义 T_Semi = 79
+定义 T_Eof = 99
+
+// Lexer 状态 [src, pos, len]
+函数 lex_new(源码) {
+    // 跳过 BOM (源码为字符串, 逐字节处理)
+    定义 可变 _起始 = 0
+    定义 n = 字节长度(源码)
+    如果 (n >= 3) {
+        如果 (字节取(源码, 0) == 0xEF 且 字节取(源码, 1) == 0xBB 且 字节取(源码, 2) == 0xBF) {
+            _起始 = 3
+        }
+    }
+    返回 [源码, _起始, n]
+}
+
+函数 lex_peek(lx) {
+    如果 (lx[1] < lx[2]) { 返回 字节取(lx[0], lx[1]) }
+    返回 0
+}
+
+函数 lex_advance(lx) {
+    定义 b = lex_peek(lx)
+    如果 (lx[1] < lx[2]) { lx[1] = lx[1] + 1 }
+    返回 b
+}
+
+函数 lex_skip_ws(lx) {
+    当 (lx[1] < lx[2]) {
+        定义 b = 字节取(lx[0], lx[1])
+        如果 (b == 32 或 b == 9 或 b == 13 或 b == 10) {
+            lx[1] = lx[1] + 1
+        } 否则 如果 (b == 47 且 lx[1] + 1 < lx[2] 且 字节取(lx[0], lx[1] + 1) == 47) {
+            当 (lx[1] < lx[2] 且 字节取(lx[0], lx[1]) != 10) {
+                lx[1] = lx[1] + 1
+            }
+        } 否则 {
+            返回 空
+        }
+    }
+}
+
+// 读取标识符 (UTF-8多字节支持)
+函数 lex_read_ident(lx) {
+    定义 start = lx[1]
+    当 (lx[1] < lx[2]) {
+        定义 b = 字节取(lx[0], lx[1])
+        如果 (b >= 0x80) {
+            // UTF-8多字节
+            如果 (b >= 0xF0 且 lx[1] + 3 < lx[2]) { lx[1] = lx[1] + 4 }
+            否则 如果 (b >= 0xE0 且 lx[1] + 2 < lx[2]) { lx[1] = lx[1] + 3 }
+            否则 如果 (b >= 0xC0 且 lx[1] + 1 < lx[2]) { lx[1] = lx[1] + 2 }
+            否则 { lx[1] = lx[1] + 1 }
+        } 否则 如果 ((b >= 48 且 b <= 57) 或 (b >= 65 且 b <= 90) 或 (b >= 97 且 b <= 122) 或 b == 95) {
+            lx[1] = lx[1] + 1
+        } 否则 {
+            返回 子串(lx[0], start, lx[1] - start)
+        }
+    }
+    返回 子串(lx[0], start, lx[1] - start)
+}
+
+函数 lex_read_number(lx) {
+    定义 start = lx[1]
+    // 检查 0x 十六进制
+    如果 (lex_peek(lx) == 48 且 lx[1] + 1 < lx[2]) {
+        定义 b2 = 字节取(lx[0], lx[1] + 1)
+        如果 (b2 == 120 或 b2 == 88) {  // 'x' or 'X'
+            lx[1] = lx[1] + 2
+            当 (lx[1] < lx[2]) {
+                定义 hb = 字节取(lx[0], lx[1])
+                如果 ((hb >= 48 且 hb <= 57) 或 (hb >= 65 且 hb <= 70) 或 (hb >= 97 且 hb <= 102)) {
+                    lx[1] = lx[1] + 1
+                } 否则 { 返回 [T_Int, _hex_parse(lx[0], start + 2, lx[1])] }
+            }
+            返回 [T_Int, _hex_parse(lx[0], start + 2, lx[1])]
+        }
+    }
+    当 (lx[1] < lx[2]) {
+        定义 db = 字节取(lx[0], lx[1])
+        如果 (db >= 48 且 db <= 57) { lx[1] = lx[1] + 1 } 否则 { 返回 [T_Int, 转数字(子串(lx[0], start, lx[1] - start))] }
+    }
+    返回 [T_Int, 转数字(子串(lx[0], start, lx[1] - start))]
+}
+
+函数 _hex_parse(s, start, end) {
+    定义 可变 v = 0
+    定义 可变 i = start
+    当 (i < end) {
+        定义 c = 字节取(s, i)
+        定义 可变 d = 0
+        如果 (c >= 48 且 c <= 57) { d = c - 48 }
+        否则 如果 (c >= 65 且 c <= 70) { d = c - 55 }
+        否则 如果 (c >= 97 且 c <= 102) { d = c - 87 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    返回 v
+}
+
+函数 lex_read_string(lx) {
+    lx[1] = lx[1] + 1  // skip "
+    定义 start = lx[1]
+    当 (lx[1] < lx[2] 且 字节取(lx[0], lx[1]) != 34) {
+        如果 (字节取(lx[0], lx[1]) == 92 且 lx[1] + 1 < lx[2]) {
+            lx[1] = lx[1] + 2
+        } 否则 {
+            lx[1] = lx[1] + 1
+        }
+    }
+    定义 s = 子串(lx[0], start, lx[1] - start)
+    如果 (lx[1] < lx[2]) { lx[1] = lx[1] + 1 }  // skip "
+    返回 [T_Str, s]
+}
+
+// 中文关键字映射
+函数 _kw_lookup(ident) {
+    如果 (字符串相等(ident, "函数") 或 字符串相等(ident, "做法") 或 字符串相等(ident, "法")) { 返回 T_Func }
+    如果 (字符串相等(ident, "定义") 或 字符串相等(ident, "称为") 或 字符串相等(ident, "叫做")) { 返回 T_Define }
+    如果 (字符串相等(ident, "可变")) { 返回 T_Mutable }
+    如果 (字符串相等(ident, "返回") 或 字符串相等(ident, "给出")) { 返回 T_Return }
+    如果 (字符串相等(ident, "如果") 或 字符串相等(ident, "假如") 或 字符串相等(ident, "倘若") 或 字符串相等(ident, "要是") 或 字符串相等(ident, "若是") 或 字符串相等(ident, "每当") 或 字符串相等(ident, "凡是")) { 返回 T_If }
+    如果 (字符串相等(ident, "否则") 或 字符串相等(ident, "不然的话") 或 字符串相等(ident, "否则的话") 或 字符串相等(ident, "除此之外")) { 返回 T_Else }
+    如果 (字符串相等(ident, "当") 或 字符串相等(ident, "循环")) { 返回 T_While }
+    如果 (字符串相等(ident, "导入") 或 字符串相等(ident, "入")) { 返回 T_Import }
+    如果 (字符串相等(ident, "真")) { 返回 T_True }
+    如果 (字符串相等(ident, "假")) { 返回 T_False }
+    如果 (字符串相等(ident, "空")) { 返回 T_Null }
+    如果 (字符串相等(ident, "结构")) { 返回 T_Struct }
+    如果 (字符串相等(ident, "建")) { 返回 T_Build }
+    如果 (字符串相等(ident, "中断") 或 字符串相等(ident, "止")) { 返回 T_Break }
+    如果 (字符串相等(ident, "继续") 或 字符串相等(ident, "续")) { 返回 T_Continue }
+    如果 (字符串相等(ident, "且") 或 字符串相等(ident, "并且") 或 字符串相等(ident, "而且")) { 返回 T_And }
+    如果 (字符串相等(ident, "或") 或 字符串相等(ident, "或者")) { 返回 T_Or }
+    如果 (字符串相等(ident, "非")) { 返回 T_Not }
+    如果 (字符串相等(ident, "等于")) { 返回 T_EqEq }
+    如果 (字符串相等(ident, "不等于")) { 返回 T_NotEq }
+    如果 (字符串相等(ident, "大于")) { 返回 T_Gt }
+    如果 (字符串相等(ident, "小于")) { 返回 T_Lt }
+    如果 (字符串相等(ident, "大于等于")) { 返回 T_GtEq }
+    如果 (字符串相等(ident, "小于等于")) { 返回 T_LtEq }
+    返回 0  // 不是关键字
+}
+
+函数 lex_next(lx) {
+    lex_skip_ws(lx)
+    如果 (lx[1] >= lx[2]) { 返回 [T_Eof, 0] }
+    定义 b = 字节取(lx[0], lx[1])
+    // UTF-8中文
+    如果 (b >= 0xC0) {
+        定义 id = lex_read_ident(lx)
+        定义 kw = _kw_lookup(id)
+        如果 (kw != 0) { 返回 [kw, id] }
+        返回 [T_Ident, id]
+    }
+    // 数字
+    如果 (b >= 48 且 b <= 57) { 返回 lex_read_number(lx) }
+    // 字符串
+    如果 (b == 34) { 返回 lex_read_string(lx) }
+    // ASCII标识符
+    如果 ((b >= 65 且 b <= 90) 或 (b >= 97 且 b <= 122) 或 b == 95) {
+        定义 id2 = lex_read_ident(lx)
+        返回 [T_Ident, id2]
+    }
+    // 运算符/分隔符
+    lx[1] = lx[1] + 1
+    如果 (b == 43) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_Plus, "+="] }
+        返回 [T_Plus, "+"]
+    }
+    如果 (b == 45) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_Minus, "-="] }
+        返回 [T_Minus, "-"]
+    }
+    如果 (b == 42) { 返回 [T_Star, "*"] }
+    如果 (b == 47) { 返回 [T_Slash, "/"] }
+    如果 (b == 37) { 返回 [T_Percent, "%"] }
+    如果 (b == 40) { 返回 [T_LParen, "("] }
+    如果 (b == 41) { 返回 [T_RParen, ")"] }
+    如果 (b == 123) { 返回 [T_LBrace, "{"] }
+    如果 (b == 125) { 返回 [T_RBrace, "}"] }
+    如果 (b == 91) { 返回 [T_LBracket, "["] }
+    如果 (b == 93) { 返回 [T_RBracket, "]"] }
+    如果 (b == 44) { 返回 [T_Comma, ","] }
+    如果 (b == 46) { 返回 [T_Dot, "."] }
+    如果 (b == 58) { 返回 [T_Colon, ":"] }
+    如果 (b == 59) { 返回 [T_Semi, ";"] }
+    如果 (b == 33) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_NotEq, "!="] }
+        返回 [T_Not, "!"]
+    }
+    如果 (b == 61) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_EqEq, "=="] }
+        返回 [T_Eq, "="]
+    }
+    如果 (b == 60) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_LtEq, "<="] }
+        如果 (lex_peek(lx) == 60) { lx[1] = lx[1] + 1 返回 [T_Shl, "<<"] }
+        返回 [T_Lt, "<"]
+    }
+    如果 (b == 62) {
+        如果 (lex_peek(lx) == 61) { lx[1] = lx[1] + 1 返回 [T_GtEq, ">="] }
+        如果 (lex_peek(lx) == 62) { lx[1] = lx[1] + 1 返回 [T_Shr, ">>"] }
+        返回 [T_Gt, ">"]
+    }
+    如果 (b == 38) {
+        如果 (lex_peek(lx) == 38) { lx[1] = lx[1] + 1 返回 [T_And, "&&"] }
+        返回 [T_BitAnd, "&"]
+    }
+    如果 (b == 124) {
+        如果 (lex_peek(lx) == 124) { lx[1] = lx[1] + 1 返回 [T_Or, "||"] }
+        返回 [T_BitOr, "|"]
+    }
+    如果 (b == 94) { 返回 [T_BitXor, "^"] }
+    返回 [T_Ident, "?"]
+}
+
+函数 tokenize(源码) {
+    定义 lx = lex_new(源码)
+    定义 可变 tokens = []
+    当 (真) {
+        定义 t = lex_next(lx)
+        如果 (t[0] == T_Eof) { 返回 tokens }
+        追加(tokens, t)
+    }
+    返回 tokens
+}
+
+// ═══ 自测 ═══
+函数 主程序() {
+    定义 源码1 = "函数 fib(n) { 如果 (n < 2) { 返回 n } 返回 fib(n-1) + fib(n-2) }"
+    定义 toks = tokenize(源码1)
+    打印(字符串拼接("fib35 tokens=", 转字符串(计数(toks))))
+    // 验证前几个token
+    定义 t0 = toks[0]
+    如果 (t0[0] == T_Func) { 打印("✓ token[0] = Func") } 否则 { 打印(字符串拼接("✗ token[0] got ", 转字符串(t0[0]))) }
+    定义 t1 = toks[1]
+    如果 (t1[0] == T_Ident 且 字符串相等(t1[1], "fib")) { 打印("✓ token[1] = Ident(fib)") } 否则 { 打印("✗ token[1]") }
+    定义 t2 = toks[2]
+    如果 (t2[0] == T_LParen) { 打印("✓ token[2] = LParen") } 否则 { 打印("✗ token[2]") }
+    定义 t3 = toks[3]
+    如果 (t3[0] == T_Ident 且 字符串相等(t3[1], "n")) { 打印("✓ token[3] = Ident(n)") } 否则 { 打印("✗ token[3]") }
+
+    定义 源码2 = "定义 x = 0x1F 可变 y = 100"
+    定义 toks2 = tokenize(源码2)
+    打印(字符串拼接("hex tokens=", 转字符串(计数(toks2))))
+    // toks2[2] 应为 Int(31)
+    定义 intok = toks2[3]
+    如果 (intok[0] == T_Int 且 intok[1] == 31) { 打印("✓ 0x1F = Int(31)") } 否则 { 打印(字符串拼接(字符串拼接("✗ hex got tag=", 转字符串(intok[0])), 字符串拼接(" val=", 转字符串(intok[1])))) }
+
+    定义 源码3 = "写文件(\"out.txt\", \"hello\")"
+    定义 toks3 = tokenize(源码3)
+    定义 strtok = toks3[2]
+    如果 (strtok[0] == T_Str 且 字符串相等(strtok[1], "out.txt")) { 打印("✓ 字符串字面量") } 否则 { 打印("✗ 字符串") }
+    返回 0
+}

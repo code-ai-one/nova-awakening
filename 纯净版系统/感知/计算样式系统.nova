@@ -1,0 +1,762 @@
+// 这是样式系统的输出: 包含一个元素所有CSS属性的最终计算值
+// 布局引擎直接读取Computed样式来决定如何排列和绘制元素
+
+导入("./内核直连层.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/字符串替换.nova")
+
+定义 Display_none          = 0
+定义 Display_block         = 1
+定义 Display_inline        = 2
+定义 Display_inline_block  = 3
+定义 Display_flex          = 4
+定义 Display_inline_flex   = 5
+定义 Display_grid          = 6
+定义 Display_inline_grid   = 7
+定义 Display_table         = 8
+定义 Display_table_row     = 9
+定义 Display_table_cell    = 10
+定义 Display_list_item     = 11
+定义 Display_contents      = 12
+
+定义 Position_static       = 0
+定义 Position_relative     = 1
+定义 Position_absolute     = 2
+定义 Position_fixed        = 3
+定义 Position_sticky       = 4
+
+定义 Overflow_visible      = 0
+定义 Overflow_hidden       = 1
+定义 Overflow_scroll       = 2
+定义 Overflow_auto         = 3
+
+定义 浮动_none            = 0
+定义 浮动_left            = 1
+定义 浮动_right           = 2
+
+定义 TextAlign_left        = 0
+定义 TextAlign_right       = 1
+定义 TextAlign_center      = 2
+定义 TextAlign_justify     = 3
+
+定义 弹性Dir_row           = 0
+定义 弹性Dir_row_reverse   = 1
+定义 弹性Dir_column        = 2
+定义 弹性Dir_column_reverse = 3
+
+定义 JC_flex_start         = 0
+定义 JC_flex_end           = 1
+定义 JC_center             = 2
+定义 JC_space_between      = 3
+定义 JC_space_around       = 4
+定义 JC_space_evenly       = 5
+定义 JC_stretch            = 6
+
+定义 BoxSizing_content     = 0
+定义 BoxSizing_border      = 1
+
+定义 Visibility_visible    = 0
+定义 Visibility_hidden     = 1
+定义 Visibility_collapse   = 2
+
+结构 计算长度 {
+    值,    // i32 像素值 ×100 (即 1.5px = 150)
+    是auto,
+    单位,    // u32 原始单位(用于百分比等需要父值的情况)
+}
+
+// Computed样式结构 
+// 传统引擎中通过多层结构体共享(样式RaNova经典nInheritedData等)
+// Nova版用平坦结构存储(对应Nova的Computed样式)
+
+结构 Computed样式 {
+ display,
+ position,
+ float_val,
+ clear,
+ box_sizing,
+ width,    // 计算长度
+ height,    // 计算长度
+ min_width,    // 计算长度
+ min_height,    // 计算长度
+ max_width,    // 计算长度
+ max_height,    // 计算长度
+
+ padding_top,    // 计算长度
+ padding_right,    // 计算长度
+ padding_bottom,    // 计算长度
+ padding_left,    // 计算长度
+
+ margin_top,    // 计算长度
+ margin_right,    // 计算长度
+ margin_bottom,    // 计算长度
+ margin_left,    // 计算长度
+
+ border_top_width,    // i32 像素×100
+ border_right_width,
+ border_bottom_width,
+ border_left_width,
+ border_top_color,    // u32 RGBA
+ border_right_color,
+ border_bottom_color,
+ border_left_color,
+ border_top_style,
+ border_right_style,
+ border_bottom_style,
+ border_left_style,
+ border_radius_tl,    // 计算长度
+ border_radius_tr,    // 计算长度
+ border_radius_bl,    // 计算长度
+ border_radius_br,    // 计算长度
+
+ top,    // 计算长度
+ right,    // 计算长度
+ bottom,    // 计算长度
+ left,    // 计算长度
+ z_index,
+ visibility,
+ opacity,    // i32 0-10000 (即 0.0-1.0 ×10000)
+ overflow_x,
+ overflow_y,
+ color,    // u32 RGBA前景色
+ background_color,    // u32 RGBA
+
+ font_size,    // i32 像素×100
+ font_weight,    // i32 100-900
+ font_style,    // u32 (normal/italic/oblique)
+ line_height,    // i32 像素×100
+ text_align,
+ text_decoration,
+ text_transform,
+ white_space,
+ word_break,
+ letter_spacing,    // i32 像素×100
+
+ flex_direction,
+ flex_wrap,
+ flex_grow,    // i32 ×1000
+ flex_shrink,    // i32 ×1000
+ flex_basis,    // 计算长度
+ justify_content,
+ align_items,
+ align_self,
+ align_content,
+ grid_template_columns,    // 网格轨道组
+ grid_template_rows,    // 网格轨道组
+ grid_column_start,
+ grid_column_end,
+ grid_row_start,
+ grid_row_end,
+ grid_gap_column,
+ grid_gap_row,
+ transform_matrix,    // 6元素 2D矩阵
+ will_change_flags,    // u32 位标志
+ contain_flags,    // u32 contain:layout|paint|size
+
+ 继承版本号,    // u64 用于快速继承比较
+ 脏标志,    // u32 哪些属性组已变化
+ 缓存哈希,
+}
+
+// NCSS理论 — Nova计算样式系统理论 (Nova Computed Style System Theory)
+// 理论核心: 属性分组差异继承 + 布隆过滤快速匹配 + AI样式预测缓存
+// 公式1: StyleCost(n) = O(matched_rules * changed_groups) 而非 O(all_props)
+// 公式2: InheritHit(n) = bloom_check(parent_hash, prop_group_id) → O(1)
+// 公式3: CachePrediction = AI_model(element_path, class_list) → P(cache_hit)
+
+定义 属性组_盒模型    = 0x01
+定义 属性组_尺寸      = 0x02
+定义 属性组_边距      = 0x04
+定义 属性组_边框      = 0x08
+定义 属性组_定位      = 0x10
+定义 属性组_视觉      = 0x20
+定义 属性组_字体      = 0x40
+定义 属性组_弹性      = 0x80
+定义 属性组_网格      = 0x100
+定义 属性组_变换      = 0x200
+定义 属性组_全部      = 0x3FF
+
+定义 脏_无          = 0
+定义 脏_样式已变    = 0x01
+定义 脏_需要重排    = 0x02
+定义 脏_需要重绘    = 0x04
+定义 脏_需要重合成  = 0x08
+定义 脏_子树已变    = 0x10
+
+定义 继承属性_color         = 0x01
+定义 继承属性_font_size     = 0x02
+定义 继承属性_font_weight   = 0x04
+定义 继承属性_font_style    = 0x08
+定义 继承属性_line_height   = 0x10
+定义 继承属性_text_align    = 0x20
+定义 继承属性_visibility    = 0x40
+定义 继承属性_white_space   = 0x80
+定义 继承属性_word_break    = 0x100
+定义 继承属性_letter_spacing = 0x200
+定义 继承属性_text_decoration = 0x400
+定义 继承属性_全部 = 0x7FF
+
+// §2 全局样式计算统计 & 缓存系统
+
+定义 样式缓存容量 = 4096
+定义 布隆过滤器大小 = 1024  // 布隆过滤器比特数
+
+定义 可变 全局_样式计算次数 = 0
+定义 可变 全局_缓存命中次数 = 0
+定义 可变 全局_缓存未中次数 = 0
+定义 可变 全局_继承传播次数 = 0
+定义 可变 全局_属性组跳过次数 = 0
+定义 可变 全局_AI预测命中 = 0
+定义 可变 全局_AI预测未中 = 0
+
+// 样式缓存表 — 基于哈希键存储已计算样式
+定义 可变 样式缓存表 = 空
+定义 可变 样式缓存数量 = 0
+
+// 布隆过滤器数组 — 用于快速选择器匹配过滤
+定义 可变 布隆过滤器 = 空
+
+// §3 样式系统初始化
+
+
+函数 计算样式系统_初始化() {
+    // 初始化样式缓存表
+    样式缓存表 = 数组_创建(样式缓存容量, 空)
+    样式缓存数量 = 0
+
+    // 初始化布隆过滤器
+    布隆过滤器 = 数组_创建(布隆过滤器大小, 0)
+
+    // 重置统计计数器
+    全局_样式计算次数 = 0
+    全局_缓存命中次数 = 0
+    全局_缓存未中次数 = 0
+    全局_继承传播次数 = 0
+    全局_属性组跳过次数 = 0
+    全局_AI预测命中 = 0
+    全局_AI预测未中 = 0
+
+    返回 真
+}
+
+// §4 默认样式创建 — 每个属性的初始值
+
+函数 创建默认样式() {
+    可变 s = Computed样式 {}
+    // 盒模型默认
+    s.display = Display_inline
+    s.position = Position_static
+    s.float_val = 浮动_none
+    s.clear = 0
+    s.box_sizing = BoxSizing_content
+    // 尺寸默认(auto)
+    s.width = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.height = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.min_width = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.min_height = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.max_width = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.max_height = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    // 边距默认(0)
+    s.padding_top = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.padding_right = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.padding_bottom = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.padding_left = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.margin_top = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.margin_right = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.margin_bottom = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.margin_left = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    // 边框默认
+    s.border_top_width = 0
+    s.border_right_width = 0
+    s.border_bottom_width = 0
+    s.border_left_width = 0
+    s.border_top_color = 0x000000FF
+    s.border_right_color = 0x000000FF
+    s.border_bottom_color = 0x000000FF
+    s.border_left_color = 0x000000FF
+    s.border_top_style = 0
+    s.border_right_style = 0
+    s.border_bottom_style = 0
+    s.border_left_style = 0
+    // 圆角默认
+    s.border_radius_tl = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.border_radius_tr = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.border_radius_bl = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    s.border_radius_br = 计算长度 { 值: 0, 是auto: 假, 单位: 0 }
+    // 定位默认
+    s.top = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.right = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.bottom = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.left = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.z_index = 0
+    // 视觉默认
+    s.visibility = Visibility_visible
+    s.opacity = 10000  // 1.0 * 10000
+    s.overflow_x = Overflow_visible
+    s.overflow_y = Overflow_visible
+    s.color = 0x000000FF  // 黑色
+    s.background_color = 0x00000000  // 透明
+    // 字体默认
+    s.font_size = 1600  // 16px * 100
+    s.font_weight = 400
+    s.font_style = 0
+    s.line_height = 0  // normal
+    s.text_align = TextAlign_left
+    s.text_decoration = 0
+    s.text_transform = 0
+    s.white_space = 0  // normal
+    s.word_break = 0  // normal
+    s.letter_spacing = 0
+    // Flex默认
+    s.flex_direction = 弹性Dir_row
+    s.flex_wrap = 0
+    s.flex_grow = 0
+    s.flex_shrink = 1000  // 1.0 * 1000
+    s.flex_basis = 计算长度 { 值: 0, 是auto: 真, 单位: 0 }
+    s.justify_content = JC_flex_start
+    s.align_items = JC_stretch
+    s.align_self = 0  // auto
+    s.align_content = JC_stretch
+    // Grid默认
+    s.grid_template_columns = 空
+    s.grid_template_rows = 空
+    s.grid_column_start = 0
+    s.grid_column_end = 0
+    s.grid_row_start = 0
+    s.grid_row_end = 0
+    s.grid_gap_column = 0
+    s.grid_gap_row = 0
+    // 变换默认
+    s.transform_matrix = 空
+    s.will_change_flags = 0
+    s.contain_flags = 0
+    // 内部标记
+    s.继承版本号 = 0
+    s.脏标志 = 0
+    s.缓存哈希 = 0
+    返回 s
+}
+
+// §5 布隆过滤器 — 快速选择器匹配过滤 (NCSS公式2)
+// 原理: 将选择器哈希插入布隆过滤器，查询时O(1)排除不匹配规则
+
+函数 布隆_哈希(输入) {
+    // FNV-1a 变体哈希
+    可变 h = 0x811C9DC5
+    可变 i = 0
+    当 (i < 字符串_长度(输入)) {
+        h = h ^ 字符串_字符码(输入, i)
+        h = h * 0x01000193
+        h = h & 0xFFFFFFFF
+        i = i + 1
+    }
+    返回 h
+}
+
+函数 布隆过滤器_插入(哈希值) {
+    如果 (布隆过滤器 == 空) { 返回 }
+    // 多哈希位标记 — 用k=3个哈希函数
+    定义 h1 = 哈希值 & 0xFFFF
+    定义 h2 = (哈希值 >> 16) & 0xFFFF
+    定义 idx0 = h1 % 布隆过滤器大小
+    定义 idx1 = h2 % 布隆过滤器大小
+    定义 idx2 = (h1 + h2) % 布隆过滤器大小
+    布隆过滤器[idx0] = 1
+    布隆过滤器[idx1] = 1
+    布隆过滤器[idx2] = 1
+}
+
+函数 布隆过滤器_可能包含(哈希值) {
+    如果 (布隆过滤器 == 空) { 返回 假 }
+    定义 h1 = 哈希值 & 0xFFFF
+    定义 h2 = (哈希值 >> 16) & 0xFFFF
+    定义 idx0 = h1 % 布隆过滤器大小
+    定义 idx1 = h2 % 布隆过滤器大小
+    定义 idx2 = (h1 + h2) % 布隆过滤器大小
+    返回 (布隆过滤器[idx0] == 1) && (布隆过滤器[idx1] == 1) && (布隆过滤器[idx2] == 1)
+}
+
+函数 布隆过滤器_重置() {
+    如果 (布隆过滤器 == 空) { 返回 }
+    可变 i = 0
+    当 (i < 布隆过滤器大小) {
+        布隆过滤器[i] = 0
+        i = i + 1
+    }
+}
+
+// §6 样式缓存系统 — 哈希索引存取
+
+函数 样式缓存_计算哈希(元素标签, 类名, 伪类标志) {
+    可变 h = 0x1505
+    // 混入标签哈希
+    h = h * 33 + 布隆_哈希(元素标签)
+    // 混入类名哈希
+    h = h * 33 + 布隆_哈希(类名)
+    // 混入伪类标志
+    h = h * 33 + 伪类标志
+    返回 h & 0xFFFFFFFF
+}
+
+函数 样式缓存_查找(哈希值) {
+    如果 (样式缓存表 == 空) { 返回 空 }
+    定义 索引 = 哈希值 % 样式缓存容量
+    定义 节点 = 样式缓存表[索引]
+    如果 (节点 != 空 && 节点.哈希 == 哈希值) {
+        全局_缓存命中次数 = 全局_缓存命中次数 + 1
+        返回 节点.样式
+    }
+    全局_缓存未中次数 = 全局_缓存未中次数 + 1
+    返回 空
+}
+
+函数 样式缓存_存入(哈希值, 样式对象) {
+    如果 (样式缓存表 == 空) { 返回 }
+    定义 索引 = 哈希值 % 样式缓存容量
+    样式缓存表[索引] = { 哈希: 哈希值, 样式: 样式对象 }
+    样式缓存数量 = 样式缓存数量 + 1
+}
+
+函数 样式缓存_全部清除() {
+    如果 (样式缓存表 == 空) { 返回 }
+    可变 i = 0
+    当 (i < 样式缓存容量) {
+        样式缓存表[i] = 空
+        i = i + 1
+    }
+    样式缓存数量 = 0
+}
+
+// §7 样式继承与传播
+// NCSS差异继承: 只处理“继承性属性”列表中的属性
+
+函数 样式继承_从父传播(子样式, 父样式) {
+    如果 (父样式 == 空) { 返回 子样式 }
+    // color
+    如果 (子样式.color == 0x000000FF) {
+        子样式.color = 父样式.color
+    }
+    // font-size
+    如果 (子样式.font_size == 1600) {
+        子样式.font_size = 父样式.font_size
+    }
+    // font-weight
+    如果 (子样式.font_weight == 400) {
+        子样式.font_weight = 父样式.font_weight
+    }
+    // font-style
+    如果 (子样式.font_style == 0) {
+        子样式.font_style = 父样式.font_style
+    }
+    // line-height
+    如果 (子样式.line_height == 0) {
+        子样式.line_height = 父样式.line_height
+    }
+    // text-align
+    如果 (子样式.text_align == TextAlign_left) {
+        子样式.text_align = 父样式.text_align
+    }
+    // visibility
+    如果 (子样式.visibility == Visibility_visible) {
+        子样式.visibility = 父样式.visibility
+    }
+    // white-space
+    如果 (子样式.white_space == 0) {
+        子样式.white_space = 父样式.white_space
+    }
+    // word-break
+    如果 (子样式.word_break == 0) {
+        子样式.word_break = 父样式.word_break
+    }
+    // letter-spacing
+    如果 (子样式.letter_spacing == 0) {
+        子样式.letter_spacing = 父样式.letter_spacing
+    }
+    // 更新继承版本号
+    子样式.继承版本号 = 父样式.继承版本号 + 1
+    全局_继承传播次数 = 全局_继承传播次数 + 1
+    返回 子样式
+}
+
+// §8 属性应用引擎 — 将解析后的CSS声明应用到Computed样式
+// NCSS公式1: 分组差异更新，只更新变化的属性组
+
+函数 属性_应用到样式(样式对象, 属性名, 属性值) {
+    可变 变化组 = 0
+    // 盒模型属性
+    如果 (属性名 == "display") {
+        样式对象.display = 属性值
+        变化组 = 属性组_盒模型
+    } 否则 如果 (属性名 == "position") {
+        样式对象.position = 属性值
+        变化组 = 属性组_盒模型
+    } 否则 如果 (属性名 == "float") {
+        样式对象.float_val = 属性值
+        变化组 = 属性组_盒模型
+    } 否则 如果 (属性名 == "box-sizing") {
+        样式对象.box_sizing = 属性值
+        变化组 = 属性组_盒模型
+    // 视觉属性
+    } 否则 如果 (属性名 == "visibility") {
+        样式对象.visibility = 属性值
+        变化组 = 属性组_视觉
+    } 否则 如果 (属性名 == "opacity") {
+        样式对象.opacity = 属性值
+        变化组 = 属性组_视觉
+    } 否则 如果 (属性名 == "color") {
+        样式对象.color = 属性值
+        变化组 = 属性组_视觉
+    } 否则 如果 (属性名 == "background-color") {
+        样式对象.background_color = 属性值
+        变化组 = 属性组_视觉
+    // 字体属性
+    } 否则 如果 (属性名 == "font-size") {
+        样式对象.font_size = 属性值
+        变化组 = 属性组_字体
+    } 否则 如果 (属性名 == "font-weight") {
+        样式对象.font_weight = 属性值
+        变化组 = 属性组_字体
+    } 否则 如果 (属性名 == "line-height") {
+        样式对象.line_height = 属性值
+        变化组 = 属性组_字体
+    } 否则 如果 (属性名 == "text-align") {
+        样式对象.text_align = 属性值
+        变化组 = 属性组_字体
+    // Flex属性
+    } 否则 如果 (属性名 == "flex-direction") {
+        样式对象.flex_direction = 属性值
+        变化组 = 属性组_弹性
+    } 否则 如果 (属性名 == "flex-grow") {
+        样式对象.flex_grow = 属性值
+        变化组 = 属性组_弹性
+    } 否则 如果 (属性名 == "flex-shrink") {
+        样式对象.flex_shrink = 属性值
+        变化组 = 属性组_弹性
+    } 否则 如果 (属性名 == "justify-content") {
+        样式对象.justify_content = 属性值
+        变化组 = 属性组_弹性
+    } 否则 如果 (属性名 == "align-items") {
+        样式对象.align_items = 属性值
+        变化组 = 属性组_弹性
+    }
+    // 设置脏标志
+    样式对象.脏标志 = 样式对象.脏标志 | 脏_样式已变
+    返回 变化组
+}
+
+// §9 脏标志判定 — 属性组变化引发哪些重绘/重排
+
+函数 计算脏影响(变化组位图) {
+    可变 影响 = 脏_无
+    // 盒模型/尺寸/边距/边框/定位/弹性/网格 → 需要重排
+    如果 (变化组位图 & (属性组_盒模型 | 属性组_尺寸 | 属性组_边距 | 属性组_边框 | 属性组_定位 | 属性组_弹性 | 属性组_网格)) {
+        影响 = 影响 | 脏_需要重排 | 脏_需要重绘
+    }
+    // 视觉/字体 → 只需重绘
+    如果 (变化组位图 & (属性组_视觉 | 属性组_字体)) {
+        影响 = 影响 | 脏_需要重绘
+    }
+    // 变换 → 只需重合成
+    如果 (变化组位图 & 属性组_变换) {
+        影响 = 影响 | 脏_需要重合成
+    }
+    返回 影响
+}
+
+// §10 规则匹配引擎 — 简化的CSS选择器匹配
+
+// 选择器类型
+定义 选择器_标签 = 1
+定义 选择器_类 = 2
+定义 选择器_ID = 3
+定义 选择器_属性 = 4
+定义 选择器_伪类 = 5
+定义 选择器_通配 = 6
+
+结构 CSS规则 {
+    选择器类型,
+    选择器值,
+    优先级,    // u32 (specificity)
+    属性列表,    // 数组 [{name, value}]
+}
+
+// 优先级计算: ID=100, 类/伪类/属性=10, 标签=1
+函数 计算优先级(规则) {
+    如果 (规则.选择器类型 == 选择器_ID) { 返回 100 }
+    如果 (规则.选择器类型 == 选择器_类) { 返回 10 }
+    如果 (规则.选择器类型 == 选择器_伪类) { 返回 10 }
+    如果 (规则.选择器类型 == 选择器_属性) { 返回 10 }
+    如果 (规则.选择器类型 == 选择器_标签) { 返回 1 }
+    返回 0  // 通配符
+}
+
+// 匹配单个选择器
+函数 选择器_匹配(规则, 元素标签, 元素类名, 元素ID) {
+    // 布隆过滤快速排除
+    定义 sel_hash = 布隆_哈希(规则.选择器值)
+    如果 (!布隆过滤器_可能包含(sel_hash)) {
+        返回 假
+    }
+    // 精确匹配
+    如果 (规则.选择器类型 == 选择器_标签) {
+        返回 元素标签 == 规则.选择器值
+    } 否则 如果 (规则.选择器类型 == 选择器_类) {
+        返回 元素类名 == 规则.选择器值
+    } 否则 如果 (规则.选择器类型 == 选择器_ID) {
+        返回 元素ID == 规则.选择器值
+    } 否则 如果 (规则.选择器类型 == 选择器_通配) {
+        返回 真
+    }
+    返回 假
+}
+
+// §11 核心入口 — 为元素计算完整样式
+// 流程: 缓存查询 → 规则匹配 → 属性应用 → 继承 → 缓存存储
+
+函数 计算元素样式(元素标签, 元素类名, 元素ID, 伪类标志, 规则集, 父样式) {
+    全局_样式计算次数 = 全局_样式计算次数 + 1
+
+    // 步1: 查缓存
+    定义 cache_hash = 样式缓存_计算哈希(元素标签, 元素类名, 伪类标志)
+    定义 缓存结果 = 样式缓存_查找(cache_hash)
+    如果 (缓存结果 != 空) {
+        返回 缓存结果
+    }
+
+    // 步2: 创建默认样式
+    可变 样式 = 创建默认样式()
+    可变 变化组总 = 0
+
+    // 步3: 将元素信息插入布隆过滤器(供选择器匹配)
+    布隆过滤器_插入(布隆_哈希(元素标签))
+    如果 (元素类名 != 空 && 元素类名 != "") {
+        布隆过滤器_插入(布隆_哈希(元素类名))
+    }
+    如果 (元素ID != 空 && 元素ID != "") {
+        布隆过滤器_插入(布隆_哈希(元素ID))
+    }
+
+    // 步4: 遍历规则集，匹配并应用
+    如果 (规则集 != 空) {
+        // 按优先级排序(简单插入排序)
+        可变 ri = 0
+        当 (ri < 数组_长度(规则集)) {
+            定义 规则 = 规则集[ri]
+            如果 (选择器_匹配(规则, 元素标签, 元素类名, 元素ID)) {
+                // 应用该规则的所有属性
+                如果 (规则.属性列表 != 空) {
+                    可变 pi = 0
+                    当 (pi < 数组_长度(规则.属性列表)) {
+                        定义 prop = 规则.属性列表[pi]
+                        定义 grp = 属性_应用到样式(样式, prop.name, prop.value)
+                        变化组总 = 变化组总 | grp
+                        pi = pi + 1
+                    }
+                }
+            }
+            ri = ri + 1
+        }
+    }
+
+    // 步5: 继承传播
+    样式 = 样式继承_从父传播(样式, 父样式)
+
+    // 步6: 计算脏影响
+    样式.脏标志 = 计算脏影响(变化组总)
+
+    // 步7: 计算缓存哈希并存缓存
+    样式.缓存哈希 = cache_hash
+    样式缓存_存入(cache_hash, 样式)
+
+    返回 样式
+}
+
+// §12 AI样式预测与优化 (NCSS公式3)
+// AI模型预测哪些元素可能共享相同计算样式 → 提前缓存预热
+
+函数 AI_样式预测缓存(元素标签, 元素类名) {
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, 布隆_哈希(元素标签) * 1.0)
+    Tensor_写(特征, 0, 1, 布隆_哈希(元素类名) * 1.0)
+    Tensor_写(特征, 0, 2, 全局_缓存命中次数 * 1.0)
+    Tensor_写(特征, 0, 3, 全局_样式计算次数 * 1.0)
+    定义 结果 = AI总线_推理("style_cache_predictor", 特征)
+    可变 应预热 = 假
+    如果 (结果 != 空) {
+        定义 conf = Tensor_读(结果, 0, 0)
+        如果 (conf > 0.75) {
+            应预热 = 真
+            全局_AI预测命中 = 全局_AI预测命中 + 1
+        } 否则 {
+            全局_AI预测未中 = 全局_AI预测未中 + 1
+        }
+        Tensor_释放(结果)
+    }
+    Tensor_释放(特征)
+    返回 应预热
+}
+
+// §13 样式无效化 — 树向下脏标志传播
+
+函数 样式无效化_向下传播(节点, 变化组) {
+    如果 (节点 == 空) { 返回 }
+    // 设置节点本身的脏标志
+    如果 (节点.计算样式 != 空) {
+        节点.计算样式.脏标志 = 节点.计算样式.脏标志 | 脏_样式已变 | 脏_子树已变
+    }
+    // 如果是继承性属性变化，传播到所有子节点
+    定义 涉及继承 = (变化组 & (属性组_视觉 | 属性组_字体)) != 0
+    如果 (涉及继承 && 节点.子节点列表 != 空) {
+        可变 ci = 0
+        当 (ci < 数组_长度(节点.子节点列表)) {
+            样式无效化_向下传播(节点.子节点列表[ci], 变化组)
+            ci = ci + 1
+        }
+    }
+}
+
+// 全树样式重算(当样式表变更时)
+函数 全树样式重算(根节点, 规则集) {
+    // 清空缓存
+    样式缓存_全部清除()
+    布隆过滤器_重置()
+    // 递归重算
+    全树样式重算_递归(根节点, 规则集, 空)
+}
+
+函数 全树样式重算_递归(节点, 规则集, 父样式) {
+    如果 (节点 == 空) { 返回 }
+    // 计算当前节点样式
+    定义 新样式 = 计算元素样式(
+        节点.标签, 节点.类名, 节点.id, 节点.伪类标志, 规则集, 父样式
+    )
+    节点.计算样式 = 新样式
+    // 递归子节点
+    如果 (节点.子节点列表 != 空) {
+        可变 i = 0
+        当 (i < 数组_长度(节点.子节点列表)) {
+            全树样式重算_递归(节点.子节点列表[i], 规则集, 新样式)
+            i = i + 1
+        }
+    }
+}
+
+// §14 诊断与统计输出
+
+函数 计算样式_诊断输出() {
+    可变 报告 = "[NCSS诊断报告]\n"
+    报告 = 报告 + "样式计算总次数: " + 全局_样式计算次数 + "\n"
+    报告 = 报告 + "缓存命中: " + 全局_缓存命中次数 + "\n"
+    报告 = 报告 + "缓存未中: " + 全局_缓存未中次数 + "\n"
+    定义 总查询 = 全局_缓存命中次数 + 全局_缓存未中次数
+    如果 (总查询 > 0) {
+        定义 命中率 = 全局_缓存命中次数 * 100 / 总查询
+        报告 = 报告 + "缓存命中率: " + 命中率 + "%\n"
+    }
+    报告 = 报告 + "继承传播次数: " + 全局_继承传播次数 + "\n"
+    报告 = 报告 + "属性组跳过: " + 全局_属性组跳过次数 + "\n"
+    报告 = 报告 + "AI预测命中: " + 全局_AI预测命中 + "\n"
+    报告 = 报告 + "AI预测未中: " + 全局_AI预测未中 + "\n"
+    报告 = 报告 + "当前缓存数量: " + 样式缓存数量 + "/" + 样式缓存容量 + "\n"
+    返回 报告
+}

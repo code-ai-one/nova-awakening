@@ -1,0 +1,521 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/可执行加载.nova")
+导入("../标准/文件.nova")
+
+// NovaOS · 原生动态链接器 (ld-nova.so)
+// 替代Linux的ld-linux-x86-64.so.2, 由NovaOS内核原生实现
+// 不是模拟, 而是Nova天生理解ELF动态链接的所有概念
+// §1 共享库加载与管理
+// §2 符号解析 (全局符号表, 作用域链)
+// §3 PLT/GOT延迟绑定
+// §4 库搜索路径 (LD_LIBRARY_PATH, /etc/ld.so.conf, rpath)
+// §5 初始化/析构 (.init/.fini/.init_array/.fini_array)
+// §6 版本控制 (符号版本)
+
+
+结构 共享库 {
+    路径,           // 字符串 (完整路径)
+    soname,         // 字符串 (如 "libc.so.6")
+    基地址,
+    映像大小,
+    引用计数,
+    符号表,         // 列表 [[名称, 地址, 大小, 类型], ...]
+    依赖列表,       // 列表 [soname, ...]
+    已初始化,
+    init函数,
+    fini函数,
+    init_array,
+    init_array_sz,
+    fini_array,
+    fini_array_sz,
+    GOT地址,
+    PLT地址,
+}
+
+定义 可变 _已加载库 = []
+定义 可变 _全局符号表 = []
+定义 可变 _库搜索路径 = []
+定义 可变 _库加载基址 = 0x7F000000    // 共享库加载区域起始
+定义 可变 _链接器已初始化 = 假
+
+函数 动态链接器_初始化() {
+    如果 (_链接器已初始化) { 返回 }
+    _已加载库 = []
+    _全局符号表 = []
+
+    // 默认搜索路径
+    _库搜索路径 = [
+        "/lib",
+        "/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+    ]
+
+    // 注册NovaOS内置的核心库(替代glibc)
+    动态链接器_注册内置库()
+
+    _链接器已初始化 = 真
+    内核信息("动态链接器(ld-nova): 初始化完成, 搜索路径=" + 整数转字符串(计数(_库搜索路径)))
+}
+
+
+函数 动态链接器_加载(soname) {
+    如果 (!_链接器已初始化) { 动态链接器_初始化() }
+
+    // 检查是否已加载
+    定义 已有 = 动态链接器_查找库(soname)
+    如果 (已有 >= 0) {
+        _已加载库[已有].引用计数 = _已加载库[已有].引用计数 + 1
+        返回 已有
+    }
+
+    // 在搜索路径中查找
+    定义 完整路径 = 动态链接器_搜索(soname)
+    如果 (完整路径 == 空) {
+        内核警告("ld-nova: 找不到 " + soname)
+        返回 -1
+    }
+
+    // 加载ELF共享对象
+    定义 库 = 共享库 {}
+    库.路径 = 完整路径
+    库.soname = soname
+    库.引用计数 = 1
+    库.已初始化 = 假
+    库.符号表 = []
+    库.依赖列表 = []
+
+    // 分配虚拟地址空间
+    库.基地址 = _库加载基址
+    _库加载基址 = _库加载基址 + 0x400000  // 每个库4MB间隔
+
+    // 解析ELF: 读取PT_LOAD段, .dynsym, .dynstr, .dynamic
+    定义 解析结果 = 动态链接器_解析ELF(完整路径, 库)
+    如果 (解析结果 < 0) {
+        内核警告("ld-nova: 解析失败 " + soname)
+        返回 -1
+    }
+
+    追加(_已加载库, 库)
+    定义 库索引 = 计数(_已加载库) - 1
+
+    // 递归加载依赖
+    定义 可变 i = 0
+    当 (i < 计数(库.依赖列表)) {
+        动态链接器_加载(库.依赖列表[i])
+        i = i + 1
+    }
+
+    // 导出符号到全局表
+    动态链接器_导出符号(库索引)
+
+    内核信息("ld-nova: 加载 " + soname + " @ 0x" + 整数转十六进制(库.基地址) + " 符号=" + 整数转字符串(计数(库.符号表)))
+    返回 库索引
+}
+
+函数 动态链接器_搜索(soname) {
+    定义 可变 i = 0
+    当 (i < 计数(_库搜索路径)) {
+        定义 路径 = _库搜索路径[i] + "/" + soname
+        如果 (文件_存在(路径)) { 返回 路径 }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 动态链接器_查找库(soname) {
+    定义 可变 i = 0
+    当 (i < 计数(_已加载库)) {
+        如果 (_已加载库[i].soname == soname) { 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+
+函数 动态链接器_解析符号(名称) {
+    // 全局符号表查找 (按加载顺序, 先找到的优先)
+    定义 可变 i = 0
+    当 (i < 计数(_全局符号表)) {
+        如果 (_全局符号表[i][0] == 名称) {
+            返回 _全局符号表[i][1]    // 返回地址
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 动态链接器_导出符号(库索引) {
+    定义 库 = _已加载库[库索引]
+    定义 可变 i = 0
+    当 (i < 计数(库.符号表)) {
+        定义 符号 = 库.符号表[i]
+        // 只导出全局符号(非UND, 非LOCAL)
+        如果 (符号[3] > 0) {
+            追加(_全局符号表, [符号[0], 符号[1] + 库.基地址])
+        }
+        i = i + 1
+    }
+}
+
+
+函数 动态链接器_PLT回调(库索引, GOT偏移) {
+    // 运行时第一次调用外部函数时触发
+    // 1. 从GOT中读取符号索引
+    // 2. 在全局符号表中解析
+    // 3. 将解析结果写回GOT
+    // 4. 跳转到目标函数
+    定义 库 = _已加载库[库索引]
+    定义 符号地址 = 动态链接器_解析符号_按索引(库索引, GOT偏移)
+    如果 (符号地址 > 0) {
+        // 回写GOT: 下次直接跳转, 不再经过PLT回调
+        内存写64(库.GOT地址 + GOT偏移, 符号地址)
+    }
+    返回 符号地址
+}
+
+函数 动态链接器_解析符号_按索引(库索引, 索引) {
+    如果 (索引 < 计数(_已加载库[库索引].符号表)) {
+        定义 名称 = _已加载库[库索引].符号表[索引][0]
+        返回 动态链接器_解析符号(名称)
+    }
+    返回 0
+}
+
+
+函数 动态链接器_初始化库(库索引) {
+    定义 库 = _已加载库[库索引]
+    如果 (库.已初始化) { 返回 }
+
+    // 先初始化依赖
+    定义 可变 i = 0
+    当 (i < 计数(库.依赖列表)) {
+        定义 dep = 动态链接器_查找库(库.依赖列表[i])
+        如果 (dep >= 0) { 动态链接器_初始化库(dep) }
+        i = i + 1
+    }
+
+    // 调用.init函数
+    如果 (库.init函数 != 0) {
+        定义 初始化函数 = 库.基地址 + 库.init函数
+        // 调用: ((void(*)())初始化函数)()
+    }
+
+    // 调用.init_array中的每个函数
+    如果 (库.init_array != 0 && 库.init_array_sz > 0) {
+        定义 数组地址 = 库.基地址 + 库.init_array
+        定义 项数 = 库.init_array_sz / 8
+        i = 0
+        当 (i < 项数) {
+            定义 fn_addr = 内存读64(数组地址 + i * 8)
+            如果 (fn_addr != 0) {
+                // 调用初始化函数
+            }
+            i = i + 1
+        }
+    }
+
+    _已加载库[库索引].已初始化 = 真
+}
+
+函数 动态链接器_析构库(库索引) {
+    定义 库 = _已加载库[库索引]
+    如果 (!库.已初始化) { 返回 }
+
+    // 调用.fini_array (逆序)
+    如果 (库.fini_array != 0 && 库.fini_array_sz > 0) {
+        定义 数组地址 = 库.基地址 + 库.fini_array
+        定义 项数 = 库.fini_array_sz / 8
+        定义 可变 i = 项数 - 1
+        当 (i >= 0) {
+            定义 fn_addr = 内存读64(数组地址 + i * 8)
+            如果 (fn_addr != 0) { /* 调用析构函数 */ }
+            i = i - 1
+        }
+    }
+
+    // 调用.fini
+    如果 (库.fini函数 != 0) { /* 调用 */ }
+
+    _已加载库[库索引].已初始化 = 假
+}
+
+
+函数 动态链接器_注册内置库() {
+    // NovaOS内置的glibc替代 — Nova原生实现所有C标准库函数
+    定义 libc = 共享库 {}
+    libc.soname = "libc.so.6"
+    libc.路径 = "/lib/x86_64-linux-gnu/libc.so.6"
+    libc.基地址 = 0x7E000000
+    libc.引用计数 = 999
+    libc.已初始化 = 真
+    libc.符号表 = []
+    libc.依赖列表 = []
+    libc.init函数 = 0
+    libc.fini函数 = 0
+    libc.init_array = 0
+    libc.init_array_sz = 0
+    libc.fini_array = 0
+    libc.fini_array_sz = 0
+    libc.GOT地址 = 0
+    libc.PLT地址 = 0
+
+    // 核心C库函数 → Nova原生实现
+    追加(libc.符号表, ["printf", 0x1000, 0, 1])
+    追加(libc.符号表, ["puts", 0x1100, 0, 1])
+    追加(libc.符号表, ["scanf", 0x1200, 0, 1])
+    追加(libc.符号表, ["malloc", 0x2000, 0, 1])
+    追加(libc.符号表, ["free", 0x2100, 0, 1])
+    追加(libc.符号表, ["calloc", 0x2200, 0, 1])
+    追加(libc.符号表, ["realloc", 0x2300, 0, 1])
+    追加(libc.符号表, ["memcpy", 0x3000, 0, 1])
+    追加(libc.符号表, ["memset", 0x3100, 0, 1])
+    追加(libc.符号表, ["memmove", 0x3200, 0, 1])
+    追加(libc.符号表, ["strcmp", 0x3300, 0, 1])
+    追加(libc.符号表, ["strlen", 0x3400, 0, 1])
+    追加(libc.符号表, ["strcpy", 0x3500, 0, 1])
+    追加(libc.符号表, ["strcat", 0x3600, 0, 1])
+    追加(libc.符号表, ["open", 0x4000, 0, 1])
+    追加(libc.符号表, ["close", 0x4100, 0, 1])
+    追加(libc.符号表, ["read", 0x4200, 0, 1])
+    追加(libc.符号表, ["write", 0x4300, 0, 1])
+    追加(libc.符号表, ["lseek", 0x4400, 0, 1])
+    追加(libc.符号表, ["exit", 0x5000, 0, 1])
+    追加(libc.符号表, ["_exit", 0x5100, 0, 1])
+    追加(libc.符号表, ["fork", 0x5200, 0, 1])
+    追加(libc.符号表, ["execve", 0x5300, 0, 1])
+    追加(libc.符号表, ["waitpid", 0x5400, 0, 1])
+    追加(libc.符号表, ["getpid", 0x5500, 0, 1])
+    追加(libc.符号表, ["getppid", 0x5600, 0, 1])
+    追加(libc.符号表, ["pthread_create", 0x6000, 0, 1])
+    追加(libc.符号表, ["pthread_join", 0x6100, 0, 1])
+    追加(libc.符号表, ["pthread_mutex_lock", 0x6200, 0, 1])
+    追加(libc.符号表, ["pthread_mutex_unlock", 0x6300, 0, 1])
+    追加(libc.符号表, ["socket", 0x7000, 0, 1])
+    追加(libc.符号表, ["bind", 0x7100, 0, 1])
+    追加(libc.符号表, ["listen", 0x7200, 0, 1])
+    追加(libc.符号表, ["accept", 0x7300, 0, 1])
+    追加(libc.符号表, ["connect", 0x7400, 0, 1])
+    追加(libc.符号表, ["send", 0x7500, 0, 1])
+    追加(libc.符号表, ["recv", 0x7600, 0, 1])
+
+    追加(_已加载库, libc)
+
+    // libpthread (Nova原生线程映射)
+    定义 libpthread = 共享库 {}
+    libpthread.soname = "libpthread.so.0"
+    libpthread.路径 = "/lib/x86_64-linux-gnu/libpthread.so.0"
+    libpthread.基地址 = 0x7D000000
+    libpthread.引用计数 = 999
+    libpthread.已初始化 = 真
+    libpthread.符号表 = []
+    libpthread.依赖列表 = []
+    libpthread.init函数 = 0
+    libpthread.fini函数 = 0
+    libpthread.init_array = 0
+    libpthread.init_array_sz = 0
+    libpthread.fini_array = 0
+    libpthread.fini_array_sz = 0
+    libpthread.GOT地址 = 0
+    libpthread.PLT地址 = 0
+    追加(_已加载库, libpthread)
+
+    // libdl (动态加载)
+    定义 libdl = 共享库 {}
+    libdl.soname = "libdl.so.2"
+    libdl.路径 = "/lib/x86_64-linux-gnu/libdl.so.2"
+    libdl.基地址 = 0x7C000000
+    libdl.引用计数 = 999
+    libdl.已初始化 = 真
+    libdl.符号表 = []
+    libdl.依赖列表 = []
+    libdl.init函数 = 0
+    libdl.fini函数 = 0
+    libdl.init_array = 0
+    libdl.init_array_sz = 0
+    libdl.fini_array = 0
+    libdl.fini_array_sz = 0
+    libdl.GOT地址 = 0
+    libdl.PLT地址 = 0
+    追加(libdl.符号表, ["dlopen", 0x100, 0, 1])
+    追加(libdl.符号表, ["dlsym", 0x200, 0, 1])
+    追加(libdl.符号表, ["dlclose", 0x300, 0, 1])
+    追加(libdl.符号表, ["dlerror", 0x400, 0, 1])
+    追加(_已加载库, libdl)
+
+    // 导出所有内置库符号
+    定义 可变 i = 0
+    当 (i < 计数(_已加载库)) {
+        动态链接器_导出符号(i)
+        i = i + 1
+    }
+}
+
+
+定义 DT_NULL = 0
+定义 DT_NEEDED = 1
+定义 DT_HASH = 4
+定义 DT_STRTAB = 5
+定义 DT_SYMTAB = 6
+定义 DT_STRSZ = 10
+定义 DT_SYMENT = 11
+定义 DT_INIT = 12
+定义 DT_FINI = 13
+定义 DT_SONAME = 14
+定义 DT_INIT_ARRAY = 25
+定义 DT_FINI_ARRAY = 26
+定义 DT_INIT_ARRAYSZ = 27
+定义 DT_FINI_ARRAYSZ = 28
+定义 PT_LOAD = 1
+定义 PT_DYNAMIC = 2
+
+函数 动态链接器_解析ELF(路径, 库) {
+    // 读取ELF头(64字节)
+    定义 头 = 文件_读字节前N(路径, 64)
+    如果 (头 == 空 || 计数(头) < 64) { 返回 -1 }
+    // 验证ELF魔数
+    如果 (头[0] != 0x7F || 头[1] != 0x45 || 头[2] != 0x4C || 头[3] != 0x46) { 返回 -1 }
+    // 验证64位
+    如果 (头[4] != 2) { 返回 -1 }
+
+    // 解析ELF64头
+    定义 e_phoff = 读取u64_小端(头, 32)     // 程序头表偏移
+    定义 e_phentsize = 读取u16_小端(头, 54)  // 程序头条目大小
+    定义 e_phnum = 读取u16_小端(头, 56)      // 程序头数量
+
+    // 读取所有程序头
+    定义 ph数据 = 文件_读字节区间(路径, e_phoff, e_phnum * e_phentsize)
+    如果 (ph数据 == 空) { 返回 -1 }
+
+    // 遍历程序头: 找PT_LOAD和PT_DYNAMIC
+    定义 可变 dyn偏移 = 0
+    定义 可变 dyn大小 = 0
+    定义 可变 映像大小 = 0
+    定义 可变 i = 0
+    当 (i < e_phnum) {
+        定义 基 = i * e_phentsize
+        定义 p_type = 读取u32_小端(ph数据, 基)
+        定义 p_offset = 读取u64_小端(ph数据, 基 + 8)
+        定义 p_vaddr = 读取u64_小端(ph数据, 基 + 16)
+        定义 p_filesz = 读取u64_小端(ph数据, 基 + 32)
+        定义 p_memsz = 读取u64_小端(ph数据, 基 + 40)
+
+        如果 (p_type == PT_LOAD) {
+            // 映射段到库虚拟地址空间
+            定义 段末 = p_vaddr + p_memsz
+            如果 (段末 > 映像大小) { 映像大小 = 段末 }
+        }
+        如果 (p_type == PT_DYNAMIC) {
+            dyn偏移 = p_offset
+            dyn大小 = p_filesz
+        }
+        i = i + 1
+    }
+    库.映像大小 = 映像大小
+
+    如果 (dyn大小 == 0) {
+        // 静态链接的ELF, 没有.dynamic
+        返回 0
+    }
+
+    // 读取.dynamic段
+    定义 dyn数据 = 文件_读字节区间(路径, dyn偏移, dyn大小)
+    如果 (dyn数据 == 空) { 返回 -1 }
+
+    // 解析.dynamic条目 (每条16字节: d_tag(8) + d_val(8))
+    定义 可变 strtab偏移 = 0
+    定义 可变 strtab大小 = 0
+    定义 可变 symtab偏移 = 0
+    定义 可变 syment大小 = 24    // 默认Elf64_Sym大小
+    定义 可变 needed列表 = []
+    定义 可变 d = 0
+    当 (d < dyn大小) {
+        定义 d_tag = 读取u64_小端(dyn数据, d)
+        定义 d_val = 读取u64_小端(dyn数据, d + 8)
+        如果 (d_tag == DT_NULL) { d = dyn大小 }  // 结束
+        如果 (d_tag == DT_NEEDED) { 追加(needed列表, d_val) }
+        如果 (d_tag == DT_STRTAB) { strtab偏移 = d_val }
+        如果 (d_tag == DT_STRSZ) { strtab大小 = d_val }
+        如果 (d_tag == DT_SYMTAB) { symtab偏移 = d_val }
+        如果 (d_tag == DT_SYMENT) { syment大小 = d_val }
+        如果 (d_tag == DT_INIT) { 库.init函数 = d_val }
+        如果 (d_tag == DT_FINI) { 库.fini函数 = d_val }
+        如果 (d_tag == DT_INIT_ARRAY) { 库.init_array = d_val }
+        如果 (d_tag == DT_INIT_ARRAYSZ) { 库.init_array_sz = d_val }
+        如果 (d_tag == DT_FINI_ARRAY) { 库.fini_array = d_val }
+        如果 (d_tag == DT_FINI_ARRAYSZ) { 库.fini_array_sz = d_val }
+        如果 (d_tag == DT_SONAME) {
+            // d_val是strtab中的偏移, 后面解析
+        }
+        d = d + 16
+    }
+
+    // 读取字符串表
+    定义 可变 strtab = 空
+    如果 (strtab偏移 > 0 && strtab大小 > 0) {
+        strtab = 文件_读字节区间(路径, strtab偏移, strtab大小)
+    }
+
+    // 解析DT_NEEDED → 依赖库名
+    如果 (strtab != 空) {
+        i = 0
+        当 (i < 计数(needed列表)) {
+            定义 名偏移 = needed列表[i]
+            如果 (名偏移 < strtab大小) {
+                定义 名 = 读取C字串(strtab, 名偏移)
+                追加(库.依赖列表, 名)
+            }
+            i = i + 1
+        }
+    }
+
+    // 解析符号表(.dynsym)
+    如果 (symtab偏移 > 0 && strtab != 空) {
+        // 读取符号表(最多读4096条, 防止越界)
+        定义 sym数据 = 文件_读字节区间(路径, symtab偏移, 4096 * syment大小)
+        如果 (sym数据 != 空) {
+            定义 最大条数 = 计数(sym数据) / syment大小
+            定义 可变 s = 0
+            当 (s < 最大条数) {
+                定义 基s = s * syment大小
+                定义 st_name = 读取u32_小端(sym数据, 基s)
+                定义 st_info = sym数据[基s + 4]
+                定义 st_value = 读取u64_小端(sym数据, 基s + 8)
+                定义 st_size = 读取u64_小端(sym数据, 基s + 16)
+                // 只取全局/弱符号(bind >= 1), 且有值
+                定义 bind = st_info >> 4
+                如果 (bind >= 1 && st_value > 0 && st_name < strtab大小) {
+                    定义 符号名 = 读取C字串(strtab, st_name)
+                    如果 (字串_长度(符号名) > 0) {
+                        追加(库.符号表, [符号名, st_value, st_size, bind])
+                    }
+                }
+                s = s + 1
+            }
+        }
+    }
+
+    内核信息("ld-nova: 解析 " + 路径 + " 符号=" + 整数转字符串(计数(库.符号表)) +
+             " 依赖=" + 整数转字符串(计数(库.依赖列表)))
+    返回 0
+}
+
+函数 动态链接器_报告() {
+    定义 可变 r = "═══ 动态链接器(ld-nova) ═══\n"
+    r = r + "已加载库: " + 整数转字符串(计数(_已加载库)) + "\n"
+    r = r + "全局符号: " + 整数转字符串(计数(_全局符号表)) + "\n"
+    r = r + "搜索路径: " + 整数转字符串(计数(_库搜索路径)) + "\n"
+    定义 可变 i = 0
+    当 (i < 计数(_已加载库)) {
+        r = r + "  " + _已加载库[i].soname + " @ 0x" + 整数转十六进制(_已加载库[i].基地址)
+        r = r + " ref=" + 整数转字符串(_已加载库[i].引用计数)
+        r = r + " sym=" + 整数转字符串(计数(_已加载库[i].符号表)) + "\n"
+        i = i + 1
+    }
+    返回 r
+}

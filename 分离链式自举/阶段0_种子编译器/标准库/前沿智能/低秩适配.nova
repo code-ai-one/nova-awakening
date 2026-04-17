@@ -1,0 +1,433 @@
+导入("../基础.nova")
+导入("../数学/工具.nova")
+
+// LoRA / QLoRA — 低秩适配 (v2: 2024 前沿迭代)
+// 核心思想: W' = W + BA, 其中 B∈R^{d×r}, A∈R^{r×k}, r << min(d,k)
+// ref: "LoRA: Low-Rank Adaptation of Large Language Models" (ICLR 2022)
+// ref: "QLoRA: Efficient Finetuning of Quantized LLMs" (NeurIPS 2023)
+// ref: Liu et al. 2024 "DoRA: Weight-Decomposed Low-Rank Adaptation"
+//   (将权重分解为方向+幅度, 只用LoRA调方向, 幅度独立学习)
+// ref: Zhao et al. 2024 "GaLore: Memory-Efficient LLM Training by
+//   Gradient Low-Rank Projection" (梯度投影到低秩子空间, 全参数训练
+//   但优化器状态只需O(r)内存)
+// ref: Kalajdzievski 2023 "rsLoRA: 秩稳定缩放" (α/√r替代α/r)
+
+定义 LORA精度 = 10000
+
+// LoRA层
+// W_原始: [d_out × d_in] 冻结权重
+// B: [d_out × r] 低秩矩阵
+// A: [r × d_in] 低秩矩阵
+// 前向: y = W·x + (α/r)·B·A·x
+
+函数 LoRA_创建(d_out, d_in, 秩, 缩放α) {
+    // 初始化: A用Kaiming初始化, B初始化为零
+    定义 可变 A = []
+    定义 可变 ai = 0
+    当 (ai < 秩 * d_in) {
+        // Kaiming: N(0, 1/√d_in) → 简化为 hash散列确定性初始化
+        定义 值 = ((ai * 2654435761 + 12345) % 2000 - 1000) * LORA精度 / (d_in * 100 + 1)
+        追加(A, 值)
+        ai = ai + 1
+    }
+    定义 可变 B = []
+    定义 可变 bi = 0
+    当 (bi < d_out * 秩) { 追加(B, 0); bi = bi + 1 }  // B初始化为0
+    // [d_out, d_in, 秩, 缩放α, A矩阵, B矩阵]
+    返回 [d_out, d_in, 秩, 缩放α, A, B]
+}
+
+// LoRA前向: Δy = (α/r) × B × A × x
+函数 LoRA_前向(层, x) {
+    定义 可变 dot = 0
+    定义 可变 oi = 0
+    定义 可变 ri = 0
+    定义 d_out = 层[0]
+    定义 d_in = 层[1]
+    定义 秩 = 层[2]
+    定义 α = 层[3]
+    定义 A = 层[4]
+    定义 B = 层[5]
+    // 第一步: h = A × x  (r × d_in) × (d_in × 1) = (r × 1)
+    定义 可变 h = []
+    当 (ri < 秩) {
+        定义 可变 j = 0
+        当 (j < d_in) {
+            dot = dot + A[ri * d_in + j] * x[j] / LORA精度
+            j = j + 1
+        }
+        追加(h, dot)
+        ri = ri + 1
+    }
+    // 第二步: y = B × h  (d_out × r) × (r × 1) = (d_out × 1)
+    定义 可变 y = []
+    当 (oi < d_out) {
+        定义 可变 j = 0
+        当 (j < 秩) {
+            dot = dot + B[oi * 秩 + j] * h[j] / LORA精度
+            j = j + 1
+        }
+        // 缩放: α/r
+        追加(y, dot * α / (秩 + 1))
+        oi = oi + 1
+    }
+    返回 y
+}
+
+// LoRA梯度更新 (简化SGD)
+函数 LoRA_更新(层, x, 梯度, 学习率) {
+    定义 可变 oi = 0
+    定义 可变 ri = 0
+    定义 d_out = 层[0]
+    定义 d_in = 层[1]
+    定义 秩 = 层[2]
+    定义 α = 层[3]
+    定义 可变 A = 层[4]
+    定义 可变 B = 层[5]
+    // ∂L/∂B = (∂L/∂y) × h^T,  h = A×x
+    // ∂L/∂A = B^T × (∂L/∂y) × x^T
+    // 先算h
+    定义 可变 h = []
+    当 (ri < 秩) {
+        定义 可变 j = 0
+        当 (j < d_in) { dot = dot + A[ri * d_in + j] * x[j] / LORA精度; j = j + 1 }
+        追加(h, dot)
+        ri = ri + 1
+    }
+    // 更新B: B -= lr × 梯度 × h^T
+    当 (oi < d_out) {
+        定义 可变 rj = 0
+        当 (rj < 秩) {
+            B[oi * 秩 + rj] = B[oi * 秩 + rj] - 学习率 * 梯度[oi] * h[rj] / (LORA精度 * LORA精度 / LORA精度)
+            rj = rj + 1
+        }
+        oi = oi + 1
+    }
+    // 更新A: 先算 B^T × 梯度
+    定义 可变 Bg = []
+    ri = 0
+    当 (ri < 秩) {
+        定义 可变 oi2 = 0
+        当 (oi2 < d_out) { dot = dot + B[oi2 * 秩 + ri] * 梯度[oi2] / LORA精度; oi2 = oi2 + 1 }
+        追加(Bg, dot)
+        ri = ri + 1
+    }
+    // A -= lr × Bg × x^T
+    ri = 0
+    当 (ri < 秩) {
+        定义 可变 j = 0
+        当 (j < d_in) {
+            A[ri * d_in + j] = A[ri * d_in + j] - 学习率 * Bg[ri] * x[j] / (LORA精度 * LORA精度 / LORA精度)
+            j = j + 1
+        }
+        ri = ri + 1
+    }
+    返回 [d_out, d_in, 秩, α, A, B]
+}
+
+// QLoRA: 4bit NormalFloat量化
+// NF4量化: 将权重映射到16个NormalFloat量化级别
+// 每个块(通常64个权重)共享一个缩放因子
+
+定义 NF4_级别 = [
+    -10000, -8617, -7229, -5819, -4399, -2966, -1510, 0,
+    0, 1510, 2966, 4399, 5819, 7229, 8617, 10000
+]
+
+函数 QLoRA_量化(权重, 块大小) {
+    定义 n = 计数(权重)
+    定义 块数 = (n + 块大小 - 1) / 块大小
+    定义 可变 量化值 = []
+    定义 可变 缩放因子 = []
+    定义 可变 b = 0
+    当 (b < 块数) {
+        定义 起 = b * 块大小
+        定义 可变 止 = 起 + 块大小
+        如果 (止 > n) { 止 = n }
+        // 找块内绝对值最大
+        定义 可变 abs_max = 0
+        定义 可变 i = 起
+        当 (i < 止) {
+            定义 可变 av = 权重[i]
+            如果 (av < 0) { av = 0 - av }
+            如果 (av > abs_max) { abs_max = av }
+            i = i + 1
+        }
+        如果 (abs_max == 0) { abs_max = 1 }
+        追加(缩放因子, abs_max)
+        // 量化每个权重到最近的NF4级别
+        i = 起
+        当 (i < 止) {
+            定义 归一 = 权重[i] * LORA精度 / abs_max
+            // 二分搜索最近级别
+            定义 可变 最佳 = 0
+            定义 可变 最佳距离 = LORA精度 * 100
+            定义 可变 k = 0
+            当 (k < 16) {
+                定义 可变 距离 = 归一 - NF4_级别[k]
+                如果 (距离 < 0) { 距离 = 0 - 距离 }
+                如果 (距离 < 最佳距离) { 最佳距离 = 距离; 最佳 = k }
+                k = k + 1
+            }
+            追加(量化值, 最佳)
+            i = i + 1
+        }
+        b = b + 1
+    }
+    返回 [量化值, 缩放因子, 块大小]
+}
+
+函数 QLoRA_反量化(量化数据, 索引) {
+    定义 量化值 = 量化数据[0]
+    定义 缩放因子 = 量化数据[1]
+    定义 块大小 = 量化数据[2]
+    定义 块号 = 索引 / 块大小
+    定义 级别 = NF4_级别[量化值[索引]]
+    返回 级别 * 缩放因子[块号] / LORA精度
+}
+
+// LoRA合并: W' = W + (α/r)·B·A (推理时用, 消除额外计算)
+函数 LoRA_合并(W原始, 层) {
+    定义 d_out = 层[0]
+    定义 d_in = 层[1]
+    定义 秩 = 层[2]
+    定义 α = 层[3]
+    定义 A = 层[4]
+    定义 B = 层[5]
+    定义 可变 W合并 = []
+    定义 可变 i = 0
+    当 (i < d_out * d_in) { 追加(W合并, W原始[i]); i = i + 1 }
+    // BA矩阵乘并加到W
+    i = 0
+    当 (i < d_out) {
+        定义 可变 j = 0
+        当 (j < d_in) {
+            定义 可变 ba = 0
+            定义 可变 r = 0
+            当 (r < 秩) {
+                ba = ba + B[i * 秩 + r] * A[r * d_in + j] / LORA精度
+                r = r + 1
+            }
+            W合并[i * d_in + j] = W合并[i * d_in + j] + ba * α / (秩 + 1)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 W合并
+}
+
+// DoRA: Weight-Decomposed Low-Rank Adaptation (Liu et al. 2024)
+// 核心洞见: 全量微调同时改变权重的方向和幅度
+// LoRA主要改方向, 幅度变化不足 → DoRA分开处理
+// W = m · (W₀ + BA)/||W₀ + BA||  (m=可学习幅度向量, 每输出维度一个标量)
+// m初始化为||W₀||的列范数, 训练时独立更新
+// 效果: 接近全量微调的表达力, 参数量仅比LoRA多d_out个标量
+
+函数 DoRA_创建(d_out, d_in, 秩, 缩放α, W原始) {
+    // 创建LoRA部分
+    定义 lora = LoRA_创建(d_out, d_in, 秩, 缩放α)
+    // 初始化幅度向量m: m_i = ||W₀[i,:]||₂ (每行的L2范数)
+    定义 可变 幅度 = []
+    定义 可变 i = 0
+    当 (i < d_out) {
+        定义 可变 行范数平方 = 0
+        定义 可变 j = 0
+        当 (j < d_in) {
+            行范数平方 = 行范数平方 + W原始[i * d_in + j] * W原始[i * d_in + j] / LORA精度
+            j = j + 1
+        }
+        // √(行范数平方) 牛顿法
+        定义 可变 s = 行范数平方 / 2
+        如果 (s == 0) { s = 1 }
+        定义 可变 k = 0
+        当 (k < 6) { s = (s + 行范数平方 * LORA精度 / s) / 2; k = k + 1 }
+        追加(幅度, s)
+        i = i + 1
+    }
+    // [lora层, 幅度向量]
+    返回 [lora, 幅度]
+}
+
+// DoRA前向: y = m · (W₀·x + ΔW·x) / ||(W₀ + ΔW)[i,:]||
+函数 DoRA_前向(dora, W原始, x) {
+    定义 lora = dora[0]
+    定义 幅度 = dora[1]
+    定义 d_out = lora[0]
+    定义 d_in = lora[1]
+    // 计算LoRA增量: Δy = (α/r)·B·A·x
+    定义 Δy = LoRA_前向(lora, x)
+    // 计算W₀·x
+    定义 可变 Wx = []
+    定义 可变 i = 0
+    当 (i < d_out) {
+        定义 可变 dot = 0
+        定义 可变 j = 0
+        当 (j < d_in) {
+            dot = dot + W原始[i * d_in + j] * x[j] / LORA精度
+            j = j + 1
+        }
+        追加(Wx, dot)
+        i = i + 1
+    }
+    // 合并输出并应用方向归一化 + 幅度缩放
+    // 简化: 对每个输出维度 y_i = m_i · (Wx_i + Δy_i) / ||W'[i,:]||
+    // 近似 ||W'[i,:]|| ≈ ||W₀[i,:]|| (因为ΔW很小)
+    定义 可变 输出 = []
+    i = 0
+    当 (i < d_out) {
+        定义 原始范数 = 幅度[i]
+        如果 (原始范数 < 1) { 原始范数 = 1 }
+        定义 组合 = Wx[i] + Δy[i]
+        追加(输出, 幅度[i] * 组合 / 原始范数)
+        i = i + 1
+    }
+    返回 输出
+}
+
+// GaLore: Gradient Low-Rank Projection (Zhao et al. 2024)
+// 核心: 全参数训练, 但优化器状态压缩到低秩子空间
+// 步骤: 1. 计算梯度G  2. 投影到秩r子空间: G̃ = P^T·G
+// 3. 在低秩空间做Adam: m,v只存r×d维  4. 反投影: ΔW = P·update(G̃)
+// 投影矩阵P由G的SVD左奇异向量确定, 每T步更新一次
+// 效果: 全参数训练质量, 但Adam状态只需O(r·max(d_in,d_out))而非O(d_in·d_out)
+
+函数 GaLore_创建(d_out, d_in, 秩, 投影更新间隔) {
+    // 初始化投影矩阵P: [d_out × 秩] (随机正交近似)
+    定义 可变 P = []
+    定义 可变 i = 0
+    当 (i < d_out * 秩) {
+        // 近似正交: 用哈希散列初始化后Gram-Schmidt会更好
+        定义 值 = ((i * 2654435761 + 12345) % 2000 - 1000)
+        追加(P, 值)
+        i = i + 1
+    }
+    // 低秩Adam状态: m=[秩×d_in], v=[秩×d_in]
+    定义 可变 m = []
+    定义 可变 v = []
+    i = 0
+    当 (i < 秩 * d_in) { 追加(m, 0); 追加(v, 0); i = i + 1 }
+    // [d_out, d_in, 秩, 更新间隔, P, m, v, 当前步数]
+    返回 [d_out, d_in, 秩, 投影更新间隔, P, m, v, 0]
+}
+
+// GaLore投影: G̃ = P^T · G  (将d_out×d_in梯度压缩到秩×d_in)
+函数 GaLore_投影(状态, 梯度矩阵) {
+    定义 d_out = 状态[0]
+    定义 d_in = 状态[1]
+    定义 秩 = 状态[2]
+    定义 P = 状态[4]
+    // G̃[r][j] = Σ_i P[i][r] * G[i][j]  (P^T · G)
+    定义 可变 G低秩 = []
+    定义 可变 r = 0
+    当 (r < 秩) {
+        定义 可变 j = 0
+        当 (j < d_in) {
+            定义 可变 val = 0
+            定义 可变 i = 0
+            当 (i < d_out) {
+                val = val + P[i * 秩 + r] * 梯度矩阵[i * d_in + j] / LORA精度
+                i = i + 1
+            }
+            追加(G低秩, val)
+            j = j + 1
+        }
+        r = r + 1
+    }
+    返回 G低秩
+}
+
+// GaLore Adam步进 (在低秩空间做Adam)
+函数 GaLore_步进(状态, 梯度矩阵, 学习率, β1, β2) {
+    定义 d_out = 状态[0]
+    定义 d_in = 状态[1]
+    定义 秩 = 状态[2]
+    定义 P = 状态[4]
+    定义 可变 m = 状态[5]
+    定义 可变 v = 状态[6]
+    // 1. 投影梯度到低秩空间
+    定义 G低秩 = GaLore_投影(状态, 梯度矩阵)
+    // 2. Adam更新 (在秩×d_in空间)
+    定义 可变 更新 = []
+    定义 可变 idx = 0
+    当 (idx < 秩 * d_in) {
+        // m = β1·m + (1-β1)·g
+        m[idx] = β1 * m[idx] / LORA精度 + (LORA精度 - β1) * G低秩[idx] / LORA精度
+        // v = β2·v + (1-β2)·g²
+        v[idx] = β2 * v[idx] / LORA精度 + (LORA精度 - β2) * G低秩[idx] * G低秩[idx] / (LORA精度 * LORA精度 / LORA精度)
+        // update = m / (√v + ε)
+        定义 可变 sv = v[idx]
+        如果 (sv < 0) { sv = 0 - sv }
+        // 牛顿法√
+        定义 可变 sqr = sv / 2
+        如果 (sqr == 0) { sqr = 1 }
+        定义 可变 k = 0
+        当 (k < 4) { sqr = (sqr + sv * LORA精度 / sqr) / 2; k = k + 1 }
+        追加(更新, m[idx] * LORA精度 / (sqr + 100))
+        idx = idx + 1
+    }
+    // 3. 反投影: ΔW = P · update  (d_out×d_in = d_out×秩 · 秩×d_in)
+    定义 可变 ΔW = []
+    定义 可变 i = 0
+    当 (i < d_out) {
+        定义 可变 j = 0
+        当 (j < d_in) {
+            定义 可变 val = 0
+            定义 可变 r = 0
+            当 (r < 秩) {
+                val = val + P[i * 秩 + r] * 更新[r * d_in + j] / LORA精度
+                r = r + 1
+            }
+            追加(ΔW, 学习率 * val / LORA精度)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    状态[5] = m
+    状态[6] = v
+    状态[7] = 状态[7] + 1
+    返回 ΔW
+}
+
+// rsLoRA: 秩稳定缩放 (Kalajdzievski 2023)
+// 原始LoRA: 缩放 = α/r → 高秩时缩放过小, 信号衰减
+// rsLoRA: 缩放 = α/√r → 数学上保证梯度范数与秩无关
+// 简单但重要: 允许安全使用更高秩而不损失信号强度
+函数 rsLoRA_缩放(α, 秩) {
+    // √r 牛顿法
+    定义 可变 s = 秩 / 2
+    如果 (s == 0) { s = 1 }
+    定义 可变 k = 0
+    当 (k < 6) { s = (s + 秩 * LORA精度 / s) / 2; k = k + 1 }
+    返回 α * LORA精度 / s
+}
+
+函数 rsLoRA_前向(层, x) {
+    定义 d_out = 层[0]
+    定义 d_in = 层[1]
+    定义 秩 = 层[2]
+    定义 α = 层[3]
+    定义 A = 层[4]
+    定义 B = 层[5]
+    定义 缩放 = rsLoRA_缩放(α, 秩)
+    // h = A·x
+    定义 可变 h = []
+    定义 可变 ri = 0
+    当 (ri < 秩) {
+        定义 可变 dot = 0
+        定义 可变 j = 0
+        当 (j < d_in) { dot = dot + A[ri * d_in + j] * x[j] / LORA精度; j = j + 1 }
+        追加(h, dot)
+        ri = ri + 1
+    }
+    // y = (α/√r)·B·h
+    定义 可变 y = []
+    定义 可变 oi = 0
+    当 (oi < d_out) {
+        定义 可变 dot = 0
+        定义 可变 rj = 0
+        当 (rj < 秩) { dot = dot + B[oi * 秩 + rj] * h[rj] / LORA精度; rj = rj + 1 }
+        追加(y, dot * 缩放 / LORA精度)
+        oi = oi + 1
+    }
+    返回 y
+}

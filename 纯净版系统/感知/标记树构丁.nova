@@ -1,0 +1,130 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式解析.nova")
+导入("./元素栈创建.nova")
+导入("./帧.nova")
+导入("./原生独创用.nova")
+导入("./文档接口属.nova")
+导入("./文档节点.nova")
+导入("./原子驻留.nova")
+导入("./树构建器.nova")
+
+函数 HTMLTreeBuilder_head前模式(tb, 令牌) {
+    如果 (令牌.类型 == 令牌类型_字符) {
+        // 忽略空白
+        返回
+    }
+    如果 (令牌.类型 == 令牌类型_开始标签) {
+        定义 标签原子 = 原子_驻留(令牌.标签名)
+        如果 (标签原子 == 原子_head) {
+            定义 head = HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            tb.head指针 = head
+            元素栈_压入(tb.开放元素栈, head)
+            Document_设置head(tb.文档, head)
+            tb.插入模式 = 插入模式_head中
+            返回
+        }
+    }
+    // 隐式创建<head>
+    定义 head = Document_create元素(tb.文档, "head")
+    定义 当前 = 元素栈_顶部(tb.开放元素栈)
+    节点_appendChild(当前, head)
+    tb.head指针 = head
+    元素栈_压入(tb.开放元素栈, head)
+    Document_设置head(tb.文档, head)
+    tb.插入模式 = 插入模式_head中
+    HTMLTreeBuilder_处理令牌(tb, 令牌)
+}
+
+函数 HTMLTreeBuilder_head中模式(tb, 令牌) {
+    如果 (令牌.类型 == 令牌类型_字符) {
+        HTMLTreeBuilder_插入文本(tb, 令牌.数据, 令牌.数据长度)
+        返回
+    }
+    如果 (令牌.类型 == 令牌类型_注释) {
+        定义 注释 = Comment_创建(令牌.数据)
+        定义 当前 = 元素栈_顶部(tb.开放元素栈)
+        节点_appendChild(当前, 注释)
+        返回
+    }
+    如果 (令牌.类型 == 令牌类型_开始标签) {
+        定义 标签原子 = 原子_驻留(令牌.标签名)
+
+        如果 (标签原子 == 原子_title) {
+            // <title> → RCDATA解析模式
+            HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            HTML令牌izer_切换到RCDATA(tb.令牌izer)
+            tb.原始插入模式 = tb.插入模式
+            tb.插入模式 = 插入模式_文本
+            返回
+        }
+        如果 (标签原子 == 原子_style) {
+            // <style> → RAWTEXT解析模式
+            HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            HTML令牌izer_切换到RAWTEXT(tb.令牌izer)
+            tb.原始插入模式 = tb.插入模式
+            tb.插入模式 = 插入模式_文本
+            返回
+        }
+        如果 (标签原子 == 原子_script) {
+            // <script> → Script data解析模式
+            HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            HTML令牌izer_切换到脚本数据(tb.令牌izer)
+            tb.原始插入模式 = tb.插入模式
+            tb.插入模式 = 插入模式_文本
+            返回
+        }
+        如果 (标签原子 == 原子_meta || 标签原子 == 原子_link) {
+            // 自闭合标签,不压栈
+            HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            如果 (令牌.自闭合 || 元素_是空元素_原子(标签原子)) {
+                元素栈_弹出(tb.开放元素栈)
+            }
+            返回
+        }
+        // 其他标签: 关闭head,转到after head
+        返回 HTMLTreeBuilder_关闭head(tb, 令牌)
+    }
+    如果 (令牌.类型 == 令牌类型_结束标签) {
+        定义 标签原子 = 原子_驻留(令牌.标签名)
+        如果 (标签原子 == 原子_head) {
+            元素栈_弹出(tb.开放元素栈)
+            tb.插入模式 = 插入模式_head后
+            返回
+        }
+    }
+    HTMLTreeBuilder_关闭head(tb, 令牌)
+}
+
+函数 HTMLTreeBuilder_关闭head(tb, 令牌) {
+    元素栈_弹出(tb.开放元素栈)    // 弹出<head>
+    tb.插入模式 = 插入模式_head后
+    HTMLTreeBuilder_处理令牌(tb, 令牌)
+}
+
+函数 HTMLTreeBuilder_head后模式(tb, 令牌) {
+    如果 (令牌.类型 == 令牌类型_字符) {
+        // 空白插入到当前节点
+        HTMLTreeBuilder_插入文本(tb, 令牌.数据, 令牌.数据长度)
+        返回
+    }
+    如果 (令牌.类型 == 令牌类型_开始标签) {
+        定义 标签原子 = 原子_驻留(令牌.标签名)
+        如果 (标签原子 == 原子_body) {
+            定义 body = HTMLTreeBuilder_创建元素并插入(tb, 令牌, 0)
+            元素栈_压入(tb.开放元素栈, body)
+            Document_设置body(tb.文档, body)
+            tb.frameset_ok = 假
+            tb.插入模式 = 插入模式_body中
+            返回
+        }
+    }
+    // 隐式创建<body>
+    定义 body = Document_create元素(tb.文档, "body")
+    定义 当前 = 元素栈_顶部(tb.开放元素栈)
+    节点_appendChild(当前, body)
+    元素栈_压入(tb.开放元素栈, body)
+    Document_设置body(tb.文档, body)
+    tb.插入模式 = 插入模式_body中
+    HTMLTreeBuilder_处理令牌(tb, 令牌)
+}

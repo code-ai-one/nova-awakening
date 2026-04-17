@@ -1,0 +1,208 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/辅助存根.nova")
+导入("./内核直连层.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../外联/地址解析辅.nova")
+导入("./文档事件.nova")
+导入("./历史接口甲.nova")
+导入("./渲染管线从.nova")
+
+// §2 Location对象
+// window.location / document.location
+
+结构 LocationState {
+    tab,    // u64 TabPage*
+    history,    // u64 历史State*
+}
+
+
+函数 Location_assign(loc, url) {
+    // 导航到新URL(添加到历史)
+    如果 (loc.tab != 0) {
+        渲染管线_导航到URL(loc.tab, url)
+    }
+}
+
+函数 Location_replace(loc, url) {
+    // 导航到新URL(替换当前历史条目)
+    如果 (loc.history != 0) {
+        历史_replaceState(loc.history, 0, 0, url)
+    }
+    如果 (loc.tab != 0) {
+        渲染管线_导航到URL(loc.tab, url)
+    }
+}
+
+函数 Location_reload(loc) {
+    如果 (loc.tab != 0) {
+        渲染管线_导航到URL(loc.tab, loc.tab.URL)
+    }
+}
+
+函数 Location_设置hash(loc, hash) {
+    // 只改变hash部分
+    如果 (loc.tab == 0) { 返回 }
+    定义 url = URL_解析(loc.tab.URL)
+    如果 (url == 0) { 返回 }
+
+    定义 旧hash = url.片段
+
+    // 构建新URL
+    定义 可变 新url = 字符串_连接(url.协议, "://")
+    新url = 字符串_连接(新url, url.主机)
+    新url = 字符串_连接(新url, url.路径)
+    如果 (url.查询 != 0 && url.查询长度 > 0) {
+        新url = 字符串_连接(新url, "?")
+        新url = 字符串_连接(新url, url.查询)
+    }
+    新url = 字符串_连接(新url, "#")
+    新url = 字符串_连接(新url, hash)
+
+    loc.tab.URL = 新url
+
+    // 触发hashchange事件
+    如果 (旧hash == 0 || !字符串_相等(旧hash, hash)) {
+        如果 (loc.tab.文档 != 0) {
+            定义 事件 = 事件_创建("hashchange", 真, 假)
+            事件.是受信任的 = 真
+            事件Target_dispatch事件(loc.tab.文档, 事件)
+        }
+    }
+}
+
+// §3 CSS自定义属性 (CSS Variables / Custom Properties)
+// var(--name, fallback)
+
+结构 CSSCustomProperty {
+    名,    // u64 --property-name
+    值,    // u64 值字符串
+    继承,    // 布尔 自定义属性默认继承
+}
+
+结构 CustomPropertyRegistry {
+    属性列表,    // u64 CSSCustomProperty*数组
+    属性数量,
+    属性容量,
+}
+
+函数 CustomPropertyRegistry_创建() {
+    定义 r = 堆_分配(CustomPropertyRegistry)
+    r.属性容量 = 128
+    r.属性列表 = 堆_分配_数组(r.属性容量 * 24)
+    r.属性数量 = 0
+    返回 r
+}
+
+函数 CustomProperty_设置(registry, 名, 值) {
+    // 更新已有
+    定义 可变 i = 0
+    当 (i < registry.属性数量) {
+        定义 偏移 = registry.属性列表 + i * 24
+        如果 (字符串_相等(内存_读64(偏移), 名)) {
+            内存_写64(偏移 + 8, 字符串_复制(值))
+            返回
+        }
+        i = i + 1
+    }
+    // 新增
+    如果 (registry.属性数量 >= registry.属性容量) { 返回 }
+    定义 偏移 = registry.属性列表 + registry.属性数量 * 24
+    内存_写64(偏移, 字符串_复制(名))
+    内存_写64(偏移 + 8, 字符串_复制(值))
+    内存_写8(偏移 + 16, 1)    // 继承=true
+    registry.属性数量 = registry.属性数量 + 1
+}
+
+函数 CustomProperty_获取(registry, 名) {
+    如果 (registry == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < registry.属性数量) {
+        定义 偏移 = registry.属性列表 + i * 24
+        如果 (字符串_相等(内存_读64(偏移), 名)) {
+            返回 内存_读64(偏移 + 8)
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 CSS_解析var引用(值字符串, registry, 父registry) {
+    // 解析 var(--name) 和 var(--name, fallback)
+    如果 (值字符串 == 0) { 返回 值字符串 }
+    定义 长度 = 字符串_长度(值字符串)
+    如果 (长度 < 6) { 返回 值字符串 }    // 最短: var(--)
+
+    // 查找 "var("
+    定义 可变 pos = 0
+    定义 结果 = 堆_分配(长度 * 2 + 1)
+    定义 可变 写pos = 0
+
+    当 (pos < 长度) {
+        // 检查 var(
+        如果 (pos + 4 <= 长度 && 内存_读8(值字符串+pos)==0x76 && 内存_读8(值字符串+pos+1)==0x61 && 内存_读8(值字符串+pos+2)==0x72 && 内存_读8(值字符串+pos+3)==0x28) {
+            pos = pos + 4
+            // 读变量名
+            当 (pos < 长度 && 内存_读8(值字符串+pos) == 0x20) { pos = pos + 1 }
+            定义 名起 = pos
+            当 (pos < 长度 && 内存_读8(值字符串+pos) != 0x2C && 内存_读8(值字符串+pos) != 0x29) { pos = pos + 1 }
+            定义 变量名 = 字符串_复制_N(值字符串 + 名起, pos - 名起)
+
+            // 读fallback(可选)
+            定义 可变 fallback = 0
+            如果 (pos < 长度 && 内存_读8(值字符串+pos) == 0x2C) {
+                pos = pos + 1
+                当 (pos < 长度 && 内存_读8(值字符串+pos) == 0x20) { pos = pos + 1 }
+                定义 fb起 = pos
+                定义 可变 深度 = 1
+                当 (pos < 长度 && 深度 > 0) {
+                    如果 (内存_读8(值字符串+pos) == 0x28) { 深度 = 深度 + 1 }
+                    如果 (内存_读8(值字符串+pos) == 0x29) { 深度 = 深度 - 1 }
+                    如果 (深度 > 0) { pos = pos + 1 }
+                }
+                fallback = 字符串_复制_N(值字符串 + fb起, pos - fb起)
+            }
+
+            // 跳过 )
+            如果 (pos < 长度 && 内存_读8(值字符串+pos) == 0x29) { pos = pos + 1 }
+
+            // 查找变量值
+            定义 解析值 = CustomProperty_获取(registry, 变量名)
+            如果 (解析值 == 0 && 父registry != 0) {
+                解析值 = CustomProperty_获取(父registry, 变量名)
+            }
+            如果 (解析值 == 0) { 解析值 = fallback }
+            如果 (解析值 == 0) { 解析值 = "" }
+
+            // 递归解析(var可以嵌套)
+            解析值 = CSS_解析var引用(解析值, registry, 父registry)
+
+            // 写入结果
+            定义 解析长度 = 字符串_长度(解析值)
+            内存_复制(结果 + 写pos, 解析值, 解析长度)
+            写pos = 写pos + 解析长度
+        } 否则 {
+            内存_写8(结果 + 写pos, 内存_读8(值字符串 + pos))
+            写pos = 写pos + 1
+            pos = pos + 1
+        }
+    }
+
+    内存_写8(结果 + 写pos, 0)
+    返回 结果
+}
+
+定义 可变 AI_历史接口位_样式缓存命中 = 0
+
+函数 AI_历史接口位_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_历史接口位_布局缓存(元素哈希) {
+    AI_历史接口位_样式缓存命中 = AI_历史接口位_样式缓存命中 + 1
+    返回 元素哈希
+}

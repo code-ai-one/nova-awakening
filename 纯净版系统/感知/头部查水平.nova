@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文字绘制最.nova")
+导入("./真字体字体.nova")
+
+// §2 head/hhea/maxp 表解析
+
+函数 TrueType_解析head(font) {
+    如果 (font.head_偏移 == 0) { 返回 }
+    定义 d = font.数据 + font.head_偏移
+    // head表: version(4) + revision(4) + checksumAdj(4) + magic(4)
+    //         flags(2) + unitsPerEm(2) + created(8) + modified(8)
+    //         xMin(2) + yMin(2) + xMax(2) + yMax(2) + mac样式(2)
+    //         lowestRecPPEM(2) + fontDirectionHint(2) + indexToLocFormat(2) + glyphDataFormat(2)
+    font.标志 = 读16(d, 16)
+    font.upem = 读16(d, 18)
+    font.loca格式 = 读16(d, 50)  // 0=short offsets, 1=long offsets
+}
+
+函数 TrueType_解析hhea(font) {
+    如果 (font.hhea_偏移 == 0) { 返回 }
+    定义 d = font.数据 + font.hhea_偏移
+    // hhea表: version(4) + ascender(2) + descender(2) + lineGap(2) + advanceWidthMax(2)
+    //         ... + numberOfHMetrics(2)
+    font.上升 = 读i16(d, 4)
+    font.下降 = 读i16(d, 6)
+    font.行距 = 读i16(d, 8)
+    font.最大宽度 = 读16(d, 10)
+    font.水平度量数 = 读16(d, 34)
+}
+
+函数 TrueType_解析maxp(font) {
+    如果 (font.maxp_偏移 == 0) { 返回 }
+    定义 d = font.数据 + font.maxp_偏移
+    // maxp表: version(4) + numGlyphs(2)
+    font.字形总数 = 读16(d, 4)
+}
+
+// §3 cmap表解析 — Unicode码点→字形ID
+
+函数 TrueType_解析cmap(font) {
+    如果 (font.cmap_偏移 == 0) { 返回 }
+    定义 d = font.数据 + font.cmap_偏移
+    // cmap头: version(2) + numTables(2)
+    定义 子表数 = 读16(d, 2)
+
+    // 查找最优Unicode子表 (优先级: platformID=3,encodingID=10 > 3,1 > 0,3)
+    定义 可变 最佳偏移 = 0
+    定义 可变 最佳优先级 = 0
+    定义 可变 i = 0
+    当 (i < 子表数) {
+        定义 rec = 4 + i * 8
+        定义 platformID = 读16(d, rec)
+        定义 encodingID = 读16(d, rec + 2)
+        定义 offset = 读32(d, rec + 4)
+        定义 优先级 = 0
+
+        如果 (platformID == 3 && encodingID == 10) { 优先级 = 4 }      // Windows UCS-4
+        否则 如果 (platformID == 3 && encodingID == 1) { 优先级 = 3 }  // Windows UCS-2
+        否则 如果 (platformID == 0 && encodingID == 4) { 优先级 = 2 }  // Unicode full
+        否则 如果 (platformID == 0 && encodingID == 3) { 优先级 = 1 }  // Unicode BMP
+
+        如果 (优先级 > 最佳优先级) {
+            最佳优先级 = 优先级
+            最佳偏移 = offset
+        }
+        i = i + 1
+    }
+
+    如果 (最佳偏移 == 0) { 返回 }
+
+    font.cmap子表偏移 = font.cmap_偏移 + 最佳偏移
+    font.cmap子表格式 = 读16(font.数据, font.cmap子表偏移)
+}
+
+// 通过cmap查找码点对应的字形ID
+函数 TrueType_查找字形(font, 码点) {
+    如果 (font.cmap子表偏移 == 0) { 返回 0 }
+    定义 d = font.数据 + font.cmap子表偏移
+    定义 格式 = font.cmap子表格式
+
+    如果 (格式 == 4) {
+        // Format 4: Segment mapping to delta values (BMP only)
+        返回 cmap_格式4_查找(d, 码点)
+    }
+    否则 如果 (格式 == 12) {
+        // Format 12: Segmented coverage (full Unicode)
+        返回 cmap_格式12_查找(d, 码点)
+    }
+    返回 0   // .notdef
+}
+
+函数 cmap_格式4_查找(d, 码点) {
+    如果 (码点 > 0xFFFF) { 返回 0 }
+    // format(2) + length(2) + language(2) + segCountX2(2)
+    定义 segCount = 读16(d, 6) / 2
+    // endCode数组从偏移14开始
+    定义 endCodes = 14
+    定义 startCodes = endCodes + segCount * 2 + 2  // +2 for reservedPad
+    定义 idDeltas = startCodes + segCount * 2
+    定义 idRangeOffsets = idDeltas + segCount * 2
+
+    // 二分查找段
+    定义 可变 lo = 0
+    定义 可变 hi = segCount - 1
+    当 (lo <= hi) {
+        定义 mid = (lo + hi) / 2
+        定义 endCode = 读16(d, endCodes + mid * 2)
+        定义 startCode = 读16(d, startCodes + mid * 2)
+
+        如果 (码点 > endCode) {
+            lo = mid + 1
+        } 否则 如果 (码点 < startCode) {
+            hi = mid - 1
+        } 否则 {
+            // 找到所在段
+            定义 idRangeOffset = 读16(d, idRangeOffsets + mid * 2)
+            定义 idDelta = 读i16(d, idDeltas + mid * 2)
+
+            如果 (idRangeOffset == 0) {
+                返回 (码点 + idDelta) & 0xFFFF
+            } 否则 {
+                定义 glyphOffset = idRangeOffsets + mid * 2 + idRangeOffset + (码点 - startCode) * 2
+                定义 glyphID = 读16(d, glyphOffset)
+                如果 (glyphID != 0) {
+                    返回 (glyphID + idDelta) & 0xFFFF
+                }
+                返回 0
+            }
+        }
+    }
+    返回 0
+}
+
+函数 cmap_格式12_查找(d, 码点) {
+    // format(2) + reserved(2) + length(4) + language(4) + numGroups(4)
+    定义 numGroups = 读32(d, 12)
+    // 每组: startCharCode(4) + endCharCode(4) + startGlyphID(4) = 12字节
+    定义 groups = 16
+
+    // 二分查找
+    定义 可变 lo = 0
+    定义 可变 hi = numGroups - 1
+    当 (lo <= hi) {
+        定义 mid = (lo + hi) / 2
+        定义 g = groups + mid * 12
+        定义 startChar = 读32(d, g)
+        定义 endChar = 读32(d, g + 4)
+
+        如果 (码点 > endChar) {
+            lo = mid + 1
+        } 否则 如果 (码点 < startChar) {
+            hi = mid - 1
+        } 否则 {
+            定义 startGlyph = 读32(d, g + 8)
+            返回 startGlyph + (码点 - startChar)
+        }
+    }
+    返回 0
+}
+
+定义 可变 AI_头部查水平_热点函数 = []
+
+函数 AI_头部查水平_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_头部查水平_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_头部查水平_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

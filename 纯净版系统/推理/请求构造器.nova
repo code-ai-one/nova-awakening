@@ -1,0 +1,188 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/硬链接.nova")
+
+// NovaOS · 统一请求构造器
+// 将统一消息格式→转换为各模型的真实接口 序列请求体
+// 每个模型接口的请求格式都不同:
+//   Nova智能: {"model":"Nova语言模型-4o","messages":[...],"max_令牌s":4096}
+//   Anthropic: {"model":"claude-...","system":"...","messages":[...],"max_令牌s":4096}
+//   GLM: {"model":"glm-4","messages":[...],"max_令牌s":4096,"temperature":0.7}
+//   MiniMax: {"model":"MiniMax-Text-01","messages":[...],"令牌s_to_generate":16384}
+//   Qwen: Nova智能兼容 + enable_search扩展
+//   文心: {"messages":[...],"temperature":0.7} (model在URL里)
+//   Kimi: Nova智能兼容格式
+// 本构造器统一输入: (Provider配置, 系统提示, 消息列表, 参数)
+// 输出: 正确的序列字符串
+
+
+// 消息 = [角色, 内容]  角色: "system"/"user"/"assistant"
+
+函数 请求_构造(cfg, 系统提示, 消息列表) {
+    定义 格式 = cfg.消息格式版本
+    如果 (格式 == 0) { 返回 请求_Nova智能格式(cfg, 系统提示, 消息列表) }
+    如果 (格式 == 1) { 返回 请求_Anthropic格式(cfg, 系统提示, 消息列表) }
+    如果 (格式 == 2) { 返回 请求_GLM格式(cfg, 系统提示, 消息列表) }
+    如果 (格式 == 3) { 返回 请求_MiniMax格式(cfg, 系统提示, 消息列表) }
+    如果 (格式 == 4) { 返回 请求_Qwen格式(cfg, 系统提示, 消息列表) }
+    返回 请求_Nova智能格式(cfg, 系统提示, 消息列表)  // 默认Nova智能兼容
+}
+
+// 适用: Nova语言模型-4o, Kimi, 本地Ollama, vLLM, LM Studio
+
+函数 请求_Nova智能格式(cfg, 系统提示, 消息列表) {
+    定义 可变 json = "{\"model\":\"" + cfg.模型标识 + "\""
+    json = json + ",\"max_令牌s\":" + 整数转字符串(cfg.最大输出令牌)
+    json = json + ",\"temperature\":" + 请求_浮点字符串(cfg.温度)
+    json = json + ",\"top_p\":" + 请求_浮点字符串(cfg.TopP)
+    如果 (cfg.启用流式 == 1) { json = json + ",\"stream\":true" }
+
+    // messages数组
+    json = json + ",\"messages\":["
+    // 系统提示作为第一条message
+    如果 (字符串长度(系统提示) > 0) {
+        json = json + "{\"role\":\"system\",\"content\":" + 请求_转义序列字符串(系统提示) + "},"
+    }
+    // 用户/助手消息
+    定义 可变 i = 0
+    当 (i < 计数(消息列表)) {
+        如果 (i > 0 || 字符串长度(系统提示) > 0) { 如果 (i > 0) { json = json + "," } }
+        json = json + "{\"role\":" + 请求_转义序列字符串(消息列表[i][0])
+        json = json + ",\"content\":" + 请求_转义序列字符串(消息列表[i][1]) + "}"
+        i = i + 1
+    }
+    json = json + "]}"
+    返回 json
+}
+
+// 关键差异: system是顶层字段, 不在messages里; 需要anthropic-version头
+
+函数 请求_Anthropic格式(cfg, 系统提示, 消息列表) {
+    定义 可变 json = "{\"model\":\"" + cfg.模型标识 + "\""
+    json = json + ",\"max_令牌s\":" + 整数转字符串(cfg.最大输出令牌)
+    json = json + ",\"temperature\":" + 请求_浮点字符串(cfg.温度)
+    如果 (cfg.启用流式 == 1) { json = json + ",\"stream\":true" }
+
+    // Anthropic: system是顶层字段
+    如果 (字符串长度(系统提示) > 0) {
+        json = json + ",\"system\":" + 请求_转义序列字符串(系统提示)
+    }
+
+    // messages (Anthropic不允许system角色在messages里)
+    json = json + ",\"messages\":["
+    定义 可变 i = 0
+    定义 可变 第一个 = 真
+    当 (i < 计数(消息列表)) {
+        如果 (消息列表[i][0] != "system") {
+            如果 (!第一个) { json = json + "," }
+            json = json + "{\"role\":" + 请求_转义序列字符串(消息列表[i][0])
+            json = json + ",\"content\":" + 请求_转义序列字符串(消息列表[i][1]) + "}"
+            第一个 = 假
+        }
+        i = i + 1
+    }
+    json = json + "]}"
+    返回 json
+}
+
+// 智谱: 基本兼容Nova智能, 但有tool_choice/web_search扩展
+
+函数 请求_GLM格式(cfg, 系统提示, 消息列表) {
+    定义 可变 json = "{\"model\":\"" + cfg.模型标识 + "\""
+    json = json + ",\"max_令牌s\":" + 整数转字符串(cfg.最大输出令牌)
+    json = json + ",\"temperature\":" + 请求_浮点字符串(cfg.温度)
+    json = json + ",\"top_p\":" + 请求_浮点字符串(cfg.TopP)
+    如果 (cfg.启用流式 == 1) { json = json + ",\"stream\":true" }
+
+    json = json + ",\"messages\":["
+    如果 (字符串长度(系统提示) > 0) {
+        json = json + "{\"role\":\"system\",\"content\":" + 请求_转义序列字符串(系统提示) + "},"
+    }
+    定义 可变 i = 0
+    当 (i < 计数(消息列表)) {
+        如果 (i > 0) { json = json + "," }
+        json = json + "{\"role\":" + 请求_转义序列字符串(消息列表[i][0])
+        json = json + ",\"content\":" + 请求_转义序列字符串(消息列表[i][1]) + "}"
+        i = i + 1
+    }
+    json = json + "]}"
+    返回 json
+}
+
+// MiniMax: 令牌s_to_generate替代max_令牌s, role_meta扩展
+
+函数 请求_MiniMax格式(cfg, 系统提示, 消息列表) {
+    定义 可变 json = "{\"model\":\"" + cfg.模型标识 + "\""
+    json = json + ",\"令牌s_to_generate\":" + 整数转字符串(cfg.最大输出令牌)
+    json = json + ",\"temperature\":" + 请求_浮点字符串(cfg.温度)
+    json = json + ",\"top_p\":" + 请求_浮点字符串(cfg.TopP)
+    如果 (cfg.启用流式 == 1) { json = json + ",\"stream\":true" }
+
+    json = json + ",\"messages\":["
+    如果 (字符串长度(系统提示) > 0) {
+        json = json + "{\"role\":\"system\",\"content\":" + 请求_转义序列字符串(系统提示) + "},"
+    }
+    定义 可变 i = 0
+    当 (i < 计数(消息列表)) {
+        如果 (i > 0) { json = json + "," }
+        json = json + "{\"role\":" + 请求_转义序列字符串(消息列表[i][0])
+        json = json + ",\"content\":" + 请求_转义序列字符串(消息列表[i][1]) + "}"
+        i = i + 1
+    }
+    json = json + "]}"
+    返回 json
+}
+
+// 通义千问: Nova智能兼容模式, 通过DashScope 接口
+
+函数 请求_Qwen格式(cfg, 系统提示, 消息列表) {
+    // Qwen的compatible-mode就是标准Nova智能格式
+    返回 请求_Nova智能格式(cfg, 系统提示, 消息列表)
+}
+
+
+函数 请求_构造头(cfg, api密钥) {
+    定义 可变 头列表 = []
+    // Content-Type
+    追加(头列表, ["Content-Type", "application/json"])
+    // 认证头
+    如果 (字符串长度(api密钥) > 0) {
+        追加(头列表, [cfg.认证头名, cfg.认证头前缀 + api密钥])
+    }
+    // Anthropic特殊头
+    如果 (cfg.类型 == 提供者_Anthropic) {
+        追加(头列表, ["anthropic-version", "2023-06-01"])
+    }
+    返回 头列表
+}
+
+
+函数 请求_浮点字符串(千分值) {
+    // 700 → "0.700"
+    定义 整数部分 = 千分值 / 1000
+    定义 小数部分 = 千分值 % 1000
+    定义 可变 结果 = 整数转字符串(整数部分) + "."
+    如果 (小数部分 < 100) { 结果 = 结果 + "0" }
+    如果 (小数部分 < 10) { 结果 = 结果 + "0" }
+    结果 = 结果 + 整数转字符串(小数部分)
+    返回 结果
+}
+
+函数 请求_转义序列字符串(s) {
+    // 简单序列字符串转义: 加引号, 转义\和"和换行
+    定义 可变 结果 = "\""
+    定义 可变 i = 0
+    当 (i < 字符串长度(s)) {
+        定义 ch = 字符串字符(s, i)
+        如果 (ch == 34) { 追加(部件, "\\\"" }          // ")
+        否则 如果 (ch == 92) { 追加(部件, "\\\\" }     // \)
+        否则 如果 (ch == 10) { 追加(部件, "\\n" }      // \n)
+        否则 如果 (ch == 13) { 追加(部件, "\\r" }      // \r)
+        否则 如果 (ch == 9) { 追加(部件, "\\t" }       // \t)
+        否则 { 追加(部件, 字符串从字符(ch) })
+        i = i + 1
+    }
+    追加(部件, "\"")
+    返回 字符串_连接列表(部件, "")
+}

@@ -1,0 +1,302 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./哈希整数.nova")
+导入("./尾部零.nova")
+导入("../标准/内存.nova")
+导入("../感知/内核直连层.nova")
+导入("./内存初始化.nova")
+导入("./环形缓冲.nova")
+
+// NovaOS eBPF — 可编程内核虚拟机
+// 技术: Extended Berkeley Packet Filter (2014-)
+// 核心: 在内核中安全执行用户态沙箱程序，无需修改内核代码
+//   - 验证器确保程序安全(无死循环/无越界/无空指针)
+//   - JIT编译到本机代码(x86-64/ARM64)
+//   - 挂载点: kprobe/tracepoint/XDP/tc/cgroup/LSM
+//   - Map数据结构: 哈希Map/数组/RingBuf/LPMTrie
+// NovaOS创新: AI辅助验证 + 神经网络Map类型
+
+
+定义 BPF_REG_数量 = 11        // R0-R10 (R10=帧指针,只读)
+定义 BPF_栈大小 = 512         // 每程序512字节栈
+定义 BPF_最大指令数 = 1000000 // 100万条指令上限
+定义 BPF_最大嵌套 = 8         // 尾调用最大嵌套
+
+// 指令类别
+定义 BPF_ALU64 = 0x07
+定义 BPF_ALU32 = 0x04
+定义 BPF_JMP64 = 0x05
+定义 BPF_JMP32 = 0x06
+定义 BPF_LD    = 0x00
+定义 BPF_LDX   = 0x01
+定义 BPF_ST    = 0x02
+定义 BPF_STX   = 0x03
+
+// ALU操作
+定义 BPF_ADD  = 0x00
+定义 BPF_SUB  = 0x10
+定义 BPF_MUL  = 0x20
+定义 BPF_DIV  = 0x30
+定义 BPF_OR   = 0x40
+定义 BPF_AND  = 0x50
+定义 BPF_LSH  = 0x60
+定义 BPF_RSH  = 0x70
+定义 BPF_XOR  = 0xa0
+定义 BPF_MOV  = 0xb0
+定义 BPF_ARSH = 0xc0
+
+// 跳转操作
+定义 BPF_JEQ  = 0x10
+定义 BPF_JGT  = 0x20
+定义 BPF_JGE  = 0x30
+定义 BPF_JSGT = 0x60
+定义 BPF_JSGE = 0x70
+定义 BPF_CALL = 0x80
+定义 BPF_EXIT = 0x90
+
+// 程序类型
+定义 BPF_PROG_KPROBE     = 1
+定义 BPF_PROG_TRACEPOINT = 2
+定义 BPF_PROG_XDP        = 3
+定义 BPF_PROG_TC         = 4
+定义 BPF_PROG_CGROUP     = 5
+定义 BPF_PROG_LSM        = 6
+定义 BPF_PROG_SCHED      = 7   // NovaOS扩展: 可编程调度器
+
+结构 BPF指令 {
+    操作码,
+    目标寄存器,    // u8 低4位
+    源寄存器,    // u8 高4位
+    偏移,
+    立即数,
+}
+
+结构 BPF程序 {
+    类型,
+    指令数,
+    指令,    // u64 BPF指令数组
+    JIT代码,    // u64 JIT编译后的本机代码
+    JIT大小,
+    已验证,
+    Map列表,    // u64 关联的Map
+    辅助函数表,    // u64 允许调用的辅助函数
+    名称,
+}
+
+
+函数 BPF_验证(程序) {
+    定义 指令数 = 程序.指令数
+    如果 (指令数 > BPF_最大指令数) { 返回 错误_程序过大 }
+
+    // 寄存器状态追踪
+    定义 可变 寄存器类型 = 数组_创建(BPF_REG_数量)
+    定义 可变 寄存器范围 = 数组_创建(BPF_REG_数量)
+
+    // R1 = 上下文指针(根据程序类型)
+    数组_设置(寄存器类型, 1, 类型_CTX指针)
+    数组_设置(寄存器类型, 10, 类型_帧指针)
+
+    // 探索所有可达路径(DAG遍历)
+    定义 可变 已访问 = 位图_创建(指令数)
+    定义 可变 栈 = [(0, 寄存器类型, 寄存器范围)]
+
+    当 (计数(栈) > 0) {
+        定义 当前 = 弹出(栈)
+        定义 pc = 当前[0]
+        定义 reg = 当前[1]
+        定义 range = 当前[2]
+
+        如果 (pc >= 指令数) { 返回 错误_越界跳转 }
+        如果 (位图_测试(已访问, pc)) { 继续 }
+        位图_设置(已访问, pc)
+
+        定义 insn = BPF_取指令(程序, pc)
+
+        // 检查每条指令的安全性
+        定义 结果 = BPF_验证指令(insn, reg, range, 程序.类型)
+        如果 (结果 != 0) { 返回 结果 }
+
+        // 更新寄存器状态
+        BPF_更新寄存器状态(insn, reg, range)
+
+        // 分支: 两条路径都要验证
+        定义 操作 = insn.操作码 & 0xf0
+        如果 ((insn.操作码 & 0x07) == BPF_JMP64 && 操作 != BPF_CALL && 操作 != BPF_EXIT) {
+            追加(栈, [pc + 1 + insn.偏移, 数组_复制(reg), 数组_复制(range)])
+            追加(栈, [pc + 1, 数组_复制(reg), 数组_复制(range)])
+        } 否则 如果 (操作 == BPF_EXIT) {
+            // 验证R0有有效返回值
+        } 否则 {
+            追加(栈, [pc + 1, reg, range])
+        }
+    }
+
+    程序.已验证 = 真
+    返回 0
+}
+
+
+函数 BPF_执行(程序, 上下文) {
+    如果 (!程序.已验证) { 返回 错误_未验证 }
+
+    // 优先使用JIT编译的代码
+    如果 (程序.JIT代码 != 0) {
+        返回 调用本机(程序.JIT代码, 上下文)
+    }
+
+    // 解释执行
+    定义 可变 R = 数组_创建(BPF_REG_数量)
+    数组_设置(R, 1, 上下文)     // R1 = ctx
+    数组_设置(R, 10, 栈_分配(BPF_栈大小))  // R10 = fp
+
+    定义 可变 pc = 0
+    当 (pc < 程序.指令数) {
+        定义 insn = BPF_取指令(程序, pc)
+        定义 dst = insn.目标寄存器
+        定义 src = insn.源寄存器
+        定义 cls = insn.操作码 & 0x07
+        定义 op = insn.操作码 & 0xf0
+
+        如果 (cls == BPF_ALU64) {
+            如果 (op == BPF_ADD) { R[dst] = R[dst] + R[src] }
+            否则 如果 (op == BPF_SUB) { R[dst] = R[dst] - R[src] }
+            否则 如果 (op == BPF_MUL) { R[dst] = R[dst] * R[src] }
+            否则 如果 (op == BPF_DIV) { 如果 (R[src] != 0) { R[dst] = R[dst] / R[src] } }
+            否则 如果 (op == BPF_AND) { R[dst] = R[dst] & R[src] }
+            否则 如果 (op == BPF_OR)  { R[dst] = R[dst] | R[src] }
+            否则 如果 (op == BPF_XOR) { R[dst] = R[dst] ^ R[src] }
+            否则 如果 (op == BPF_LSH) { R[dst] = R[dst] << R[src] }
+            否则 如果 (op == BPF_RSH) { R[dst] = R[dst] >> R[src] }
+            否则 如果 (op == BPF_MOV) { R[dst] = R[src] }
+        }
+        否则 如果 (cls == BPF_JMP64) {
+            如果 (op == BPF_JEQ && R[dst] == R[src]) { pc = pc + insn.偏移 }
+            否则 如果 (op == BPF_JGT && R[dst] > R[src]) { pc = pc + insn.偏移 }
+            否则 如果 (op == BPF_JGE && R[dst] >= R[src]) { pc = pc + insn.偏移 }
+            否则 如果 (op == BPF_CALL) {
+                R[0] = BPF_调用辅助函数(insn.立即数, R[1], R[2], R[3], R[4], R[5])
+            }
+            否则 如果 (op == BPF_EXIT) { 返回 R[0] }
+        }
+        否则 如果 (cls == BPF_LDX) {
+            定义 地址 = R[src] + insn.偏移
+            如果 (op == 0x18) { R[dst] = 内存_读64(地址) }
+            否则 如果 (op == 0x40) { R[dst] = 内存_读32(地址) }
+            否则 如果 (op == 0x28) { R[dst] = 内存_读16(地址) }
+            否则 如果 (op == 0x10) { R[dst] = 内存_读8(地址) }
+        }
+        否则 如果 (cls == BPF_STX) {
+            定义 地址 = R[dst] + insn.偏移
+            如果 (op == 0x18) { 内存_写64(地址, R[src]) }
+            否则 如果 (op == 0x40) { 内存_写32(地址, R[src]) }
+        }
+
+        pc = pc + 1
+    }
+
+    返回 R[0]
+}
+
+
+定义 BPF_MAP_HASH     = 1
+定义 BPF_MAP_ARRAY    = 2
+定义 BPF_MAP_RINGBUF  = 3
+定义 BPF_MAP_LPM_TRIE = 4
+定义 BPF_MAP_PERCPU   = 5
+
+结构 BPFMap {
+    类型,
+    键大小,
+    值大小,
+    最大项数,
+    数据,
+}
+
+函数 BPFMap_创建(类型, 键大小, 值大小, 最大项数) {
+    定义 可变 map = BPFMap {}
+    map.类型 = 类型
+    map.键大小 = 键大小
+    map.值大小 = 值大小
+    map.最大项数 = 最大项数
+
+    如果 (类型 == BPF_MAP_HASH) {
+        map.数据 = 哈希表_创建(最大项数, 键大小, 值大小)
+    }
+    否则 如果 (类型 == BPF_MAP_ARRAY) {
+        map.数据 = 内存_分配(最大项数 * 值大小)
+    }
+    否则 如果 (类型 == BPF_MAP_RINGBUF) {
+        map.数据 = 环形缓冲_创建(最大项数 * 值大小)
+    }
+
+    返回 map
+}
+
+函数 BPFMap_查找(map, 键) {
+    如果 (map.类型 == BPF_MAP_HASH) {
+        返回 哈希表_查找(map.数据, 键, map.键大小)
+    }
+    如果 (map.类型 == BPF_MAP_ARRAY) {
+        定义 索引 = 内存_读32(键)
+        如果 (索引 >= map.最大项数) { 返回 空 }
+        返回 map.数据 + 索引 * map.值大小
+    }
+    返回 空
+}
+
+函数 BPFMap_更新(map, 键, 值) {
+    如果 (map.类型 == BPF_MAP_HASH) {
+        返回 哈希表_插入(map.数据, 键, map.键大小, 值, map.值大小)
+    }
+    如果 (map.类型 == BPF_MAP_ARRAY) {
+        定义 索引 = 内存_读32(键)
+        如果 (索引 >= map.最大项数) { 返回 错误_越界 }
+        内存_复制(map.数据 + 索引 * map.值大小, 值, map.值大小)
+        返回 0
+    }
+    返回 错误_不支持
+}
+
+// BPF虚拟机健康检查
+
+定义 可变 BPF_程序数 = 0
+定义 可变 BPF_执行次数 = 0
+定义 可变 BPF_错误次数 = 0
+
+函数 BPF_健康检查() {
+    定义 可变 问题 = []
+    如果 (BPF_错误次数 > BPF_执行次数 / 10 && BPF_执行次数 > 100) {
+        追加(问题, "BPF错误率过高")
+    }
+    如果 (计数(问题) == 0) { 返回 "BPF虚拟机健康" }
+    返回 问题
+}
+
+函数 BPF_统计() {
+    返回 {
+        程序数: BPF_程序数,
+        执行次数: BPF_执行次数,
+        错误次数: BPF_错误次数,
+    }
+}
+
+函数 BPF_重置统计() {
+    BPF_程序数 = 0
+    BPF_执行次数 = 0
+    BPF_错误次数 = 0
+}
+
+定义 可变 AI_虚拟机虚拟_威胁计数 = 0
+
+函数 AI_虚拟机虚拟_风险评分(操作类型, 权限级别, 来源可信度) {
+    定义 可变 风险 = 0
+    如果 (权限级别 > 500) { 风险 = 风险 + 300 }
+    如果 (来源可信度 < 200) { 风险 = 风险 + 400 }
+    如果 (风险 > 500) { AI_虚拟机虚拟_威胁计数 = AI_虚拟机虚拟_威胁计数 + 1 }
+    返回 风险
+}
+
+函数 AI_虚拟机虚拟_异常行为检测(操作频率, 基线频率) {
+    如果 (基线频率 > 0 && 操作频率 > 基线频率 * 5) { 返回 真 }
+    返回 假
+}

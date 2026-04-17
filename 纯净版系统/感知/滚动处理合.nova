@@ -1,0 +1,123 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./合成器合成.nova")
+导入("../推理/总线预测.nova")
+
+// §6 滚动处理 — 合成线程直接处理(不经过主线程!)
+// 关键: 滚动在合成线程处理, 即使JS阻塞主线程, 滚动仍流畅
+// 这是Nova浏览器流畅度的核心秘密
+
+
+函数 Compositor_处理滚动(comp, deltaX, deltaY) {
+    // 更新滚动位置
+    comp.视口x = comp.视口x + deltaX
+    comp.视口y = comp.视口y + deltaY
+
+    // 边界检查
+    如果 (comp.视口x < 0) { comp.视口x = 0 }
+    如果 (comp.视口y < 0) { comp.视口y = 0 }
+
+    // 更新滚动速度(用于惯性滚动和AI预测)
+    comp.滚动速度x = deltaX
+    comp.滚动速度y = deltaY
+
+    // 通知AI总线(用于运动掩蔽和行为预测)
+    定义 bus = 全局AI总线
+    如果 (bus != 0) {
+        AI总线_感知_滚动(bus, deltaY)
+    }
+
+    // 标记需要合成新帧
+    comp.状态 = 合成状态_等待VSync
+
+    // 更新Tile优先级(新的Tile需要光栅化)
+    Compositor_更新Tile优先级(comp)
+}
+
+// 惯性滚动: 手指松开后继续滚动(指数衰减)
+函数 Compositor_惯性滚动步(comp) {
+    如果 (!comp.惯性滚动中) { 返回 }
+
+    // 速度衰减: v = v × 0.95
+    comp.滚动速度y = comp.滚动速度y * 972 / 1024    // 0.95 × 1024 ≈ 972
+
+    // 速度太小 → 停止
+    如果 (comp.滚动速度y > -2 && comp.滚动速度y < 2) {
+        comp.惯性滚动中 = 假
+        comp.滚动速度y = 0
+        返回
+    }
+
+    // 应用滚动
+    Compositor_处理滚动(comp, 0, comp.滚动速度y)
+}
+
+// §7 CSS动画/过渡 — 合成线程驱动(不经过主线程!)
+// 以下CSS属性可在合成线程动画化(不触发重排重绘):
+//   transform, opacity, filter
+// 其他属性(width/height/color等)仍需主线程
+
+结构 合成动画 {
+    层ID,
+    属性,    // u32 0=transform 1=opacity 2=filter
+    开始时间,
+    持续时间,    // u32 毫秒
+    起始值,    // [6]i32 Q10定点
+    目标值,    // [6]i32 Q10定点
+    缓动函数,    // u32 0=linear 1=ease 2=ease-in 3=ease-out 4=ease-in-out
+    是否循环,
+    已完成,
+}
+
+// 缓动函数: Nova三次方-bezier插值
+函数 缓动_计算(类型, t) {
+    // t ∈ [0, Q_ONE]
+    如果 (类型 == 0) { 返回 t }    // linear
+    如果 (类型 == 1) {
+        // ease: Nova三次方-bezier(0.25, 0.1, 0.25, 1.0)
+        // Hermite平滑插值: 3t² - 2t³
+        定义 t2 = Q乘(t, t)
+        定义 t3 = Q乘(t2, t)
+        返回 3 * t2 - 2 * t3
+    }
+    如果 (类型 == 2) {
+        // ease-in: t²
+        返回 Q乘(t, t)
+    }
+    如果 (类型 == 3) {
+        // ease-out: 1-(1-t)²
+        定义 inv = Q_ONE - t
+        返回 Q_ONE - Q乘(inv, inv)
+    }
+    如果 (类型 == 4) {
+        // ease-in-out: Hermite插值 3t²-2t³
+        定义 t2 = Q乘(t, t)
+        定义 t3 = Q乘(t2, t)
+        返回 3 * t2 - 2 * t3
+    }
+    返回 t
+}
+
+// 推进合成动画
+函数 Compositor_更新动画(comp, 当前时间) {
+    // 遍历活跃动画, 计算当前值, 应用到Layer
+    // 遍历活跃动画列表
+    定义 可变 i = 0
+    当 (i < comp.动画数量) {
+        定义 anim = 内存_读64(comp.动画列表 + i * 8)
+        如果 (anim == 0) { i = i + 1; 继续 }
+        定义 elapsed = 当前时间 - anim.开始时间
+        如果 (elapsed >= anim.持续时间) {
+            // 动画完成: 应用最终值并移除
+            Layer_设置属性(anim.目标层, anim.属性, anim.结束值)
+            anim.状态 = ANIM_FINISHED
+        } 否则 {
+            // 计算进度并插值
+            定义 t = elapsed * Q_ONE / anim.持续时间
+            定义 eased_t = 缓动_计算(anim.缓动类型, t)
+            定义 当前值 = anim.开始值 + (anim.结束值 - anim.开始值) * eased_t / Q_ONE
+            Layer_设置属性(anim.目标层, anim.属性, 当前值)
+        }
+        i = i + 1
+    }
+}

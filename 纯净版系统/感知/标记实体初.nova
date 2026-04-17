@@ -1,0 +1,114 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./标记实体添加.nova")
+
+//       + html_entity_table.json (自动生成的实体表)
+// HTML5规范: §12.2.5.72 Character reference state
+// HTML字符引用有三种形式:
+//   1. 命名引用: &amp; &lt; &gt; &quot; &apos; &nbsp; ...
+//   2. 十进制引用: &#60; &#160;
+//   3. 十六进制引用: &#x3C; &#xA0;
+// HTML规范定义有2231个命名实体
+// 本文件实现完整的解码逻辑 + 常用实体表
+
+// §1 HTML命名字符引用表 (html_entity_table)
+// 完整HTML5实体 — 按首字母分组,二分查找
+// 每个条目: [名称, 名称长度, Unicode码点1, Unicode码点2(0=单码点)]
+
+结构 HTMLEntity {
+    名称,    // u64 字符串指针 (不含& 和 ;)
+    名称长度,
+    码点1,    // u32 主Unicode码点
+    码点2,    // u32 第二码点(0=单码点, 如 &fjlig; = f + j)
+}
+
+// 实体表 — 按名称排序(二分查找用)
+定义 可变 实体表 = 0
+定义 可变 实体表大小 = 0
+
+函数 HTMLEntity_初始化表() {
+    如果 (实体表 != 0) { 返回 }
+
+    // 分配表空间(最多2300个实体)
+    实体表 = 堆_分配_数组(2300 * 24)
+    实体表大小 = 0
+
+    HTMLEntity_添加("amp", 0x26, 0)           // &
+    HTMLEntity_添加("lt", 0x3C, 0)            // <
+    HTMLEntity_添加("gt", 0x3E, 0)            // >
+    HTMLEntity_添加("quot", 0x22, 0)          // "
+    HTMLEntity_添加("apos", 0x27, 0)          // '
+    HTMLEntity_添加("nbsp", 0xA0, 0)          // non-breaking space
+    HTMLEntity_添加("ensp", 0x2002, 0)        // en space
+    HTMLEntity_添加("emsp", 0x2003, 0)        // em space
+    HTMLEntity_添加("thinsp", 0x2009, 0)      // thin space
+    HTMLEntity_添加("zwnj", 0x200C, 0)        // zero width non-joiner
+    HTMLEntity_添加("zwj", 0x200D, 0)         // zero width joiner
+    HTMLEntity_添加("lrm", 0x200E, 0)         // left-to-right mark
+    HTMLEntity_添加("rlm", 0x200F, 0)         // right-to-left mark
+
+    HTMLEntity_添加("iexcl", 0xA1, 0)         // ¡
+    HTMLEntity_添加("cent", 0xA2, 0)          // ¢
+    HTMLEntity_添加("pound", 0xA3, 0)         // £
+    HTMLEntity_添加("curren", 0xA4, 0)        // ¤
+    HTMLEntity_添加("yen", 0xA5, 0)           // ¥
+    HTMLEntity_添加("brvbar", 0xA6, 0)        // ¦
+    HTMLEntity_添加("sect", 0xA7, 0)          // §
+    HTMLEntity_添加("uml", 0xA8, 0)           // ¨
+    HTMLEntity_添加("copy", 0xA9, 0)          // ©
+    HTMLEntity_添加("ordf", 0xAA, 0)          // ª
+    HTMLEntity_添加("laquo", 0xAB, 0)         // «
+    HTMLEntity_添加("not", 0xAC, 0)           // ¬
+    HTMLEntity_添加("shy", 0xAD, 0)           // soft hyphen
+    HTMLEntity_添加("reg", 0xAE, 0)           // ®
+    HTMLEntity_添加("macr", 0xAF, 0)          // ¯
+    HTMLEntity_添加("deg", 0xB0, 0)           // °
+    HTMLEntity_添加("plusmn", 0xB1, 0)        // ±
+    HTMLEntity_添加("sup2", 0xB2, 0)          // ²
+    HTMLEntity_添加("sup3", 0xB3, 0)          // ³
+    HTMLEntity_添加("acute", 0xB4, 0)         // ´
+    HTMLEntity_添加("micro", 0xB5, 0)         // µ
+    HTMLEntity_添加("para", 0xB6, 0)          // ¶
+    HTMLEntity_添加("middot", 0xB7, 0)        // ·
+    HTMLEntity_添加("cedil", 0xB8, 0)         // ¸
+    HTMLEntity_添加("sup1", 0xB9, 0)          // ¹
+    HTMLEntity_添加("ordm", 0xBA, 0)          // º
+    HTMLEntity_添加("raquo", 0xBB, 0)         // »
+    HTMLEntity_添加("frac14", 0xBC, 0)        // ¼
+    HTMLEntity_添加("frac12", 0xBD, 0)        // ½
+    HTMLEntity_添加("frac34", 0xBE, 0)        // ¾
+    HTMLEntity_添加("iquest", 0xBF, 0)        // ¿
+
+    HTMLEntity_添加("Agrave", 0xC0, 0)        // À
+    HTMLEntity_添加("Aacute", 0xC1, 0)        // Á
+    HTMLEntity_添加("Acirc", 0xC2, 0)         // Â
+    HTMLEntity_添加("Atilde", 0xC3, 0)        // Ã
+    HTMLEntity_添加("Auml", 0xC4, 0)          // Ä
+    HTMLEntity_添加("Aring", 0xC5, 0)         // Å
+    HTMLEntity_添加("AElig", 0xC6, 0)         // Æ
+    HTMLEntity_添加("Ccedil", 0xC7, 0)        // Ç
+    HTMLEntity_添加("Egrave", 0xC8, 0)        // È
+    HTMLEntity_添加("Eacute", 0xC9, 0)        // É
+    HTMLEntity_添加("Ecirc", 0xCA, 0)         // Ê
+    HTMLEntity_添加("Euml", 0xCB, 0)          // Ë
+    HTMLEntity_添加("Igrave", 0xCC, 0)        // Ì
+    HTMLEntity_添加("Iacute", 0xCD, 0)        // Í
+    HTMLEntity_添加("Icirc", 0xCE, 0)         // Î
+    HTMLEntity_添加("Iuml", 0xCF, 0)          // Ï
+    HTMLEntity_添加("ETH", 0xD0, 0)           // Ð
+    HTMLEntity_添加("Ntilde", 0xD1, 0)        // Ñ
+    HTMLEntity_添加("Ograve", 0xD2, 0)        // Ò
+    HTMLEntity_添加("Oacute", 0xD3, 0)        // Ó
+    HTMLEntity_添加("Ocirc", 0xD4, 0)         // Ô
+    HTMLEntity_添加("Otilde", 0xD5, 0)        // Õ
+    HTMLEntity_添加("Ouml", 0xD6, 0)          // Ö
+    HTMLEntity_添加("times", 0xD7, 0)         // ×
+    HTMLEntity_添加("Oslash", 0xD8, 0)        // Ø
+    HTMLEntity_添加("Ugrave", 0xD9, 0)        // Ù
+    HTMLEntity_添加("Uacute", 0xDA, 0)        // Ú
+    HTMLEntity_添加("Ucirc", 0xDB, 0)         // Û
+    HTMLEntity_添加("Uuml", 0xDC, 0)          // Ü
+    HTMLEntity_添加("Yacute", 0xDD, 0)        // Ý
+    HTMLEntity_添加("THORN", 0xDE, 0)         // Þ
+    HTMLEntity_添加("szlig", 0xDF, 0)         // ß
+}

@@ -1,0 +1,476 @@
+// NovaOS · on-事件属性处理引擎
+// 功能:
+//  §1 on-属性设置/获取: onclick/onload/onerror等
+//  §2 事件处理器内容属性解析 (HTML属性字符串→函数)
+//  §3 GlobalEventHandlers: 全部on*属性映射表
+//  §4 WindowEventHandlers: onhashchange/onpopstate等
+//  §5 懒惰事件处理器编译 + 缓存
+//  §6 便捷事件分发: click/focus/blur/input/自定义
+//  §7 鼠标事件完整派发: mousedown/up/move/enter/leave
+//  §8 键盘事件派发: keydown/keyup/keypress
+//  §9 AI总线: 事件优先级推理 + 语义感知
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("../中枢/硬链接.nova")
+导入("../推理/值乘.nova")
+导入("./文档节点.nova")
+导入("./文档事件.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./触摸事件.nova")
+导入("../推理/智能总线鼠标.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/内核打印.nova")
+
+// §1 数据结构
+
+定义 ON_HANDLER_FLAG = 0x80000000  // 标记为on-属性处理器(而非addEventListener)
+定义 Q10 = 1024
+定义 Q_ONE = 1024
+
+结构 EventHandlerEntry {
+    类型原子,       // 事件类型原子ID
+    回调,           // 当前的on-属性回调函数
+    源码,           // HTML属性字符串(用于懒惰编译)
+    已编译,         // 是否已从unicode编译为函数
+}
+
+// §2 on-属性设置/获取
+
+
+函数 事件Target_设置on事件(目标节点, 类型原子, 回调) {
+    // element.onclick = function() {...}
+    定义 map = 事件Target_获取监听器Map(目标节点)
+    如果 (map == 0) {
+        map = 事件ListenerMap_创建()
+        事件Target_设置监听器Map(目标节点, map)
+    }
+    // 移除旧的on-属性监听器
+    定义 可变 i = 0
+    当 (i < map.监听器数量) {
+        定义 偏移 = map.监听器列表 + i * 40
+        定义 已有类型 = 内存_读32(偏移)
+        定义 标志 = 内存_读32(偏移 + 36)
+        如果 (已有类型 == 类型原子 && (标志 & ON_HANDLER_FLAG) != 0) {
+            // 找到旧的on-属性监听器, 移除它
+            内存_写32(偏移 + 32, 1)  // 标记已移除
+        }
+        i = i + 1
+    }
+    // 添加新回调
+    如果 (回调 != 0) {
+        事件ListenerMap_添加_带标志(map, 类型原子, 回调, 假, 假, 假, ON_HANDLER_FLAG)
+    }
+}
+
+函数 事件Target_获取on事件(目标节点, 类型原子) {
+    // 返回当前的on-属性回调
+    定义 map = 事件Target_获取监听器Map(目标节点)
+    如果 (map == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < map.监听器数量) {
+        定义 偏移 = map.监听器列表 + i * 40
+        定义 已有类型 = 内存_读32(偏移)
+        定义 标志 = 内存_读32(偏移 + 36)
+        定义 已移除 = 内存_读32(偏移 + 32)
+        如果 (已有类型 == 类型原子 && (标志 & ON_HANDLER_FLAG) != 0 && !已移除) {
+            返回 内存_读64(偏移 + 8)  // 回调函数
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+// §3 HTML属性字符串→函数: 懒惰编译
+
+函数 事件处理器_从属性创建(Nova运行时, 元素, 事件名, 属性值) {
+    // <div onclick="alert(1)"> → 将属性值包装为函数体
+    // function onclick(event) { alert(1) }
+    定义 函数体 = 属性值
+    如果 (函数体 == 0 || 字符串长度(函数体) == 0) { 返回 0 }
+    // 构建函数源码: function onXXX(event) { ... }
+    定义 源码 = 字符串_拼接("function ", 事件名)
+    源码 = 字符串_拼接(源码, "(event) { ")
+    源码 = 字符串_拼接(源码, 函数体)
+    源码 = 字符串_拼接(源码, " }")
+    // 编译为函数
+    定义 结果 = Nova脚本_编译(源码, Nova运行时)
+    如果 (结果.错误 != 0) {
+        // 编译失败: 报告错误但不崩溃
+        控制台_报告错误("EventHandler", 事件名, 结果.错误)
+        返回 0
+    }
+    返回 结果.函数
+}
+
+函数 事件处理器_懒惰编译(entry, Nova运行时, 元素) {
+    // 首次调用时才编译属性字符串
+    如果 (entry.已编译) { 返回 entry.回调 }
+    如果 (entry.源码 == 0) { 返回 0 }
+    定义 事件名 = 原子_转字符串(entry.类型原子)
+    entry.回调 = 事件处理器_从属性创建(Nova运行时, 元素, 事件名, entry.源码)
+    entry.已编译 = 真
+    返回 entry.回调
+}
+
+// §4 GlobalEventHandlers: on*属性映射表
+
+// GlobalEventHandlers 接口的所有on*属性
+函数 注册_全局事件处理器属性(Nova运行时, 原型) {
+    定义 事件表 = [
+        "abort", "auxclick", "beforeinput", "blur", "cancel",
+        "canplay", "canplaythrough", "change", "click", "close",
+        "contextmenu", "copy", "cut", "dblclick", "drag",
+        "dragend", "dragenter", "dragleave", "dragover", "dragstart",
+        "drop", "durationchange", "emptied", "ended", "error",
+        "focus", "focusin", "focusout", "gotpointercapture",
+        "input", "invalid", "keydown", "keypress", "keyup",
+        "load", "loadeddata", "loadedmetadata", "loadstart",
+        "lostpointercapture", "mousedown", "mouseenter", "mouseleave",
+        "mousemove", "mouseout", "mouseover", "mouseup",
+        "paste", "pause", "play", "playing", "pointercancel",
+        "pointerdown", "pointerenter", "pointerleave", "pointermove",
+        "pointerout", "pointerover", "pointerup", "progress",
+        "ratechange", "reset", "resize", "scroll", "scrollend",
+        "securitypolicyviolation", "seeked", "seeking", "select",
+        "selectionchange", "selectstart", "slotchange", "stalled",
+        "submit", "suspend", "timeupdate", "toggle", "touchcancel",
+        "touchend", "touchmove", "touchstart", "transitioncancel",
+        "transitionend", "transitionrun", "transitionstart",
+        "volumechange", "waiting", "wheel"
+    ]
+    定义 可变 i = 0
+    当 (i < 计数(事件表)) {
+        定义 名称 = 字符串_拼接("on", 事件表[i])
+        定义 原子 = 原子_获取或创建(事件表[i])
+        注册_on属性访问器(Nova运行时, 原型, 名称, 原子)
+        i = i + 1
+    }
+}
+
+函数 注册_on属性访问器(Nova运行时, 原型, 名称, 原子) {
+    // 定义getter/setter以实现element.onclick访问
+    Nova对象_定义属性(Nova运行时, 原型, 名称, 
+        on属性_getter_创建(原子),
+        on属性_setter_创建(原子))
+}
+
+函数 on属性_getter_创建(原子) {
+    返回 函数(Nova运行时, this值, argc, argv) {
+        返回 事件Target_获取on事件(this值, 原子)
+    }
+}
+
+函数 on属性_setter_创建(原子) {
+    返回 函数(Nova运行时, this值, argc, argv) {
+        定义 值 = 如果(argc > 0, argv[0], 0)
+        事件Target_设置on事件(this值, 原子, 值)
+        返回 Nova运行时.undefined值
+    }
+}
+
+// §5 WindowEventHandlers: onhashchange等
+
+函数 注册_窗口事件处理器属性(Nova运行时, 原型) {
+    定义 事件表 = [
+        "afterprint", "beforeprint", "beforeunload",
+        "hashchange", "languagechange", "message",
+        "messageerror", "offline", "online",
+        "pagehide", "pageshow", "popstate",
+        "rejectionhandled", "storage", "unhandledrejection", "unload"
+    ]
+    定义 可变 i = 0
+    当 (i < 计数(事件表)) {
+        定义 名称 = 字符串_拼接("on", 事件表[i])
+        定义 原子 = 原子_获取或创建(事件表[i])
+        注册_on属性访问器(Nova运行时, 原型, 名称, 原子)
+        i = i + 1
+    }
+}
+
+// §6 便捷事件分发: click/focus/blur/input/自定义
+
+函数 事件Target_触发click(目标节点, x, y) {
+    定义 me = Mouse事件_创建("click", x, y, 0, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标节点, me.基类)
+}
+
+函数 事件Target_触发dblclick(目标节点, x, y) {
+    定义 me = Mouse事件_创建("dblclick", x, y, 0, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标节点, me.基类)
+}
+
+函数 事件Target_触发focus(目标节点, 旧焦点) {
+    // focus不冒泡, focusin冒泡
+    定义 focus事件 = Focus事件_创建("focus", 旧焦点)
+    focus事件.基础事件.冒泡 = 假
+    事件Target_dispatch事件(目标节点, focus事件.基础事件)
+    // focusin冒泡
+    定义 focusin事件 = Focus事件_创建("focusin", 旧焦点)
+    focusin事件.基础事件.冒泡 = 真
+    事件Target_dispatch事件(目标节点, focusin事件.基础事件)
+}
+
+函数 事件Target_触发blur(目标节点, 新焦点) {
+    定义 blur事件 = Focus事件_创建("blur", 新焦点)
+    blur事件.基础事件.冒泡 = 假
+    事件Target_dispatch事件(目标节点, blur事件.基础事件)
+    定义 focusout事件 = Focus事件_创建("focusout", 新焦点)
+    focusout事件.基础事件.冒泡 = 真
+    事件Target_dispatch事件(目标节点, focusout事件.基础事件)
+}
+
+函数 事件Target_触发input(目标节点, 文本) {
+    定义 ie = Input事件_创建(文本, "insertText")
+    ie.基础事件.冒泡 = 真
+    ie.基础事件.可取消 = 假  // input不可取消
+    事件Target_dispatch事件(目标节点, ie.基础事件)
+}
+
+函数 事件Target_触发change(目标节点) {
+    定义 ev = 事件_创建("change", 真, 假)
+    事件Target_dispatch事件(目标节点, ev)
+}
+
+函数 事件Target_触发submit(表单, 提交者) {
+    定义 ev = Submit事件_创建(提交者)
+    ev.基础事件.冒泡 = 真
+    ev.基础事件.可取消 = 真
+    事件Target_dispatch事件(表单, ev.基础事件)
+}
+
+函数 事件Target_触发自定义事件(目标节点, 类型, 详情) {
+    定义 ce = Custom事件_创建(类型, 真, 真, 详情)
+    事件Target_dispatch事件(目标节点, ce.基础事件)
+}
+
+// §7 鼠标事件完整派发
+
+函数 事件Target_触发mousedown(目标, x, y, 按钮) {
+    定义 me = Mouse事件_创建("mousedown", x, y, 按钮, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mouseup(目标, x, y, 按钮) {
+    定义 me = Mouse事件_创建("mouseup", x, y, 按钮, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mousemove(目标, x, y) {
+    定义 me = Mouse事件_创建("mousemove", x, y, 0, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mouseenter(目标, x, y, 来源) {
+    // mouseenter不冒泡
+    定义 me = Mouse事件_创建("mouseenter", x, y, 0, 0)
+    me.基类.冒泡 = 假
+    me.relatedTarget = 来源
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mouseleave(目标, x, y, 去向) {
+    // mouseleave不冒泡
+    定义 me = Mouse事件_创建("mouseleave", x, y, 0, 0)
+    me.基类.冒泡 = 假
+    me.relatedTarget = 去向
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mouseover(目标, x, y, 来源) {
+    定义 me = Mouse事件_创建("mouseover", x, y, 0, 0)
+    me.基类.冒泡 = 真
+    me.relatedTarget = 来源
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发mouseout(目标, x, y, 去向) {
+    定义 me = Mouse事件_创建("mouseout", x, y, 0, 0)
+    me.基类.冒泡 = 真
+    me.relatedTarget = 去向
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+函数 事件Target_触发contextmenu(目标, x, y) {
+    定义 me = Mouse事件_创建("contextmenu", x, y, 2, 0)
+    me.基类.冒泡 = 真
+    me.基类.可取消 = 真
+    事件Target_dispatch事件(目标, me.基类)
+}
+
+// §8 键盘事件派发
+
+函数 事件Target_触发keydown(目标, key, code, 修饰符) {
+    定义 ke = Keyboard事件_创建("keydown", key, code, 0, 修饰符)
+    ke.基类.冒泡 = 真
+    ke.基类.可取消 = 真
+    事件Target_dispatch事件(目标, ke.基类)
+}
+
+函数 事件Target_触发keyup(目标, key, code, 修饰符) {
+    定义 ke = Keyboard事件_创建("keyup", key, code, 0, 修饰符)
+    ke.基类.冒泡 = 真
+    ke.基类.可取消 = 真
+    事件Target_dispatch事件(目标, ke.基类)
+}
+
+函数 事件Target_触发keypress(目标, charCode) {
+    // keypress已废弃, 但仍需兼容
+    定义 ke = Keyboard事件_创建("keypress", "", "", 0, 0)
+    ke.charCode = charCode
+    ke.基类.冒泡 = 真
+    ke.基类.可取消 = 真
+    事件Target_dispatch事件(目标, ke.基类)
+}
+
+// §9 AI总线: 事件优先级推理 + 语义感知
+
+定义 EWMA_事件_ALPHA = 205   // 0.2 * Q10
+定义 可变 EWMA_事件处理时间 = 0
+
+函数 智能_事件Target_AI语义感知(节点) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0 || 节点 == 0) { 返回 }
+    // DOM操作时触发AI语义分析
+    节点_AI语义分析(节点)
+}
+
+函数 智能_事件Target_AI事件优先级(事件类型, 目标节点) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 128 }
+    // AI总线判断事件处理优先级
+    // 输入: [事件类型哈希, 节点深度, 注意力权重, 冒泡次数]
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, 事件类型 & 0xFF)
+    如果 (目标节点 != 0) {
+        Tensor_写(特征, 0, 1, 目标节点.深度 * Q10 / 32)
+        Tensor_写(特征, 0, 2, 目标节点.注意力权重)
+    } 否则 {
+        Tensor_写(特征, 0, 1, 0)
+        Tensor_写(特征, 0, 2, 0)
+    }
+    Tensor_写(特征, 0, 3, Q10)  // 偏置
+    定义 分数 = AI总线_注意力权重(bus, 特征)
+    Tensor_释放(特征)
+    如果 (分数 > 800) { 返回 255 }   // 极高优先级
+    如果 (分数 > 500) { 返回 192 }   // 高优先级
+    如果 (分数 > 200) { 返回 128 }   // 普通
+    返回 64                            // 低优先级
+}
+
+函数 智能_事件Target_AI反馈处理时间(执行时间_us) {
+    // EWMA平滑事件处理时间
+    EWMA_事件处理时间 = (EWMA_事件_ALPHA * 执行时间_us + (Q10 - EWMA_事件_ALPHA) * EWMA_事件处理时间) / Q10
+}
+
+函数 智能_事件Target_AI应该延迟(事件类型) {
+    // AI判断是否应该延迟处理(降低优先级)
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 假 }
+    // 如果事件处理时间过长且事件不紧急, 延迟处理
+    如果 (EWMA_事件处理时间 > 5000 && 事件类型 != "click" && 事件类型 != "keydown") {
+        返回 真
+    }
+    返回 假
+}
+
+// §10 触摸事件派发
+
+函数 事件Target_触发touchstart(目标, touches, changedTouches) {
+    定义 te = Touch事件_创建("touchstart", touches, changedTouches)
+    te.基础事件.冒泡 = 真
+    te.基础事件.可取消 = 真
+    事件Target_dispatch事件(目标, te.基础事件)
+}
+
+函数 事件Target_触发touchmove(目标, touches, changedTouches) {
+    定义 te = Touch事件_创建("touchmove", touches, changedTouches)
+    te.基础事件.冒泡 = 真
+    te.基础事件.可取消 = 真
+    事件Target_dispatch事件(目标, te.基础事件)
+}
+
+函数 事件Target_触发touchend(目标, touches, changedTouches) {
+    定义 te = Touch事件_创建("touchend", touches, changedTouches)
+    te.基础事件.冒泡 = 真
+    te.基础事件.可取消 = 真
+    事件Target_dispatch事件(目标, te.基础事件)
+}
+
+函数 事件Target_触发touchcancel(目标, touches) {
+    定义 te = Touch事件_创建("touchcancel", touches, [])
+    te.基础事件.冒泡 = 真
+    te.基础事件.可取消 = 假
+    事件Target_dispatch事件(目标, te.基础事件)
+}
+
+函数 事件Target_触发focusin(目标, 来源) {
+    定义 fe = Focus事件_创建("focusin", 来源)
+    fe.基础事件.冒泡 = 真
+    fe.基础事件.可取消 = 假
+    事件Target_dispatch事件(目标, fe.基础事件)
+}
+
+函数 事件Target_触发focusout(目标, 去向) {
+    定义 fe = Focus事件_创建("focusout", 去向)
+    fe.基础事件.冒泡 = 真
+    fe.基础事件.可取消 = 假
+    事件Target_dispatch事件(目标, fe.基础事件)
+}
+
+函数 事件Target_触发wheel(目标, deltaX, deltaY, deltaZ, 模式) {
+    定义 we = Wheel事件_创建("wheel", deltaX, deltaY, deltaZ, 模式)
+    we.基础事件.冒泡 = 真
+    we.基础事件.可取消 = 真
+    事件Target_dispatch事件(目标, we.基础事件)
+}
+
+// §12 事件统计重置与存取
+
+定义 可变 全局_事件分发总数 = 0
+定义 可变 全局_事件冒泡总数 = 0
+定义 可变 全局_事件阻止总数 = 0
+定义 可变 全局_事件延迟总数 = 0
+
+函数 事件_记录分发() { 全局_事件分发总数 = 全局_事件分发总数 + 1 }
+函数 事件_记录冒泡() { 全局_事件冒泡总数 = 全局_事件冒泡总数 + 1 }
+函数 事件_记录阻止() { 全局_事件阻止总数 = 全局_事件阻止总数 + 1 }
+函数 事件_记录延迟() { 全局_事件延迟总数 = 全局_事件延迟总数 + 1 }
+
+函数 事件_获取分发总数() { 返回 全局_事件分发总数 }
+函数 事件_获取EWMA处理时间() { 返回 EWMA_事件处理时间 }
+
+函数 事件_重置统计() {
+    全局_事件分发总数 = 0
+    全局_事件冒泡总数 = 0
+    全局_事件阻止总数 = 0
+    全局_事件延迟总数 = 0
+    EWMA_事件处理时间 = 0
+}
+
+函数 事件_打印统计() {
+    打印行("=== on-事件属性处理统计 ===")
+    打印行("分发总数: " + 整数转字符串(全局_事件分发总数))
+    打印行("冒泡总数: " + 整数转字符串(全局_事件冒泡总数))
+    打印行("阻止总数: " + 整数转字符串(全局_事件阻止总数))
+    打印行("延迟总数: " + 整数转字符串(全局_事件延迟总数))
+    打印行("EWMA处理: " + 整数转字符串(EWMA_事件处理时间) + " us")
+}
+
+// ◆ EDPS 理论 — Event Dispatch Priority Scheduling
+//   公理1: 事件优先级由AI注意力权重与DOM深度联合决定
+//   公理2: EWMA平滑可抑制处理时间抖动
+//   公理3: 触摸/焦点/滚轮事件遵循W3C冒泡规范
+//   定理: 自适应延迟策略使高频低优事件不阻塞关键路径
+//         P(delay|type,ewma) → min(主线程阻塞时间)

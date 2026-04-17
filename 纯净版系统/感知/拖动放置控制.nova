@@ -1,0 +1,497 @@
+// §3 Drag & Drop 控制器
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("./文档事件.nova")
+导入("../中枢/创建甲.nova")
+
+结构 DragState {
+    活跃,
+    源元素,    // u64 拖拽源元素*
+    当前目标,    // u64 当前悬停的元素*
+    数据传输,    // u64 DataTransfer*
+    起始X,
+    起始Y,
+    当前X,
+    当前Y,
+}
+
+定义 可变 全局拖拽状态 = 0
+
+函数 Drag_获取状态() {
+    如果 (全局拖拽状态 == 0) {
+        全局拖拽状态 = 堆_分配(DragState)
+        全局拖拽状态.活跃 = 假
+    }
+    返回 全局拖拽状态
+}
+
+函数 Drag_开始(源元素, x, y) {
+    定义 state = Drag_获取状态()
+    如果 (state == 0 || 源元素 == 0) { 返回 }
+
+    state.数据传输 = DataTransfer_创建()
+    state.数据传输.effectAllowed = EFFECT_ALLOWED_UNINITIALIZED
+
+    // 触发dragstart事件
+    定义 evt = Drag事件_创建("dragstart", x, y, state.数据传输)
+    // dispatch到源元素
+    // 如果pr事件Default()被调用, 取消拖拽
+    // 否则:
+    state.活跃 = 真; state.源元素 = 源元素
+    state.起始X = x; state.起始Y = y; state.当前X = x; state.当前Y = y
+    state.当前目标 = 0
+}
+
+函数 Drag_移动(x, y) {
+    定义 state = Drag_获取状态()
+    如果 (state == 0 || !state.活跃) { 返回 }
+    state.当前X = x; state.当前Y = y
+
+    // 命中测试: 找到当前位置下的元素
+    定义 目标 = 0    // hitTest(x, y)
+
+    // 如果目标改变
+    如果 (目标 != state.当前目标) {
+        // 旧目标: dragleave
+        如果 (state.当前目标 != 0) {
+            定义 leave = Drag事件_创建("dragleave", x, y, state.数据传输)
+        }
+        // 新目标: dr智能体er
+        如果 (目标 != 0) {
+            定义 enter = Drag事件_创建("dr智能体er", x, y, state.数据传输)
+        }
+        state.当前目标 = 目标
+    }
+
+    // 持续触发drag(在源元素上)和dragover(在目标上)
+    定义 drag = Drag事件_创建("drag", x, y, state.数据传输)
+    如果 (state.当前目标 != 0) {
+        定义 over = Drag事件_创建("dragover", x, y, state.数据传输)
+    }
+}
+
+函数 Drag_释放(x, y) {
+    定义 state = Drag_获取状态()
+    如果 (state == 0 || !state.活跃) { 返回 }
+
+    如果 (state.当前目标 != 0) {
+        // 触发drop事件
+        定义 drop = Drag事件_创建("drop", x, y, state.数据传输)
+        // dispatch到当前目标
+        // 处理器中: 事件.dataTransfer.getData('text/plain')
+    }
+
+    // 触发dragend事件(在源元素上)
+    定义 end = Drag事件_创建("dragend", x, y, state.数据传输)
+
+    state.活跃 = 假; state.源元素 = 0; state.当前目标 = 0
+}
+
+结构 Drag事件 {
+    基类,    // 事件
+    clientX,
+    clientY,
+    dataTransfer,    // u64 DataTransfer*
+}
+
+函数 Drag事件_创建(类型, x, y, dt) {
+    定义 evt = 堆_分配(Drag事件)
+    evt.基类 = 事件_创建2(类型, 真, 真)
+    evt.clientX = x; evt.clientY = y; evt.dataTransfer = dt
+    返回 evt
+}
+
+// NDDC理论 — Nova拖放控制器理论
+// (Nova Drag & Drop Controller Theory)
+// 原创DataTransfer多格式数据存储 + 拖放状态机 + AI拖放预测
+// 核心创新: 拖放效果协商 + 拖拽图像 + 命中测试联动
+
+定义 NDDC_版本 = 1
+定义 NDDC_最大数据项 = 16
+定义 NDDC_AI特征维度 = 10
+
+定义 可变 NDDC_拖放总数 = 0
+定义 可变 NDDC_成功数 = 0
+定义 可变 NDDC_取消数 = 0
+定义 可变 NDDC_AI推理次数 = 0
+
+// 效果常量
+定义 EFFECT_NONE = 0
+定义 EFFECT_COPY = 1
+定义 EFFECT_MOVE = 2
+定义 EFFECT_LINK = 3
+定义 EFFECT_ALLOWED_UNINITIALIZED = -1
+
+
+结构 DataTransferItem {
+    类型名,        // MIME类型字符串
+    类型原子,
+    种类,          // 0=string, 1=file
+    数据,            // 字符串或文件指针
+    文件名
+}
+
+结构 DataTransfer {
+    数据项,
+    数据项数,
+    dropEffect,
+    effectAllowed,
+    拖拽图像,      // 可选图像元素
+    图像X偏移,
+    图像Y偏移
+}
+
+函数 DataTransfer_创建() {
+    定义 dt = 堆_分配(DataTransfer)
+    dt.数据项 = 数组_创建(NDDC_最大数据项)
+    dt.数据项数 = 0
+    dt.dropEffect = EFFECT_NONE
+    dt.effectAllowed = EFFECT_ALLOWED_UNINITIALIZED
+    dt.拖拽图像 = 0
+    dt.图像X偏移 = 0
+    dt.图像Y偏移 = 0
+    返回 dt
+}
+
+函数 DataTransfer_释放(dt) {
+    如果 (dt == 0) { 返回 }
+    堆_释放(dt.数据项)
+    堆_释放(dt)
+}
+
+// setData(type, data)
+函数 DataTransfer_setData(dt, 类型, 数据) {
+    如果 (dt == 0) { 返回 }
+    定义 原子 = 原子化(类型)
+
+    // 检查是否已有相同类型
+    定义 可变 i = 0
+    当 (i < dt.数据项数) {
+        如果 (dt.数据项[i].类型原子 == 原子) {
+            dt.数据项[i].数据 = 数据
+            返回
+        }
+        i = i + 1
+    }
+
+    // 新增
+    如果 (dt.数据项数 >= NDDC_最大数据项) { 返回 }
+    定义 idx = dt.数据项数
+    dt.数据项[idx] = {
+        类型名: 类型,
+        类型原子: 原子,
+        种类: 0,
+        数据: 数据,
+        文件名: ""
+    }
+    dt.数据项数 = idx + 1
+}
+
+// getData(type)
+函数 DataTransfer_getData(dt, 类型) {
+    如果 (dt == 0) { 返回 "" }
+    定义 原子 = 原子化(类型)
+    定义 可变 i = 0
+    当 (i < dt.数据项数) {
+        如果 (dt.数据项[i].类型原子 == 原子) {
+            返回 dt.数据项[i].数据
+        }
+        i = i + 1
+    }
+    返回 ""
+}
+
+// clearData(type?)
+函数 DataTransfer_clearData(dt, 类型) {
+    如果 (dt == 0) { 返回 }
+    如果 (类型 == 0) {
+        // 清除所有
+        dt.数据项数 = 0
+        返回
+    }
+    定义 原子 = 原子化(类型)
+    定义 可变 写位 = 0
+    定义 可变 i = 0
+    当 (i < dt.数据项数) {
+        如果 (dt.数据项[i].类型原子 != 原子) {
+            如果 (写位 != i) {
+                dt.数据项[写位] = dt.数据项[i]
+            }
+            写位 = 写位 + 1
+        }
+        i = i + 1
+    }
+    dt.数据项数 = 写位
+}
+
+// setDragImage
+函数 DataTransfer_setDragImage(dt, 元素, x, y) {
+    如果 (dt == 0) { 返回 }
+    dt.拖拽图像 = 元素
+    dt.图像X偏移 = x
+    dt.图像Y偏移 = y
+}
+
+// §5 效果协商
+
+函数 NDDC_协商效果(dt, dropEffect) {
+    如果 (dt == 0) { 返回 EFFECT_NONE }
+
+    // effectAllowed未初始化时返回全部允许
+    如果 (dt.effectAllowed == EFFECT_ALLOWED_UNINITIALIZED) {
+        返回 dropEffect
+    }
+
+    // 检查dropEffect是否在effectAllowed内
+    如果 (dt.effectAllowed == EFFECT_COPY && dropEffect == EFFECT_COPY) { 返回 EFFECT_COPY }
+    如果 (dt.effectAllowed == EFFECT_MOVE && dropEffect == EFFECT_MOVE) { 返回 EFFECT_MOVE }
+    如果 (dt.effectAllowed == EFFECT_LINK && dropEffect == EFFECT_LINK) { 返回 EFFECT_LINK }
+
+    返回 EFFECT_NONE
+}
+
+// §6 完整拖放流程 (带命中测试)
+
+函数 NDDC_完整拖放开始(源元素, x, y) {
+    如果 (源元素 == 0) { 返回 假 }
+
+    // 检查元素是否draggable
+    如果 (!元素_是可拖拽(源元素)) { 返回 假 }
+
+    Drag_开始(源元素, x, y)
+    NDDC_拖放总数 = NDDC_拖放总数 + 1
+    返回 真
+}
+
+函数 NDDC_完整拖放移动(x, y) {
+    定义 state = Drag_获取状态()
+    如果 (state == 0 || !state.活跃) { 返回 }
+
+    // 命中测试找到目标元素
+    定义 目标 = NDDC_命中测试(x, y)
+    Drag_移动(x, y)
+
+    // 更新游标样式
+    如果 (目标 != 0 && state.数据传输 != 0) {
+        定义 效果 = NDDC_协商效果(state.数据传输, state.数据传输.dropEffect)
+        NDDC_更新游标(效果)
+    }
+}
+
+函数 NDDC_完整拖放释放(x, y) {
+    定义 state = Drag_获取状态()
+    如果 (state == 0 || !state.活跃) { 返回 }
+
+    Drag_释放(x, y)
+
+    如果 (state.当前目标 != 0) {
+        NDDC_成功数 = NDDC_成功数 + 1
+    } 否则 {
+        NDDC_取消数 = NDDC_取消数 + 1
+    }
+}
+
+函数 NDDC_命中测试(x, y) {
+    // 遍历文档树找到坐标下的元素
+    // 这里简化为调用全局命中测试
+    返回 0  // 由外部命中测试提供
+}
+
+函数 NDDC_更新游标(效果) {
+    如果 (效果 == EFFECT_COPY) {
+        平台_设置游标(游标_复制)
+    } 否则 如果 (效果 == EFFECT_MOVE) {
+        平台_设置游标(游标_移动)
+    } 否则 如果 (效果 == EFFECT_LINK) {
+        平台_设置游标(游标_链接)
+    } 否则 {
+        平台_设置游标(游标_禁止)
+    }
+}
+
+函数 元素_是可拖拽(元素) {
+    如果 (元素 == 0) { 返回 假 }
+    // 检查draggable属性
+    如果 (元素.属性_draggable == 真) { 返回 真 }
+    // img和a[href]默认可拖拽
+    如果 (元素.标签名原子 == 原子化("img")) { 返回 真 }
+    如果 (元素.标签名原子 == 原子化("a") && 元素.属性_href != 0) { 返回 真 }
+    返回 假
+}
+
+// §7 文件拖放支持
+
+函数 DataTransfer_addFile(dt, 文件名, 类型, 数据, 大小) {
+    如果 (dt == 0 || dt.数据项数 >= NDDC_最大数据项) { 返回 }
+    定义 idx = dt.数据项数
+    dt.数据项[idx] = {
+        类型名: 类型,
+        类型原子: 原子化(类型),
+        种类: 1,
+        数据: 数据,
+        文件名: 文件名
+    }
+    dt.数据项数 = idx + 1
+}
+
+函数 DataTransfer_获取文件数(dt) {
+    如果 (dt == 0) { 返回 0 }
+    定义 可变 计数 = 0
+    定义 可变 i = 0
+    当 (i < dt.数据项数) {
+        如果 (dt.数据项[i].种类 == 1) {
+            计数 = 计数 + 1
+        }
+        i = i + 1
+    }
+    返回 计数
+}
+
+// §8 AI拖放预测 + 诊断
+
+函数 NDDC_AI预测拖放() {
+    定义 特征 = Tensor_创建([NDDC_AI特征维度])
+    Tensor_写(特征, [0], NDDC_拖放总数)
+    Tensor_写(特征, [1], NDDC_成功数)
+    Tensor_写(特征, [2], NDDC_取消数)
+    Tensor_写(特征, [3], 0)
+    Tensor_写(特征, [4], 0)
+    Tensor_写(特征, [5], 0)
+    Tensor_写(特征, [6], 0)
+    Tensor_写(特征, [7], 0)
+    Tensor_写(特征, [8], 0)
+    Tensor_写(特征, [9], 0)
+    定义 预测 = AI总线_推理("NDDC拖放预测", 特征)
+    NDDC_AI推理次数 = NDDC_AI推理次数 + 1
+    Tensor_释放(特征)
+    Tensor_释放(预测)
+}
+
+函数 NDDC_获取统计() {
+    返回 {
+        版本: NDDC_版本,
+        拖放总数: NDDC_拖放总数,
+        成功数: NDDC_成功数,
+        取消数: NDDC_取消数,
+        成功率: NDDC_拖放总数 > 0 ?
+            (NDDC_成功数 * 1000) / NDDC_拖放总数 : 0,
+        AI推理次数: NDDC_AI推理次数
+    }
+}
+
+函数 NDDC_重置统计() {
+    NDDC_拖放总数 = 0
+    NDDC_成功数 = 0
+    NDDC_取消数 = 0
+    NDDC_AI推理次数 = 0
+}
+
+// §9 剪贴板集成
+
+定义 NDDC_剪贴板最大项 = 8
+
+结构 剪贴板项 {
+    类型,
+    数据,
+    时间戳
+}
+
+定义 可变 NDDC_剪贴板 = []
+定义 可变 NDDC_剪贴板数 = 0
+
+函数 NDDC_剪贴板初始化() {
+    NDDC_剪贴板 = 数组_创建(NDDC_剪贴板最大项)
+    NDDC_剪贴板数 = 0
+}
+
+函数 NDDC_剪贴板写入(类型, 数据) {
+    // 检查是否已有同类型
+    定义 原子 = 原子化(类型)
+    定义 可变 i = 0
+    当 (i < NDDC_剪贴板数) {
+        如果 (原子化(NDDC_剪贴板[i].类型) == 原子) {
+            NDDC_剪贴板[i].数据 = 数据
+            NDDC_剪贴板[i].时间戳 = 平台_获取高精度时间()
+            返回
+        }
+        i = i + 1
+    }
+    如果 (NDDC_剪贴板数 >= NDDC_剪贴板最大项) { 返回 }
+    NDDC_剪贴板[NDDC_剪贴板数] = {
+        类型: 类型,
+        数据: 数据,
+        时间戳: 平台_获取高精度时间()
+    }
+    NDDC_剪贴板数 = NDDC_剪贴板数 + 1
+}
+
+函数 NDDC_剪贴板读取(类型) {
+    定义 原子 = 原子化(类型)
+    定义 可变 i = 0
+    当 (i < NDDC_剪贴板数) {
+        如果 (原子化(NDDC_剪贴板[i].类型) == 原子) {
+            返回 NDDC_剪贴板[i].数据
+        }
+        i = i + 1
+    }
+    返回 ""
+}
+
+函数 NDDC_剪贴板清空() {
+    NDDC_剪贴板数 = 0
+}
+
+// §10 选区管理 (Selection API)
+
+结构 文本选区 {
+    锚点节点,
+    锚点偏移,
+    焦点节点,
+    焦点偏移,
+    是否折叠,
+    方向    // 0=前向, 1=后向
+}
+
+定义 可变 全局选区 = 0
+
+函数 选区_获取() {
+    如果 (全局选区 == 0) {
+        全局选区 = 堆_分配(文本选区)
+        全局选区.锚点节点 = 0
+        全局选区.焦点节点 = 0
+        全局选区.是否折叠 = 真
+    }
+    返回 全局选区
+}
+
+函数 选区_设置范围(锚节点, 锚偏移, 焦节点, 焦偏移) {
+    定义 sel = 选区_获取()
+    sel.锚点节点 = 锚节点
+    sel.锚点偏移 = 锚偏移
+    sel.焦点节点 = 焦节点
+    sel.焦点偏移 = 焦偏移
+    sel.是否折叠 = (锚节点 == 焦节点 && 锚偏移 == 焦偏移)
+}
+
+函数 选区_折叠到开头() {
+    定义 sel = 选区_获取()
+    sel.焦点节点 = sel.锚点节点
+    sel.焦点偏移 = sel.锚点偏移
+    sel.是否折叠 = 真
+}
+
+函数 选区_折叠到末尾() {
+    定义 sel = 选区_获取()
+    sel.锚点节点 = sel.焦点节点
+    sel.锚点偏移 = sel.焦点偏移
+    sel.是否折叠 = 真
+}
+
+函数 选区_清除() {
+    定义 sel = 选区_获取()
+    sel.锚点节点 = 0
+    sel.焦点节点 = 0
+    sel.是否折叠 = 真
+}

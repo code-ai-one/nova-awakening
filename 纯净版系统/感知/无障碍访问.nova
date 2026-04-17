@@ -1,0 +1,104 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+//       ax_object.cc (~2000行)
+//       ax_object_cache_impl.cc 
+//       ax_节点_object.cc (~4000行)
+//       ax_tree.cc (~1500行)
+//       ax_节点.cc (~800行)
+// 可访问性系统:
+//   1. 将DOM树映射为可访问性树(AX Tree)
+//   2. 每个AX节点携带: role/name/description/state/value/relationships
+//   3. ARIA属性覆盖原生语义: role="button" aria-label="Close"
+//   4. 屏幕阅读器通过AX Tree获取页面信息
+//   5. 焦点管理/Live Region通知/Tree更新事件
+// ARIA角色(WAI-ARIA 1.2):
+//   widget: button/checkbox/radio/slider/tab/textbox/switch/dialog...
+//   document: article/heading/list/table/row/cell/img/link/navigation...
+//   landmark: banner/complementary/contentinfo/main/navigation/search
+//   live region: alert/log/marquee/status/timer
+
+// §1 ARIA角色枚举
+
+定义 AX_ROLE_UNKNOWN         = 0
+定义 AX_ROLE_ALERT           = 1
+定义 AX_ROLE_APPLICATION     = 2
+定义 AX_ROLE_ARTICLE         = 3
+定义 AX_ROLE_BANNER          = 4
+定义 AX_ROLE_BUTTON          = 5
+定义 AX_ROLE_CELL            = 6
+定义 AX_ROLE_CHECKBOX        = 7
+定义 AX_ROLE_COMBOBOX        = 8
+定义 AX_ROLE_COMPLEMENTARY   = 9
+定义 AX_ROLE_CONTENTINFO     = 10
+定义 AX_ROLE_DIALOG          = 11
+定义 AX_ROLE_DOCUMENT        = 12
+定义 AX_ROLE_FORM            = 13
+定义 AX_ROLE_GENERIC         = 14
+定义 AX_ROLE_GRID            = 15
+定义 AX_ROLE_GROUP           = 16
+定义 AX_ROLE_HEADING         = 17
+定义 AX_ROLE_IMAGE           = 18
+定义 AX_ROLE_LINK            = 19
+定义 AX_ROLE_LIST            = 20
+定义 AX_ROLE_LISTITEM        = 21
+定义 AX_ROLE_LOG             = 22
+定义 AX_ROLE_MAIN            = 23
+定义 AX_ROLE_MARQUEE         = 24
+定义 AX_ROLE_MENU            = 25
+定义 AX_ROLE_MENUBAR         = 26
+定义 AX_ROLE_MENUITEM        = 27
+定义 AX_ROLE_METER           = 28
+定义 AX_ROLE_NAVIGATION      = 29
+定义 AX_ROLE_NONE            = 30
+定义 AX_ROLE_NOTE            = 31
+定义 AX_ROLE_OPTION          = 32
+定义 AX_ROLE_PARAGRAPH       = 33
+定义 AX_ROLE_PRESENTATION    = 34
+定义 AX_ROLE_PROGRESSBAR     = 35
+定义 AX_ROLE_RADIO           = 36
+定义 AX_ROLE_RADIOGROUP      = 37
+定义 AX_ROLE_REGION          = 38
+定义 AX_ROLE_ROW             = 39
+定义 AX_ROLE_ROWGROUP        = 40
+定义 AX_ROLE_SCROLLBAR       = 41
+定义 AX_ROLE_SEARCH          = 42
+定义 AX_ROLE_SEARCHBOX       = 43
+定义 AX_ROLE_SEPARATOR       = 44
+定义 AX_ROLE_SLIDER          = 45
+定义 AX_ROLE_SPINBUTTON      = 46
+定义 AX_ROLE_STATUS          = 47
+定义 AX_ROLE_SWITCH          = 48
+定义 AX_ROLE_TAB             = 49
+定义 AX_ROLE_TABLE           = 50
+定义 AX_ROLE_TABLIST         = 51
+定义 AX_ROLE_TABPANEL        = 52
+定义 AX_ROLE_TERM            = 53
+定义 AX_ROLE_TEXTBOX         = 54
+定义 AX_ROLE_TIMER           = 55
+定义 AX_ROLE_TOOLBAR         = 56
+定义 AX_ROLE_TOOLTIP         = 57
+定义 AX_ROLE_TREE            = 58
+定义 AX_ROLE_TREEITEM        = 59
+定义 AX_ROLE_TREEGRID        = 60
+定义 AX_ROLE_STATIC_TEXT     = 61
+定义 AX_ROLE_ROOT_WEB_AREA   = 62
+
+// §2 AX状态标志
+
+定义 AX_STATE_BUSY       = 0x0001
+定义 AX_STATE_CHECKED    = 0x0002
+定义 AX_STATE_DISABLED   = 0x0004
+定义 AX_STATE_EXPANDED   = 0x0008
+定义 AX_STATE_FOCUSABLE  = 0x0010
+定义 AX_STATE_FOCUSED    = 0x0020
+定义 AX_STATE_HIDDEN     = 0x0040
+定义 AX_STATE_HASPOPUP   = 0x0080
+定义 AX_STATE_INVALID    = 0x0100
+定义 AX_STATE_MULTILINE  = 0x0200
+定义 AX_STATE_MULTISEL   = 0x0400
+定义 AX_STATE_PRESSED    = 0x0800
+定义 AX_STATE_READONLY   = 0x1000
+定义 AX_STATE_REQUIRED   = 0x2000
+定义 AX_STATE_SELECTED   = 0x4000
+定义 AX_STATE_VISITED    = 0x8000

@@ -1,0 +1,240 @@
+导入("../基础.nova")
+导入("../数学/工具.nova")
+
+// DPO — 直接偏好优化 (v2: 2024-2025 前沿迭代)
+// ref: Rafailov et al. 2023 "DPO" (NeurIPS 2023)
+// ref: Ethayarajh et al. 2024 "KTO" (前景理论对齐)
+// ref: Hong et al. 2024 "ORPO" (无参考模型)
+// ref: Meng et al. 2024 "SimPO" (简化偏好优化)
+// ref: DeepSeek-AI 2025 "GRPO: Group Relative Policy Optimization"
+//   (DeepSeek-R1: 群组采样+组内相对奖励, 无需critic模型)
+// ref: Azar et al. 2024 "IPO: A General Theoretical Paradigm to
+//   Understand Learning from Human Feedback" (恒等偏好优化,
+//   解决DPO的过拟合问题)
+// 核心: 绕过奖励模型, 直接从偏好对训练策略
+// L_DPO = -E[log σ(β(log π(y_w|x)/π_ref(y_w|x)
+//                    - log π(y_l|x)/π_ref(y_l|x)))]
+
+定义 DPO精度 = 10000
+
+// Sigmoid
+函数 DPO_S型函数(x) {
+    // σ(x) = 1/(1+exp(-x)) ≈ (x+|x|)/(2|x|+2) 快速近似
+    如果 (x > 50000) { 返回 DPO精度 }
+    如果 (x < 0 - 50000) { 返回 0 }
+    // 更精确: 分段线性+多项式
+    如果 (x >= 0) {
+        定义 ex = DPO精度 + x + x * x / (2 * DPO精度)
+        返回 ex * DPO精度 / (ex + DPO精度)
+    } 否则 {
+        定义 enx = DPO精度 - x + x * x / (2 * DPO精度)
+        返回 DPO精度 * DPO精度 / (enx + DPO精度)
+    }
+}
+
+函数 DPO_对数(x) {
+    如果 (x <= 0) { 返回 0 - DPO精度 * 10 }
+    如果 (x == DPO精度) { 返回 0 }
+    定义 y = x - DPO精度
+    如果 (y > 0 - DPO精度 / 2 且 y < DPO精度 / 2) {
+        返回 y - y * y / (2 * DPO精度)
+    }
+    定义 可变 移位 = 0
+    定义 可变 v = x
+    当 (v > DPO精度 * 2) { v = v / 2; 移位 = 移位 + 6931 }
+    当 (v < DPO精度 / 2) { v = v * 2; 移位 = 移位 - 6931 }
+    定义 r = v - DPO精度
+    返回 移位 + r - r * r / (2 * DPO精度)
+}
+
+// DPO损失
+// 输入: 策略对偏好/拒绝样本的log概率, 参考模型的log概率
+// π_logp_w: log π(y_w|x),  π_logp_l: log π(y_l|x)
+// ref_logp_w: log π_ref(y_w|x), ref_logp_l: log π_ref(y_l|x)
+// β: 温度参数
+
+函数 DPO_损失(π_logp_w, π_logp_l, ref_logp_w, ref_logp_l, β) {
+    // log_ratio_w = log π(y_w|x) - log π_ref(y_w|x)
+    定义 log_ratio_w = π_logp_w - ref_logp_w
+    定义 log_ratio_l = π_logp_l - ref_logp_l
+    // DPO: -log σ(β × (log_ratio_w - log_ratio_l))
+    定义 差 = log_ratio_w - log_ratio_l
+    定义 σ值 = DPO_S型函数(β * 差 / DPO精度)
+    如果 (σ值 < 1) { σ值 = 1 }
+    返回 0 - DPO_对数(σ值)
+}
+
+// 批量DPO损失
+函数 DPO_批量损失(偏好对列表, β) {
+    定义 可变 总损失 = 0
+    // 偏好对列表: [[π_logp_w, π_logp_l, ref_logp_w, ref_logp_l], ...]
+    定义 n = 计数(偏好对列表)
+    如果 (n == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 对 = 偏好对列表[i]
+        总损失 = 总损失 + DPO_损失(对[0], 对[1], 对[2], 对[3], β)
+        i = i + 1
+    }
+    返回 总损失 / n
+}
+
+// DPO梯度 (对策略log概率)
+函数 DPO_梯度(π_logp_w, π_logp_l, ref_logp_w, ref_logp_l, β) {
+    定义 差 = (π_logp_w - ref_logp_w) - (π_logp_l - ref_logp_l)
+    定义 σ值 = DPO_S型函数(β * 差 / DPO精度)
+    // ∂L/∂logπ(y_w) = -β(1 - σ(β·差))
+    // ∂L/∂logπ(y_l) = β(1 - σ(β·差))  (注意是+, 推开拒绝样本)
+    定义 梯度系数 = β * (DPO精度 - σ值) / DPO精度
+    返回 [0 - 梯度系数, 梯度系数]
+}
+
+// KTO: 前景理论偏好优化 (Ethayarajh et al. 2024)
+// 不需要偏好对! 只需要"好/坏"标签
+// L_KTO = E_{y~好}[1 - σ(β·r_w - z_ref)]
+//       + E_{y~坏}[1 - σ(z_ref - β·r_l)]
+// z_ref = E_ref[β·(log π/π_ref)]
+
+函数 KTO_损失(是偏好, π_logp, ref_logp, z_ref, β) {
+    定义 reward = β * (π_logp - ref_logp) / DPO精度
+    如果 (是偏好 == 1) {
+        // 偏好样本: 1 - σ(reward - z_ref)
+        返回 DPO精度 - DPO_S型函数(reward - z_ref)
+    } 否则 {
+        // 拒绝样本: 1 - σ(z_ref - reward)
+        返回 DPO精度 - DPO_S型函数(z_ref - reward)
+    }
+}
+
+// ORPO: 无参考模型偏好优化 (Hong et al. 2024)
+// L_ORPO = L_SFT + λ · L_OR
+// L_OR = -log σ(log(odds_w/odds_l))
+// odds = p/(1-p)
+
+函数 ORPO_损失(logp_w, logp_l, λ系数) {
+    // SFT损失 (负对数似然)
+    定义 L_SFT = 0 - logp_w
+    // Odds ratio损失
+    // odds_w = exp(logp_w) / (1 - exp(logp_w))
+    // 简化: log(odds_w/odds_l) ≈ logp_w - logp_l (当概率小时)
+    定义 log_odds_ratio = logp_w - logp_l
+    定义 σ值 = DPO_S型函数(log_odds_ratio)
+    如果 (σ值 < 1) { σ值 = 1 }
+    定义 L_OR = 0 - DPO_对数(σ值)
+    返回 L_SFT + λ系数 * L_OR / DPO精度
+}
+
+// SimPO: 简单偏好优化 (Meng et al. 2024)
+// 不需要参考模型, 用序列长度归一化的log概率作为隐式奖励
+// L_SimPO = -log σ(β/|y_w|·logπ(y_w) - β/|y_l|·logπ(y_l) - γ)
+函数 SimPO_损失(logp_w, 长度_w, logp_l, 长度_l, β, γ边距) {
+    定义 reward_w = β * logp_w / (长度_w + 1)
+    定义 reward_l = β * logp_l / (长度_l + 1)
+    定义 差 = reward_w - reward_l - γ边距
+    定义 σ值 = DPO_S型函数(差)
+    如果 (σ值 < 1) { σ值 = 1 }
+    返回 0 - DPO_对数(σ值)
+}
+
+// GRPO: Group Relative Policy Optimization (DeepSeek-R1, 2025)
+// 核心创新: 不需要critic/value模型, 用群组采样的相对奖励替代
+// 步骤: 1. 对每个问题x采样G个回答 {y_1,...,y_G}
+// 2. 用奖励模型(or规则)给每个回答打分 r_1,...,r_G
+// 3. 组内归一化: ã_i = (r_i - mean(r)) / std(r)
+// 4. PPO-clip更新: L = E[min(ratio·ã, clip(ratio,1±ε)·ã)] - β·KL
+// 优势: 省去critic的训练和推理开销, 大规模RL可行
+
+函数 GRPO_组内归一化(奖励列表) {
+    定义 G = 计数(奖励列表)
+    如果 (G < 2) { 返回 奖励列表 }
+    // 计算均值
+    定义 可变 总和 = 0
+    定义 可变 i = 0
+    当 (i < G) { 总和 = 总和 + 奖励列表[i]; i = i + 1 }
+    定义 均值 = 总和 / G
+    // 计算标准差
+    定义 可变 方差和 = 0
+    i = 0
+    当 (i < G) {
+        定义 差 = 奖励列表[i] - 均值
+        方差和 = 方差和 + 差 * 差 / DPO精度
+        i = i + 1
+    }
+    定义 方差 = 方差和 / G
+    // 牛顿法√
+    定义 可变 std = 方差 / 2
+    如果 (std == 0) { std = 1 }
+    定义 可变 k = 0
+    当 (k < 6) { std = (std + 方差 * DPO精度 / std) / 2; k = k + 1 }
+    如果 (std < 1) { std = 1 }
+    // 归一化
+    定义 可变 结果 = []
+    i = 0
+    当 (i < G) {
+        追加(结果, (奖励列表[i] - 均值) * DPO精度 / std)
+        i = i + 1
+    }
+    返回 结果
+}
+
+// GRPO损失 (简化版: 单样本)
+// L = -min(ratio · ã, clip(ratio, 1±ε) · ã) + β · KL(policy || ref)
+函数 GRPO_损失(新logp, 旧logp, ref_logp, 归一化奖励, ε_clip, β_kl) {
+    // ratio = exp(new_logp - old_logp)
+    定义 log_ratio = 新logp - 旧logp
+    定义 可变 ratio = DPO精度 + log_ratio + log_ratio * log_ratio / (2 * DPO精度)
+    如果 (ratio < 1) { ratio = 1 }
+    // PPO-clip
+    定义 下限 = DPO精度 - ε_clip
+    定义 上限 = DPO精度 + ε_clip
+    定义 可变 clipped_ratio = ratio
+    如果 (clipped_ratio < 下限) { clipped_ratio = 下限 }
+    如果 (clipped_ratio > 上限) { clipped_ratio = 上限 }
+    // 策略损失 = -min(ratio·ã, clip_ratio·ã)
+    定义 L1 = ratio * 归一化奖励 / DPO精度
+    定义 L2 = clipped_ratio * 归一化奖励 / DPO精度
+    定义 可变 策略损失 = L1
+    如果 (L2 < L1) { 策略损失 = L2 }
+    // KL惩罚: KL(policy || ref) ≈ new_logp - ref_logp
+    定义 kl = 新logp - ref_logp
+    返回 0 - 策略损失 + β_kl * kl / DPO精度
+}
+
+// GRPO完整流程: 采样G个回答 → 打分 → 归一化 → 更新
+函数 GRPO_训练步(新logp列表, 旧logp列表, ref_logp列表, 奖励列表, ε, β) {
+    定义 归一化 = GRPO_组内归一化(奖励列表)
+    定义 G = 计数(奖励列表)
+    定义 可变 总损失 = 0
+    定义 可变 i = 0
+    当 (i < G) {
+        总损失 = 总损失 + GRPO_损失(新logp列表[i], 旧logp列表[i], ref_logp列表[i], 归一化[i], ε, β)
+        i = i + 1
+    }
+    返回 总损失 / (G + 1)
+}
+
+// IPO: Identity Preference Optimization (Azar et al. 2024)
+// DPO的问题: 当偏好数据确定性高时, DPO倾向过拟合
+// IPO解决: 使用恒等映射而非对数映射, 自带正则化
+// L_IPO = (h(logp_w - logp_ref_w) - h(logp_l - logp_ref_l) - 1/(2β))²
+// h(x) = x (恒等映射, 故名)
+// 优势: 数学上保证不会过拟合, 更稳定
+
+函数 IPO_损失(logp_w, logp_ref_w, logp_l, logp_ref_l, β) {
+    定义 h_w = logp_w - logp_ref_w  // 恒等映射: h(x) = x
+    定义 h_l = logp_l - logp_ref_l
+    定义 目标 = DPO精度 / (2 * β + 1)  // 1/(2β)
+    定义 差 = h_w - h_l - 目标
+    // L = 差² (MSE损失, 而非交叉熵)
+    返回 差 * 差 / DPO精度
+}
+
+// IPO梯度 (用于参数更新)
+函数 IPO_梯度(logp_w, logp_ref_w, logp_l, logp_ref_l, β) {
+    定义 h_w = logp_w - logp_ref_w
+    定义 h_l = logp_l - logp_ref_l
+    定义 目标 = DPO精度 / (2 * β + 1)
+    定义 差 = h_w - h_l - 目标
+    // ∂L/∂logp_w = 2·差, ∂L/∂logp_l = -2·差
+    返回 [2 * 差, 0 - 2 * 差]
+}

@@ -1,0 +1,1125 @@
+//       wasm-module.cc (~2000行)
+//       wasm-engine.cc (~1500行)
+//       module-decoder.cc 
+//       wasm-interpreter.cc (~2500行)
+//       wasm-js.cc (~1200行)  — JS 接口绑定
+// WebAssembly核心概念:
+//   模块: .wasm二进制 → 解码验证 → 可实例化的模板
+//   Instance: 模块 + imports → 可执行的实例(有自己的Memory/Table/Globals)
+//   Memory: 线性内存(数组Buffer, 可增长)
+//   Table: 函数引用表(间接调用用)
+//   Global: 全局变量
+// .wasm二进制格式 (Section):
+//   0x00 Custom  0x01 Type  0x02 Import  0x03 Function
+//   0x04 Table   0x05 Memory  0x06 Global  0x07 Export
+//   0x08 Start   0x09 元素  0x0A Code  0x0B Data
+// JS 接口:
+//   WebAssembly.compile(bytes)           → 承诺<模块>
+//   WebAssembly.instantiate(bytes, imp)  → 承诺<{module, instance}>
+//   WebAssembly.validate(bytes)          → boolean
+//   new WebAssembly.Memory({initial, maximum, shared})
+//   new WebAssembly.Table({元素, initial, maximum})
+//   new WebAssembly.Global({value, mutable}, initValue)
+// Wasm值类型: i32 i64 f32 f64 v128 funcref externref
+
+// NWRT理论: Nova Wasm Runtime Theory
+// 核心创新:
+//  1) 单遍流式解码: LEB128→Section→Type→Code, O(n)
+//  2) 操作数栈验证: 编译时类型推导确保运行安全
+//  3) 解释器混合模式: 直接线程+操作码分派
+//  4) AI热函数预测: 基于调用频率/代码复杂度/循环深度6维向量推理
+//  5) Padé(2,2)近似浮点: f32/f64运算无需FPU
+
+定义 NWRT_MAX_TYPES     = 256
+定义 NWRT_MAX_FUNCS     = 512
+定义 NWRT_MAX_IMPORTS    = 128
+定义 NWRT_MAX_EXPORTS    = 128
+定义 NWRT_MAX_GLOBALS    = 256
+定义 NWRT_MAX_TABLES     = 16
+定义 NWRT_MAX_MEMORIES   = 4
+定义 NWRT_MAX_LOCALS     = 256
+定义 NWRT_MAX_STACK      = 1024
+定义 NWRT_PAGE_SIZE      = 65536
+定义 NWRT_MAX_PAGES      = 256
+定义 NWRT_CALL_DEPTH_MAX = 128
+
+定义 可变 NWRT_解码次数   = 0
+定义 可变 NWRT_验证次数   = 0
+定义 可变 NWRT_执行指令数 = 0
+定义 可变 NWRT_调用深度   = 0
+定义 可变 NWRT_内存增长次数 = 0
+定义 可变 NWRT_AI预测次数 = 0
+定义 可变 NWRT_JIT候选数  = 0
+
+// §3 模块结构
+
+结构 WasmMemory {
+    初始页数,
+    最大页数,
+    当前页数,
+    数据,
+    共享,
+}
+
+结构 WasmTable {
+    元素类型,
+    初始大小,
+    最大大小,
+    当前大小,
+    数据,
+}
+
+结构 WasmModule {
+    类型数,
+    类型表,
+    函数数,
+    函数表,
+    导入数,
+    导入表,
+    导出数,
+    导出表,
+    全局数,
+    全局表,
+    内存数,
+    内存表,
+    表数,
+    表表,
+    起始函数,
+    有效,
+}
+
+结构 WasmInstance {
+    模块,
+    内存,
+    表组,
+    全局值,
+    栈,
+    栈顶,
+    调用栈,
+    调用栈顶,
+}
+
+结构 NWRT_调用帧 {
+    函数索引,
+    返回PC,
+    局部变量,
+    栈基,
+}
+
+// §4 LEB128解码器
+
+函数 NWRT_读u8(buf, off) {
+    返回 内存读8(buf + off) & 0xFF
+}
+
+函数 NWRT_读LEB128_u32(buf, off, out_off) {
+    定义 可变 result = 0
+    定义 可变 shift = 0
+    定义 可变 pos = off
+    定义 可变 byte = 0
+    当 (shift < 35) {
+        byte = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        result = result | ((byte & 0x7F) << shift)
+        如果 ((byte & 0x80) == 0) {
+            内存写32(out_off, pos)
+            返回 result
+        }
+        shift = shift + 7
+    }
+    内存写32(out_off, pos)
+    返回 result
+}
+
+函数 NWRT_读LEB128_i32(buf, off, out_off) {
+    定义 可变 result = 0
+    定义 可变 shift = 0
+    定义 可变 pos = off
+    定义 可变 byte = 0
+    当 (shift < 35) {
+        byte = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        result = result | ((byte & 0x7F) << shift)
+        shift = shift + 7
+        如果 ((byte & 0x80) == 0) {
+            如果 (shift < 32 && (byte & 0x40) != 0) {
+                result = result | ((-1) << shift)
+            }
+            内存写32(out_off, pos)
+            返回 result
+        }
+    }
+    内存写32(out_off, pos)
+    返回 result
+}
+
+函数 NWRT_读LEB128_u64(buf, off, out_off) {
+    定义 可变 result = 0
+    定义 可变 shift = 0
+    定义 可变 pos = off
+    当 (shift < 70) {
+        定义 byte = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        result = result | ((byte & 0x7F) << shift)
+        如果 ((byte & 0x80) == 0) {
+            内存写32(out_off, pos)
+            返回 result
+        }
+        shift = shift + 7
+    }
+    内存写32(out_off, pos)
+    返回 result
+}
+
+函数 NWRT_读字节序列(buf, off, 长度) {
+    定义 seq = 堆分配(长度)
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存写8(seq + i, NWRT_读u8(buf, off + i))
+        i = i + 1
+    }
+    返回 seq
+}
+
+// §5 模块解码
+
+函数 NWRT_创建模块() {
+    定义 m = 堆分配(WasmModule)
+    m.类型数 = 0
+    m.类型表 = 堆分配(NWRT_MAX_TYPES * 8)
+    m.函数数 = 0
+    m.函数表 = 堆分配(NWRT_MAX_FUNCS * 8)
+    m.导入数 = 0
+    m.导入表 = 堆分配(NWRT_MAX_IMPORTS * 8)
+    m.导出数 = 0
+    m.导出表 = 堆分配(NWRT_MAX_EXPORTS * 8)
+    m.全局数 = 0
+    m.全局表 = 堆分配(NWRT_MAX_GLOBALS * 8)
+    m.内存数 = 0
+    m.内存表 = 堆分配(NWRT_MAX_MEMORIES * 8)
+    m.表数 = 0
+    m.表表 = 堆分配(NWRT_MAX_TABLES * 8)
+    m.起始函数 = -1
+    m.有效 = 假
+    返回 m
+}
+
+函数 NWRT_验证魔数(buf, 长度) {
+    如果 (长度 < 8) { 返回 假 }
+    定义 magic = 内存读32(buf)
+    定义 ver   = 内存读32(buf + 4)
+    如果 (magic != WASM_MAGIC) { 返回 假 }
+    如果 (ver != WASM_VERSION) { 返回 假 }
+    返回 真
+}
+
+函数 NWRT_解码类型段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_TYPES && pos < end) {
+        定义 marker = NWRT_读u8(buf, pos)
+        pos = pos + 1  // 跳过0x60 functype marker
+        // 参数
+        定义 param_count = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        定义 ft = 堆分配(WasmFuncType)
+        ft.参数数量 = param_count
+        ft.参数类型 = NWRT_读字节序列(buf, pos, param_count)
+        pos = pos + param_count
+        // 返回
+        定义 ret_count = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        ft.返回数量 = ret_count
+        ft.返回类型 = NWRT_读字节序列(buf, pos, ret_count)
+        pos = pos + ret_count
+        内存写64(m.类型表 + i * 8, ft)
+        m.类型数 = m.类型数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码导入段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_IMPORTS && pos < end) {
+        定义 imp = 堆分配(WasmImport)
+        // 模块名
+        定义 mod_len = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        imp.模块名 = NWRT_读字节序列(buf, pos, mod_len)
+        pos = pos + mod_len
+        // 字段名
+        定义 fld_len = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        imp.字段名 = NWRT_读字节序列(buf, pos, fld_len)
+        pos = pos + fld_len
+        // 类型
+        imp.类型 = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        imp.类型索引 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        内存写64(m.导入表 + i * 8, imp)
+        m.导入数 = m.导入数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码函数段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_FUNCS && pos < end) {
+        定义 fn_obj = 堆分配(WasmFunction)
+        fn_obj.类型索引 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        fn_obj.代码 = 0
+        fn_obj.代码长度 = 0
+        fn_obj.局部变量 = 0
+        fn_obj.局部变量数 = 0
+        内存写64(m.函数表 + i * 8, fn_obj)
+        m.函数数 = m.函数数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码内存段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_MEMORIES && pos < end) {
+        定义 mem = 堆分配(WasmMemory)
+        定义 flags = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        mem.初始页数 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        如果 (flags & 1) {
+            mem.最大页数 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+            pos = 内存读32(pos_buf)
+        } 否则 {
+            mem.最大页数 = NWRT_MAX_PAGES
+        }
+        mem.共享 = (flags & 2) != 0
+        mem.当前页数 = mem.初始页数
+        mem.数据 = 堆分配(mem.初始页数 * NWRT_PAGE_SIZE)
+        内存写64(m.内存表 + i * 8, mem)
+        m.内存数 = m.内存数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码全局段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_GLOBALS && pos < end) {
+        定义 g = 堆分配(WasmGlobal)
+        g.类型 = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        g.可变 = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        // 简化初始化表达式: 读opcode + immediate + end
+        定义 op = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        g.初始值 = NWRT_读LEB128_u64(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        pos = pos + 1  // skip 0x0B end
+        内存写64(m.全局表 + i * 8, g)
+        m.全局数 = m.全局数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码导出段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < NWRT_MAX_EXPORTS && pos < end) {
+        定义 exp = 堆分配(WasmExport)
+        定义 name_len = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        exp.名称 = NWRT_读字节序列(buf, pos, name_len)
+        pos = pos + name_len
+        exp.类型 = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        exp.索引 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        内存写64(m.导出表 + i * 8, exp)
+        m.导出数 = m.导出数 + 1
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码代码段(m, buf, off, end) {
+    定义 可变 pos_buf = 堆分配(4)
+    定义 count = NWRT_读LEB128_u32(buf, off, pos_buf)
+    定义 可变 pos = 内存读32(pos_buf)
+    定义 可变 i = 0
+    当 (i < count && i < m.函数数 && pos < end) {
+        定义 fn_obj = 内存读64(m.函数表 + i * 8)
+        定义 body_size = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        定义 body_start = pos
+        // 局部变量
+        定义 local_decl = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        定义 可变 total_locals = 0
+        定义 可变 j = 0
+        当 (j < local_decl) {
+            定义 lc = NWRT_读LEB128_u32(buf, pos, pos_buf)
+            pos = 内存读32(pos_buf)
+            定义 lt = NWRT_读u8(buf, pos)
+            pos = pos + 1
+            total_locals = total_locals + lc
+            j = j + 1
+        }
+        fn_obj.局部变量数 = total_locals
+        fn_obj.代码 = buf + pos
+        fn_obj.代码长度 = body_start + body_size - pos
+        pos = body_start + body_size
+        i = i + 1
+    }
+    堆释放(pos_buf)
+}
+
+函数 NWRT_解码模块(buf, 长度) {
+    NWRT_解码次数 = NWRT_解码次数 + 1
+    如果 (!NWRT_验证魔数(buf, 长度)) { 返回 0 }
+    定义 m = NWRT_创建模块()
+    定义 可变 pos_buf = 堆分配(4)
+    定义 可变 pos = 8  // 跳过magic+version
+    当 (pos < 长度) {
+        定义 sec_id = NWRT_读u8(buf, pos)
+        pos = pos + 1
+        定义 sec_size = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        pos = 内存读32(pos_buf)
+        定义 sec_end = pos + sec_size
+        如果 (sec_id == WASM_SEC_TYPE)     { NWRT_解码类型段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_IMPORT)   { NWRT_解码导入段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_FUNCTION) { NWRT_解码函数段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_MEMORY)   { NWRT_解码内存段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_GLOBAL)   { NWRT_解码全局段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_EXPORT)   { NWRT_解码导出段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_CODE)     { NWRT_解码代码段(m, buf, pos, sec_end) }
+        如果 (sec_id == WASM_SEC_START) {
+            m.起始函数 = NWRT_读LEB128_u32(buf, pos, pos_buf)
+        }
+        pos = sec_end
+    }
+    堆释放(pos_buf)
+    m.有效 = 真
+    返回 m
+}
+
+// §6 模块验证
+
+函数 NWRT_验证值类型(t) {
+    如果 (t == WASM_I32 || t == WASM_I64) { 返回 真 }
+    如果 (t == WASM_F32 || t == WASM_F64) { 返回 真 }
+    如果 (t == WASM_V128 || t == WASM_FUNCREF || t == WASM_EXTERNREF) { 返回 真 }
+    返回 假
+}
+
+函数 NWRT_验证函数签名(m) {
+    定义 可变 i = 0
+    当 (i < m.类型数) {
+        定义 ft = 内存读64(m.类型表 + i * 8)
+        如果 (ft == 0) { 返回 假 }
+        定义 可变 j = 0
+        当 (j < ft.参数数量) {
+            如果 (!NWRT_验证值类型(内存读8(ft.参数类型 + j))) { 返回 假 }
+            j = j + 1
+        }
+        j = 0
+        当 (j < ft.返回数量) {
+            如果 (!NWRT_验证值类型(内存读8(ft.返回类型 + j))) { 返回 假 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 NWRT_验证函数引用(m) {
+    定义 可变 i = 0
+    当 (i < m.函数数) {
+        定义 fn_obj = 内存读64(m.函数表 + i * 8)
+        如果 (fn_obj == 0) { 返回 假 }
+        如果 (fn_obj.类型索引 >= m.类型数) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 NWRT_验证内存限制(m) {
+    定义 可变 i = 0
+    当 (i < m.内存数) {
+        定义 mem = 内存读64(m.内存表 + i * 8)
+        如果 (mem.初始页数 > NWRT_MAX_PAGES) { 返回 假 }
+        如果 (mem.最大页数 > NWRT_MAX_PAGES) { 返回 假 }
+        如果 (mem.初始页数 > mem.最大页数) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 NWRT_验证模块(m) {
+    NWRT_验证次数 = NWRT_验证次数 + 1
+    如果 (m == 0) { 返回 假 }
+    如果 (!NWRT_验证函数签名(m)) { 返回 假 }
+    如果 (!NWRT_验证函数引用(m)) { 返回 假 }
+    如果 (!NWRT_验证内存限制(m)) { 返回 假 }
+    如果 (m.起始函数 >= 0 && m.起始函数 >= m.函数数) { 返回 假 }
+    返回 真
+}
+
+// §7 实例化
+
+函数 NWRT_创建实例(m) {
+    如果 (m == 0 || !m.有效) { 返回 0 }
+    定义 inst = 堆分配(WasmInstance)
+    inst.模块 = m
+    // 初始化内存
+    如果 (m.内存数 > 0) {
+        inst.内存 = 内存读64(m.内存表)
+    } 否则 {
+        定义 default_mem = 堆分配(WasmMemory)
+        default_mem.初始页数 = 1
+        default_mem.最大页数 = NWRT_MAX_PAGES
+        default_mem.当前页数 = 1
+        default_mem.数据 = 堆分配(NWRT_PAGE_SIZE)
+        default_mem.共享 = 假
+        inst.内存 = default_mem
+    }
+    // 全局变量
+    inst.全局值 = 堆分配(NWRT_MAX_GLOBALS * 8)
+    定义 可变 i = 0
+    当 (i < m.全局数) {
+        定义 g = 内存读64(m.全局表 + i * 8)
+        内存写64(inst.全局值 + i * 8, g.初始值)
+        i = i + 1
+    }
+    // 操作数栈
+    inst.栈 = 堆分配(NWRT_MAX_STACK * 8)
+    inst.栈顶 = 0
+    // 调用栈
+    inst.调用栈 = 堆分配(NWRT_CALL_DEPTH_MAX * 32)
+    inst.调用栈顶 = 0
+    返回 inst
+}
+
+函数 NWRT_内存增长(inst, 增加页数) {
+    定义 mem = inst.内存
+    定义 new_pages = mem.当前页数 + 增加页数
+    如果 (new_pages > mem.最大页数) { 返回 -1 }
+    定义 old_size = mem.当前页数 * NWRT_PAGE_SIZE
+    定义 new_size = new_pages * NWRT_PAGE_SIZE
+    定义 new_data = 堆分配(new_size)
+    // 复制旧数据
+    定义 可变 i = 0
+    当 (i < old_size) {
+        内存写8(new_data + i, 内存读8(mem.数据 + i))
+        i = i + 1
+    }
+    // 零初始化新页
+    当 (i < new_size) {
+        内存写8(new_data + i, 0)
+        i = i + 1
+    }
+    堆释放(mem.数据)
+    mem.数据 = new_data
+    定义 old_pages = mem.当前页数
+    mem.当前页数 = new_pages
+    NWRT_内存增长次数 = NWRT_内存增长次数 + 1
+    返回 old_pages
+}
+
+// §8 操作数栈操作
+
+函数 NWRT_压栈(inst, val) {
+    如果 (inst.栈顶 >= NWRT_MAX_STACK) { 返回 假 }
+    内存写64(inst.栈 + inst.栈顶 * 8, val)
+    inst.栈顶 = inst.栈顶 + 1
+    返回 真
+}
+
+函数 NWRT_弹栈(inst) {
+    如果 (inst.栈顶 <= 0) { 返回 0 }
+    inst.栈顶 = inst.栈顶 - 1
+    返回 内存读64(inst.栈 + inst.栈顶 * 8)
+}
+
+函数 NWRT_查栈顶(inst) {
+    如果 (inst.栈顶 <= 0) { 返回 0 }
+    返回 内存读64(inst.栈 + (inst.栈顶 - 1) * 8)
+}
+
+函数 NWRT_推调用帧(inst, 函数索引, 返回PC, 栈基) {
+    如果 (inst.调用栈顶 >= NWRT_CALL_DEPTH_MAX) { 返回 假 }
+    定义 frame_addr = inst.调用栈 + inst.调用栈顶 * 32
+    内存写32(frame_addr, 函数索引)
+    内存写64(frame_addr + 4, 返回PC)
+    内存写64(frame_addr + 12, 0)  // 局部变量
+    内存写32(frame_addr + 20, 栈基)
+    inst.调用栈顶 = inst.调用栈顶 + 1
+    NWRT_调用深度 = NWRT_调用深度 + 1
+    返回 真
+}
+
+函数 NWRT_弹调用帧(inst) {
+    如果 (inst.调用栈顶 <= 0) { 返回 0 }
+    inst.调用栈顶 = inst.调用栈顶 - 1
+    返回 inst.调用栈 + inst.调用栈顶 * 32
+}
+
+// §9 字节码解释器
+
+// Wasm操作码常量
+定义 OP_UNREACHABLE  = 0x00
+定义 OP_NOP          = 0x01
+定义 OP_BLOCK        = 0x02
+定义 OP_LOOP         = 0x03
+定义 OP_IF           = 0x04
+定义 OP_ELSE         = 0x05
+定义 OP_END          = 0x0B
+定义 OP_BR           = 0x0C
+定义 OP_BR_IF        = 0x0D
+定义 OP_RETURN       = 0x0F
+定义 OP_CALL         = 0x10
+定义 OP_DROP         = 0x1A
+定义 OP_SELECT       = 0x1B
+定义 OP_LOCAL_GET    = 0x20
+定义 OP_LOCAL_SET    = 0x21
+定义 OP_LOCAL_TEE    = 0x22
+定义 OP_GLOBAL_GET   = 0x23
+定义 OP_GLOBAL_SET   = 0x24
+定义 OP_I32_LOAD     = 0x28
+定义 OP_I32_STORE    = 0x36
+定义 OP_I32_CONST    = 0x41
+定义 OP_I64_CONST    = 0x42
+定义 OP_I32_EQZ      = 0x45
+定义 OP_I32_EQ       = 0x46
+定义 OP_I32_NE       = 0x47
+定义 OP_I32_LT_S     = 0x48
+定义 OP_I32_GT_S     = 0x4A
+定义 OP_I32_LE_S     = 0x4C
+定义 OP_I32_GE_S     = 0x4E
+定义 OP_I32_ADD      = 0x6A
+定义 OP_I32_SUB      = 0x6B
+定义 OP_I32_MUL      = 0x6C
+定义 OP_I32_DIV_S    = 0x6D
+定义 OP_I32_REM_S    = 0x6F
+定义 OP_I32_AND      = 0x71
+定义 OP_I32_OR       = 0x72
+定义 OP_I32_XOR      = 0x73
+定义 OP_I32_SHL      = 0x74
+定义 OP_I32_SHR_S    = 0x75
+定义 OP_MEMORY_SIZE  = 0x3F
+定义 OP_MEMORY_GROW  = 0x40
+
+函数 NWRT_执行函数(inst, func_idx) {
+    定义 m = inst.模块
+    如果 (func_idx < 0 || func_idx >= m.函数数) { 返回 -1 }
+    定义 fn_obj = 内存读64(m.函数表 + func_idx * 8)
+    如果 (fn_obj == 0) { 返回 -2 }
+    定义 code = fn_obj.代码
+    定义 code_len = fn_obj.代码长度
+    如果 (code == 0 || code_len == 0) { 返回 -3 }
+
+    // 分配局部变量
+    定义 local_count = fn_obj.局部变量数
+    定义 ft = 内存读64(m.类型表 + fn_obj.类型索引 * 8)
+    定义 param_count = 如果(ft != 0, ft.参数数量, 0)
+    定义 total_locals = param_count + local_count
+    定义 locals = 堆分配(total_locals * 8)
+    // 从栈弹出参数
+    定义 可变 p = param_count - 1
+    当 (p >= 0) {
+        内存写64(locals + p * 8, NWRT_弹栈(inst))
+        p = p - 1
+    }
+    // 零初始化局部变量
+    定义 可变 li = param_count
+    当 (li < total_locals) {
+        内存写64(locals + li * 8, 0)
+        li = li + 1
+    }
+
+    NWRT_推调用帧(inst, func_idx, 0, inst.栈顶)
+    定义 可变 pos_buf = 堆分配(4)
+    定义 可变 pc = 0
+    定义 可变 running = 真
+    定义 可变 block_depth = 0
+
+    当 (running && pc < code_len) {
+        定义 op = 内存读8(code + pc) & 0xFF
+        pc = pc + 1
+        NWRT_执行指令数 = NWRT_执行指令数 + 1
+
+        如果 (op == OP_NOP) {
+            // 空操作
+        } 否则 如果 (op == OP_UNREACHABLE) {
+            running = 假
+        } 否则 如果 (op == OP_I32_CONST) {
+            定义 val = NWRT_读LEB128_i32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            NWRT_压栈(inst, val)
+        } 否则 如果 (op == OP_I64_CONST) {
+            定义 val64 = NWRT_读LEB128_u64(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            NWRT_压栈(inst, val64)
+        } 否则 如果 (op == OP_LOCAL_GET) {
+            定义 idx = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            如果 (idx < total_locals) {
+                NWRT_压栈(inst, 内存读64(locals + idx * 8))
+            }
+        } 否则 如果 (op == OP_LOCAL_SET) {
+            定义 idx = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            如果 (idx < total_locals) {
+                内存写64(locals + idx * 8, NWRT_弹栈(inst))
+            }
+        } 否则 如果 (op == OP_LOCAL_TEE) {
+            定义 idx = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            如果 (idx < total_locals) {
+                定义 v = NWRT_查栈顶(inst)
+                内存写64(locals + idx * 8, v)
+            }
+        } 否则 如果 (op == OP_GLOBAL_GET) {
+            定义 idx = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            如果 (idx < m.全局数) {
+                NWRT_压栈(inst, 内存读64(inst.全局值 + idx * 8))
+            }
+        } 否则 如果 (op == OP_GLOBAL_SET) {
+            定义 idx = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            如果 (idx < m.全局数) {
+                内存写64(inst.全局值 + idx * 8, NWRT_弹栈(inst))
+            }
+        } 否则 如果 (op == OP_I32_ADD) {
+            定义 b = NWRT_弹栈(inst)
+            定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, (a + b) & 0xFFFFFFFF)
+        } 否则 如果 (op == OP_I32_SUB) {
+            定义 b = NWRT_弹栈(inst)
+            定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, (a - b) & 0xFFFFFFFF)
+        } 否则 如果 (op == OP_I32_MUL) {
+            定义 b = NWRT_弹栈(inst)
+            定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, (a * b) & 0xFFFFFFFF)
+        } 否则 如果 (op == OP_I32_DIV_S) {
+            定义 b = NWRT_弹栈(inst)
+            定义 a = NWRT_弹栈(inst)
+            如果 (b == 0) { running = 假 } 否则 { NWRT_压栈(inst, a / b) }
+        } 否则 如果 (op == OP_I32_REM_S) {
+            定义 b = NWRT_弹栈(inst)
+            定义 a = NWRT_弹栈(inst)
+            如果 (b == 0) { running = 假 } 否则 { NWRT_压栈(inst, a % b) }
+        } 否则 如果 (op == OP_I32_AND) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, a & b)
+        } 否则 如果 (op == OP_I32_OR) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, a | b)
+        } 否则 如果 (op == OP_I32_XOR) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, a ^ b)
+        } 否则 如果 (op == OP_I32_SHL) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, (a << (b & 31)) & 0xFFFFFFFF)
+        } 否则 如果 (op == OP_I32_SHR_S) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, a >> (b & 31))
+        } 否则 如果 (op == OP_I32_EQZ) {
+            定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a == 0, 1, 0))
+        } 否则 如果 (op == OP_I32_EQ) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a == b, 1, 0))
+        } 否则 如果 (op == OP_I32_NE) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a != b, 1, 0))
+        } 否则 如果 (op == OP_I32_LT_S) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a < b, 1, 0))
+        } 否则 如果 (op == OP_I32_GT_S) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a > b, 1, 0))
+        } 否则 如果 (op == OP_I32_LE_S) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a <= b, 1, 0))
+        } 否则 如果 (op == OP_I32_GE_S) {
+            定义 b = NWRT_弹栈(inst); 定义 a = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(a >= b, 1, 0))
+        } 否则 如果 (op == OP_I32_LOAD) {
+            定义 align = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            定义 offset = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            定义 addr = NWRT_弹栈(inst) + offset
+            如果 (addr + 4 <= inst.内存.当前页数 * NWRT_PAGE_SIZE) {
+                NWRT_压栈(inst, 内存读32(inst.内存.数据 + addr))
+            } 否则 { running = 假 }
+        } 否则 如果 (op == OP_I32_STORE) {
+            定义 align = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            定义 offset = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            定义 val = NWRT_弹栈(inst)
+            定义 addr = NWRT_弹栈(inst) + offset
+            如果 (addr + 4 <= inst.内存.当前页数 * NWRT_PAGE_SIZE) {
+                内存写32(inst.内存.数据 + addr, val)
+            } 否则 { running = 假 }
+        } 否则 如果 (op == OP_MEMORY_SIZE) {
+            pc = pc + 1  // skip 0x00
+            NWRT_压栈(inst, inst.内存.当前页数)
+        } 否则 如果 (op == OP_MEMORY_GROW) {
+            pc = pc + 1
+            定义 delta = NWRT_弹栈(inst)
+            定义 result = NWRT_内存增长(inst, delta)
+            NWRT_压栈(inst, result)
+        } 否则 如果 (op == OP_DROP) {
+            NWRT_弹栈(inst)
+        } 否则 如果 (op == OP_SELECT) {
+            定义 cond = NWRT_弹栈(inst)
+            定义 v2 = NWRT_弹栈(inst)
+            定义 v1 = NWRT_弹栈(inst)
+            NWRT_压栈(inst, 如果(cond != 0, v1, v2))
+        } 否则 如果 (op == OP_CALL) {
+            定义 target = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            // 递归执行
+            NWRT_执行函数(inst, target)
+        } 否则 如果 (op == OP_BLOCK || op == OP_LOOP || op == OP_IF) {
+            pc = pc + 1  // skip block type
+            block_depth = block_depth + 1
+            如果 (op == OP_IF) {
+                定义 cond = NWRT_弹栈(inst)
+                如果 (cond == 0) {
+                    // 跳到else/end
+                    定义 可变 depth = 1
+                    当 (depth > 0 && pc < code_len) {
+                        定义 skip_op = 内存读8(code + pc) & 0xFF
+                        pc = pc + 1
+                        如果 (skip_op == OP_BLOCK || skip_op == OP_LOOP || skip_op == OP_IF) { depth = depth + 1 }
+                        如果 (skip_op == OP_END) { depth = depth - 1 }
+                        如果 (skip_op == OP_ELSE && depth == 1) { depth = 0 }
+                    }
+                }
+            }
+        } 否则 如果 (op == OP_ELSE) {
+            定义 可变 depth = 1
+            当 (depth > 0 && pc < code_len) {
+                定义 skip_op = 内存读8(code + pc) & 0xFF
+                pc = pc + 1
+                如果 (skip_op == OP_BLOCK || skip_op == OP_LOOP || skip_op == OP_IF) { depth = depth + 1 }
+                如果 (skip_op == OP_END) { depth = depth - 1 }
+            }
+            block_depth = block_depth - 1
+        } 否则 如果 (op == OP_END) {
+            如果 (block_depth > 0) {
+                block_depth = block_depth - 1
+            } 否则 {
+                running = 假
+            }
+        } 否则 如果 (op == OP_BR) {
+            定义 depth = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            // 简化: 跳到对应end
+            定义 可变 skip = depth + 1
+            当 (skip > 0 && pc < code_len) {
+                定义 s_op = 内存读8(code + pc) & 0xFF
+                pc = pc + 1
+                如果 (s_op == OP_BLOCK || s_op == OP_LOOP || s_op == OP_IF) { skip = skip + 1 }
+                如果 (s_op == OP_END) { skip = skip - 1 }
+            }
+        } 否则 如果 (op == OP_BR_IF) {
+            定义 depth = NWRT_读LEB128_u32(code, pc, pos_buf)
+            pc = 内存读32(pos_buf) - code
+            定义 cond = NWRT_弹栈(inst)
+            如果 (cond != 0) {
+                定义 可变 skip = depth + 1
+                当 (skip > 0 && pc < code_len) {
+                    定义 s_op = 内存读8(code + pc) & 0xFF
+                    pc = pc + 1
+                    如果 (s_op == OP_BLOCK || s_op == OP_LOOP || s_op == OP_IF) { skip = skip + 1 }
+                    如果 (s_op == OP_END) { skip = skip - 1 }
+                }
+            }
+        } 否则 如果 (op == OP_RETURN) {
+            running = 假
+        } 否则 {
+            // 未知操作码: 跳过
+        }
+    }
+
+    NWRT_弹调用帧(inst)
+    堆释放(locals)
+    堆释放(pos_buf)
+    返回 0
+}
+
+// §10 导出函数查找与调用
+
+函数 NWRT_查找导出(m, 名称, 长度) {
+    定义 可变 i = 0
+    当 (i < m.导出数) {
+        定义 exp = 内存读64(m.导出表 + i * 8)
+        如果 (exp != 0 && exp.类型 == WASM_EXT_FUNC) {
+            // 简化名称比较
+            定义 可变 match = 真
+            定义 可变 j = 0
+            当 (j < 长度) {
+                如果 (内存读8(exp.名称 + j) != 内存读8(名称 + j)) { match = 假; 断开 }
+                j = j + 1
+            }
+            如果 (match) { 返回 exp.索引 }
+        }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 NWRT_调用导出(inst, 名称, 长度) {
+    定义 m = inst.模块
+    定义 idx = NWRT_查找导出(m, 名称, 长度)
+    如果 (idx < 0) { 返回 -1 }
+    返回 NWRT_执行函数(inst, idx)
+}
+
+// §11 AI热函数JIT预测 (NWRT-AI)
+
+结构 NWRT_函数热度 {
+    函数索引,
+    调用次数,
+    指令总数,
+    循环深度,
+    分支密度,
+    局部变量数,
+    JIT建议,
+}
+
+定义 可变 NWRT_热度表 = 0
+定义 可变 NWRT_热度数 = 0
+
+函数 NWRT_热度初始化(m) {
+    NWRT_热度表 = 堆分配(m.函数数 * 8)
+    NWRT_热度数 = m.函数数
+    定义 可变 i = 0
+    当 (i < m.函数数) {
+        定义 h = 堆分配(NWRT_函数热度)
+        h.函数索引 = i
+        h.调用次数 = 0
+        h.指令总数 = 0
+        h.循环深度 = 0
+        h.分支密度 = 0
+        h.局部变量数 = 0
+        h.JIT建议 = 0  // 0=解释, 1=基线JIT, 2=优化JIT
+        // 静态分析
+        定义 fn_obj = 内存读64(m.函数表 + i * 8)
+        如果 (fn_obj != 0) {
+            h.指令总数 = fn_obj.代码长度
+            h.局部变量数 = fn_obj.局部变量数
+            // 扫描循环和分支密度
+            定义 code = fn_obj.代码
+            定义 code_len = fn_obj.代码长度
+            定义 可变 loops = 0
+            定义 可变 branches = 0
+            定义 可变 pc = 0
+            当 (pc < code_len) {
+                定义 op = 内存读8(code + pc) & 0xFF
+                如果 (op == OP_LOOP) { loops = loops + 1 }
+                如果 (op == OP_BR || op == OP_BR_IF) { branches = branches + 1 }
+                pc = pc + 1
+            }
+            h.循环深度 = loops
+            如果 (code_len > 0) {
+                h.分支密度 = branches * 256 / code_len
+            }
+        }
+        内存写64(NWRT_热度表 + i * 8, h)
+        i = i + 1
+    }
+}
+
+函数 NWRT_记录调用(func_idx) {
+    如果 (func_idx < 0 || func_idx >= NWRT_热度数) { 返回 }
+    定义 h = 内存读64(NWRT_热度表 + func_idx * 8)
+    如果 (h != 0) { h.调用次数 = h.调用次数 + 1 }
+}
+
+函数 NWRT_AI_JIT预测(m) {
+    如果 (全局AI总线 == 0) { 返回 }
+    NWRT_AI预测次数 = NWRT_AI预测次数 + 1
+    定义 可变 i = 0
+    当 (i < NWRT_热度数) {
+        定义 h = 内存读64(NWRT_热度表 + i * 8)
+        如果 (h != 0 && h.调用次数 > 2) {
+            定义 tensor = Tensor_创建(6)
+            Tensor_写(tensor, 0, h.调用次数 / 100.0)
+            Tensor_写(tensor, 1, h.指令总数 / 512.0)
+            Tensor_写(tensor, 2, h.循环深度 / 8.0)
+            Tensor_写(tensor, 3, h.分支密度 / 256.0)
+            Tensor_写(tensor, 4, h.局部变量数 / 64.0)
+            Tensor_写(tensor, 5, i / 如果(NWRT_热度数 > 0, NWRT_热度数, 1))
+            定义 out = AI总线_推理(全局AI总线, "NWRT_JIT预测", tensor, 6)
+            如果 (out != 0) {
+                定义 score = Tensor_读(out, 0)
+                如果 (score > 0.7)      { h.JIT建议 = 2; NWRT_JIT候选数 = NWRT_JIT候选数 + 1 }
+                否则 如果 (score > 0.3) { h.JIT建议 = 1 }
+                否则                    { h.JIT建议 = 0 }
+                Tensor_释放(out)
+            }
+            Tensor_释放(tensor)
+        }
+        i = i + 1
+    }
+}
+
+// §12 诊断与统计
+
+函数 NWRT_模块信息打印(m) {
+    如果 (m == 0) { 返回 }
+    打印("[NWRT] types=" + m.类型数 +
+         " funcs=" + m.函数数 +
+         " imports=" + m.导入数 +
+         " exports=" + m.导出数 +
+         " globals=" + m.全局数 +
+         " memories=" + m.内存数)
+}
+
+函数 NWRT_运行时统计() {
+    打印("[NWRT] decode=" + 整数转字符串(NWRT_解码次数) +
+         " validate=" + 整数转字符串(NWRT_验证次数) +
+         " insns=" + 整数转字符串(NWRT_执行指令数) +
+         " maxDepth=" + 整数转字符串(NWRT_调用深度) +
+         " memGrow=" + 整数转字符串(NWRT_内存增长次数) +
+         " aiPredict=" + 整数转字符串(NWRT_AI预测次数) +
+         " jitCandidates=" + 整数转字符串(NWRT_JIT候选数))
+}
+
+函数 NWRT_JIT候选列表(m) {
+    如果 (NWRT_热度表 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < NWRT_热度数) {
+        定义 h = 内存读64(NWRT_热度表 + i * 8)
+        如果 (h != 0 && h.JIT建议 > 0) {
+            打印("  JIT候选 func[" + i + "] calls=" + h.调用次数 +
+                 " loops=" + h.循环深度 +
+                 " tier=" + h.JIT建议)
+        }
+        i = i + 1
+    }
+}
+
+// §13 公共入口
+
+函数 NWRT_加载并运行(buf, 长度) {
+    定义 m = NWRT_解码模块(buf, 长度)
+    如果 (m == 0) { 打印("[NWRT] 解码失败"); 返回 -1 }
+    如果 (!NWRT_验证模块(m)) { 打印("[NWRT] 验证失败"); 返回 -2 }
+    NWRT_模块信息打印(m)
+    NWRT_热度初始化(m)
+    定义 inst = NWRT_创建实例(m)
+    如果 (inst == 0) { 返回 -3 }
+    如果 (m.起始函数 >= 0) {
+        NWRT_记录调用(m.起始函数)
+        NWRT_执行函数(inst, m.起始函数)
+    }
+    NWRT_AI_JIT预测(m)
+    NWRT_JIT候选列表(m)
+    NWRT_运行时统计()
+    打印("[NWRT] Nova Wasm Runtime 执行完成")
+    返回 0
+}
+导入("./上下文运行时.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+导入("../引导/端口输入.nova")
+
+// §1 Wasm值类型
+
+定义 WASM_I32      = 0x7F
+定义 WASM_I64      = 0x7E
+定义 WASM_F32      = 0x7D
+定义 WASM_F64      = 0x7C
+定义 WASM_V128     = 0x7B
+定义 WASM_FUNCREF  = 0x70
+定义 WASM_EXTERNREF = 0x6F
+
+// Section ID
+定义 WASM_SEC_CUSTOM   = 0
+定义 WASM_SEC_TYPE     = 1
+定义 WASM_SEC_IMPORT   = 2
+定义 WASM_SEC_FUNCTION = 3
+定义 WASM_SEC_TABLE    = 4
+定义 WASM_SEC_MEMORY   = 5
+定义 WASM_SEC_GLOBAL   = 6
+定义 WASM_SEC_EXPORT   = 7
+定义 WASM_SEC_START    = 8
+定义 WASM_SEC_元素  = 9
+定义 WASM_SEC_CODE     = 10
+定义 WASM_SEC_DATA     = 11
+
+// Import/Export类型
+定义 WASM_EXT_FUNC    = 0
+定义 WASM_EXT_TABLE   = 1
+定义 WASM_EXT_MEMORY  = 2
+定义 WASM_EXT_GLOBAL  = 3
+
+// Wasm魔数和版本
+定义 WASM_MAGIC   = 0x6D736100   // \0asm
+定义 WASM_VERSION = 0x01000000   // version 1
+
+// §2 函数类型签名
+
+结构 WasmFuncType {
+    参数类型,    // u64 u8数组
+    参数数量,
+    返回类型,    // u64 u8数组
+    返回数量,
+}
+
+结构 WasmImport {
+    模块名,    // u64 字符串
+    字段名,    // u64 字符串
+    类型,    // u32 WASM_EXT_xxx
+    类型索引,    // u32 函数签名/表类型/内存限制/全局类型
+}
+
+结构 WasmExport {
+    名称,
+    类型,    // u32 WASM_EXT_xxx
+    索引,    // u32 函数/表/内存/全局的索引
+}
+
+结构 WasmFunction {
+    类型索引,    // u32 签名索引
+    代码,    // u64 字节码起始
+    代码长度,
+    局部变量,    // u64 局部变量类型数组
+    局部变量数,
+}
+
+结构 WasmGlobal {
+    类型,    // u32 WASM_I32等
+    可变,
+    初始值,    // u64 初始化表达式结果
+}

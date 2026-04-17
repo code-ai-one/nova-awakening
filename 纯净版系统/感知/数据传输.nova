@@ -1,0 +1,107 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §2 DataTransfer (用于Drag&Drop和copy/paste事件)
+
+定义 DROP_EFFECT_NONE    = 0
+定义 DROP_EFFECT_COPY    = 1
+定义 DROP_EFFECT_MOVE    = 2
+定义 DROP_EFFECT_LINK    = 3
+
+定义 EFFECT_ALLOWED_NONE          = 0
+定义 EFFECT_ALLOWED_COPY          = 1
+定义 EFFECT_ALLOWED_MOVE          = 2
+定义 EFFECT_ALLOWED_LINK          = 3
+定义 EFFECT_ALLOWED_COPY_MOVE     = 4
+定义 EFFECT_ALLOWED_COPY_LINK     = 5
+定义 EFFECT_ALLOWED_MOVE_LINK     = 6
+定义 EFFECT_ALLOWED_ALL           = 7
+定义 EFFECT_ALLOWED_UNINITIALIZED = 8
+
+结构 DataTransferItem {
+    kind,    // u8 0="string" 1="file"
+    类型,    // u64 MIME类型
+    数据,    // u64 字符串或File*
+    数据长度,
+}
+
+结构 DataTransfer {
+    dropEffect,    // u8 DROP_EFFECT_xxx
+    effectAllowed,    // u8 EFFECT_ALLOWED_xxx
+    // 数据项
+    items,    // [16]DataTransferItem
+    items数,
+    // 拖拽图像
+    拖拽图像,    // u64 元素*或图像Bitmap*
+    拖拽偏移X,
+    拖拽偏移Y,
+    // 文件列表
+    files,    // [8]u64 File*
+    files数,
+}
+
+函数 DataTransfer_创建() {
+    定义 dt = 堆_分配(DataTransfer)
+    dt.dropEffect = DROP_EFFECT_NONE
+    dt.effectAllowed = EFFECT_ALLOWED_UNINITIALIZED
+    dt.items数 = 0; dt.files数 = 0
+    dt.拖拽图像 = 0; dt.拖拽偏移X = 0; dt.拖拽偏移Y = 0
+    返回 dt
+}
+
+函数 DataTransfer_setData(dt, 类型, 数据) {
+    如果 (dt == 0 || 类型 == 0 || 数据 == 0) { 返回 }
+    // 检查是否已有同类型
+    定义 可变 i = 0
+    当 (i < dt.items数) {
+        如果 (字符串_相等(dt.items[i].类型, 类型)) {
+            dt.items[i].数据 = 字符串_复制(数据)
+            dt.items[i].数据长度 = 字节长度(数据)
+            返回
+        }
+        i = i + 1
+    }
+    如果 (dt.items数 >= 16) { 返回 }
+    dt.items[dt.items数].kind = 0    // string
+    dt.items[dt.items数].类型 = 字符串_复制(类型)
+    dt.items[dt.items数].数据 = 字符串_复制(数据)
+    dt.items[dt.items数].数据长度 = 字节长度(数据)
+    dt.items数 = dt.items数 + 1
+}
+
+函数 DataTransfer_getData(dt, 类型) {
+    如果 (dt == 0 || 类型 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < dt.items数) {
+        如果 (字符串_相等(dt.items[i].类型, 类型)) { 返回 dt.items[i].数据 }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 DataTransfer_clearData(dt, 类型) {
+    如果 (dt == 0) { 返回 }
+    如果 (类型 == 0) { dt.items数 = 0; 返回 }
+    定义 可变 i = 0
+    当 (i < dt.items数) {
+        如果 (字符串_相等(dt.items[i].类型, 类型)) {
+            // 移除: 后面的前移
+            定义 可变 j = i
+            当 (j < dt.items数 - 1) {
+                dt.items[j] = dt.items[j + 1]
+                j = j + 1
+            }
+            dt.items数 = dt.items数 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 DataTransfer_setDrag图像(dt, image, x, y) {
+    如果 (dt == 0) { 返回 }
+    dt.拖拽图像 = image; dt.拖拽偏移X = x; dt.拖拽偏移Y = y
+}

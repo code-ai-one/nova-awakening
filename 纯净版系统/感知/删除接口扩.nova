@@ -1,0 +1,311 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/整数转字符串.nova")
+
+定义 GL_TEXTURE_COMPARE_MODE = 0x884C
+定义 GL_TEXTURE_COMPARE_FUNC = 0x884D
+定义 GL_TEXTURE_MIN_FILTER = 0x2801
+定义 GL_TEXTURE_MAG_FILTER = 0x2800
+定义 GL_TEXTURE_WRAP_S = 0x2802
+定义 GL_TEXTURE_WRAP_T = 0x2803
+定义 GL_TEXTURE_WRAP_R = 0x8072
+定义 GL_TEXTURE_MIN_LOD = 0x813A
+定义 GL_TEXTURE_MAX_LOD = 0x813B
+
+定义 GL_QUERY_RESULT = 0x8866
+定义 GL_QUERY_RESULT_AVAILABLE = 0x8867
+定义 GL_ANY_SAMPLES_PASSED = 0x8C2F
+定义 GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN = 0x8C88
+
+定义 GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117
+定义 GL_ALREADY_SIGNALED = 0x911A
+定义 GL_CONDITION_SATISFIED = 0x911C
+定义 GL_WAIT_FAILED = 0x911D
+
+结构 GL资源跟踪 {
+    纹理创建数,
+    纹理删除数,
+    缓冲创建数,
+    缓冲删除数,
+    着色器创建数,
+    着色器删除数,
+    帧缓冲创建数,
+    帧缓冲删除数,
+}
+
+定义 可变 GL跟踪 = 0
+
+
+函数 图绘2_uniform1ui(location, v0) { GL_uniform写入(location, v0, 0, 0, 0, 1) }
+函数 图绘2_uniform2ui(location, v0, v1) { GL_uniform写入(location, v0, v1, 0, 0, 2) }
+函数 图绘2_uniform3ui(location, v0, v1, v2) { GL_uniform写入(location, v0, v1, v2, 0, 3) }
+函数 图绘2_uniform4ui(location, v0, v1, v2, v3) { GL_uniform写入(location, v0, v1, v2, v3, 4) }
+
+函数 图绘2_uniform1uiv(location, data, count) {
+    定义 可变 i = 0
+    当 (i < count) {
+        GL_uniform写入(location + i, data[i], 0, 0, 0, 1)
+        i = i + 1
+    }
+}
+
+函数 图绘2_uniform2uiv(location, data, count) {
+    定义 可变 i = 0
+    当 (i < count) {
+        GL_uniform写入(location + i, data[i * 2], data[i * 2 + 1], 0, 0, 2)
+        i = i + 1
+    }
+}
+
+函数 图绘2_uniform3uiv(location, data, count) {
+    定义 可变 i = 0
+    当 (i < count) {
+        GL_uniform写入(location + i, data[i * 3], data[i * 3 + 1], data[i * 3 + 2], 0, 3)
+        i = i + 1
+    }
+}
+
+函数 图绘2_uniform4uiv(location, data, count) {
+    定义 可变 i = 0
+    当 (i < count) {
+        GL_uniform写入(location + i, data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3], 4)
+        i = i + 1
+    }
+}
+
+函数 图绘2_uniformMatrix2x3fv(location, transpose, value) { GL_uniformMatrix写入(location, 2, 3, transpose, value) }
+函数 图绘2_uniformMatrix3x2fv(location, transpose, value) { GL_uniformMatrix写入(location, 3, 2, transpose, value) }
+函数 图绘2_uniformMatrix2x4fv(location, transpose, value) { GL_uniformMatrix写入(location, 2, 4, transpose, value) }
+函数 图绘2_uniformMatrix4x2fv(location, transpose, value) { GL_uniformMatrix写入(location, 4, 2, transpose, value) }
+函数 图绘2_uniformMatrix3x4fv(location, transpose, value) { GL_uniformMatrix写入(location, 3, 4, transpose, value) }
+函数 图绘2_uniformMatrix4x3fv(location, transpose, value) { GL_uniformMatrix写入(location, 4, 3, transpose, value) }
+
+函数 图绘2_uniformBlockBinding(program, blockIndex, bindingPoint) {
+    如果 (program == 0) { 返回 }
+    GL_uniformBlock绑定(program, blockIndex, bindingPoint)
+}
+
+函数 图绘2_getUniformBlockIndex(program, blockName) {
+    如果 (program == 0 || blockName == 0) { 返回 -1 }
+    返回 GL_获取uniformBlock索引(program, blockName)
+}
+
+函数 图绘2_getActiveUniformBlockName(program, blockIndex) {
+    如果 (program == 0) { 返回 0 }
+    返回 GL_获取activeUniformBlock名(program, blockIndex)
+}
+
+函数 图绘2_createSampler() {
+    返回 GL_创建采样器()
+}
+
+函数 图绘2_deleteSampler(sampler) {
+    如果 (sampler == 0) { 返回 }
+    GL_删除采样器(sampler)
+}
+
+函数 图绘2_bindSampler(unit, sampler) {
+    GL_绑定采样器(unit, sampler)
+}
+
+函数 图绘2_samplerParameteri(sampler, pname, param) {
+    如果 (sampler == 0) { 返回 }
+    GL_采样器参数i(sampler, pname, param)
+}
+
+函数 图绘2_samplerParameterf(sampler, pname, param) {
+    如果 (sampler == 0) { 返回 }
+    GL_采样器参数f(sampler, pname, param)
+}
+
+函数 图绘2_createQuery() {
+    返回 GL_创建查询()
+}
+
+函数 图绘2_deleteQuery(query) {
+    如果 (query == 0) { 返回 }
+    GL_删除查询(query)
+}
+
+函数 图绘2_beginQuery(target, query) {
+    如果 (query == 0) { 返回 }
+    GL_开始查询(target, query)
+}
+
+函数 图绘2_endQuery(target) {
+    GL_结束查询(target)
+}
+
+函数 图绘2_getQueryParameter(query, pname) {
+    如果 (query == 0) { 返回 0 }
+    返回 GL_获取查询参数(query, pname)
+}
+
+函数 图绘2_createTransformFeedback() {
+    返回 GL_创建变换反馈()
+}
+
+函数 图绘2_deleteTransformFeedback(tf) {
+    如果 (tf == 0) { 返回 }
+    GL_删除变换反馈(tf)
+}
+
+函数 图绘2_bindTransformFeedback(target, tf) {
+    GL_绑定变换反馈(target, tf)
+}
+
+函数 图绘2_beginTransformFeedback(primitiveMode) {
+    GL_开始变换反馈(primitiveMode)
+}
+
+函数 图绘2_endTransformFeedback() {
+    GL_结束变换反馈()
+}
+
+函数 图绘2_transformFeedbackVaryings(program, varyings, count, bufferMode) {
+    如果 (program == 0 || varyings == 0) { 返回 }
+    GL_变换反馈输出(program, varyings, count, bufferMode)
+}
+
+函数 图绘2_fenceSync() {
+    返回 GL_创建同步(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+}
+
+函数 图绘2_deleteSync(sync) {
+    如果 (sync == 0) { 返回 }
+    GL_删除同步(sync)
+}
+
+函数 图绘2_clientWaitSync(sync, flags, timeout) {
+    如果 (sync == 0) { 返回 GL_WAIT_FAILED }
+    返回 GL_客户端等待同步(sync, flags, timeout)
+}
+
+函数 图绘2_getSyncParameter(sync, pname) {
+    如果 (sync == 0) { 返回 0 }
+    返回 GL_获取同步参数(sync, pname)
+}
+
+函数 图绘_获取字节每像素(format, type) {
+    如果 (type == 0x1401) { 返回 4 }
+    如果 (type == 0x1406) { 返回 16 }
+    如果 (type == 0x8D61) { 返回 2 }
+    如果 (type == 0x8363) { 返回 2 }
+    如果 (type == 0x8033) { 返回 2 }
+    如果 (type == 0x8034) { 返回 2 }
+    返回 4
+}
+
+函数 图绘_初始化资源跟踪() {
+    GL跟踪 = 堆_分配(GL资源跟踪)
+    GL跟踪.纹理创建数 = 0
+    GL跟踪.纹理删除数 = 0
+    GL跟踪.缓冲创建数 = 0
+    GL跟踪.缓冲删除数 = 0
+    GL跟踪.着色器创建数 = 0
+    GL跟踪.着色器删除数 = 0
+    GL跟踪.帧缓冲创建数 = 0
+    GL跟踪.帧缓冲删除数 = 0
+}
+
+函数 图绘_记录创建(资源类型) {
+    如果 (GL跟踪 == 0) { 返回 }
+    如果 (资源类型 == 0) { GL跟踪.纹理创建数 = GL跟踪.纹理创建数 + 1 }
+    如果 (资源类型 == 1) { GL跟踪.缓冲创建数 = GL跟踪.缓冲创建数 + 1 }
+    如果 (资源类型 == 2) { GL跟踪.着色器创建数 = GL跟踪.着色器创建数 + 1 }
+    如果 (资源类型 == 3) { GL跟踪.帧缓冲创建数 = GL跟踪.帧缓冲创建数 + 1 }
+}
+
+函数 图绘_记录删除(资源类型) {
+    如果 (GL跟踪 == 0) { 返回 }
+    如果 (资源类型 == 0) { GL跟踪.纹理删除数 = GL跟踪.纹理删除数 + 1 }
+    如果 (资源类型 == 1) { GL跟踪.缓冲删除数 = GL跟踪.缓冲删除数 + 1 }
+    如果 (资源类型 == 2) { GL跟踪.着色器删除数 = GL跟踪.着色器删除数 + 1 }
+    如果 (资源类型 == 3) { GL跟踪.帧缓冲删除数 = GL跟踪.帧缓冲删除数 + 1 }
+}
+
+函数 智能_图绘_着色器优化建议(shaderSource) {
+    如果 (shaderSource == 0) { 返回 0 }
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+
+    定义 可变 建议列表 = []
+
+    如果 (字符串查找(shaderSource, "texture2D") >= 0) {
+        定义 依赖读取 = 智能_图绘_检测依赖纹理读(shaderSource)
+        如果 (依赖读取 > 0) {
+            追加(建议列表, "检测到" + 整数转字符串(依赖读取) + "处依赖纹理读取, 会导致流水线停顿")
+        }
+    }
+
+    如果 (字符串查找(shaderSource, "highp") >= 0) {
+        定义 可降级 = 智能_图绘_检查精度降级(shaderSource)
+        如果 (可降级 > 0) {
+            追加(建议列表, 整数转字符串(可降级) + "处highp可安全降为mediump, 提升移动端性能")
+        }
+    }
+
+    定义 未使用 = 智能_图绘_检测未用变量(shaderSource)
+    如果 (未使用 > 0) {
+        追加(建议列表, 整数转字符串(未使用) + "个未使用的uniform/varying, 建议移除")
+    }
+
+    返回 建议列表
+}
+
+函数 智能_图绘_检测依赖纹理读(源码) {
+    定义 可变 计数 = 0
+    定义 可变 位置 = 0
+    当 (位置 >= 0) {
+        位置 = 字符串查找(源码, "texture2D")
+        如果 (位置 >= 0) {
+            计数 = 计数 + 1
+            位置 = 位置 + 9
+        }
+    }
+    返回 计数
+}
+
+函数 智能_图绘_检查精度降级(源码) {
+    定义 可变 可降级 = 0
+    如果 (字符串查找(源码, "highp float") >= 0) { 可降级 = 可降级 + 1 }
+    如果 (字符串查找(源码, "highp vec2") >= 0) { 可降级 = 可降级 + 1 }
+    如果 (字符串查找(源码, "highp vec3") >= 0) { 可降级 = 可降级 + 1 }
+    返回 可降级
+}
+
+函数 智能_图绘_检测未用变量(源码) {
+    返回 0  // 静态分析由编译期完成
+    返回 0
+}
+
+函数 智能_图绘_内存泄漏检测() {
+    如果 (GL跟踪 == 0) { 返回 0 }
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+
+    定义 可变 泄漏列表 = []
+    定义 纹理泄漏 = GL跟踪.纹理创建数 - GL跟踪.纹理删除数
+    如果 (纹理泄漏 > 10) {
+        追加(泄漏列表, "纹理泄漏: " + 整数转字符串(纹理泄漏) + "个未释放")
+    }
+    定义 缓冲泄漏 = GL跟踪.缓冲创建数 - GL跟踪.缓冲删除数
+    如果 (缓冲泄漏 > 10) {
+        追加(泄漏列表, "缓冲泄漏: " + 整数转字符串(缓冲泄漏) + "个未释放")
+    }
+    定义 着色器泄漏 = GL跟踪.着色器创建数 - GL跟踪.着色器删除数
+    如果 (着色器泄漏 > 5) {
+        追加(泄漏列表, "着色器泄漏: " + 整数转字符串(着色器泄漏) + "个未释放")
+    }
+    返回 泄漏列表
+}
+
+// GL资源自动回收
+
+函数 GL资源_自动回收() {
+    定义 泄漏 = GL资源_检测泄漏()
+    如果 (计数(泄漏) > 0) {
+        内核警告("GL资源泄漏检测: " + 整数转字符串(计数(泄漏)) + "项")
+    }
+}

@@ -1,0 +1,115 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../执行/控制台输出.nova")
+
+// §5 图像Data — 像素级操作
+
+结构 图像Data {
+    数据,    // u64 Uint8Clamped数组 (RGBA)
+    宽度,
+    高度,
+    色彩空间,    // u8 0=srgb 1=display-p3
+}
+
+
+函数 图像Data_创建(宽度, 高度) {
+    定义 id = 堆_分配(图像Data)
+    id.宽度 = 宽度; id.高度 = 高度
+    id.色彩空间 = 0
+    定义 大小 = 宽度 * 高度 * 4
+    id.数据 = 堆_分配(大小)
+    // 初始化为透明黑色
+    内存_填充(id.数据, 0, 大小)
+    返回 id
+}
+
+函数 图像Data_获取像素(id, x, y) {
+    如果 (id == 0 || x >= id.宽度 || y >= id.高度) { 返回 0 }
+    定义 偏移 = (y * id.宽度 + x) * 4
+    定义 r = 字节取(id.数据, 偏移)
+    定义 g = 字节取(id.数据, 偏移 + 1)
+    定义 b = 字节取(id.数据, 偏移 + 2)
+    定义 a = 字节取(id.数据, 偏移 + 3)
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+函数 图像Data_设置像素(id, x, y, rgba) {
+    如果 (id == 0 || x >= id.宽度 || y >= id.高度) { 返回 }
+    定义 偏移 = (y * id.宽度 + x) * 4
+    字节写(id.数据, 偏移, (rgba >> 16) & 0xFF)       // R
+    字节写(id.数据, 偏移 + 1, (rgba >> 8) & 0xFF)    // G
+    字节写(id.数据, 偏移 + 2, rgba & 0xFF)            // B
+    字节写(id.数据, 偏移 + 3, (rgba >> 24) & 0xFF)   // A
+}
+
+// §6 画布状态 (画布State)
+
+结构 画布State {
+    // 变换矩阵 (2D affine) [a,b,c,d,e,f] = | a c e |
+    //                                        | b d f |
+    变换,    // [6]i32 Q10
+    // 裁剪路径
+    裁剪路径,    // u64 Path2D*
+    // 填充/描边样式
+    fill样式_颜色,    // u32 RGBA
+    fill样式_渐变,    // u64 画布Gradient*
+    fill样式_图案,    // u64 画布Pattern*
+    stroke样式_颜色,
+    stroke样式_渐变,
+    stroke样式_图案,
+    // 线条
+    lineWidth,    // i32 Q10
+    lineCap,
+    lineJoin,
+    miterLimit,    // i32 Q10
+    // 虚线
+    lineDash,    // [16]i32 Q10
+    lineDash数,
+    lineDashOffset,
+    // 阴影
+    shadowColor,    // u32 RGBA
+    shadowBlur,    // i32 Q10
+    shadowOffsetX,
+    shadowOffsetY,
+    // 文本
+    font,    // u64 字体描述字符串
+    fontSize,    // i32 Q10
+    textAlign,
+    textBaseline,
+    direction,
+    letterSpacing,
+    wordSpacing,
+    // 合成
+    globalAlpha,    // i32 Q10 (0-1024)
+    globalCompositeOperation,
+    // 滤镜
+    filter,    // u64 CSS滤镜字符串
+    // 平滑
+    imageSmoothingEnabled,
+    imageSmoothingQuality,
+    // 栈链接
+    上一个状态,    // u64 画布State* (save/restore栈)
+}
+
+函数 画布State_创建() {
+    定义 s = 堆_分配(画布State)
+    // 单位矩阵
+    s.变换[0] = 1024; s.变换[1] = 0; s.变换[2] = 0
+    s.变换[3] = 1024; s.变换[4] = 0; s.变换[5] = 0
+    s.裁剪路径 = 0
+    s.fill样式_颜色 = 0xFF000000    // 黑色
+    s.fill样式_渐变 = 0; s.fill样式_图案 = 0
+    s.stroke样式_颜色 = 0xFF000000
+    s.stroke样式_渐变 = 0; s.stroke样式_图案 = 0
+    s.lineWidth = 1024; s.lineCap = CAP_BUTT; s.lineJoin = JOIN_MITER
+    s.miterLimit = 10240; s.lineDash数 = 0; s.lineDashOffset = 0
+    s.shadowColor = 0; s.shadowBlur = 0; s.shadowOffsetX = 0; s.shadowOffsetY = 0
+    s.font = 0; s.fontSize = 10240    // 10px
+    s.textAlign = TEXT_ALIGN_START; s.textBaseline = TEXT_BASE_ALPHABETIC
+    s.direction = TEXT_DIR_INHERIT
+    s.globalAlpha = 1024; s.globalCompositeOperation = COMP_SOURCE_OVER
+    s.filter = 0; s.imageSmoothingEnabled = 真; s.imageSmoothingQuality = SMOOTH_LOW
+    s.上一个状态 = 0
+    返回 s
+}

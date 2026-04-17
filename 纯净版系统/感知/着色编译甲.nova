@@ -1,0 +1,160 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+
+
+函数 ShaderCompiler_预处理(sc) {
+    如果 (sc == 0) { 返回 }
+    // 处理: #version 300 es
+    //       #define / #ifdef / #ifndef / #else / #endif
+    //       #extension
+    // 解析#version
+    定义 可变 i = 0
+    当 (i < sc.源码长度) {
+        定义 ch = 字节取(sc.源码, i)
+        如果 (ch == 35) {    // '#'
+            // 检查 #version
+            如果 (i + 8 < sc.源码长度) {
+                如果 (字节取(sc.源码, i+1) == 118) {   // 'v'ersion
+                    sc.版本 = 300
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 ShaderCompiler_词法分析(sc) {
+    如果 (sc == 0) { 返回 }
+    sc.位置 = 0
+    当 (sc.位置 < sc.源码长度 && sc.令牌数 < sc.令牌容量) {
+        定义 ch = 字节取(sc.源码, sc.位置)
+        // 跳过空白
+        如果 (ch == 32 || ch == 9 || ch == 13) { sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 10) { sc.当前行 = sc.当前行 + 1; sc.当前列 = 1; sc.位置 = sc.位置 + 1; 继续 }
+        // 跳过注释
+        如果 (ch == 47 && sc.位置 + 1 < sc.源码长度) {
+            定义 next = 字节取(sc.源码, sc.位置 + 1)
+            如果 (next == 47) {   // // 行注释
+                当 (sc.位置 < sc.源码长度 && 字节取(sc.源码, sc.位置) != 10) { sc.位置 = sc.位置 + 1 }
+                继续
+            }
+            如果 (next == 42) {   // /* 块注释 */
+                sc.位置 = sc.位置 + 2
+                当 (sc.位置 + 1 < sc.源码长度) {
+                    如果 (字节取(sc.源码, sc.位置) == 42 && 字节取(sc.源码, sc.位置+1) == 47) {
+                        sc.位置 = sc.位置 + 2; 跳出
+                    }
+                    如果 (字节取(sc.源码, sc.位置) == 10) { sc.当前行 = sc.当前行 + 1 }
+                    sc.位置 = sc.位置 + 1
+                }
+                继续
+            }
+        }
+        // 预处理指令
+        如果 (ch == 35) {
+            GLSL_添加令牌(sc, GLSL_TOK_PREPROC, 0)
+            当 (sc.位置 < sc.源码长度 && 字节取(sc.源码, sc.位置) != 10) { sc.位置 = sc.位置 + 1 }
+            继续
+        }
+        // 标识符/关键字
+        如果 ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95) {
+            定义 起始 = sc.位置
+            当 (sc.位置 < sc.源码长度) {
+                定义 c = 字节取(sc.源码, sc.位置)
+                如果 (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95)) { 跳出 }
+                sc.位置 = sc.位置 + 1
+            }
+            定义 词 = 字符串_子串(sc.源码, 起始, sc.位置)
+            定义 是关键字 = GLSL_是关键字(词)
+            GLSL_添加令牌(sc, 如果(是关键字, GLSL_TOK_KEYWORD, GLSL_TOK_IDENT), 词)
+            继续
+        }
+        // 数字
+        如果 (ch >= 48 && ch <= 57) {
+            定义 起始 = sc.位置
+            定义 可变 是浮点 = 假
+            当 (sc.位置 < sc.源码长度) {
+                定义 c = 字节取(sc.源码, sc.位置)
+                如果 (c == 46) { 是浮点 = 真 }
+                否则 如果 (!(c >= 48 && c <= 57) && c != 101 && c != 69 && c != 102) { 跳出 }
+                sc.位置 = sc.位置 + 1
+            }
+            GLSL_添加令牌(sc, 如果(是浮点, GLSL_TOK_FLOAT, GLSL_TOK_INT), 0)
+            继续
+        }
+        // 运算符和标点
+        如果 (ch == 59) { GLSL_添加令牌(sc, GLSL_TOK_SEMICOL, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 123) { GLSL_添加令牌(sc, GLSL_TOK_LBRACE, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 125) { GLSL_添加令牌(sc, GLSL_TOK_RBRACE, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 40) { GLSL_添加令牌(sc, GLSL_TOK_LPAREN, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 41) { GLSL_添加令牌(sc, GLSL_TOK_RPAREN, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 44) { GLSL_添加令牌(sc, GLSL_TOK_COMMA, 0); sc.位置 = sc.位置 + 1; 继续 }
+        如果 (ch == 46) { GLSL_添加令牌(sc, GLSL_TOK_DOT, 0); sc.位置 = sc.位置 + 1; 继续 }
+        GLSL_添加令牌(sc, GLSL_TOK_OPERATOR, ch)
+        sc.位置 = sc.位置 + 1
+    }
+    GLSL_添加令牌(sc, GLSL_TOK_EOF, 0)
+}
+
+函数 GLSL_添加令牌(sc, 类型, 值) {
+    如果 (sc == 0 || sc.令牌数 >= sc.令牌容量) { 返回 }
+    定义 t = sc.令牌s + sc.令牌数 * 大小of(GLSL令牌)
+    t.类型 = 类型; t.值 = 值; t.行号 = sc.当前行; t.列号 = sc.当前列
+    sc.令牌数 = sc.令牌数 + 1
+}
+
+函数 GLSL_是关键字(词) {
+    如果 (词 == 0) { 返回 假 }
+    如果 (字符串_相等(词, "void") || 字符串_相等(词, "bool") ||
+        字符串_相等(词, "int") || 字符串_相等(词, "uint") ||
+        字符串_相等(词, "float") || 字符串_相等(词, "vec2") ||
+        字符串_相等(词, "vec3") || 字符串_相等(词, "vec4") ||
+        字符串_相等(词, "mat2") || 字符串_相等(词, "mat3") ||
+        字符串_相等(词, "mat4") || 字符串_相等(词, "sampler2D") ||
+        字符串_相等(词, "sampler3D") || 字符串_相等(词, "samplerCube") ||
+        字符串_相等(词, "in") || 字符串_相等(词, "out") ||
+        字符串_相等(词, "uniform") || 字符串_相等(词, "const") ||
+        字符串_相等(词, "if") || 字符串_相等(词, "else") ||
+        字符串_相等(词, "for") || 字符串_相等(词, "while") ||
+        字符串_相等(词, "return") || 字符串_相等(词, "discard") ||
+        字符串_相等(词, "struct") || 字符串_相等(词, "layout") ||
+        字符串_相等(词, "precision") || 字符串_相等(词, "flat") ||
+        字符串_相等(词, "smooth")) {
+        返回 真
+    }
+    返回 假
+}
+
+函数 ShaderCompiler_语法分析(sc) {
+    如果 (sc == 0) { 返回 }
+    // 递归下降解析GLSL
+    // translation_unit = external_declaration*
+    // external_declaration = function_definition | declaration
+    // function_definition = type identifier '(' params ')' compound_statement
+    // declaration = [layout_qualifier] [precision] type identifier [= initializer] ';'
+}
+
+函数 ShaderCompiler_语义检查(sc) {
+    如果 (sc == 0) { 返回 }
+    // 类型检查: 赋值兼容性, 函数参数匹配
+    // 矩阵*向量维度匹配
+    // uniform/in/out限定符合法性
+    // 顶点着色器必须写gl_Position
+    // 片段着色器输出类型匹配
+}
+
+函数 ShaderCompiler_优化(sc) {
+    如果 (sc == 0) { 返回 }
+    // 常量折叠
+    // 死代码消除
+    // 向量swizzle优化
+    // 纹理采样合并
+}
+
+函数 ShaderCompiler_生成代码(sc, 着色器类型) {
+    如果 (sc == 0) { 返回 }
+    // 生成图处字节码或SPIR-V
+}

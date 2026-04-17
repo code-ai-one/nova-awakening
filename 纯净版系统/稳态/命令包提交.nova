@@ -1,0 +1,118 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/完成量完成.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/高级中控设置.nova")
+
+// §10 PM4命令包提交
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 AMD_PM4_写(环_CPU地址, 写偏移, 值) {
+    内存写32(环_CPU地址 + 写偏移, 值)
+    返回 写偏移 + 4
+}
+
+函数 AMD_PM4_头(操作码, 数据词数) {
+    // Type3包头: [31:30]=11 [29:16]=数据词数-1 [15:8]=操作码 [7:0]=保留
+    返回 PM4_TYPE3 | ((数据词数 - 1) << 16) | (操作码 << 8)
+}
+
+函数 AMD_GFX_提交(环地址_CPU, 写偏移, 环大小) {
+    // 通知图处: 更新GFX环WPTR
+    定义 mmio = AMD状态.mmio
+    AMD状态.GFX环_WPTR = 写偏移
+    内存屏障_写()
+    MMIO写32(mmio + mmCP_RB_WPTR, 写偏移 / 4)  // WPTR单位是DWord
+}
+
+函数 AMD_计算_提交(写偏移) {
+    定义 mmio = AMD状态.mmio
+    AMD状态.计算环_WPTR = 写偏移
+    内存屏障_写()
+    MMIO写32(mmio + mmCP_COMPUTE_RB_WPTR, 写偏移 / 4)
+}
+
+// §11 图处 2D加速(PM4命令)
+
+函数 AMD_2D_矩形填充(x, y, 宽, 高, 颜色) {
+    如果 (!AMD状态.已初始化 || AMD状态.GFX环_地址 == 空) { 返回 }
+    定义 环地址 = AMD状态.GFX环_地址.CPU地址
+    定义 可变 偏移 = AMD状态.GFX环_WPTR
+
+    // 写SET_CONTEXT_REG设置渲染目标颜色
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_SET_CONTEXT_REG, 2))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x010C)   // CB_COLOR0_BASE偏移
+    偏移 = AMD_PM4_写(环地址, 偏移, 颜色)
+
+    // 写DRAW命令(矩形)
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_DRAW_INDEX_AUTO, 2))
+    偏移 = AMD_PM4_写(环地址, 偏移, 6)         // 6个顶点(2个三角形)
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)         // 标志
+
+    // 同步
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_事件_WRITE, 1))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x14)      // CACHE_FLUSH_AND_INV
+
+    AMD_GFX_提交(环地址, 偏移, AMD状态.GFX环_大小)
+}
+
+函数 AMD_直传_复制(源地址, 目标地址, 大小) {
+    如果 (!AMD状态.已初始化 || AMD状态.GFX环_地址 == 空) { 返回 }
+    定义 环地址 = AMD状态.GFX环_地址.CPU地址
+    定义 可变 偏移 = AMD状态.GFX环_WPTR
+
+    // PM4 直传_DATA命令
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_直传_DATA, 6))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)                                // 控制(线性→线性)
+    偏移 = AMD_PM4_写(环地址, 偏移, 源地址 & 0xFFFFFFFF)              // 源低
+    偏移 = AMD_PM4_写(环地址, 偏移, (源地址 >> 32) & 0xFFFFFFFF)      // 源高
+    偏移 = AMD_PM4_写(环地址, 偏移, 目标地址 & 0xFFFFFFFF)            // 目标低
+    偏移 = AMD_PM4_写(环地址, 偏移, (目标地址 >> 32) & 0xFFFFFFFF)    // 目标高
+    偏移 = AMD_PM4_写(环地址, 偏移, 大小)                              // 字节数
+
+    AMD_GFX_提交(环地址, 偏移, AMD状态.GFX环_大小)
+}
+
+// §12 图处计算分发(Compute Shader)
+
+函数 AMD_计算分发(核函数地址, 网格X, 网格Y, 网格Z, 块X, 块Y, 块Z) {
+    如果 (!AMD状态.已初始化 || AMD状态.计算环_地址 == 空) { 返回 错误_未就绪 }
+    定义 环地址 = AMD状态.计算环_地址.CPU地址
+    定义 可变 偏移 = AMD状态.计算环_WPTR
+
+    // 设置着色器程序地址
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_SET_SH_REG, 3))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x020C)   // COMPUTE_PGM_LO
+    偏移 = AMD_PM4_写(环地址, 偏移, (核函数地址 >> 8) & 0xFFFFFFFF)
+    偏移 = AMD_PM4_写(环地址, 偏移, (核函数地址 >> 40) & 0xFF)
+
+    // 设置工作组大小
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_SET_SH_REG, 2))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x0212)   // COMPUTE_NUM_THREAD_X
+    偏移 = AMD_PM4_写(环地址, 偏移, 块X | (块Y << 16))
+    // Z维度
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_SET_SH_REG, 2))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x0214)   // COMPUTE_NUM_THREAD_Z
+    偏移 = AMD_PM4_写(环地址, 偏移, 块Z)
+
+    // 分发计算: DISPATCH_DIRECT
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_DISPATCH_DIRECT, 4))
+    偏移 = AMD_PM4_写(环地址, 偏移, 网格X)
+    偏移 = AMD_PM4_写(环地址, 偏移, 网格Y)
+    偏移 = AMD_PM4_写(环地址, 偏移, 网格Z)
+    偏移 = AMD_PM4_写(环地址, 偏移, 1)   // DISPATCH_INITIATOR
+
+    // 栅栏(完成通知)
+    AMD状态.栅栏值 = AMD状态.栅栏值 + 1
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD_PM4_头(PM4_RELEASE_MEM, 7))
+    偏移 = AMD_PM4_写(环地址, 偏移, 0x50000000)  // 缓存策略
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)            // 地址低
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)            // 地址高
+    偏移 = AMD_PM4_写(环地址, 偏移, AMD状态.栅栏值 & 0xFFFFFFFF)
+    偏移 = AMD_PM4_写(环地址, 偏移, (AMD状态.栅栏值 >> 32) & 0xFFFFFFFF)
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)
+    偏移 = AMD_PM4_写(环地址, 偏移, 0)
+
+    AMD_计算_提交(偏移)
+    返回 成功
+}

@@ -1,0 +1,28 @@
+函数 exp_approx(x) {
+    定义 x2 = x * x
+    定义 x3 = x2 * x
+    定义 x4 = x3 * x
+    定义 x5 = x4 * x
+    定义 x6 = x5 * x
+    返回 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0 + x5 / 120.0 + x6 / 720.0
+}
+
+函数 softmax2(a, b) {
+    定义 可变 m = a
+    如果 (b > m) { m = b }
+    定义 ea = exp_approx(a - m)
+    定义 eb = exp_approx(b - m)
+    定义 s = ea + eb
+    返回 [ea / s, eb / s]
+}
+
+函数 主程序() {
+    定义 r = softmax2(1.0, 0.0)
+    打印(字符串拼接("r[0] bits=", 转字符串(r[0])))
+    打印(字符串拼接("r[1] bits=", 转字符串(r[1])))
+    定义 sum = r[0] + r[1]
+    打印(字符串拼接("sum bits=", 转字符串(sum)))
+    定义 diff = sum - 1.0
+    打印(字符串拼接("diff bits=", 转字符串(diff)))
+    返回 0
+}

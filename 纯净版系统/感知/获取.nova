@@ -1,0 +1,132 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/创建甲.nova")
+
+// 对应: nova/renderer/modules/geolocation/ (
+// nova/renderer/modules/battery/ (
+// nova/renderer/modules/gamepad/ (
+// nova/renderer/modules/screen_orientation/ (
+// Geolocation 接口:
+// navigator.geolocation.getCurrentPosition(success, error, options)
+// navigator.geolocation.watchPosition(success, error, options)
+// navigator.geolocation.clearWatch(id)
+// Screen Orientation 接口:
+// screen.orientation.type / angle / lock(type) / unlock()
+// Battery Status 接口:
+// navigator.getBattery() → BatteryManager
+// battery.charging / chargingTime / dischargingTime / level
+// Vibration 接口:
+// navigator.vibrate(pattern)
+// Gamepad 接口:
+// navigator.getGamepads()
+// window.ongamepadconnected / ongamepaddisconnected
+// gamepad.buttons / axes / id / mapping / timestamp
+// Screen Wake Lock 接口:
+// navigator.wakeLock.request('screen') → WakeLockSentinel
+// Device Memory 接口:
+// navigator.deviceMemory → 近似内存(GB)
+// Network Information 接口:
+// navigator.connection → NetworkInformation
+// connection.effectiveType / downlink / Nova往返时间 / saveData
+
+// §1 Geolocation
+
+定义 GEO_PERMISSION_DENIED = 1
+定义 GEO_POSITION_UNAVAILABLE = 2
+定义 GEO_TIMEOUT = 3
+
+结构 GeolocationPosition {
+ 纬度,    // i64 Q20 (degrees, -90~90)
+ 经度,    // i64 Q20 (degrees, -180~180)
+ 海拔,    // i64 Q10 (meters, 可选)
+ 精度,    // u32 meters
+ 海拔精度,    // u32 meters
+ 航向,    // i32 Q10 degrees (0-360, 可选)
+ 速度,    // i32 Q10 m/s (可选)
+ 时间戳,    // u64 毫秒
+}
+
+结构 GeolocationOptions {
+ enableHighAccuracy,
+ timeout,    // u32 毫秒 (0=无限)
+ maximumAge,    // u32 毫秒 (缓存有效期)
+}
+
+结构 GeolocationWatch {
+ ID,
+ 成功回调,
+ 错误回调,
+ 选项,    // GeolocationOptions
+ 活跃,
+}
+
+结构 Geolocation {
+ // 权限
+ 权限,    // u8 0=prompt 1=granted 2=denied
+ // 缓存位置
+ 最后位置,    // u64 GeolocationPosition*
+ 最后时间,
+ // Watch列表
+ watches,    // [16]GeolocationWatch
+ watch数,
+ 下一个watchID,
+}
+
+定义 可变 全局Geo = 0
+
+函数 Geo_获取() {
+ 如果 (全局Geo == 0) {
+ 全局Geo = 堆_分配(Geolocation)
+ 全局Geo.权限 = 0; 全局Geo.最后位置 = 0; 全局Geo.最后时间 = 0
+ 全局Geo.watch数 = 0; 全局Geo.下一个watchID = 1
+ }
+ 返回 全局Geo
+}
+
+函数 Geo_getCurrentPosition(成功回调, 错误回调, highAccuracy, timeout, maxAge) {
+ 定义 geo = Geo_获取()
+ 如果 (geo.权限 == 2) {
+ // 权限被拒绝
+ 如果 (错误回调 != 0) { /* 调用错误(GEO_PERMISSION_DENIED) */ }
+ 返回
+ }
+ // 检查缓存
+ 如果 (geo.最后位置 != 0 && maxAge > 0) {
+ 定义 age = 平台_获取高精度时间() - geo.最后时间
+ 如果 (age <= maxAge) {
+ 如果 (成功回调 != 0) { /* 调用成功(geo.最后位置) */ }
+ 返回
+ }
+ }
+ // 请求平台位置
+ 定义 pos = 堆_分配(GeolocationPosition)
+ pos.时间戳 = 平台_获取高精度时间()
+ // 平台调用获取GPS/WiFi/Cell定位
+ geo.最后位置 = pos; geo.最后时间 = pos.时间戳
+ 如果 (成功回调 != 0) { /* 调用成功(pos) */ }
+}
+
+函数 Geo_watchPosition(成功回调, 错误回调, highAccuracy, timeout, maxAge) {
+ 定义 geo = Geo_获取()
+ 如果 (geo.watch数 >= 16) { 返回 0 }
+ 定义 id = geo.下一个watchID; geo.下一个watchID = geo.下一个watchID + 1
+ 定义 idx = geo.watch数
+ geo.watches[idx].ID = id
+ geo.watches[idx].成功回调 = 成功回调
+ geo.watches[idx].错误回调 = 错误回调
+ geo.watches[idx].选项.enableHighAccuracy = highAccuracy
+ geo.watches[idx].选项.timeout = timeout
+ geo.watches[idx].选项.maximumAge = maxAge
+ geo.watches[idx].活跃 = 真
+ geo.watch数 = geo.watch数 + 1
+ 返回 id
+}
+
+函数 Geo_clearWatch(id) {
+ 定义 geo = Geo_获取()
+ 定义 可变 i = 0
+ 当 (i < geo.watch数) {
+ 如果 (geo.watches[i].ID == id) { geo.watches[i].活跃 = 假; 返回 }
+ i = i + 1
+ }
+}

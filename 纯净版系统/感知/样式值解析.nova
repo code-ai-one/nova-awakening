@@ -1,0 +1,104 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/配置获取.nova")
+
+    如果 (style.height >= 0 && style.height != -1) {
+        定义 内容高 = CSS值_解析为像素(style.height, 包含块高)
+        如果 (style.box_sizing == 1) {
+            内容高 = 内容高 - layout.padding_top - layout.padding_bottom
+                     - layout.border_top - layout.border_bottom
+            如果 (内容高 < 0) { 内容高 = 0 }
+        }
+        layout.高度 = 内容高
+        layout.高度已确定 = 真
+    }
+
+    如果 (style.margin_left == -1 && style.margin_right == -1 && 宽度指定 >= 0) {
+        // 两侧auto: 水平居中
+        定义 总宽 = 内容宽 + layout.padding_left + layout.padding_right
+                   + layout.border_left + layout.border_right
+        定义 剩余 = 包含块宽 - 总宽
+        如果 (剩余 > 0) {
+            layout.margin_left = 剩余 / 2
+            layout.margin_right = 剩余 - layout.margin_left
+        } 否则 {
+            layout.margin_left = 0
+            layout.margin_right = 0
+        }
+    } 否则 如果 (style.margin_left == -1) {
+        layout.margin_left = 0
+    } 否则 如果 (style.margin_right == -1) {
+        layout.margin_right = 0
+    }
+}
+
+
+函数 CSS值_解析为像素(值, 参照) {
+    // 值的编码: 正数=px×100, 负数特殊含义
+    // 百分比编码: 值 = -(百分比×100 + 10000)
+    // em编码: 值 = -(em值×100 + 20000)
+    如果 (值 >= 0) { 返回 值 }    // 已经是px×100
+    如果 (值 == -1) { 返回 0 }    // auto → 0(由上下文决定)
+
+    定义 编码 = 0 - 值
+    如果 (编码 >= 10000 && 编码 < 20000) {
+        // 百分比
+        定义 百分比 = 编码 - 10000
+        返回 参照 * 百分比 / 10000
+    }
+    如果 (编码 >= 20000 && 编码 < 30000) {
+        // em (相对于元素计算后字号)
+        定义 em值 = 编码 - 20000
+        // 从元素样式获取计算后字号, 默认回退1600 (16px×100)
+        定义 font_size = 1600    // 默认16px×100
+        // 实际应从当前元素的Computed样式.font_size获取
+        返回 em值 * font_size / 10000
+    }
+    如果 (编码 >= 30000 && 编码 < 40000) {
+        // rem (相对于根字号)
+        定义 rem值 = 编码 - 30000
+        返回 rem值 * 16
+    }
+    如果 (编码 >= 40000 && 编码 < 50000) {
+        // vw (相对于视口宽度)
+        定义 vw值 = 编码 - 40000
+        // 从配置系统获取实际视口宽度
+        定义 视口宽 = Config_视口宽() * 100    // 像素×100
+        返回 视口宽 * vw值 / 10000
+    }
+
+    返回 0
+}
+
+函数 CSS值_解析margin(值, 参照) {
+    如果 (值 == -1) { 返回 -1 }    // auto保持-1标记
+    返回 CSS值_解析为像素(值, 参照)
+}
+
+函数 CSS值_解析边框宽(值) {
+    如果 (值 == 0) { 返回 0 }
+    如果 (值 == -10) { 返回 100 }     // thin = 1px
+    如果 (值 == -20) { 返回 300 }     // medium = 3px
+    如果 (值 == -30) { 返回 500 }     // thick = 5px
+    返回 值    // px×100
+}
+
+// §2 块级 Flow 布局 — 块级布局主算法
+// (对应 布局块级Flow::布局Children + 布局块级::布局Child)
+// 算法:
+//   1. 遍历所有子节点
+//   2. 每个子节点解析盒模型
+//   3. 处理margin折叠
+//   4. 处理浮动(float)
+//   5. 定位子节点(y += 子高度 + margin)
+//   6. 计算自身高度
+
+函数 布局块级Flow_布局(layout) {
+    如果 (layout == 0) { 返回 }
+    定义 style = layout.样式
+    如果 (style == 0) { 返回 }
+
+    // 包含块尺寸
+    定义 包含块宽 = layout.宽度
+    定义 包含块高 = layout.高度
+    如果 (包含块高 == 0) { 包含块高 = 100000 }    // 未确定高度用大值

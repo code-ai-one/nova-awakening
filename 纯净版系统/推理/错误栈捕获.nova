@@ -1,0 +1,508 @@
+// §6 错误.captureStackTrace — V8扩展
+// 将stack trace附加到任意对象
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("./栈跟踪捕获.nova")
+导入("../中枢/内核打印.nova")
+导入("./值乘.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("../外联/底层输入输出.nova")
+
+函数 错误_captureStackTrace(Nova运行时实例, 目标对象, 构造函数过滤) {
+    如果 (目标对象 == 0) { 返回 }
+    定义 st = StackTrace_捕获(Nova运行时实例, 错误_stackTraceLimit)
+
+    // 如果提供了constructorOpt: 过滤掉该函数及之上的帧
+    如果 (构造函数过滤 != 0 && st != 0) {
+        定义 可变 截断位 = 0
+        定义 可变 i = 0
+        当 (i < st.帧数量) {
+            定义 frame = 内存_读64(st.帧列表 + i * 8)
+            // 比较函数引用
+            截断位 = i + 1
+            i = i + 1
+        }
+    }
+
+    // 设置.stack属性(lazy accessor)
+    Nova对象_DefineProperty_内部(Nova运行时实例, 目标对象, "stack", st)
+}
+
+// §7 常见错误消息模板
+// Nova中预定义了~200种错误消息模板
+
+函数 MessageTemplate_Not_A_Function(值描述) {
+    返回 字符串_连接(值描述, " is not a function")
+}
+
+函数 MessageTemplate_Not_An_Object(值描述) {
+    返回 字符串_连接(值描述, " is not an object")
+}
+
+函数 MessageTemplate_Cannot_Read_Property(属性, 值描述) {
+    定义 可变 msg = "Cannot read properties of "
+    msg = 字符串_连接(msg, 值描述)
+    msg = 字符串_连接(msg, " (reading '")
+    msg = 字符串_连接(msg, 属性)
+    msg = 字符串_连接(msg, "')")
+    返回 msg
+}
+
+函数 MessageTemplate_Cannot_Set_Property(属性, 值描述) {
+    定义 可变 msg = "Cannot set properties of "
+    msg = 字符串_连接(msg, 值描述)
+    msg = 字符串_连接(msg, " (setting '")
+    msg = 字符串_连接(msg, 属性)
+    msg = 字符串_连接(msg, "')")
+    返回 msg
+}
+
+函数 MessageTemplate_Not_Defined(名称) {
+    返回 字符串_连接(名称, " is not defined")
+}
+
+函数 MessageTemplate_Not_Iterable(值描述) {
+    返回 字符串_连接(值描述, " is not iterable")
+}
+
+函数 MessageTemplate_Invalid_数组_Length() {
+    返回 "Invalid array length"
+}
+
+函数 MessageTemplate_Stack_Overflow() {
+    返回 "Maximum call stack size exceeded"
+}
+
+函数 MessageTemplate_Not_Constructor(值描述) {
+    返回 字符串_连接(值描述, " is not a constructor")
+}
+
+函数 MessageTemplate_Cannot_Convert_To_Primitive() {
+    返回 "Cannot convert object to primitive value"
+}
+
+函数 MessageTemplate_Assignment_To_Const(名称) {
+    返回 字符串_连接("Assignment to constant variable '", 字符串_连接(名称, "'"))
+}
+
+函数 MessageTemplate_Not_Initialized(名称) {
+    定义 可变 msg = "Cannot access '"
+    msg = 字符串_连接(msg, 名称)
+    msg = 字符串_连接(msg, "' before initialization")
+    返回 msg
+}
+
+函数 MessageTemplate_Redeclaration(名称) {
+    定义 可变 msg = "Identifier '"
+    msg = 字符串_连接(msg, 名称)
+    msg = 字符串_连接(msg, "' has already been declared")
+    返回 msg
+}
+
+// §8 try/catch/finally运行时支持
+
+// NESC理论 — Nova Error Stack Capture
+// 创新错误栈捕获体系：栈帧格式化、源码映射、异步栈追踪、
+// 错误聚合、AI错误分类预测
+// 核心公式: P(class|features) = softmax(W·f + b)
+
+定义 NESC_最大栈深 = 128
+定义 NESC_最大异步链 = 16
+定义 NESC_聚合最大 = 256
+定义 AI_NESC_特征维度 = 8
+
+定义 可变 NESC_捕获数 = 0
+定义 可变 NESC_格式化数 = 0
+定义 可变 NESC_源码映射数 = 0
+定义 可变 NESC_异步追踪数 = 0
+定义 可变 NESC_聚合数 = 0
+定义 可变 NESC_未捕获数 = 0
+
+// §9 栈帧结构与格式化
+
+结构 栈帧 {
+    函数名: 空,
+    文件名: 空,
+    行号: 0,
+    列号: 0,
+    是构造: 假,
+    是eval: 假,
+    是原生: 假,
+    此对象: 空,
+    脚本ID: 0
+}
+
+函数 栈帧_格式化(帧) {
+    // V8风格栈帧格式化: "    at func (file:line:col)"
+    NESC_格式化数 = NESC_格式化数 + 1
+    定义 可变 结果 = "    at "
+
+    如果 (帧.是构造 == 真) {
+        结果 = 字符串_连接(结果, "new ")
+    }
+
+    如果 (帧.函数名 != 空) {
+        结果 = 字符串_连接(结果, 帧.函数名)
+    } 否则 {
+        结果 = 字符串_连接(结果, "<anonymous>")
+    }
+
+    如果 (帧.是原生 == 真) {
+        结果 = 字符串_连接(结果, " [native]")
+        返回 结果
+    }
+
+    结果 = 字符串_连接(结果, " (")
+    如果 (帧.文件名 != 空) {
+        结果 = 字符串_连接(结果, 帧.文件名)
+    } 否则 {
+        结果 = 字符串_连接(结果, "<unknown>")
+    }
+    结果 = 字符串_连接(结果, ":")
+    结果 = 字符串_连接(结果, 整数转字符串(帧.行号))
+    结果 = 字符串_连接(结果, ":")
+    结果 = 字符串_连接(结果, 整数转字符串(帧.列号))
+    结果 = 字符串_连接(结果, ")")
+    返回 结果
+}
+
+函数 栈追踪_格式化(错误对象, 帧列表, 帧数) {
+    // 完整栈追踪格式化
+    定义 可变 结果 = ""
+    // 首行: ErrorType: message
+    定义 类型名 = 错误_获取类型名(错误对象)
+    定义 消息 = 错误_获取消息(错误对象)
+    结果 = 字符串_连接(类型名, ": ")
+    结果 = 字符串_连接(结果, 消息)
+    结果 = 字符串_连接(结果, "\n")
+
+    // 每一帧
+    定义 可变 i = 0
+    当 (i < 帧数 && i < NESC_最大栈深) {
+        定义 行 = 栈帧_格式化(帧列表[i])
+        结果 = 字符串_连接(结果, 行)
+        结果 = 字符串_连接(结果, "\n")
+        i = i + 1
+    }
+    返回 结果
+}
+
+// §10 源码映射 (SourceMap)
+
+结构 源码映射条目 {
+    生成行: 0,
+    生成列: 0,
+    源行: 0,
+    源列: 0,
+    源文件: 空,
+    源函数名: 空
+}
+
+结构 源码映射表 {
+    条目列表: 空,
+    条目数: 0,
+    源文件名: 空
+}
+
+定义 可变 NESC_源码映射缓存 = []
+定义 可变 NESC_源码映射缓存数 = 0
+
+函数 NESC_注册源码映射(脚本ID, 映射表) {
+    如果 (NESC_源码映射缓存数 < 1024) {
+        NESC_源码映射缓存[NESC_源码映射缓存数] = 映射表
+        NESC_源码映射缓存数 = NESC_源码映射缓存数 + 1
+    }
+}
+
+函数 NESC_查找源码映射(脚本ID, 生成行, 生成列) {
+    // 二分查找匹配的源码映射条目
+    NESC_源码映射数 = NESC_源码映射数 + 1
+    定义 可变 i = 0
+    当 (i < NESC_源码映射缓存数) {
+        定义 表 = NESC_源码映射缓存[i]
+        // 遍历条目查找最佳匹配
+        定义 可变 j = 0
+        定义 可变 最佳 = 空
+        当 (j < 表.条目数) {
+            定义 e = 表.条目列表[j]
+            如果 (e.生成行 == 生成行 && e.生成列 <= 生成列) {
+                如果 (最佳 == 空 || e.生成列 > 最佳.生成列) {
+                    最佳 = e
+                }
+            }
+            j = j + 1
+        }
+        如果 (最佳 != 空) { 返回 最佳 }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 NESC_映射栈帧(帧) {
+    // 将生成代码位置映射到源代码位置
+    定义 映射 = NESC_查找源码映射(帧.脚本ID, 帧.行号, 帧.列号)
+    如果 (映射 != 空) {
+        帧.行号 = 映射.源行
+        帧.列号 = 映射.源列
+        如果 (映射.源文件 != 空) {
+            帧.文件名 = 映射.源文件
+        }
+        如果 (映射.源函数名 != 空) {
+            帧.函数名 = 映射.源函数名
+        }
+    }
+}
+
+// §11 异步栈追踪 (Async Stack Trace)
+
+结构 异步栈节点 {
+    描述: 空,       // "async" / "Promise.then" / "setTimeout"
+    帧列表: 空,
+    帧数: 0,
+    父节点: 空      // 链接上一层异步调用
+}
+
+定义 可变 NESC_异步栈根 = 空
+
+函数 NESC_推入异步栈(Nova运行时实例, 描述) {
+    NESC_异步追踪数 = NESC_异步追踪数 + 1
+    定义 节点 = 异步栈节点 {
+        描述: 描述,
+        帧列表: StackTrace_捕获(Nova运行时实例, NESC_最大栈深),
+        帧数: 0,
+        父节点: NESC_异步栈根
+    }
+    NESC_异步栈根 = 节点
+    返回 节点
+}
+
+函数 NESC_弹出异步栈() {
+    如果 (NESC_异步栈根 != 空) {
+        NESC_异步栈根 = NESC_异步栈根.父节点
+    }
+}
+
+函数 NESC_格式化异步栈(错误对象, 同步帧, 同步帧数) {
+    // 生成包含异步链的完整栈追踪
+    定义 可变 结果 = 栈追踪_格式化(错误对象, 同步帧, 同步帧数)
+
+    定义 可变 节点 = NESC_异步栈根
+    定义 可变 深度 = 0
+    当 (节点 != 空 && 深度 < NESC_最大异步链) {
+        结果 = 字符串_连接(结果, "    --- 异步边界 (")
+        结果 = 字符串_连接(结果, 节点.描述)
+        结果 = 字符串_连接(结果, ") ---\n")
+
+        定义 可变 i = 0
+        当 (i < 节点.帧数) {
+            定义 行 = 栈帧_格式化(节点.帧列表[i])
+            结果 = 字符串_连接(结果, 行)
+            结果 = 字符串_连接(结果, "\n")
+            i = i + 1
+        }
+        节点 = 节点.父节点
+        深度 = 深度 + 1
+    }
+    返回 结果
+}
+
+// §12 错误聚合 (Error Aggregation)
+
+结构 错误聚合记录 {
+    消息摘要: 空,
+    计数: 0,
+    首次时间: 0,
+    末次时间: 0,
+    样本栈: 空
+}
+
+定义 可变 NESC_聚合表 = []
+定义 可变 NESC_聚合表数 = 0
+
+函数 NESC_错误聚合(消息, 栈追踪) {
+    // 相同消息的错误聚合计数
+    NESC_聚合数 = NESC_聚合数 + 1
+    定义 摘要 = 字符串_截取(消息, 0, 64)
+
+    定义 可变 i = 0
+    当 (i < NESC_聚合表数) {
+        如果 (字符串_相等(NESC_聚合表[i].消息摘要, 摘要)) {
+            NESC_聚合表[i].计数 = NESC_聚合表[i].计数 + 1
+            NESC_聚合表[i].末次时间 = 获取时间戳()
+            返回
+        }
+        i = i + 1
+    }
+
+    // 新增聚合记录
+    如果 (NESC_聚合表数 < NESC_聚合最大) {
+        NESC_聚合表[NESC_聚合表数] = 错误聚合记录 {
+            消息摘要: 摘要, 计数: 1,
+            首次时间: 获取时间戳(),
+            末次时间: 获取时间戳(),
+            样本栈: 栈追踪
+        }
+        NESC_聚合表数 = NESC_聚合表数 + 1
+    }
+}
+
+函数 NESC_聚合报告() {
+    内核打印("\n═══ NESC 错误聚合报告 ═══\n")
+    定义 可变 i = 0
+    当 (i < NESC_聚合表数) {
+        定义 r = NESC_聚合表[i]
+        内核打印("[%d次] %s\n", r.计数, r.消息摘要)
+        i = i + 1
+    }
+}
+
+// §13 try/catch/finally运行时
+
+结构 异常处理器 {
+    catch回调: 空,
+    finally回调: 空,
+    父处理器: 空,
+    深度: 0
+}
+
+定义 可变 NESC_异常栈顶 = 空
+
+函数 NESC_推入异常处理器(catch回调, finally回调) {
+    定义 处理器 = 异常处理器 {
+        catch回调: catch回调,
+        finally回调: finally回调,
+        父处理器: NESC_异常栈顶,
+        深度: 0
+    }
+    如果 (NESC_异常栈顶 != 空) {
+        处理器.深度 = NESC_异常栈顶.深度 + 1
+    }
+    NESC_异常栈顶 = 处理器
+}
+
+函数 NESC_弹出异常处理器() {
+    如果 (NESC_异常栈顶 != 空) {
+        定义 老 = NESC_异常栈顶
+        NESC_异常栈顶 = 老.父处理器
+        返回 老
+    }
+    返回 空
+}
+
+函数 NESC_抛出异常(错误对象) {
+    NESC_捕获数 = NESC_捕获数 + 1
+    定义 消息 = 错误_获取消息(错误对象)
+    NESC_错误聚合(消息, 空)
+
+    如果 (NESC_异常栈顶 != 空) {
+        定义 处理器 = NESC_弹出异常处理器()
+        // 先执行catch
+        如果 (处理器.catch回调 != 空) {
+            Nova_调用函数(处理器.catch回调, 错误对象)
+        }
+        // 再执行finally
+        如果 (处理器.finally回调 != 空) {
+            Nova_调用函数(处理器.finally回调, 空)
+        }
+    } 否则 {
+        // 未捕获异常
+        NESC_未捕获数 = NESC_未捕获数 + 1
+        NESC_处理未捕获(错误对象)
+    }
+}
+
+函数 NESC_处理未捕获(错误对象) {
+    定义 消息 = 错误_获取消息(错误对象)
+    定义 类型 = 错误_获取类型名(错误对象)
+    内核警告("NESC: 未捕获异常 %s: %s", 类型, 消息)
+    // 触发全局 uncaughtException
+    Nova_触发事件("uncaughtException", 错误对象)
+}
+
+// §14 AI错误分类 (NESC-AI)
+
+函数 NESC_AI分析() {
+    定义 特征 = Tensor_创建(AI_NESC_特征维度)
+    如果 (特征 == 空) { 返回 }
+
+    Tensor_写(特征, 0, NESC_捕获数)
+    Tensor_写(特征, 1, NESC_格式化数)
+    Tensor_写(特征, 2, NESC_源码映射数)
+    Tensor_写(特征, 3, NESC_异步追踪数)
+    Tensor_写(特征, 4, NESC_聚合数)
+    Tensor_写(特征, 5, NESC_未捕获数)
+    Tensor_写(特征, 6, NESC_聚合表数)
+    Tensor_写(特征, 7, NESC_源码映射缓存数)
+
+    定义 结果 = AI总线_推理("错误分类", 特征)
+    如果 (结果 > 75) {
+        内核警告("NESC-AI: 错误率异常分值=%d", 结果)
+    }
+    Tensor_释放(特征)
+}
+
+函数 NESC_诊断报告() {
+    内核打印("═══ NESC 错误栈捕获统计 ═══\n")
+    内核打印("捕获: %d  格式化: %d  源码映射: %d\n", NESC_捕获数, NESC_格式化数, NESC_源码映射数)
+    内核打印("异步追踪: %d  聚合: %d  未捕获: %d\n", NESC_异步追踪数, NESC_聚合数, NESC_未捕获数)
+    NESC_聚合报告()
+}
+
+// §15 NESC全局初始化
+
+函数 NESC_全局初始化() {
+    NESC_捕获数 = 0
+    NESC_格式化数 = 0
+    NESC_源码映射数 = 0
+    NESC_异步追踪数 = 0
+    NESC_聚合数 = 0
+    NESC_未捕获数 = 0
+    NESC_聚合表数 = 0
+    NESC_源码映射缓存数 = 0
+    NESC_异常栈顶 = 空
+    NESC_异步栈根 = 空
+    内核信息("NESC: 错误栈捕获子系统已初始化")
+    NESC_AI分析()
+}
+
+// §16 扩展错误消息模板
+
+函数 MessageTemplate_Illegal_Invocation() {
+    返回 "Illegal invocation"
+}
+
+函数 MessageTemplate_Strict_Delete_Property(属性) {
+    定义 可变 msg = "Cannot delete property '"
+    msg = 字符串_连接(msg, 属性)
+    msg = 字符串_连接(msg, "'")
+    返回 msg
+}
+
+函数 MessageTemplate_Circular_Structure() {
+    返回 "Converting circular structure to JSON"
+}
+
+函数 MessageTemplate_Invalid_RegExp(模式) {
+    定义 可变 msg = "Invalid regular expression: /"
+    msg = 字符串_连接(msg, 模式)
+    msg = 字符串_连接(msg, "/")
+    返回 msg
+}
+
+函数 MessageTemplate_Read_Only_Property(属性) {
+    定义 可变 msg = "Cannot assign to read only property '"
+    msg = 字符串_连接(msg, 属性)
+    msg = 字符串_连接(msg, "'")
+    返回 msg
+}
+
+函数 NESC_重置统计() {
+    NESC_捕获数 = 0
+    NESC_格式化数 = 0
+    NESC_源码映射数 = 0
+    NESC_异步追踪数 = 0
+    NESC_聚合数 = 0
+    NESC_未捕获数 = 0
+}

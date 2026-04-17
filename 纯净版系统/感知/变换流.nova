@@ -1,0 +1,494 @@
+// §6 TransformStream
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("../推理/值乘.nova")
+导入("./流.nova")
+
+结构 TransformStreamNova注意力架构 {
+    transform回调,    // u64 transform(chunk, controller) → 承诺
+    flush回调,    // u64 flush(controller) → 承诺
+    start回调,    // u64 start(controller)
+}
+
+结构 TransformStreamDefaultController {
+    stream,    // u64 TransformStream*
+    // enqueue到readable端
+    enqueue回调,
+}
+
+结构 TransformStream {
+    readable,    // u64 ReadableStream* (输出端)
+    writable,    // u64 WritableStream* (输入端)
+    Nova注意力架构,    // u64 TransformStreamNova注意力架构*
+    controller,    // u64 TransformStreamDefaultController*
+    正在转换,
+}
+
+函数 TransformStream_创建(Nova注意力架构, writableStrategy, readableStrategy) {
+    定义 ts = 堆_分配(TransformStream)
+    ts.Nova注意力架构 = Nova注意力架构; ts.正在转换 = 假
+
+    // 创建controller
+    ts.controller = 堆_分配(TransformStreamDefaultController)
+    ts.controller.stream = ts
+
+    // 创建内部sink(writable端接收数据, 调用transform, 输出到readable端)
+    定义 sink = 堆_分配(WritableStreamSink)
+    sink.write回调 = TransformStream_内部write    // 伪函数指针
+    sink.close回调 = TransformStream_内部close
+    sink.abort回调 = 0; sink.start回调 = 0
+
+    ts.writable = WritableStream_创建(sink, writableStrategy)
+
+    // 创建readable端
+    ts.readable = ReadableStream_创建(0, 0, 如果(readableStrategy != 0, readableStrategy.highWaterMark, 1))
+
+    // 调用Nova注意力架构.start(controller)
+    如果 (Nova注意力架构 != 0 && Nova注意力架构.start回调 != 0) {
+        // Nova注意力架构.start回调(ts.controller)
+    }
+
+    返回 ts
+}
+
+// 当writable端接收到数据
+函数 TransformStream_内部write(ts, chunk) {
+    如果 (ts == 0 || ts.Nova注意力架构 == 0) { 返回 }
+    ts.正在转换 = 真
+    如果 (ts.Nova注意力架构.transform回调 != 0) {
+        // ts.Nova注意力架构.transform回调(chunk, ts.controller)
+        // transform回调中调用controller.enqueue(transformedChunk)
+        // → 数据进入readable端
+    } 否则 {
+        // 无transform回调: 直接透传
+        TransformController_enqueue(ts.controller, chunk, 0)
+    }
+    ts.正在转换 = 假
+}
+
+// 当writable端关闭
+函数 TransformStream_内部close(ts) {
+    如果 (ts == 0) { 返回 }
+    如果 (ts.Nova注意力架构 != 0 && ts.Nova注意力架构.flush回调 != 0) {
+        // ts.Nova注意力架构.flush回调(ts.controller)
+        // flush中可以enqueue最终数据
+    }
+    // 关闭readable端
+    如果 (ts.readable != 0) {
+        ReadableStream_close(ts.readable)
+    }
+}
+
+// controller.enqueue(chunk)
+函数 TransformController_enqueue(ctrl, chunk, chunkSize) {
+    如果 (ctrl == 0 || ctrl.stream == 0) { 返回 }
+    定义 ts = ctrl.stream
+    如果 (ts.readable != 0) {
+        ReadableStream_enqueue(ts.readable, chunk, chunkSize)
+    }
+}
+
+// controller.error(reason)
+函数 TransformController_error(ctrl, reason) {
+    如果 (ctrl == 0 || ctrl.stream == 0) { 返回 }
+    // 使readable和writable都进入错误状态
+}
+
+// controller.terminate()
+函数 TransformController_terminate(ctrl) {
+    如果 (ctrl == 0 || ctrl.stream == 0) { 返回 }
+    定义 ts = ctrl.stream
+    如果 (ts.readable != 0) { ReadableStream_close(ts.readable) }
+}
+
+// NTST理论 — Nova变换流理论
+// (Nova Transform Stream Theory)
+// 原创背压反馈 + 管道组合 + 完整流处理 + AI流量预测
+// 核心创新: 双端背压传导 + 链式组合 + 分片处理
+
+定义 NTST_版本 = 1
+定义 NTST_默认高水位 = 1
+定义 NTST_AI特征维度 = 8
+
+定义 可变 NTST_创建总数 = 0
+定义 可变 NTST_转换总数 = 0
+定义 可变 NTST_字节总数 = 0
+定义 可变 NTST_管道总数 = 0
+定义 可变 NTST_AI推理次数 = 0
+
+
+函数 NTST_检查背压(ts) {
+    如果 (ts == 0 || ts.readable == 0) { 返回 0 }
+    // 获取readable端的内部队列大小
+    定义 队列大小 = ReadableStream_获取队列大小(ts.readable)
+    定义 高水位 = ReadableStream_获取高水位(ts.readable)
+    如果 (队列大小 >= 高水位) {
+        返回 1  // 有背压
+    }
+    返回 0
+}
+
+函数 NTST_等待背压释放(ts) {
+    定义 可变 重试 = 0
+    当 (NTST_检查背压(ts) && 重试 < 100) {
+        // 微任务等待
+        重试 = 重试 + 1
+    }
+}
+
+
+函数 NTST_pipeThrough(源流, 变换流) {
+    如果 (源流 == 0 || 变换流 == 0) { 返回 0 }
+    // 将源流pipeTo变换流的writable端
+    NTST_pipeTo(源流, 变换流.writable)
+    NTST_管道总数 = NTST_管道总数 + 1
+    // 返回变换流的readable端
+    返回 变换流.readable
+}
+
+函数 NTST_pipeTo(源流, 目标流) {
+    如果 (源流 == 0 || 目标流 == 0) { 返回 }
+
+    // 读取源流的每个chunk并写入目标流
+    定义 reader = ReadableStream_getReader(源流)
+    定义 writer = WritableStream_getWriter(目标流)
+    如果 (reader == 0 || writer == 0) { 返回 }
+
+    NTST_管道循环(reader, writer)
+}
+
+函数 NTST_管道循环(reader, writer) {
+    定义 可变 完成 = 假
+    当 (!完成) {
+        定义 结果 = ReadableStreamReader_read(reader)
+        如果 (结果 == 0 || 结果.done) {
+            WritableStreamWriter_close(writer)
+            完成 = 真
+        } 否则 {
+            WritableStreamWriter_write(writer, 结果.value)
+            NTST_转换总数 = NTST_转换总数 + 1
+        }
+    }
+}
+
+
+// 文本编码变换器 (UTF-8 TextEncoder)
+函数 NTST_创建文本编码流() {
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_文本编码_transform
+    架构.flush回调 = 0
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+函数 NTST_文本编码_transform(chunk, ctrl) {
+    // 将字符串编码为UTF-8字节序列
+    如果 (chunk == 0) { 返回 }
+    定义 长度 = 字符串长度(chunk)
+    定义 缓冲 = 堆_分配(长度 * 4)  // 最坏情况
+    定义 可变 写位置 = 0
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 c = 字符串_取字符(chunk, i)
+        如果 (c < 0x80) {
+            内存_写字节(缓冲 + 写位置, c)
+            写位置 = 写位置 + 1
+        } 否则 如果 (c < 0x800) {
+            内存_写字节(缓冲 + 写位置, 0xC0 | (c >> 6))
+            内存_写字节(缓冲 + 写位置 + 1, 0x80 | (c & 0x3F))
+            写位置 = 写位置 + 2
+        } 否则 {
+            内存_写字节(缓冲 + 写位置, 0xE0 | (c >> 12))
+            内存_写字节(缓冲 + 写位置 + 1, 0x80 | ((c >> 6) & 0x3F))
+            内存_写字节(缓冲 + 写位置 + 2, 0x80 | (c & 0x3F))
+            写位置 = 写位置 + 3
+        }
+        i = i + 1
+    }
+    NTST_字节总数 = NTST_字节总数 + 写位置
+    TransformController_enqueue(ctrl, 缓冲, 写位置)
+}
+
+// 文本解码变换器 (UTF-8 TextDecoder)
+函数 NTST_创建文本解码流() {
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_文本解码_transform
+    架构.flush回调 = 0
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+函数 NTST_文本解码_transform(chunk, ctrl) {
+    如果 (chunk == 0) { 返回 }
+    // 简化版: 假设全部是ASCII
+    定义 大小 = 内存_获取大小(chunk)
+    定义 可变 结果 = ""
+    定义 可变 i = 0
+    当 (i < 大小) {
+        定义 b = 内存_读字节(chunk + i)
+        如果 (b < 0x80) {
+            结果 = 结果 + 字符_从编码(b)
+            i = i + 1
+        } 否则 如果 ((b & 0xE0) == 0xC0) {
+            定义 c = ((b & 0x1F) << 6) | (内存_读字节(chunk + i + 1) & 0x3F)
+            结果 = 结果 + 字符_从编码(c)
+            i = i + 2
+        } 否则 如果 ((b & 0xF0) == 0xE0) {
+            定义 c = ((b & 0x0F) << 12) | ((内存_读字节(chunk + i + 1) & 0x3F) << 6) | (内存_读字节(chunk + i + 2) & 0x3F)
+            结果 = 结果 + 字符_从编码(c)
+            i = i + 3
+        } 否则 {
+            i = i + 1  // 跳过无法识别的字节
+        }
+    }
+    NTST_字节总数 = NTST_字节总数 + 大小
+    TransformController_enqueue(ctrl, 结果, 字符串长度(结果))
+}
+
+// §8 AI流量预测 + 诊断
+
+函数 NTST_AI预测流量() {
+    定义 特征 = Tensor_创建([NTST_AI特征维度])
+    Tensor_写(特征, [0], NTST_创建总数)
+    Tensor_写(特征, [1], NTST_转换总数)
+    Tensor_写(特征, [2], NTST_字节总数)
+    Tensor_写(特征, [3], NTST_管道总数)
+    Tensor_写(特征, [4], 0)
+    Tensor_写(特征, [5], 0)
+    Tensor_写(特征, [6], 0)
+    Tensor_写(特征, [7], 0)
+    定义 预测 = AI总线_推理("NTST流量预测", 特征)
+    NTST_AI推理次数 = NTST_AI推理次数 + 1
+    Tensor_释放(特征)
+    Tensor_释放(预测)
+}
+
+函数 NTST_获取统计() {
+    返回 {
+        版本: NTST_版本,
+        创建总数: NTST_创建总数,
+        转换总数: NTST_转换总数,
+        字节总数: NTST_字节总数,
+        管道总数: NTST_管道总数,
+        AI推理次数: NTST_AI推理次数
+    }
+}
+
+函数 NTST_重置统计() {
+    NTST_创建总数 = 0
+    NTST_转换总数 = 0
+    NTST_字节总数 = 0
+    NTST_管道总数 = 0
+    NTST_AI推理次数 = 0
+}
+
+// §9 分片变换器 (将大数据分块处理)
+
+定义 NTST_默认分片大小 = 4096
+
+函数 NTST_创建分片流(分片大小) {
+    如果 (分片大小 <= 0) { 分片大小 = NTST_默认分片大小 }
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_分片_transform
+    架构.flush回调 = NTST_分片_flush
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+函数 NTST_分片_transform(chunk, ctrl) {
+    如果 (chunk == 0) { 返回 }
+    定义 大小 = 内存_获取大小(chunk)
+    定义 可变 偏移 = 0
+    当 (偏移 < 大小) {
+        定义 剩余 = 大小 - 偏移
+        定义 片大小 = NTST_默认分片大小
+        如果 (剩余 < 片大小) { 片大小 = 剩余 }
+        定义 片 = 堆_分配(片大小)
+        内存_复制(片, chunk + 偏移, 片大小)
+        TransformController_enqueue(ctrl, 片, 片大小)
+        偏移 = 偏移 + 片大小
+        NTST_转换总数 = NTST_转换总数 + 1
+    }
+    NTST_字节总数 = NTST_字节总数 + 大小
+}
+
+函数 NTST_分片_flush(ctrl) {
+    如果 (ctrl != 0 && ctrl.缓冲大小 > 0) {
+        ctrl.输出回调(ctrl.缓冲, ctrl.缓冲大小)
+        ctrl.缓冲大小 = 0
+    }
+}
+
+// §10 JSON行变换器 (NDJSON/JSONLines解析)
+
+函数 NTST_创建JSON行流() {
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_JSON行_transform
+    架构.flush回调 = NTST_JSON行_flush
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+定义 可变 NTST_行缓冲 = ""
+
+函数 NTST_JSON行_transform(chunk, ctrl) {
+    如果 (chunk == 0) { 返回 }
+    NTST_行缓冲 = NTST_行缓冲 + chunk
+    // 查找换行符并分割
+    定义 可变 开始 = 0
+    定义 长度 = 字符串长度(NTST_行缓冲)
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 c = 字符串_取字符(NTST_行缓冲, i)
+        如果 (c == 10) {  // '\n'
+            定义 行 = 字符串_取子串(NTST_行缓冲, 开始, i - 开始)
+            如果 (字符串长度(行) > 0) {
+                TransformController_enqueue(ctrl, 行, 字符串长度(行))
+                NTST_转换总数 = NTST_转换总数 + 1
+            }
+            开始 = i + 1
+        }
+        i = i + 1
+    }
+    // 保留未完成的行
+    NTST_行缓冲 = 字符串_取子串(NTST_行缓冲, 开始, 长度 - 开始)
+}
+
+函数 NTST_JSON行_flush(ctrl) {
+    // 输出最后一行
+    如果 (字符串长度(NTST_行缓冲) > 0) {
+        TransformController_enqueue(ctrl, NTST_行缓冲, 字符串长度(NTST_行缓冲))
+        NTST_转换总数 = NTST_转换总数 + 1
+        NTST_行缓冲 = ""
+    }
+}
+
+// §11 压缩变换器接口 (gzip/deflate)
+
+函数 NTST_创建压缩流(格式) {
+    // 格式: "gzip", "deflate", "deflate-raw"
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_压缩_transform
+    架构.flush回调 = NTST_压缩_flush
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+函数 NTST_压缩_transform(chunk, ctrl) {
+    如果 (chunk == 0) { 返回 }
+    // 调用平台压缩API
+    定义 大小 = 内存_获取大小(chunk)
+    定义 压缩缓冲 = 堆_分配(大小)  // 压缩后可能更小
+    定义 压缩大小 = 平台_deflate压缩(chunk, 大小, 压缩缓冲)
+    TransformController_enqueue(ctrl, 压缩缓冲, 压缩大小)
+    NTST_字节总数 = NTST_字节总数 + 大小
+    NTST_转换总数 = NTST_转换总数 + 1
+}
+
+函数 NTST_压缩_flush(ctrl) {
+    如果 (ctrl != 0) {
+        ctrl.输出回调(0, 0)
+    }
+}
+
+函数 NTST_创建解压流(格式) {
+    定义 架构 = 堆_分配(TransformStreamNova注意力架构)
+    架构.transform回调 = NTST_解压_transform
+    架构.flush回调 = 0
+    架构.start回调 = 0
+    NTST_创建总数 = NTST_创建总数 + 1
+    返回 TransformStream_创建(架构, 0, 0)
+}
+
+函数 NTST_解压_transform(chunk, ctrl) {
+    如果 (chunk == 0) { 返回 }
+    定义 大小 = 内存_获取大小(chunk)
+    定义 解压缓冲 = 堆_分配(大小 * 4)  // 解压后可能更大
+    定义 解压大小 = 平台_inflate解压(chunk, 大小, 解压缓冲)
+    TransformController_enqueue(ctrl, 解压缓冲, 解压大小)
+    NTST_字节总数 = NTST_字节总数 + 大小
+    NTST_转换总数 = NTST_转换总数 + 1
+}
+
+// §12 流错误处理 + 链式组合工具
+
+函数 NTST_传播错误(ts, 原因) {
+    如果 (ts == 0) { 返回 }
+    // 同时错误化readable和writable端
+    如果 (ts.readable != 0) {
+        ReadableStream_error(ts.readable, 原因)
+    }
+    如果 (ts.writable != 0) {
+        WritableStream_error(ts.writable, 原因)
+    }
+}
+
+// 链式组合多个变换流
+函数 NTST_链式组合(源流, 变换流数组, 数量) {
+    如果 (源流 == 0 || 数量 == 0) { 返回 源流 }
+    定义 可变 当前 = 源流
+    定义 可变 i = 0
+    当 (i < 数量) {
+        当前 = NTST_pipeThrough(当前, 变换流数组[i])
+        如果 (当前 == 0) { 返回 0 }
+        i = i + 1
+    }
+    返回 当前
+}
+
+// 取消信号支持
+函数 NTST_pipeTo_可取消(源流, 目标流, 取消信号) {
+    如果 (源流 == 0 || 目标流 == 0) { 返回 }
+    定义 reader = ReadableStream_getReader(源流)
+    定义 writer = WritableStream_getWriter(目标流)
+    如果 (reader == 0 || writer == 0) { 返回 }
+
+    定义 可变 完成 = 假
+    当 (!完成) {
+        // 检查取消信号
+        如果 (取消信号 != 0 && 取消信号.已取消) {
+            ReadableStreamReader_releaseLock(reader)
+            WritableStreamWriter_abort(writer, "已取消")
+            完成 = 真
+        } 否则 {
+            定义 结果 = ReadableStreamReader_read(reader)
+            如果 (结果 == 0 || 结果.done) {
+                WritableStreamWriter_close(writer)
+                完成 = 真
+            } 否则 {
+                WritableStreamWriter_write(writer, 结果.value)
+                NTST_转换总数 = NTST_转换总数 + 1
+            }
+        }
+    }
+}
+
+// Tee (分叉流为两个副本)
+函数 NTST_tee(源流) {
+    如果 (源流 == 0) { 返回 [0, 0] }
+    定义 分支1 = ReadableStream_创建(0, 0, 1)
+    定义 分支2 = ReadableStream_创建(0, 0, 1)
+    定义 reader = ReadableStream_getReader(源流)
+    如果 (reader == 0) { 返回 [0, 0] }
+
+    定义 可变 完成 = 假
+    当 (!完成) {
+        定义 结果 = ReadableStreamReader_read(reader)
+        如果 (结果 == 0 || 结果.done) {
+            ReadableStream_close(分支1)
+            ReadableStream_close(分支2)
+            完成 = 真
+        } 否则 {
+            ReadableStream_enqueue(分支1, 结果.value, 0)
+            ReadableStream_enqueue(分支2, 结果.value, 0)
+        }
+    }
+    返回 [分支1, 分支2]
+}

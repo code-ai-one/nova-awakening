@@ -1,0 +1,283 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/平台时间.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §7 Runtime域
+
+函数 DevTools_Runtime处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Runtime.enable")) {
+        session.runtime启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Runtime.evaluate")) {
+        // 执行JS表达式
+        定义 表达式 = DevTools_解析参数_str(msg.参数, "expression")
+        // 在页面上下文中执行, 返回结果
+        // {result: {type, value, description, objectId}}
+    } 否则 如果 (字符串_相等(方法, "Runtime.callFunctionOn")) {
+        // 在特定对象上调用函数
+    } 否则 如果 (字符串_相等(方法, "Runtime.getProperties")) {
+        // 获取对象属性
+        定义 objectId = DevTools_解析参数_str(msg.参数, "objectId")
+    } 否则 如果 (字符串_相等(方法, "Runtime.releaseObject")) {
+        // 释放对象引用
+    }
+}
+
+// §8 调试ger域
+
+结构 Breakpoint {
+    id,
+    脚本URL,
+    行号,
+    列号,
+    条件,    // u64 条件断点表达式
+    启用,
+}
+
+结构 CallFrame {
+    函数名,
+    脚本URL,
+    行号,
+    列号,
+    作用域,    // u64 变量作用域
+    this值,
+}
+
+函数 DevTools_调试ger处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "调试ger.enable")) {
+        session.debugger启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "调试ger.setBreakpointByUrl")) {
+        // 按URL+行号设置断点
+        定义 url = DevTools_解析参数_str(msg.参数, "url")
+        定义 行号 = DevTools_解析参数_int(msg.参数, "lineNumber")
+        定义 条件 = DevTools_解析参数_str(msg.参数, "condition")
+        定义 bp = 堆_分配(Breakpoint)
+        bp.脚本URL = url; bp.行号 = 行号; bp.列号 = 0
+        bp.条件 = 条件; bp.启用 = 真
+        bp.id = session.断点数 + 1
+        // 添加到断点列表
+        session.断点数 = session.断点数 + 1
+    } 否则 如果 (字符串_相等(方法, "调试ger.removeBreakpoint")) {
+        // 移除断点
+    } 否则 如果 (字符串_相等(方法, "调试ger.resume")) {
+        // 继续执行
+        session.已暂停 = 假
+    } 否则 如果 (字符串_相等(方法, "调试ger.stepOver")) {
+        // 单步(不进入函数)
+    } 否则 如果 (字符串_相等(方法, "调试ger.stepInto")) {
+        // 单步(进入函数)
+    } 否则 如果 (字符串_相等(方法, "调试ger.stepOut")) {
+        // 跳出当前函数
+    } 否则 如果 (字符串_相等(方法, "调试ger.pause")) {
+        // 立即暂停
+        session.已暂停 = 真
+        session.暂停原因 = "debugCommand"
+    } 否则 如果 (字符串_相等(方法, "调试ger.setPauseOnExceptions")) {
+        // 异常时暂停: none/uncaught/all
+    } 否则 如果 (字符串_相等(方法, "调试ger.evaluateOnCallFrame")) {
+        // 在特定调用帧上求值表达式
+    }
+}
+
+// §9 Console域
+
+定义 CONSOLE_LOG     = 0
+定义 CONSOLE_WARN    = 1
+定义 CONSOLE_ERROR   = 2
+定义 CONSOLE_INFO    = 3
+定义 CONSOLE_DEBUG   = 4
+定义 CONSOLE_TABLE   = 5
+定义 CONSOLE_DIR     = 6
+定义 CONSOLE_CLEAR   = 7
+
+结构 ConsoleMessage {
+    级别,    // u8 CONSOLE_xxx
+    文本,
+    url,    // u64 源文件
+    行号,
+    时间戳,
+    栈追踪,    // u64 调用栈
+    参数,    // u64 参数列表
+    参数数,
+    下一个,    // u64 ConsoleMessage*
+}
+
+函数 DevTools_Console处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Console.enable")) {
+        session.console启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Console.clearMessages")) {
+        // 清除console消息
+        如果 (全局DevTools != 0) {
+            全局DevTools.console日志 = 0; 全局DevTools.console日志数 = 0
+        }
+        msg.结果 = "{}"
+    }
+}
+
+// console.log/warn/error/info的底层实现
+函数 Console_记录(级别, 文本, url, 行号) {
+    如果 (全局DevTools == 0) { 返回 }
+    定义 cm = 堆_分配(ConsoleMessage)
+    cm.级别 = 级别; cm.文本 = 文本; cm.url = url; cm.行号 = 行号
+    cm.时间戳 = 平台_获取高精度时间()
+    cm.栈追踪 = 0; cm.参数 = 0; cm.参数数 = 0
+    cm.下一个 = 全局DevTools.console日志
+    全局DevTools.console日志 = cm
+    全局DevTools.console日志数 = 全局DevTools.console日志数 + 1
+}
+
+// §10 Network域
+
+函数 DevTools_Network处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+    如果 (字符串_相等(方法, "Network.enable")) {
+        session.network启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Network.disable")) {
+        session.network启用 = 假; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Network.setCacheDisabled")) {
+        msg.结果 = "{}"
+    }
+}
+
+// §11 Page域
+
+函数 DevTools_Page处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+    如果 (字符串_相等(方法, "Page.enable")) {
+        session.page启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Page.reload")) {
+        msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Page.navigate")) {
+        msg.结果 = "{}"
+    }
+}
+
+// §12 DOM域
+
+函数 DevTools_DOM处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+    如果 (字符串_相等(方法, "DOM.enable")) {
+        session.dom启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "DOM.getDocument")) {
+        msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "DOM.querySelector")) {
+        msg.结果 = "{}"
+    }
+}
+
+// §13 DevTools辅助解析
+
+定义 可变 全局DevTools = 0
+
+结构 DevToolsState {
+    console日志,
+    console日志数,
+}
+
+函数 DevTools_解析参数_str(参数, 键) {
+    如果 (参数 == 0 || 键 == 0) { 返回 0 }
+    定义 位置 = 字符串_查找(参数, 键)
+    如果 (位置 < 0) { 返回 0 }
+    定义 引号1 = 字符串_查找子(参数, "\"", 位置 + 字符串长度(键) + 2)
+    如果 (引号1 < 0) { 返回 0 }
+    定义 引号2 = 字符串_查找子(参数, "\"", 引号1 + 1)
+    如果 (引号2 < 0) { 返回 0 }
+    返回 字符串子串(参数, 引号1 + 1, 引号2)
+}
+函数 DevTools_解析参数_int(参数, 键) {
+    如果 (参数 == 0 || 键 == 0) { 返回 0 }
+    定义 位置 = 字符串_查找(参数, 键)
+    如果 (位置 < 0) { 返回 0 }
+    定义 冒号 = 字符串_查找子(参数, ":", 位置)
+    如果 (冒号 < 0) { 返回 0 }
+    返回 字符串转整数(字符串子串(参数, 冒号 + 1, 字符串长度(参数)))
+}
+函数 Console_级别名(级别) {
+    如果 (级别 == CONSOLE_LOG) { 返回 "log" }
+    如果 (级别 == CONSOLE_WARN) { 返回 "warning" }
+    如果 (级别 == CONSOLE_ERROR) { 返回 "error" }
+    如果 (级别 == CONSOLE_INFO) { 返回 "info" }
+    如果 (级别 == CONSOLE_DEBUG) { 返回 "debug" }
+    如果 (级别 == CONSOLE_TABLE) { 返回 "table" }
+    返回 "log"
+}
+
+// §14 开发工具统计
+
+定义 可变 DevTools_命令总数 = 0
+定义 可变 DevTools_事件总数 = 0
+定义 可变 DevTools_断点命中数 = 0
+
+函数 DevTools_统计() {
+    返回 {
+        命令: DevTools_命令总数,
+        事件: DevTools_事件总数,
+        断点命中: DevTools_断点命中数,
+    }
+}
+
+函数 DevTools_健康检查() { 返回 "开发工具健康" }
+
+函数 DevTools_重置统计() {
+    DevTools_命令总数 = 0
+    DevTools_事件总数 = 0
+    DevTools_断点命中数 = 0
+}
+
+函数 DevTools_完整统计() {
+    返回 [DevTools_命令总数, DevTools_事件总数, DevTools_断点命中数]
+}
+
+定义 可变 AI_运行域_热节点缓存 = 0
+
+函数 AI_运行域_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { AI_运行域_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 AI_运行域_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}
+
+函数 运行域_统计() {
+    返回 {
+        DevTools命令总数: DevTools_命令总数,
+        DevTools事件总数: DevTools_事件总数
+    }
+}
+
+函数 运行域_健康评估() {
+    定义 可变 问题 = []
+    如果 (DevTools_命令总数 > 100000) { 追加(问题, "DevTools_命令总数异常增长") }
+    如果 (DevTools_事件总数 > 100000) { 追加(问题, "DevTools_事件总数异常增长") }
+    返回 计数(问题) == 0
+}
+
+函数 运行域_综合报告() {
+    打印("[运行域] ═══ 综合报告 ═══")
+    打印("  DevTools_命令总数: " + DevTools_命令总数)
+    打印("  DevTools_事件总数: " + DevTools_事件总数)
+    打印("  健康: " + 如果 (运行域_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 运行域_全局重置() {
+    DevTools_命令总数 = 0
+    DevTools_事件总数 = 0
+    打印("[运行域] 统计已重置")
+    返回 0
+}

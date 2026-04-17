@@ -1,0 +1,935 @@
+// ║ 覆盖: SALU / VALU / VMEM / SMEM / LDS / GDS / FLAT / ║
+// ║ EXPORT / MIMG / DS / SOPP / SOPC / SOP1/2 / VOP3 ║
+
+// RDNA3编码格式辅助
+函数 rdna3_标量双操作(op, dst, src1, src0) { 返回 0x80000000|((op&127)<<23)|((dst&127)<<16)|((src1&255)<<8)|(src0&255) }
+函数 rdna3_标量单操作(op, dst, src0) { 返回 0xBE800000|((dst&127)<<16)|((op&255)<<8)|(src0&255) }
+函数 rdna3_标量比较(op, src1, src0) { 返回 0xBF000000|((op&127)<<16)|((src1&255)<<8)|(src0&255) }
+函数 rdna3_标量程序流(op, imm16) { 返回 0xBF800000|((op&127)<<16)|(imm16&0xFFFF) }
+函数 rdna3_向量双操作(op, dst, src1, src0) { 返回 ((op&63)<<25)|((dst&255)<<17)|((src1&255)<<9)|(src0&511) }
+函数 rdna3_向量单操作(op, dst, src0) { 返回 0x7E000000|((dst&255)<<17)|((op&255)<<9)|(src0&511) }
+函数 rdna3_向量比较(op, src1, src0) { 返回 0x7C000000|((op&255)<<17)|((src1&255)<<9)|(src0&511) }
+函数 rdna3_向量三操作(op, dst, s0, s1, s2) { 返回 0xD4000000|((op&1023)<<16)|((dst&255)<<8) }
+函数 rdna3_数据共享(op, gds, off1, off0) { 返回 0xD8000000|((op&255)<<18)|((gds&1)<<17)|((off1&255)<<8)|(off0&255) }
+函数 rdna3_标量内存(op, sdata, sbase, off) { 返回 0xF4000000|((op&63)<<22)|((sdata&127)<<15)|((sbase&63)<<9)|(off&0x1FF) }
+函数 rdna3_缓冲内存(op, lds, off) { 返回 0xE0000000|((op&127)<<18)|((lds&1)<<16)|(off&0xFFF) }
+函数 rdna3_图像内存(op, dmask) { 返回 0xF0000000|((op&127)<<18)|((dmask&15)<<8) }
+函数 rdna3_平坦内存(op, seg, glc, slc) { 返回 0xDC000000|((op&127)<<18)|((seg&3)<<16)|((glc&1)<<14)|((slc&1)<<12) }
+函数 rdna3_导出(en, tgt, compr, done, vm) { 返回 0xF8000000|((en&15)<<20)|((tgt&63)<<14)|((compr&1)<<10)|((done&1)<<11)|((vm&1)<<12) }
+
+// SOP2 — 标量二元运算
+函数 编码_s_add_u32(d, s1, s0) { 返回 rdna3_标量双操作(0,d,s1,s0) }
+函数 编码_s_sub_u32(d, s1, s0) { 返回 rdna3_标量双操作(1,d,s1,s0) }
+函数 编码_s_add_i32(d, s1, s0) { 返回 rdna3_标量双操作(2,d,s1,s0) }
+函数 编码_s_sub_i32(d, s1, s0) { 返回 rdna3_标量双操作(3,d,s1,s0) }
+函数 编码_s_addc_u32(d, s1, s0) { 返回 rdna3_标量双操作(4,d,s1,s0) }
+函数 编码_s_subb_u32(d, s1, s0) { 返回 rdna3_标量双操作(5,d,s1,s0) }
+函数 编码_s_min_i32(d, s1, s0) { 返回 rdna3_标量双操作(6,d,s1,s0) }
+函数 编码_s_min_u32(d, s1, s0) { 返回 rdna3_标量双操作(7,d,s1,s0) }
+函数 编码_s_max_i32(d, s1, s0) { 返回 rdna3_标量双操作(8,d,s1,s0) }
+函数 编码_s_max_u32(d, s1, s0) { 返回 rdna3_标量双操作(9,d,s1,s0) }
+函数 编码_s_cselect_b32(d, s1, s0) { 返回 rdna3_标量双操作(10,d,s1,s0) }
+函数 编码_s_cselect_b64(d, s1, s0) { 返回 rdna3_标量双操作(11,d,s1,s0) }
+函数 编码_s_and_b32(d, s1, s0) { 返回 rdna3_标量双操作(14,d,s1,s0) }
+函数 编码_s_and_b64(d, s1, s0) { 返回 rdna3_标量双操作(15,d,s1,s0) }
+函数 编码_s_or_b32(d, s1, s0) { 返回 rdna3_标量双操作(16,d,s1,s0) }
+函数 编码_s_or_b64(d, s1, s0) { 返回 rdna3_标量双操作(17,d,s1,s0) }
+函数 编码_s_xor_b32(d, s1, s0) { 返回 rdna3_标量双操作(18,d,s1,s0) }
+函数 编码_s_xor_b64(d, s1, s0) { 返回 rdna3_标量双操作(19,d,s1,s0) }
+函数 编码_s_andn2_b32(d, s1, s0) { 返回 rdna3_标量双操作(20,d,s1,s0) }
+函数 编码_s_andn2_b64(d, s1, s0) { 返回 rdna3_标量双操作(21,d,s1,s0) }
+函数 编码_s_orn2_b32(d, s1, s0) { 返回 rdna3_标量双操作(22,d,s1,s0) }
+函数 编码_s_orn2_b64(d, s1, s0) { 返回 rdna3_标量双操作(23,d,s1,s0) }
+函数 编码_s_nand_b32(d, s1, s0) { 返回 rdna3_标量双操作(24,d,s1,s0) }
+函数 编码_s_nand_b64(d, s1, s0) { 返回 rdna3_标量双操作(25,d,s1,s0) }
+函数 编码_s_nor_b32(d, s1, s0) { 返回 rdna3_标量双操作(26,d,s1,s0) }
+函数 编码_s_nor_b64(d, s1, s0) { 返回 rdna3_标量双操作(27,d,s1,s0) }
+函数 编码_s_xnor_b32(d, s1, s0) { 返回 rdna3_标量双操作(28,d,s1,s0) }
+函数 编码_s_xnor_b64(d, s1, s0) { 返回 rdna3_标量双操作(29,d,s1,s0) }
+函数 编码_s_lshl_b32(d, s1, s0) { 返回 rdna3_标量双操作(30,d,s1,s0) }
+函数 编码_s_lshl_b64(d, s1, s0) { 返回 rdna3_标量双操作(31,d,s1,s0) }
+函数 编码_s_lshr_b32(d, s1, s0) { 返回 rdna3_标量双操作(32,d,s1,s0) }
+函数 编码_s_lshr_b64(d, s1, s0) { 返回 rdna3_标量双操作(33,d,s1,s0) }
+函数 编码_s_ashr_i32(d, s1, s0) { 返回 rdna3_标量双操作(34,d,s1,s0) }
+函数 编码_s_ashr_i64(d, s1, s0) { 返回 rdna3_标量双操作(35,d,s1,s0) }
+函数 编码_s_bfm_b32(d, s1, s0) { 返回 rdna3_标量双操作(36,d,s1,s0) }
+函数 编码_s_bfm_b64(d, s1, s0) { 返回 rdna3_标量双操作(37,d,s1,s0) }
+函数 编码_s_mul_i32(d, s1, s0) { 返回 rdna3_标量双操作(38,d,s1,s0) }
+函数 编码_s_bfe_u32(d, s1, s0) { 返回 rdna3_标量双操作(39,d,s1,s0) }
+函数 编码_s_bfe_i32(d, s1, s0) { 返回 rdna3_标量双操作(40,d,s1,s0) }
+函数 编码_s_bfe_u64(d, s1, s0) { 返回 rdna3_标量双操作(41,d,s1,s0) }
+函数 编码_s_bfe_i64(d, s1, s0) { 返回 rdna3_标量双操作(42,d,s1,s0) }
+函数 编码_s_absdiff_i32(d, s1, s0) { 返回 rdna3_标量双操作(44,d,s1,s0) }
+函数 编码_s_pack_ll_b32_b16(d, s1, s0) { 返回 rdna3_标量双操作(50,d,s1,s0) }
+函数 编码_s_pack_lh_b32_b16(d, s1, s0) { 返回 rdna3_标量双操作(51,d,s1,s0) }
+函数 编码_s_pack_hh_b32_b16(d, s1, s0) { 返回 rdna3_标量双操作(52,d,s1,s0) }
+函数 编码_s_mul_hi_u32(d, s1, s0) { 返回 rdna3_标量双操作(53,d,s1,s0) }
+函数 编码_s_mul_hi_i32(d, s1, s0) { 返回 rdna3_标量双操作(54,d,s1,s0) }
+函数 编码_s_lshl1_add_u32(d, s1, s0) { 返回 rdna3_标量双操作(55,d,s1,s0) }
+函数 编码_s_lshl2_add_u32(d, s1, s0) { 返回 rdna3_标量双操作(56,d,s1,s0) }
+函数 编码_s_lshl3_add_u32(d, s1, s0) { 返回 rdna3_标量双操作(57,d,s1,s0) }
+函数 编码_s_lshl4_add_u32(d, s1, s0) { 返回 rdna3_标量双操作(58,d,s1,s0) }
+函数 编码_s_and_not1_b32(d, s1, s0) { 返回 rdna3_标量双操作(59,d,s1,s0) }
+函数 编码_s_and_not1_b64(d, s1, s0) { 返回 rdna3_标量双操作(60,d,s1,s0) }
+函数 编码_s_or_not1_b32(d, s1, s0) { 返回 rdna3_标量双操作(61,d,s1,s0) }
+函数 编码_s_or_not1_b64(d, s1, s0) { 返回 rdna3_标量双操作(62,d,s1,s0) }
+
+// SOP1 — 标量一元运算
+函数 编码_s_mov_b32(d, s) { 返回 rdna3_标量单操作(0,d,s) }
+函数 编码_s_mov_b64(d, s) { 返回 rdna3_标量单操作(1,d,s) }
+函数 编码_s_cmov_b32(d, s) { 返回 rdna3_标量单操作(2,d,s) }
+函数 编码_s_cmov_b64(d, s) { 返回 rdna3_标量单操作(3,d,s) }
+函数 编码_s_not_b32(d, s) { 返回 rdna3_标量单操作(4,d,s) }
+函数 编码_s_not_b64(d, s) { 返回 rdna3_标量单操作(5,d,s) }
+函数 编码_s_wqm_b32(d, s) { 返回 rdna3_标量单操作(6,d,s) }
+函数 编码_s_wqm_b64(d, s) { 返回 rdna3_标量单操作(7,d,s) }
+函数 编码_s_brev_b32(d, s) { 返回 rdna3_标量单操作(8,d,s) }
+函数 编码_s_brev_b64(d, s) { 返回 rdna3_标量单操作(9,d,s) }
+函数 编码_s_bcnt0_i32_b32(d, s) { 返回 rdna3_标量单操作(10,d,s) }
+函数 编码_s_bcnt0_i32_b64(d, s) { 返回 rdna3_标量单操作(11,d,s) }
+函数 编码_s_bcnt1_i32_b32(d, s) { 返回 rdna3_标量单操作(12,d,s) }
+函数 编码_s_bcnt1_i32_b64(d, s) { 返回 rdna3_标量单操作(13,d,s) }
+函数 编码_s_ff0_i32_b32(d, s) { 返回 rdna3_标量单操作(14,d,s) }
+函数 编码_s_ff0_i32_b64(d, s) { 返回 rdna3_标量单操作(15,d,s) }
+函数 编码_s_ff1_i32_b32(d, s) { 返回 rdna3_标量单操作(16,d,s) }
+函数 编码_s_ff1_i32_b64(d, s) { 返回 rdna3_标量单操作(17,d,s) }
+函数 编码_s_flbit_i32_b32(d, s) { 返回 rdna3_标量单操作(18,d,s) }
+函数 编码_s_flbit_i32_b64(d, s) { 返回 rdna3_标量单操作(19,d,s) }
+函数 编码_s_flbit_i32(d, s) { 返回 rdna3_标量单操作(20,d,s) }
+函数 编码_s_flbit_i32_i64(d, s) { 返回 rdna3_标量单操作(21,d,s) }
+函数 编码_s_sext_i32_i8(d, s) { 返回 rdna3_标量单操作(22,d,s) }
+函数 编码_s_sext_i32_i16(d, s) { 返回 rdna3_标量单操作(23,d,s) }
+函数 编码_s_bitset0_b32(d, s) { 返回 rdna3_标量单操作(24,d,s) }
+函数 编码_s_bitset0_b64(d, s) { 返回 rdna3_标量单操作(25,d,s) }
+函数 编码_s_bitset1_b32(d, s) { 返回 rdna3_标量单操作(26,d,s) }
+函数 编码_s_bitset1_b64(d, s) { 返回 rdna3_标量单操作(27,d,s) }
+函数 编码_s_getpc_b64(d) { 返回 rdna3_标量单操作(28, d, 0) }
+函数 编码_s_setpc_b64(s) { 返回 rdna3_标量单操作(29,0,s) }
+函数 编码_s_swappc_b64(d, s) { 返回 rdna3_标量单操作(30,d,s) }
+函数 编码_s_rfe_b64(s) { 返回 rdna3_标量单操作(31,0,s) }
+函数 编码_s_and_saveexec_b64(d, s) { 返回 rdna3_标量单操作(32,d,s) }
+函数 编码_s_or_saveexec_b64(d, s) { 返回 rdna3_标量单操作(33,d,s) }
+函数 编码_s_xor_saveexec_b64(d, s) { 返回 rdna3_标量单操作(34,d,s) }
+函数 编码_s_andn2_saveexec_b64(d, s) { 返回 rdna3_标量单操作(35,d,s) }
+函数 编码_s_orn2_saveexec_b64(d, s) { 返回 rdna3_标量单操作(36,d,s) }
+函数 编码_s_nand_saveexec_b64(d, s) { 返回 rdna3_标量单操作(37,d,s) }
+函数 编码_s_nor_saveexec_b64(d, s) { 返回 rdna3_标量单操作(38,d,s) }
+函数 编码_s_xnor_saveexec_b64(d, s) { 返回 rdna3_标量单操作(39,d,s) }
+函数 编码_s_quadmask_b32(d, s) { 返回 rdna3_标量单操作(40,d,s) }
+函数 编码_s_quadmask_b64(d, s) { 返回 rdna3_标量单操作(41,d,s) }
+函数 编码_s_movrels_b32(d, s) { 返回 rdna3_标量单操作(42,d,s) }
+函数 编码_s_movrels_b64(d, s) { 返回 rdna3_标量单操作(43,d,s) }
+函数 编码_s_movreld_b32(d, s) { 返回 rdna3_标量单操作(44,d,s) }
+函数 编码_s_movreld_b64(d, s) { 返回 rdna3_标量单操作(45,d,s) }
+函数 编码_s_abs_i32(d, s) { 返回 rdna3_标量单操作(48,d,s) }
+函数 编码_s_andn1_saveexec_b32(d, s) { 返回 rdna3_标量单操作(49,d,s) }
+函数 编码_s_andn1_saveexec_b64(d, s) { 返回 rdna3_标量单操作(50,d,s) }
+函数 编码_s_and_saveexec_b32(d, s) { 返回 rdna3_标量单操作(53,d,s) }
+函数 编码_s_or_saveexec_b32(d, s) { 返回 rdna3_标量单操作(54,d,s) }
+函数 编码_s_xor_saveexec_b32(d, s) { 返回 rdna3_标量单操作(55,d,s) }
+函数 编码_s_nand_saveexec_b32(d, s) { 返回 rdna3_标量单操作(58,d,s) }
+函数 编码_s_nor_saveexec_b32(d, s) { 返回 rdna3_标量单操作(59,d,s) }
+函数 编码_s_xnor_saveexec_b32(d, s) { 返回 rdna3_标量单操作(60,d,s) }
+函数 编码_s_bitreplicate_b64_b32(d, s) { 返回 rdna3_标量单操作(63,d,s) }
+函数 编码_s_movrelsd_2_b32(d, s) { 返回 rdna3_标量单操作(68,d,s) }
+
+// SOPC — 标量比较
+函数 编码_s_cmp_eq_i32(s1, s0) { 返回 rdna3_标量比较(0,s1,s0) }
+函数 编码_s_cmp_lg_i32(s1, s0) { 返回 rdna3_标量比较(1,s1,s0) }
+函数 编码_s_cmp_gt_i32(s1, s0) { 返回 rdna3_标量比较(2,s1,s0) }
+函数 编码_s_cmp_ge_i32(s1, s0) { 返回 rdna3_标量比较(3,s1,s0) }
+函数 编码_s_cmp_lt_i32(s1, s0) { 返回 rdna3_标量比较(4,s1,s0) }
+函数 编码_s_cmp_le_i32(s1, s0) { 返回 rdna3_标量比较(5,s1,s0) }
+函数 编码_s_cmp_eq_u32(s1, s0) { 返回 rdna3_标量比较(6,s1,s0) }
+函数 编码_s_cmp_lg_u32(s1, s0) { 返回 rdna3_标量比较(7,s1,s0) }
+函数 编码_s_cmp_gt_u32(s1, s0) { 返回 rdna3_标量比较(8,s1,s0) }
+函数 编码_s_cmp_ge_u32(s1, s0) { 返回 rdna3_标量比较(9,s1,s0) }
+函数 编码_s_cmp_lt_u32(s1, s0) { 返回 rdna3_标量比较(10,s1,s0) }
+函数 编码_s_cmp_le_u32(s1, s0) { 返回 rdna3_标量比较(11,s1,s0) }
+函数 编码_s_bitcmp0_b32(s1, s0) { 返回 rdna3_标量比较(12,s1,s0) }
+函数 编码_s_bitcmp1_b32(s1, s0) { 返回 rdna3_标量比较(13,s1,s0) }
+函数 编码_s_bitcmp0_b64(s1, s0) { 返回 rdna3_标量比较(14,s1,s0) }
+函数 编码_s_bitcmp1_b64(s1, s0) { 返回 rdna3_标量比较(15,s1,s0) }
+函数 编码_s_cmp_eq_u64(s1, s0) { 返回 rdna3_标量比较(16,s1,s0) }
+函数 编码_s_cmp_lg_u64(s1, s0) { 返回 rdna3_标量比较(17,s1,s0) }
+
+// SOPP — 标量程序控制
+函数 编码_s_nop(imm) { 返回 rdna3_标量程序流(0,imm) }
+函数 编码_s_endpgm() { 返回 rdna3_标量程序流(1, 0) }
+函数 编码_s_branch(off) { 返回 rdna3_标量程序流(2,off) }
+函数 编码_s_wakeup() { 返回 rdna3_标量程序流(3, 0) }
+函数 编码_s_cbranch_scc0(off) { 返回 rdna3_标量程序流(4,off) }
+函数 编码_s_cbranch_scc1(off) { 返回 rdna3_标量程序流(5,off) }
+函数 编码_s_cbranch_vccz(off) { 返回 rdna3_标量程序流(6,off) }
+函数 编码_s_cbranch_vccnz(off) { 返回 rdna3_标量程序流(7,off) }
+函数 编码_s_cbranch_execz(off) { 返回 rdna3_标量程序流(8,off) }
+函数 编码_s_cbranch_execnz(off) { 返回 rdna3_标量程序流(9,off) }
+函数 编码_s_barrier() { 返回 rdna3_标量程序流(10, 0) }
+函数 编码_s_setkill(imm) { 返回 rdna3_标量程序流(11,imm) }
+函数 编码_s_waitcnt(imm) { 返回 rdna3_标量程序流(12,imm) }
+函数 编码_s_sethalt(imm) { 返回 rdna3_标量程序流(13,imm) }
+函数 编码_s_sleep(imm) { 返回 rdna3_标量程序流(14,imm) }
+函数 编码_s_setprio(imm) { 返回 rdna3_标量程序流(15,imm) }
+函数 编码_s_sendmsg(imm) { 返回 rdna3_标量程序流(16,imm) }
+函数 编码_s_sendmsghalt(imm) { 返回 rdna3_标量程序流(17,imm) }
+函数 编码_s_trap(imm) { 返回 rdna3_标量程序流(18,imm) }
+函数 编码_s_icache_inv() { 返回 rdna3_标量程序流(19, 0) }
+函数 编码_s_incperflevel(imm) { 返回 rdna3_标量程序流(20,imm) }
+函数 编码_s_decperflevel(imm) { 返回 rdna3_标量程序流(21,imm) }
+函数 编码_s_ttracedata(imm) { 返回 rdna3_标量程序流(22,imm) }
+函数 编码_s_cbranch_cdbgsys(off) { 返回 rdna3_标量程序流(23,off) }
+函数 编码_s_cbranch_cdbguser(off) { 返回 rdna3_标量程序流(24,off) }
+函数 编码_s_cbranch_cdbgsys_or_user(off) { 返回 rdna3_标量程序流(25,off) }
+函数 编码_s_cbranch_cdbgsys_and_user(off) { 返回 rdna3_标量程序流(26,off) }
+函数 编码_s_endpgm_saved() { 返回 rdna3_标量程序流(27, 0) }
+函数 编码_s_inst_prefetch(imm) { 返回 rdna3_标量程序流(29,imm) }
+函数 编码_s_clause(imm) { 返回 rdna3_标量程序流(30,imm) }
+函数 编码_s_wait_idle() { 返回 rdna3_标量程序流(31, 0) }
+函数 编码_s_waitcnt_depctr(imm) { 返回 rdna3_标量程序流(32,imm) }
+函数 编码_s_round_mode(imm) { 返回 rdna3_标量程序流(33,imm) }
+函数 编码_s_denorm_mode(imm) { 返回 rdna3_标量程序流(34,imm) }
+函数 编码_s_delay_alu(imm) { 返回 rdna3_标量程序流(36,imm) }
+函数 编码_s_wait_event(imm) { 返回 rdna3_标量程序流(37,imm) }
+
+// VOP2 — 向量二元运算
+函数 编码_v_cndmask_b32(d, s1, s0) { 返回 rdna3_向量双操作(0,d,s1,s0) }
+函数 编码_v_add_f32(d, s1, s0) { 返回 rdna3_向量双操作(3,d,s1,s0) }
+函数 编码_v_sub_f32(d, s1, s0) { 返回 rdna3_向量双操作(4,d,s1,s0) }
+函数 编码_v_subrev_f32(d, s1, s0) { 返回 rdna3_向量双操作(5,d,s1,s0) }
+函数 编码_v_mul_legacy_f32(d, s1, s0) { 返回 rdna3_向量双操作(7,d,s1,s0) }
+函数 编码_v_mul_f32(d, s1, s0) { 返回 rdna3_向量双操作(8,d,s1,s0) }
+函数 编码_v_mul_i32_i24(d, s1, s0) { 返回 rdna3_向量双操作(9,d,s1,s0) }
+函数 编码_v_mul_hi_i32_i24(d, s1, s0) { 返回 rdna3_向量双操作(10,d,s1,s0) }
+函数 编码_v_mul_u32_u24(d, s1, s0) { 返回 rdna3_向量双操作(11,d,s1,s0) }
+函数 编码_v_mul_hi_u32_u24(d, s1, s0) { 返回 rdna3_向量双操作(12,d,s1,s0) }
+函数 编码_v_min_f32(d, s1, s0) { 返回 rdna3_向量双操作(15,d,s1,s0) }
+函数 编码_v_max_f32(d, s1, s0) { 返回 rdna3_向量双操作(16,d,s1,s0) }
+函数 编码_v_min_i32(d, s1, s0) { 返回 rdna3_向量双操作(17,d,s1,s0) }
+函数 编码_v_max_i32(d, s1, s0) { 返回 rdna3_向量双操作(18,d,s1,s0) }
+函数 编码_v_min_u32(d, s1, s0) { 返回 rdna3_向量双操作(19,d,s1,s0) }
+函数 编码_v_max_u32(d, s1, s0) { 返回 rdna3_向量双操作(20,d,s1,s0) }
+函数 编码_v_lshrrev_b32(d, s1, s0) { 返回 rdna3_向量双操作(22,d,s1,s0) }
+函数 编码_v_ashrrev_i32(d, s1, s0) { 返回 rdna3_向量双操作(24,d,s1,s0) }
+函数 编码_v_lshlrev_b32(d, s1, s0) { 返回 rdna3_向量双操作(26,d,s1,s0) }
+函数 编码_v_and_b32(d, s1, s0) { 返回 rdna3_向量双操作(27,d,s1,s0) }
+函数 编码_v_or_b32(d, s1, s0) { 返回 rdna3_向量双操作(28,d,s1,s0) }
+函数 编码_v_xor_b32(d, s1, s0) { 返回 rdna3_向量双操作(29,d,s1,s0) }
+函数 编码_v_add_nc_u32(d, s1, s0) { 返回 rdna3_向量双操作(37,d,s1,s0) }
+函数 编码_v_sub_nc_u32(d, s1, s0) { 返回 rdna3_向量双操作(38,d,s1,s0) }
+函数 编码_v_subrev_nc_u32(d, s1, s0) { 返回 rdna3_向量双操作(39,d,s1,s0) }
+函数 编码_v_add_co_ci_u32(d, s1, s0) { 返回 rdna3_向量双操作(40,d,s1,s0) }
+函数 编码_v_sub_co_ci_u32(d, s1, s0) { 返回 rdna3_向量双操作(41,d,s1,s0) }
+函数 编码_v_subrev_co_ci_u32(d, s1, s0) { 返回 rdna3_向量双操作(42,d,s1,s0) }
+函数 编码_v_fmac_f32(d, s1, s0) { 返回 rdna3_向量双操作(43,d,s1,s0) }
+函数 编码_v_fmamk_f32(d, s1, s0) { 返回 rdna3_向量双操作(44,d,s1,s0) }
+函数 编码_v_fmaak_f32(d, s1, s0) { 返回 rdna3_向量双操作(45,d,s1,s0) }
+函数 编码_v_add_co_u32(d, s1, s0) { 返回 rdna3_向量双操作(47,d,s1,s0) }
+函数 编码_v_sub_co_u32(d, s1, s0) { 返回 rdna3_向量双操作(48,d,s1,s0) }
+函数 编码_v_subrev_co_u32(d, s1, s0) { 返回 rdna3_向量双操作(49,d,s1,s0) }
+函数 编码_v_add_f16(d, s1, s0) { 返回 rdna3_向量双操作(50,d,s1,s0) }
+函数 编码_v_sub_f16(d, s1, s0) { 返回 rdna3_向量双操作(51,d,s1,s0) }
+函数 编码_v_subrev_f16(d, s1, s0) { 返回 rdna3_向量双操作(52,d,s1,s0) }
+函数 编码_v_mul_f16(d, s1, s0) { 返回 rdna3_向量双操作(53,d,s1,s0) }
+函数 编码_v_fmac_f16(d, s1, s0) { 返回 rdna3_向量双操作(54,d,s1,s0) }
+函数 编码_v_fmamk_f16(d, s1, s0) { 返回 rdna3_向量双操作(55,d,s1,s0) }
+函数 编码_v_fmaak_f16(d, s1, s0) { 返回 rdna3_向量双操作(56,d,s1,s0) }
+函数 编码_v_max_f16(d, s1, s0) { 返回 rdna3_向量双操作(57,d,s1,s0) }
+函数 编码_v_min_f16(d, s1, s0) { 返回 rdna3_向量双操作(58,d,s1,s0) }
+函数 编码_v_ldexp_f16(d, s1, s0) { 返回 rdna3_向量双操作(59,d,s1,s0) }
+函数 编码_v_pk_fmac_f16(d, s1, s0) { 返回 rdna3_向量双操作(60,d,s1,s0) }
+
+// VOP1 — 向量一元运算
+函数 编码_v_nop() { 返回 rdna3_向量单操作(0, 0, 0) }
+函数 编码_v_mov_b32(d, s) { 返回 rdna3_向量单操作(1,d,s) }
+函数 编码_v_readfirstlane_b32(d, s) { 返回 rdna3_向量单操作(2,d,s) }
+函数 编码_v_cvt_i32_f64(d, s) { 返回 rdna3_向量单操作(3,d,s) }
+函数 编码_v_cvt_f64_i32(d, s) { 返回 rdna3_向量单操作(4,d,s) }
+函数 编码_v_cvt_f32_i32(d, s) { 返回 rdna3_向量单操作(5,d,s) }
+函数 编码_v_cvt_f32_u32(d, s) { 返回 rdna3_向量单操作(6,d,s) }
+函数 编码_v_cvt_u32_f32(d, s) { 返回 rdna3_向量单操作(7,d,s) }
+函数 编码_v_cvt_i32_f32(d, s) { 返回 rdna3_向量单操作(8,d,s) }
+函数 编码_v_cvt_f16_f32(d, s) { 返回 rdna3_向量单操作(10,d,s) }
+函数 编码_v_cvt_f32_f16(d, s) { 返回 rdna3_向量单操作(11,d,s) }
+函数 编码_v_cvt_rpi_i32_f32(d, s) { 返回 rdna3_向量单操作(12,d,s) }
+函数 编码_v_cvt_flr_i32_f32(d, s) { 返回 rdna3_向量单操作(13,d,s) }
+函数 编码_v_cvt_off_f32_i4(d, s) { 返回 rdna3_向量单操作(14,d,s) }
+函数 编码_v_cvt_f32_f64(d, s) { 返回 rdna3_向量单操作(15,d,s) }
+函数 编码_v_cvt_f64_f32(d, s) { 返回 rdna3_向量单操作(16,d,s) }
+函数 编码_v_cvt_f32_ubyte0(d, s) { 返回 rdna3_向量单操作(17,d,s) }
+函数 编码_v_cvt_f32_ubyte1(d, s) { 返回 rdna3_向量单操作(18,d,s) }
+函数 编码_v_cvt_f32_ubyte2(d, s) { 返回 rdna3_向量单操作(19,d,s) }
+函数 编码_v_cvt_f32_ubyte3(d, s) { 返回 rdna3_向量单操作(20,d,s) }
+函数 编码_v_cvt_u32_f64(d, s) { 返回 rdna3_向量单操作(21,d,s) }
+函数 编码_v_cvt_f64_u32(d, s) { 返回 rdna3_向量单操作(22,d,s) }
+函数 编码_v_trunc_f64(d, s) { 返回 rdna3_向量单操作(23,d,s) }
+函数 编码_v_ceil_f64(d, s) { 返回 rdna3_向量单操作(24,d,s) }
+函数 编码_v_rndne_f64(d, s) { 返回 rdna3_向量单操作(25,d,s) }
+函数 编码_v_floor_f64(d, s) { 返回 rdna3_向量单操作(26,d,s) }
+函数 编码_v_fract_f32(d, s) { 返回 rdna3_向量单操作(32,d,s) }
+函数 编码_v_trunc_f32(d, s) { 返回 rdna3_向量单操作(33,d,s) }
+函数 编码_v_ceil_f32(d, s) { 返回 rdna3_向量单操作(34,d,s) }
+函数 编码_v_rndne_f32(d, s) { 返回 rdna3_向量单操作(35,d,s) }
+函数 编码_v_floor_f32(d, s) { 返回 rdna3_向量单操作(36,d,s) }
+函数 编码_v_exp_f32(d, s) { 返回 rdna3_向量单操作(37,d,s) }
+函数 编码_v_log_f32(d, s) { 返回 rdna3_向量单操作(39,d,s) }
+函数 编码_v_rcp_f32(d, s) { 返回 rdna3_向量单操作(42,d,s) }
+函数 编码_v_rcp_iflag_f32(d, s) { 返回 rdna3_向量单操作(43,d,s) }
+函数 编码_v_rsq_f32(d, s) { 返回 rdna3_向量单操作(46,d,s) }
+函数 编码_v_rcp_f64(d, s) { 返回 rdna3_向量单操作(47,d,s) }
+函数 编码_v_rsq_f64(d, s) { 返回 rdna3_向量单操作(49,d,s) }
+函数 编码_v_sqrt_f32(d, s) { 返回 rdna3_向量单操作(51,d,s) }
+函数 编码_v_sqrt_f64(d, s) { 返回 rdna3_向量单操作(52,d,s) }
+函数 编码_v_sin_f32(d, s) { 返回 rdna3_向量单操作(53,d,s) }
+函数 编码_v_cos_f32(d, s) { 返回 rdna3_向量单操作(54,d,s) }
+函数 编码_v_not_b32(d, s) { 返回 rdna3_向量单操作(55,d,s) }
+函数 编码_v_bfrev_b32(d, s) { 返回 rdna3_向量单操作(56,d,s) }
+函数 编码_v_ffbh_u32(d, s) { 返回 rdna3_向量单操作(57,d,s) }
+函数 编码_v_ffbl_b32(d, s) { 返回 rdna3_向量单操作(58,d,s) }
+函数 编码_v_ffbh_i32(d, s) { 返回 rdna3_向量单操作(59,d,s) }
+函数 编码_v_frexp_exp_i32_f64(d, s) { 返回 rdna3_向量单操作(60,d,s) }
+函数 编码_v_frexp_mant_f64(d, s) { 返回 rdna3_向量单操作(61,d,s) }
+函数 编码_v_fract_f64(d, s) { 返回 rdna3_向量单操作(62,d,s) }
+函数 编码_v_frexp_exp_i32_f32(d, s) { 返回 rdna3_向量单操作(63,d,s) }
+函数 编码_v_frexp_mant_f32(d, s) { 返回 rdna3_向量单操作(64,d,s) }
+函数 编码_v_clrexcp() { 返回 rdna3_向量单操作(65, 0, 0) }
+函数 编码_v_cvt_f16_u16(d, s) { 返回 rdna3_向量单操作(80,d,s) }
+函数 编码_v_cvt_f16_i16(d, s) { 返回 rdna3_向量单操作(81,d,s) }
+函数 编码_v_cvt_u16_f16(d, s) { 返回 rdna3_向量单操作(82,d,s) }
+函数 编码_v_cvt_i16_f16(d, s) { 返回 rdna3_向量单操作(83,d,s) }
+函数 编码_v_rcp_f16(d, s) { 返回 rdna3_向量单操作(84,d,s) }
+函数 编码_v_sqrt_f16(d, s) { 返回 rdna3_向量单操作(85,d,s) }
+函数 编码_v_rsq_f16(d, s) { 返回 rdna3_向量单操作(86,d,s) }
+函数 编码_v_log_f16(d, s) { 返回 rdna3_向量单操作(87,d,s) }
+函数 编码_v_exp_f16(d, s) { 返回 rdna3_向量单操作(88,d,s) }
+函数 编码_v_frexp_mant_f16(d, s) { 返回 rdna3_向量单操作(89,d,s) }
+函数 编码_v_frexp_exp_i16_f16(d, s) { 返回 rdna3_向量单操作(90,d,s) }
+函数 编码_v_floor_f16(d, s) { 返回 rdna3_向量单操作(91,d,s) }
+函数 编码_v_ceil_f16(d, s) { 返回 rdna3_向量单操作(92,d,s) }
+函数 编码_v_trunc_f16(d, s) { 返回 rdna3_向量单操作(93,d,s) }
+函数 编码_v_rndne_f16(d, s) { 返回 rdna3_向量单操作(94,d,s) }
+函数 编码_v_fract_f16(d, s) { 返回 rdna3_向量单操作(95,d,s) }
+函数 编码_v_sin_f16(d, s) { 返回 rdna3_向量单操作(96,d,s) }
+函数 编码_v_cos_f16(d, s) { 返回 rdna3_向量单操作(97,d,s) }
+函数 编码_v_sat_pk_u8_i16(d, s) { 返回 rdna3_向量单操作(98,d,s) }
+函数 编码_v_swap_b32(d, s) { 返回 rdna3_向量单操作(101,d,s) }
+函数 编码_v_permlane64_b32(d, s) { 返回 rdna3_向量单操作(103,d,s) }
+函数 编码_v_not_b16(d, s) { 返回 rdna3_向量单操作(104,d,s) }
+函数 编码_v_cvt_i32_i16(d, s) { 返回 rdna3_向量单操作(105,d,s) }
+函数 编码_v_cvt_u32_u16(d, s) { 返回 rdna3_向量单操作(106,d,s) }
+函数 编码_v_mov_b16(d, s) { 返回 rdna3_向量单操作(107,d,s) }
+
+// VOPC — 向量比较 (f32/f64/i32/u32/f16/i64/u64/i16/u16)
+函数 编码_v_cmp_f_f32(s1, s0) { 返回 rdna3_向量比较(0,s1,s0) }
+函数 编码_v_cmp_lt_f32(s1, s0) { 返回 rdna3_向量比较(1,s1,s0) }
+函数 编码_v_cmp_eq_f32(s1, s0) { 返回 rdna3_向量比较(2,s1,s0) }
+函数 编码_v_cmp_le_f32(s1, s0) { 返回 rdna3_向量比较(3,s1,s0) }
+函数 编码_v_cmp_gt_f32(s1, s0) { 返回 rdna3_向量比较(4,s1,s0) }
+函数 编码_v_cmp_lg_f32(s1, s0) { 返回 rdna3_向量比较(5,s1,s0) }
+函数 编码_v_cmp_ge_f32(s1, s0) { 返回 rdna3_向量比较(6,s1,s0) }
+函数 编码_v_cmp_o_f32(s1, s0) { 返回 rdna3_向量比较(7,s1,s0) }
+函数 编码_v_cmp_u_f32(s1, s0) { 返回 rdna3_向量比较(8,s1,s0) }
+函数 编码_v_cmp_nge_f32(s1, s0) { 返回 rdna3_向量比较(9,s1,s0) }
+函数 编码_v_cmp_nlg_f32(s1, s0) { 返回 rdna3_向量比较(10,s1,s0) }
+函数 编码_v_cmp_ngt_f32(s1, s0) { 返回 rdna3_向量比较(11,s1,s0) }
+函数 编码_v_cmp_nle_f32(s1, s0) { 返回 rdna3_向量比较(12,s1,s0) }
+函数 编码_v_cmp_neq_f32(s1, s0) { 返回 rdna3_向量比较(13,s1,s0) }
+函数 编码_v_cmp_nlt_f32(s1, s0) { 返回 rdna3_向量比较(14,s1,s0) }
+函数 编码_v_cmp_tru_f32(s1, s0) { 返回 rdna3_向量比较(15,s1,s0) }
+函数 编码_v_cmp_f_f64(s1, s0) { 返回 rdna3_向量比较(32,s1,s0) }
+函数 编码_v_cmp_lt_f64(s1, s0) { 返回 rdna3_向量比较(33,s1,s0) }
+函数 编码_v_cmp_eq_f64(s1, s0) { 返回 rdna3_向量比较(34,s1,s0) }
+函数 编码_v_cmp_le_f64(s1, s0) { 返回 rdna3_向量比较(35,s1,s0) }
+函数 编码_v_cmp_gt_f64(s1, s0) { 返回 rdna3_向量比较(36,s1,s0) }
+函数 编码_v_cmp_lg_f64(s1, s0) { 返回 rdna3_向量比较(37,s1,s0) }
+函数 编码_v_cmp_ge_f64(s1, s0) { 返回 rdna3_向量比较(38,s1,s0) }
+函数 编码_v_cmp_o_f64(s1, s0) { 返回 rdna3_向量比较(39,s1,s0) }
+函数 编码_v_cmp_u_f64(s1, s0) { 返回 rdna3_向量比较(40,s1,s0) }
+函数 编码_v_cmp_nge_f64(s1, s0) { 返回 rdna3_向量比较(41,s1,s0) }
+函数 编码_v_cmp_nlg_f64(s1, s0) { 返回 rdna3_向量比较(42,s1,s0) }
+函数 编码_v_cmp_ngt_f64(s1, s0) { 返回 rdna3_向量比较(43,s1,s0) }
+函数 编码_v_cmp_nle_f64(s1, s0) { 返回 rdna3_向量比较(44,s1,s0) }
+函数 编码_v_cmp_neq_f64(s1, s0) { 返回 rdna3_向量比较(45,s1,s0) }
+函数 编码_v_cmp_nlt_f64(s1, s0) { 返回 rdna3_向量比较(46,s1,s0) }
+函数 编码_v_cmp_tru_f64(s1, s0) { 返回 rdna3_向量比较(47,s1,s0) }
+函数 编码_v_cmp_lt_i32(s1, s0) { 返回 rdna3_向量比较(65,s1,s0) }
+函数 编码_v_cmp_eq_i32(s1, s0) { 返回 rdna3_向量比较(66,s1,s0) }
+函数 编码_v_cmp_le_i32(s1, s0) { 返回 rdna3_向量比较(67,s1,s0) }
+函数 编码_v_cmp_gt_i32(s1, s0) { 返回 rdna3_向量比较(68,s1,s0) }
+函数 编码_v_cmp_ne_i32(s1, s0) { 返回 rdna3_向量比较(69,s1,s0) }
+函数 编码_v_cmp_ge_i32(s1, s0) { 返回 rdna3_向量比较(70,s1,s0) }
+函数 编码_v_cmp_lt_u32(s1, s0) { 返回 rdna3_向量比较(73,s1,s0) }
+函数 编码_v_cmp_eq_u32(s1, s0) { 返回 rdna3_向量比较(74,s1,s0) }
+函数 编码_v_cmp_le_u32(s1, s0) { 返回 rdna3_向量比较(75,s1,s0) }
+函数 编码_v_cmp_gt_u32(s1, s0) { 返回 rdna3_向量比较(76,s1,s0) }
+函数 编码_v_cmp_ne_u32(s1, s0) { 返回 rdna3_向量比较(77,s1,s0) }
+函数 编码_v_cmp_ge_u32(s1, s0) { 返回 rdna3_向量比较(78,s1,s0) }
+函数 编码_v_cmp_lt_f16(s1, s0) { 返回 rdna3_向量比较(97,s1,s0) }
+函数 编码_v_cmp_eq_f16(s1, s0) { 返回 rdna3_向量比较(98,s1,s0) }
+函数 编码_v_cmp_le_f16(s1, s0) { 返回 rdna3_向量比较(99,s1,s0) }
+函数 编码_v_cmp_gt_f16(s1, s0) { 返回 rdna3_向量比较(100,s1,s0) }
+函数 编码_v_cmp_lg_f16(s1, s0) { 返回 rdna3_向量比较(101,s1,s0) }
+函数 编码_v_cmp_ge_f16(s1, s0) { 返回 rdna3_向量比较(102,s1,s0) }
+函数 编码_v_cmp_o_f16(s1, s0) { 返回 rdna3_向量比较(103,s1,s0) }
+函数 编码_v_cmp_u_f16(s1, s0) { 返回 rdna3_向量比较(104,s1,s0) }
+函数 编码_v_cmp_nge_f16(s1, s0) { 返回 rdna3_向量比较(105,s1,s0) }
+函数 编码_v_cmp_nlg_f16(s1, s0) { 返回 rdna3_向量比较(106,s1,s0) }
+函数 编码_v_cmp_ngt_f16(s1, s0) { 返回 rdna3_向量比较(107,s1,s0) }
+函数 编码_v_cmp_nle_f16(s1, s0) { 返回 rdna3_向量比较(108,s1,s0) }
+函数 编码_v_cmp_neq_f16(s1, s0) { 返回 rdna3_向量比较(109,s1,s0) }
+函数 编码_v_cmp_nlt_f16(s1, s0) { 返回 rdna3_向量比较(110,s1,s0) }
+函数 编码_v_cmp_lt_i64(s1, s0) { 返回 rdna3_向量比较(129,s1,s0) }
+函数 编码_v_cmp_eq_i64(s1, s0) { 返回 rdna3_向量比较(130,s1,s0) }
+函数 编码_v_cmp_le_i64(s1, s0) { 返回 rdna3_向量比较(131,s1,s0) }
+函数 编码_v_cmp_gt_i64(s1, s0) { 返回 rdna3_向量比较(132,s1,s0) }
+函数 编码_v_cmp_ne_i64(s1, s0) { 返回 rdna3_向量比较(133,s1,s0) }
+函数 编码_v_cmp_ge_i64(s1, s0) { 返回 rdna3_向量比较(134,s1,s0) }
+函数 编码_v_cmp_lt_u64(s1, s0) { 返回 rdna3_向量比较(137,s1,s0) }
+函数 编码_v_cmp_eq_u64(s1, s0) { 返回 rdna3_向量比较(138,s1,s0) }
+函数 编码_v_cmp_le_u64(s1, s0) { 返回 rdna3_向量比较(139,s1,s0) }
+函数 编码_v_cmp_gt_u64(s1, s0) { 返回 rdna3_向量比较(140,s1,s0) }
+函数 编码_v_cmp_ne_u64(s1, s0) { 返回 rdna3_向量比较(141,s1,s0) }
+函数 编码_v_cmp_ge_u64(s1, s0) { 返回 rdna3_向量比较(142,s1,s0) }
+函数 编码_v_cmp_lt_i16(s1, s0) { 返回 rdna3_向量比较(145,s1,s0) }
+函数 编码_v_cmp_eq_i16(s1, s0) { 返回 rdna3_向量比较(146,s1,s0) }
+函数 编码_v_cmp_le_i16(s1, s0) { 返回 rdna3_向量比较(147,s1,s0) }
+函数 编码_v_cmp_gt_i16(s1, s0) { 返回 rdna3_向量比较(148,s1,s0) }
+函数 编码_v_cmp_ne_i16(s1, s0) { 返回 rdna3_向量比较(149,s1,s0) }
+函数 编码_v_cmp_ge_i16(s1, s0) { 返回 rdna3_向量比较(150,s1,s0) }
+函数 编码_v_cmp_lt_u16(s1, s0) { 返回 rdna3_向量比较(153,s1,s0) }
+函数 编码_v_cmp_eq_u16(s1, s0) { 返回 rdna3_向量比较(154,s1,s0) }
+函数 编码_v_cmp_le_u16(s1, s0) { 返回 rdna3_向量比较(155,s1,s0) }
+函数 编码_v_cmp_gt_u16(s1, s0) { 返回 rdna3_向量比较(156,s1,s0) }
+函数 编码_v_cmp_ne_u16(s1, s0) { 返回 rdna3_向量比较(157,s1,s0) }
+函数 编码_v_cmp_ge_u16(s1, s0) { 返回 rdna3_向量比较(158,s1,s0) }
+
+// VOP3 — 三操作数/FMA/MAD/位域等
+函数 编码_v_mad_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(449,d,s0,s1,s2) }
+函数 编码_v_mad_i32_i24(d, s0, s1, s2) { 返回 rdna3_向量三操作(450,d,s0,s1,s2) }
+函数 编码_v_mad_u32_u24(d, s0, s1, s2) { 返回 rdna3_向量三操作(451,d,s0,s1,s2) }
+函数 编码_v_cubeid_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(452,d,s0,s1,s2) }
+函数 编码_v_cubesc_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(453,d,s0,s1,s2) }
+函数 编码_v_cubetc_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(454,d,s0,s1,s2) }
+函数 编码_v_cubema_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(455,d,s0,s1,s2) }
+函数 编码_v_bfe_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(456,d,s0,s1,s2) }
+函数 编码_v_bfe_i32(d, s0, s1, s2) { 返回 rdna3_向量三操作(457,d,s0,s1,s2) }
+函数 编码_v_bfi_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(458,d,s0,s1,s2) }
+函数 编码_v_fma_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(459,d,s0,s1,s2) }
+函数 编码_v_fma_f64(d, s0, s1, s2) { 返回 rdna3_向量三操作(460,d,s0,s1,s2) }
+函数 编码_v_lerp_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(461,d,s0,s1,s2) }
+函数 编码_v_alignbit_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(462,d,s0,s1,s2) }
+函数 编码_v_alignbyte_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(463,d,s0,s1,s2) }
+函数 编码_v_min3_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(465,d,s0,s1,s2) }
+函数 编码_v_min3_i32(d, s0, s1, s2) { 返回 rdna3_向量三操作(466,d,s0,s1,s2) }
+函数 编码_v_min3_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(467,d,s0,s1,s2) }
+函数 编码_v_max3_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(468,d,s0,s1,s2) }
+函数 编码_v_max3_i32(d, s0, s1, s2) { 返回 rdna3_向量三操作(469,d,s0,s1,s2) }
+函数 编码_v_max3_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(470,d,s0,s1,s2) }
+函数 编码_v_med3_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(471,d,s0,s1,s2) }
+函数 编码_v_med3_i32(d, s0, s1, s2) { 返回 rdna3_向量三操作(472,d,s0,s1,s2) }
+函数 编码_v_med3_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(473,d,s0,s1,s2) }
+函数 编码_v_sad_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(474,d,s0,s1,s2) }
+函数 编码_v_sad_hi_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(475,d,s0,s1,s2) }
+函数 编码_v_sad_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(476,d,s0,s1,s2) }
+函数 编码_v_sad_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(477,d,s0,s1,s2) }
+函数 编码_v_cvt_pk_u8_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(478,d,s0,s1,s2) }
+函数 编码_v_div_fixup_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(479,d,s0,s1,s2) }
+函数 编码_v_div_fixup_f64(d, s0, s1, s2) { 返回 rdna3_向量三操作(480,d,s0,s1,s2) }
+函数 编码_v_div_fmas_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(482,d,s0,s1,s2) }
+函数 编码_v_div_fmas_f64(d, s0, s1, s2) { 返回 rdna3_向量三操作(483,d,s0,s1,s2) }
+函数 编码_v_msad_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(484,d,s0,s1,s2) }
+函数 编码_v_mqsad_pk_u16_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(486,d,s0,s1,s2) }
+函数 编码_v_mqsad_u32_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(487,d,s0,s1,s2) }
+函数 编码_v_mad_u64_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(488,d,s0,s1,s2) }
+函数 编码_v_mad_i64_i32(d, s0, s1, s2) { 返回 rdna3_向量三操作(489,d,s0,s1,s2) }
+函数 编码_v_mad_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(490,d,s0,s1,s2) }
+函数 编码_v_mad_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(491,d,s0,s1,s2) }
+函数 编码_v_mad_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(492,d,s0,s1,s2) }
+函数 编码_v_fma_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(493,d,s0,s1,s2) }
+函数 编码_v_div_fixup_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(494,d,s0,s1,s2) }
+函数 编码_v_perm_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(500,d,s0,s1,s2) }
+函数 编码_v_xad_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(501,d,s0,s1,s2) }
+函数 编码_v_lshl_add_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(502,d,s0,s1,s2) }
+函数 编码_v_add_lshl_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(503,d,s0,s1,s2) }
+函数 编码_v_add3_u32(d, s0, s1, s2) { 返回 rdna3_向量三操作(505,d,s0,s1,s2) }
+函数 编码_v_lshl_or_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(506,d,s0,s1,s2) }
+函数 编码_v_and_or_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(507,d,s0,s1,s2) }
+函数 编码_v_or3_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(508,d,s0,s1,s2) }
+函数 编码_v_mad_u32_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(509,d,s0,s1,s2) }
+函数 编码_v_mad_i32_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(510,d,s0,s1,s2) }
+函数 编码_v_permlane16_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(511,d,s0,s1,s2) }
+函数 编码_v_permlanex16_b32(d, s0, s1, s2) { 返回 rdna3_向量三操作(512,d,s0,s1,s2) }
+函数 编码_v_min3_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(513,d,s0,s1,s2) }
+函数 编码_v_min3_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(514,d,s0,s1,s2) }
+函数 编码_v_min3_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(515,d,s0,s1,s2) }
+函数 编码_v_max3_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(516,d,s0,s1,s2) }
+函数 编码_v_max3_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(517,d,s0,s1,s2) }
+函数 编码_v_max3_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(518,d,s0,s1,s2) }
+函数 编码_v_med3_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(519,d,s0,s1,s2) }
+函数 编码_v_med3_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(520,d,s0,s1,s2) }
+函数 编码_v_med3_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(521,d,s0,s1,s2) }
+函数 编码_v_dot2_f32_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(523,d,s0,s1,s2) }
+函数 编码_v_dot2_i32_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(524,d,s0,s1,s2) }
+函数 编码_v_dot2_u32_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(525,d,s0,s1,s2) }
+函数 编码_v_dot4_i32_i8(d, s0, s1, s2) { 返回 rdna3_向量三操作(526,d,s0,s1,s2) }
+函数 编码_v_dot4_u32_u8(d, s0, s1, s2) { 返回 rdna3_向量三操作(527,d,s0,s1,s2) }
+函数 编码_v_dot8_i32_i4(d, s0, s1, s2) { 返回 rdna3_向量三操作(528,d,s0,s1,s2) }
+函数 编码_v_dot8_u32_u4(d, s0, s1, s2) { 返回 rdna3_向量三操作(529,d,s0,s1,s2) }
+函数 编码_v_dot2_f32_bf16(d, s0, s1, s2) { 返回 rdna3_向量三操作(530,d,s0,s1,s2) }
+函数 编码_v_fma_mix_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(531,d,s0,s1,s2) }
+函数 编码_v_fma_mixlo_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(532,d,s0,s1,s2) }
+函数 编码_v_fma_mixhi_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(533,d,s0,s1,s2) }
+
+// SMEM — 标量内存
+函数 编码_s_load_b32(d, b, off) { 返回 rdna3_标量内存(0,d,b,off) }
+函数 编码_s_load_b64(d, b, off) { 返回 rdna3_标量内存(1,d,b,off) }
+函数 编码_s_load_b128(d, b, off) { 返回 rdna3_标量内存(2,d,b,off) }
+函数 编码_s_load_b256(d, b, off) { 返回 rdna3_标量内存(3,d,b,off) }
+函数 编码_s_load_b512(d, b, off) { 返回 rdna3_标量内存(4,d,b,off) }
+函数 编码_s_buffer_load_b32(d, b, off) { 返回 rdna3_标量内存(8,d,b,off) }
+函数 编码_s_buffer_load_b64(d, b, off) { 返回 rdna3_标量内存(9,d,b,off) }
+函数 编码_s_buffer_load_b128(d, b, off) { 返回 rdna3_标量内存(10,d,b,off) }
+函数 编码_s_buffer_load_b256(d, b, off) { 返回 rdna3_标量内存(11,d,b,off) }
+函数 编码_s_buffer_load_b512(d, b, off) { 返回 rdna3_标量内存(12,d,b,off) }
+函数 编码_s_store_b32(d, b, off) { 返回 rdna3_标量内存(16,d,b,off) }
+函数 编码_s_store_b64(d, b, off) { 返回 rdna3_标量内存(17,d,b,off) }
+函数 编码_s_store_b128(d, b, off) { 返回 rdna3_标量内存(18,d,b,off) }
+函数 编码_s_buffer_store_b32(d, b, off) { 返回 rdna3_标量内存(24,d,b,off) }
+函数 编码_s_buffer_store_b64(d, b, off) { 返回 rdna3_标量内存(25,d,b,off) }
+函数 编码_s_buffer_store_b128(d, b, off) { 返回 rdna3_标量内存(26,d,b,off) }
+函数 编码_s_gl1_inv() { 返回 rdna3_标量内存(32, 0, 0, 0) }
+函数 编码_s_dcache_inv() { 返回 rdna3_标量内存(33, 0, 0, 0) }
+函数 编码_s_dcache_wb() { 返回 rdna3_标量内存(34, 0, 0, 0) }
+函数 编码_s_memtime(d) { 返回 rdna3_标量内存(36, d, 0, 0) }
+函数 编码_s_memrealtime(d) { 返回 rdna3_标量内存(37, d, 0, 0) }
+函数 编码_s_atc_probe(d, b, off) { 返回 rdna3_标量内存(38,d,b,off) }
+函数 编码_s_atc_probe_buffer(d, b, off) { 返回 rdna3_标量内存(39,d,b,off) }
+
+// DS — LDS/GDS 本地数据共享
+函数 编码_ds_add_u32(o0, o1) { 返回 rdna3_数据共享(0,0,o1,o0) }
+函数 编码_ds_sub_u32(o0, o1) { 返回 rdna3_数据共享(1,0,o1,o0) }
+函数 编码_ds_rsub_u32(o0, o1) { 返回 rdna3_数据共享(2,0,o1,o0) }
+函数 编码_ds_inc_u32(o0, o1) { 返回 rdna3_数据共享(3,0,o1,o0) }
+函数 编码_ds_dec_u32(o0, o1) { 返回 rdna3_数据共享(4,0,o1,o0) }
+函数 编码_ds_min_i32(o0, o1) { 返回 rdna3_数据共享(5,0,o1,o0) }
+函数 编码_ds_max_i32(o0, o1) { 返回 rdna3_数据共享(6,0,o1,o0) }
+函数 编码_ds_min_u32(o0, o1) { 返回 rdna3_数据共享(7,0,o1,o0) }
+函数 编码_ds_max_u32(o0, o1) { 返回 rdna3_数据共享(8,0,o1,o0) }
+函数 编码_ds_and_b32(o0, o1) { 返回 rdna3_数据共享(9,0,o1,o0) }
+函数 编码_ds_or_b32(o0, o1) { 返回 rdna3_数据共享(10,0,o1,o0) }
+函数 编码_ds_xor_b32(o0, o1) { 返回 rdna3_数据共享(11,0,o1,o0) }
+函数 编码_ds_mskor_b32(o0, o1) { 返回 rdna3_数据共享(12,0,o1,o0) }
+函数 编码_ds_write_b32(o0, o1) { 返回 rdna3_数据共享(13,0,o1,o0) }
+函数 编码_ds_write2_b32(o0, o1) { 返回 rdna3_数据共享(14,0,o1,o0) }
+函数 编码_ds_write2st64_b32(o0, o1) { 返回 rdna3_数据共享(15,0,o1,o0) }
+函数 编码_ds_cmpst_b32(o0, o1) { 返回 rdna3_数据共享(16,0,o1,o0) }
+函数 编码_ds_cmpst_f32(o0, o1) { 返回 rdna3_数据共享(17,0,o1,o0) }
+函数 编码_ds_min_f32(o0, o1) { 返回 rdna3_数据共享(18,0,o1,o0) }
+函数 编码_ds_max_f32(o0, o1) { 返回 rdna3_数据共享(19,0,o1,o0) }
+函数 编码_ds_add_f32(o0, o1) { 返回 rdna3_数据共享(21,0,o1,o0) }
+函数 编码_ds_write_b8(o0, o1) { 返回 rdna3_数据共享(30,0,o1,o0) }
+函数 编码_ds_write_b16(o0, o1) { 返回 rdna3_数据共享(31,0,o1,o0) }
+函数 编码_ds_add_rtn_u32(o0, o1) { 返回 rdna3_数据共享(32,0,o1,o0) }
+函数 编码_ds_sub_rtn_u32(o0, o1) { 返回 rdna3_数据共享(33,0,o1,o0) }
+函数 编码_ds_inc_rtn_u32(o0, o1) { 返回 rdna3_数据共享(35,0,o1,o0) }
+函数 编码_ds_dec_rtn_u32(o0, o1) { 返回 rdna3_数据共享(36,0,o1,o0) }
+函数 编码_ds_min_rtn_i32(o0, o1) { 返回 rdna3_数据共享(37,0,o1,o0) }
+函数 编码_ds_max_rtn_i32(o0, o1) { 返回 rdna3_数据共享(38,0,o1,o0) }
+函数 编码_ds_min_rtn_u32(o0, o1) { 返回 rdna3_数据共享(39,0,o1,o0) }
+函数 编码_ds_max_rtn_u32(o0, o1) { 返回 rdna3_数据共享(40,0,o1,o0) }
+函数 编码_ds_and_rtn_b32(o0, o1) { 返回 rdna3_数据共享(41,0,o1,o0) }
+函数 编码_ds_or_rtn_b32(o0, o1) { 返回 rdna3_数据共享(42,0,o1,o0) }
+函数 编码_ds_xor_rtn_b32(o0, o1) { 返回 rdna3_数据共享(43,0,o1,o0) }
+函数 编码_ds_wrxchg_rtn_b32(o0, o1) { 返回 rdna3_数据共享(45,0,o1,o0) }
+函数 编码_ds_wrxchg2_rtn_b32(o0, o1) { 返回 rdna3_数据共享(46,0,o1,o0) }
+函数 编码_ds_cmpst_rtn_b32(o0, o1) { 返回 rdna3_数据共享(48,0,o1,o0) }
+函数 编码_ds_cmpst_rtn_f32(o0, o1) { 返回 rdna3_数据共享(49,0,o1,o0) }
+函数 编码_ds_min_rtn_f32(o0, o1) { 返回 rdna3_数据共享(50,0,o1,o0) }
+函数 编码_ds_max_rtn_f32(o0, o1) { 返回 rdna3_数据共享(51,0,o1,o0) }
+函数 编码_ds_read_b32(o0, o1) { 返回 rdna3_数据共享(54,0,o1,o0) }
+函数 编码_ds_read2_b32(o0, o1) { 返回 rdna3_数据共享(55,0,o1,o0) }
+函数 编码_ds_read2st64_b32(o0, o1) { 返回 rdna3_数据共享(56,0,o1,o0) }
+函数 编码_ds_read_i8(o0, o1) { 返回 rdna3_数据共享(57,0,o1,o0) }
+函数 编码_ds_read_u8(o0, o1) { 返回 rdna3_数据共享(58,0,o1,o0) }
+函数 编码_ds_read_i16(o0, o1) { 返回 rdna3_数据共享(59,0,o1,o0) }
+函数 编码_ds_read_u16(o0, o1) { 返回 rdna3_数据共享(60,0,o1,o0) }
+函数 编码_ds_swizzle_b32(o0, o1) { 返回 rdna3_数据共享(61,0,o1,o0) }
+函数 编码_ds_permute_b32(o0, o1) { 返回 rdna3_数据共享(62,0,o1,o0) }
+函数 编码_ds_bpermute_b32(o0, o1) { 返回 rdna3_数据共享(63,0,o1,o0) }
+函数 编码_ds_add_u64(o0, o1) { 返回 rdna3_数据共享(64,0,o1,o0) }
+函数 编码_ds_sub_u64(o0, o1) { 返回 rdna3_数据共享(65,0,o1,o0) }
+函数 编码_ds_inc_u64(o0, o1) { 返回 rdna3_数据共享(67,0,o1,o0) }
+函数 编码_ds_dec_u64(o0, o1) { 返回 rdna3_数据共享(68,0,o1,o0) }
+函数 编码_ds_min_i64(o0, o1) { 返回 rdna3_数据共享(69,0,o1,o0) }
+函数 编码_ds_max_i64(o0, o1) { 返回 rdna3_数据共享(70,0,o1,o0) }
+函数 编码_ds_write_b64(o0, o1) { 返回 rdna3_数据共享(77,0,o1,o0) }
+函数 编码_ds_write2_b64(o0, o1) { 返回 rdna3_数据共享(78,0,o1,o0) }
+函数 编码_ds_cmpst_b64(o0, o1) { 返回 rdna3_数据共享(80,0,o1,o0) }
+函数 编码_ds_read_b64(o0, o1) { 返回 rdna3_数据共享(118,0,o1,o0) }
+函数 编码_ds_read2_b64(o0, o1) { 返回 rdna3_数据共享(119,0,o1,o0) }
+函数 编码_ds_write_b128(o0, o1) { 返回 rdna3_数据共享(222,0,o1,o0) }
+函数 编码_ds_read_b128(o0, o1) { 返回 rdna3_数据共享(254,0,o1,o0) }
+
+// MUBUF — 向量缓冲区内存
+函数 编码_buffer_load_format_x(off) { 返回 rdna3_缓冲内存(0,0,off) }
+函数 编码_buffer_load_format_xy(off) { 返回 rdna3_缓冲内存(1,0,off) }
+函数 编码_buffer_load_format_xyz(off) { 返回 rdna3_缓冲内存(2,0,off) }
+函数 编码_buffer_load_format_xyzw(off) { 返回 rdna3_缓冲内存(3,0,off) }
+函数 编码_buffer_store_format_x(off) { 返回 rdna3_缓冲内存(4,0,off) }
+函数 编码_buffer_store_format_xy(off) { 返回 rdna3_缓冲内存(5,0,off) }
+函数 编码_buffer_store_format_xyz(off) { 返回 rdna3_缓冲内存(6,0,off) }
+函数 编码_buffer_store_format_xyzw(off) { 返回 rdna3_缓冲内存(7,0,off) }
+函数 编码_buffer_load_u8(off) { 返回 rdna3_缓冲内存(8,0,off) }
+函数 编码_buffer_load_i8(off) { 返回 rdna3_缓冲内存(9,0,off) }
+函数 编码_buffer_load_u16(off) { 返回 rdna3_缓冲内存(10,0,off) }
+函数 编码_buffer_load_i16(off) { 返回 rdna3_缓冲内存(11,0,off) }
+函数 编码_buffer_load_b32(off) { 返回 rdna3_缓冲内存(12,0,off) }
+函数 编码_buffer_load_b64(off) { 返回 rdna3_缓冲内存(13,0,off) }
+函数 编码_buffer_load_b96(off) { 返回 rdna3_缓冲内存(14,0,off) }
+函数 编码_buffer_load_b128(off) { 返回 rdna3_缓冲内存(15,0,off) }
+函数 编码_buffer_store_b8(off) { 返回 rdna3_缓冲内存(24,0,off) }
+函数 编码_buffer_store_b16(off) { 返回 rdna3_缓冲内存(25,0,off) }
+函数 编码_buffer_store_b32(off) { 返回 rdna3_缓冲内存(28,0,off) }
+函数 编码_buffer_store_b64(off) { 返回 rdna3_缓冲内存(29,0,off) }
+函数 编码_buffer_store_b96(off) { 返回 rdna3_缓冲内存(30,0,off) }
+函数 编码_buffer_store_b128(off) { 返回 rdna3_缓冲内存(31,0,off) }
+函数 编码_buffer_atomic_swap(off) { 返回 rdna3_缓冲内存(48,0,off) }
+函数 编码_buffer_atomic_cmpswap(off) { 返回 rdna3_缓冲内存(49,0,off) }
+函数 编码_buffer_atomic_add(off) { 返回 rdna3_缓冲内存(50,0,off) }
+函数 编码_buffer_atomic_sub(off) { 返回 rdna3_缓冲内存(51,0,off) }
+函数 编码_buffer_atomic_smin(off) { 返回 rdna3_缓冲内存(52,0,off) }
+函数 编码_buffer_atomic_umin(off) { 返回 rdna3_缓冲内存(53,0,off) }
+函数 编码_buffer_atomic_smax(off) { 返回 rdna3_缓冲内存(54,0,off) }
+函数 编码_buffer_atomic_umax(off) { 返回 rdna3_缓冲内存(55,0,off) }
+函数 编码_buffer_atomic_and(off) { 返回 rdna3_缓冲内存(56,0,off) }
+函数 编码_buffer_atomic_or(off) { 返回 rdna3_缓冲内存(57,0,off) }
+函数 编码_buffer_atomic_xor(off) { 返回 rdna3_缓冲内存(58,0,off) }
+函数 编码_buffer_atomic_inc(off) { 返回 rdna3_缓冲内存(59,0,off) }
+函数 编码_buffer_atomic_dec(off) { 返回 rdna3_缓冲内存(60,0,off) }
+函数 编码_buffer_atomic_add_f32(off) { 返回 rdna3_缓冲内存(61,0,off) }
+函数 编码_buffer_atomic_swap_x2(off) { 返回 rdna3_缓冲内存(80,0,off) }
+函数 编码_buffer_atomic_cmpswap_x2(off) { 返回 rdna3_缓冲内存(81,0,off) }
+函数 编码_buffer_atomic_add_x2(off) { 返回 rdna3_缓冲内存(82,0,off) }
+函数 编码_buffer_atomic_sub_x2(off) { 返回 rdna3_缓冲内存(83,0,off) }
+函数 编码_buffer_atomic_smin_x2(off) { 返回 rdna3_缓冲内存(84,0,off) }
+函数 编码_buffer_atomic_umin_x2(off) { 返回 rdna3_缓冲内存(85,0,off) }
+函数 编码_buffer_atomic_smax_x2(off) { 返回 rdna3_缓冲内存(86,0,off) }
+函数 编码_buffer_atomic_umax_x2(off) { 返回 rdna3_缓冲内存(87,0,off) }
+函数 编码_buffer_atomic_and_x2(off) { 返回 rdna3_缓冲内存(88,0,off) }
+函数 编码_buffer_atomic_or_x2(off) { 返回 rdna3_缓冲内存(89,0,off) }
+函数 编码_buffer_atomic_xor_x2(off) { 返回 rdna3_缓冲内存(90,0,off) }
+
+// FLAT/GLOBAL/SCRATCH — 扁平内存
+函数 编码_flat_load_b32(g, s) { 返回 rdna3_平坦内存(16,0,g,s) }
+函数 编码_flat_load_b64(g, s) { 返回 rdna3_平坦内存(17,0,g,s) }
+函数 编码_flat_load_b128(g, s) { 返回 rdna3_平坦内存(23,0,g,s) }
+函数 编码_flat_store_b32(g, s) { 返回 rdna3_平坦内存(24,0,g,s) }
+函数 编码_flat_store_b64(g, s) { 返回 rdna3_平坦内存(25,0,g,s) }
+函数 编码_flat_store_b128(g, s) { 返回 rdna3_平坦内存(31,0,g,s) }
+函数 编码_flat_load_u8(g, s) { 返回 rdna3_平坦内存(18,0,g,s) }
+函数 编码_flat_load_i8(g, s) { 返回 rdna3_平坦内存(19,0,g,s) }
+函数 编码_flat_load_u16(g, s) { 返回 rdna3_平坦内存(20,0,g,s) }
+函数 编码_flat_store_b8(g, s) { 返回 rdna3_平坦内存(26,0,g,s) }
+函数 编码_flat_store_b16(g, s) { 返回 rdna3_平坦内存(28,0,g,s) }
+函数 编码_flat_atomic_swap(g, s) { 返回 rdna3_平坦内存(48,0,g,s) }
+函数 编码_flat_atomic_cmpswap(g, s) { 返回 rdna3_平坦内存(49,0,g,s) }
+函数 编码_flat_atomic_add(g, s) { 返回 rdna3_平坦内存(50,0,g,s) }
+函数 编码_flat_atomic_sub(g, s) { 返回 rdna3_平坦内存(51,0,g,s) }
+函数 编码_flat_atomic_smin(g, s) { 返回 rdna3_平坦内存(53,0,g,s) }
+函数 编码_flat_atomic_umin(g, s) { 返回 rdna3_平坦内存(54,0,g,s) }
+函数 编码_flat_atomic_smax(g, s) { 返回 rdna3_平坦内存(55,0,g,s) }
+函数 编码_flat_atomic_umax(g, s) { 返回 rdna3_平坦内存(56,0,g,s) }
+函数 编码_flat_atomic_and(g, s) { 返回 rdna3_平坦内存(57,0,g,s) }
+函数 编码_flat_atomic_or(g, s) { 返回 rdna3_平坦内存(58,0,g,s) }
+函数 编码_flat_atomic_xor(g, s) { 返回 rdna3_平坦内存(59,0,g,s) }
+函数 编码_flat_atomic_inc(g, s) { 返回 rdna3_平坦内存(60,0,g,s) }
+函数 编码_flat_atomic_dec(g, s) { 返回 rdna3_平坦内存(61,0,g,s) }
+函数 编码_flat_atomic_add_f32(g, s) { 返回 rdna3_平坦内存(62,0,g,s) }
+函数 编码_global_load_b32(g, s) { 返回 rdna3_平坦内存(16,1,g,s) }
+函数 编码_global_load_b64(g, s) { 返回 rdna3_平坦内存(17,1,g,s) }
+函数 编码_global_load_b128(g, s) { 返回 rdna3_平坦内存(23,1,g,s) }
+函数 编码_global_store_b32(g, s) { 返回 rdna3_平坦内存(24,1,g,s) }
+函数 编码_global_store_b64(g, s) { 返回 rdna3_平坦内存(25,1,g,s) }
+函数 编码_global_store_b128(g, s) { 返回 rdna3_平坦内存(31,1,g,s) }
+函数 编码_global_load_u8(g, s) { 返回 rdna3_平坦内存(18,1,g,s) }
+函数 编码_global_load_i8(g, s) { 返回 rdna3_平坦内存(19,1,g,s) }
+函数 编码_global_load_u16(g, s) { 返回 rdna3_平坦内存(20,1,g,s) }
+函数 编码_global_store_b8(g, s) { 返回 rdna3_平坦内存(26,1,g,s) }
+函数 编码_global_store_b16(g, s) { 返回 rdna3_平坦内存(28,1,g,s) }
+函数 编码_global_atomic_swap(g, s) { 返回 rdna3_平坦内存(48,1,g,s) }
+函数 编码_global_atomic_cmpswap(g, s) { 返回 rdna3_平坦内存(49,1,g,s) }
+函数 编码_global_atomic_add(g, s) { 返回 rdna3_平坦内存(50,1,g,s) }
+函数 编码_global_atomic_sub(g, s) { 返回 rdna3_平坦内存(51,1,g,s) }
+函数 编码_global_atomic_smin(g, s) { 返回 rdna3_平坦内存(53,1,g,s) }
+函数 编码_global_atomic_umin(g, s) { 返回 rdna3_平坦内存(54,1,g,s) }
+函数 编码_global_atomic_smax(g, s) { 返回 rdna3_平坦内存(55,1,g,s) }
+函数 编码_global_atomic_umax(g, s) { 返回 rdna3_平坦内存(56,1,g,s) }
+函数 编码_global_atomic_and(g, s) { 返回 rdna3_平坦内存(57,1,g,s) }
+函数 编码_global_atomic_or(g, s) { 返回 rdna3_平坦内存(58,1,g,s) }
+函数 编码_global_atomic_xor(g, s) { 返回 rdna3_平坦内存(59,1,g,s) }
+函数 编码_global_atomic_inc(g, s) { 返回 rdna3_平坦内存(60,1,g,s) }
+函数 编码_global_atomic_dec(g, s) { 返回 rdna3_平坦内存(61,1,g,s) }
+函数 编码_global_atomic_add_f32(g, s) { 返回 rdna3_平坦内存(62,1,g,s) }
+函数 编码_scratch_load_b32(g, s) { 返回 rdna3_平坦内存(16,2,g,s) }
+函数 编码_scratch_load_b64(g, s) { 返回 rdna3_平坦内存(17,2,g,s) }
+函数 编码_scratch_load_b128(g, s) { 返回 rdna3_平坦内存(23,2,g,s) }
+函数 编码_scratch_store_b32(g, s) { 返回 rdna3_平坦内存(24,2,g,s) }
+函数 编码_scratch_store_b64(g, s) { 返回 rdna3_平坦内存(25,2,g,s) }
+函数 编码_scratch_store_b128(g, s) { 返回 rdna3_平坦内存(31,2,g,s) }
+函数 编码_scratch_load_u8(g, s) { 返回 rdna3_平坦内存(18,2,g,s) }
+函数 编码_scratch_load_i8(g, s) { 返回 rdna3_平坦内存(19,2,g,s) }
+函数 编码_scratch_load_u16(g, s) { 返回 rdna3_平坦内存(20,2,g,s) }
+函数 编码_scratch_store_b8(g, s) { 返回 rdna3_平坦内存(26,2,g,s) }
+函数 编码_scratch_store_b16(g, s) { 返回 rdna3_平坦内存(28,2,g,s) }
+
+// MIMG — 图像采样/加载/存储/原子
+函数 编码_image_load(dm) { 返回 rdna3_图像内存(0,dm) }
+函数 编码_image_load_mip(dm) { 返回 rdna3_图像内存(1,dm) }
+函数 编码_image_load_pck(dm) { 返回 rdna3_图像内存(2,dm) }
+函数 编码_image_load_pck_sgn(dm) { 返回 rdna3_图像内存(3,dm) }
+函数 编码_image_load_mip_pck(dm) { 返回 rdna3_图像内存(4,dm) }
+函数 编码_image_load_mip_pck_sgn(dm) { 返回 rdna3_图像内存(5,dm) }
+函数 编码_image_store(dm) { 返回 rdna3_图像内存(8,dm) }
+函数 编码_image_store_mip(dm) { 返回 rdna3_图像内存(9,dm) }
+函数 编码_image_store_pck(dm) { 返回 rdna3_图像内存(10,dm) }
+函数 编码_image_store_mip_pck(dm) { 返回 rdna3_图像内存(11,dm) }
+函数 编码_image_get_resinfo(dm) { 返回 rdna3_图像内存(14,dm) }
+函数 编码_image_atomic_swap(dm) { 返回 rdna3_图像内存(16,dm) }
+函数 编码_image_atomic_cmpswap(dm) { 返回 rdna3_图像内存(17,dm) }
+函数 编码_image_atomic_add(dm) { 返回 rdna3_图像内存(18,dm) }
+函数 编码_image_atomic_sub(dm) { 返回 rdna3_图像内存(19,dm) }
+函数 编码_image_atomic_smin(dm) { 返回 rdna3_图像内存(20,dm) }
+函数 编码_image_atomic_umin(dm) { 返回 rdna3_图像内存(21,dm) }
+函数 编码_image_atomic_smax(dm) { 返回 rdna3_图像内存(22,dm) }
+函数 编码_image_atomic_umax(dm) { 返回 rdna3_图像内存(23,dm) }
+函数 编码_image_atomic_and(dm) { 返回 rdna3_图像内存(24,dm) }
+函数 编码_image_atomic_or(dm) { 返回 rdna3_图像内存(25,dm) }
+函数 编码_image_atomic_xor(dm) { 返回 rdna3_图像内存(26,dm) }
+函数 编码_image_atomic_inc(dm) { 返回 rdna3_图像内存(27,dm) }
+函数 编码_image_atomic_dec(dm) { 返回 rdna3_图像内存(28,dm) }
+函数 编码_image_sample(dm) { 返回 rdna3_图像内存(32,dm) }
+函数 编码_image_sample_cl(dm) { 返回 rdna3_图像内存(33,dm) }
+函数 编码_image_sample_d(dm) { 返回 rdna3_图像内存(34,dm) }
+函数 编码_image_sample_d_cl(dm) { 返回 rdna3_图像内存(35,dm) }
+函数 编码_image_sample_l(dm) { 返回 rdna3_图像内存(36,dm) }
+函数 编码_image_sample_b(dm) { 返回 rdna3_图像内存(37,dm) }
+函数 编码_image_sample_b_cl(dm) { 返回 rdna3_图像内存(38,dm) }
+函数 编码_image_sample_lz(dm) { 返回 rdna3_图像内存(39,dm) }
+函数 编码_image_sample_c(dm) { 返回 rdna3_图像内存(40,dm) }
+函数 编码_image_sample_c_cl(dm) { 返回 rdna3_图像内存(41,dm) }
+函数 编码_image_sample_c_d(dm) { 返回 rdna3_图像内存(42,dm) }
+函数 编码_image_sample_c_l(dm) { 返回 rdna3_图像内存(44,dm) }
+函数 编码_image_sample_c_b(dm) { 返回 rdna3_图像内存(45,dm) }
+函数 编码_image_sample_c_lz(dm) { 返回 rdna3_图像内存(47,dm) }
+函数 编码_image_sample_o(dm) { 返回 rdna3_图像内存(48,dm) }
+函数 编码_image_sample_l_o(dm) { 返回 rdna3_图像内存(52,dm) }
+函数 编码_image_sample_b_o(dm) { 返回 rdna3_图像内存(53,dm) }
+函数 编码_image_sample_lz_o(dm) { 返回 rdna3_图像内存(55,dm) }
+函数 编码_image_sample_c_o(dm) { 返回 rdna3_图像内存(56,dm) }
+函数 编码_image_sample_c_lz_o(dm) { 返回 rdna3_图像内存(63,dm) }
+函数 编码_image_gather4(dm) { 返回 rdna3_图像内存(64,dm) }
+函数 编码_image_gather4_cl(dm) { 返回 rdna3_图像内存(65,dm) }
+函数 编码_image_gather4_l(dm) { 返回 rdna3_图像内存(68,dm) }
+函数 编码_image_gather4_b(dm) { 返回 rdna3_图像内存(69,dm) }
+函数 编码_image_gather4_b_cl(dm) { 返回 rdna3_图像内存(70,dm) }
+函数 编码_image_gather4_lz(dm) { 返回 rdna3_图像内存(71,dm) }
+函数 编码_image_gather4_c(dm) { 返回 rdna3_图像内存(72,dm) }
+函数 编码_image_gather4_c_cl(dm) { 返回 rdna3_图像内存(73,dm) }
+函数 编码_image_gather4_c_b(dm) { 返回 rdna3_图像内存(77,dm) }
+函数 编码_image_gather4_c_lz(dm) { 返回 rdna3_图像内存(79,dm) }
+函数 编码_image_gather4_o(dm) { 返回 rdna3_图像内存(80,dm) }
+函数 编码_image_gather4_lz_o(dm) { 返回 rdna3_图像内存(87,dm) }
+函数 编码_image_gather4_c_lz_o(dm) { 返回 rdna3_图像内存(95,dm) }
+函数 编码_image_get_lod(dm) { 返回 rdna3_图像内存(96,dm) }
+函数 编码_image_sample_cd(dm) { 返回 rdna3_图像内存(104,dm) }
+函数 编码_image_sample_cd_cl(dm) { 返回 rdna3_图像内存(105,dm) }
+函数 编码_image_sample_c_cd(dm) { 返回 rdna3_图像内存(106,dm) }
+函数 编码_image_sample_c_cd_cl(dm) { 返回 rdna3_图像内存(107,dm) }
+
+// 导出 — 像素/参数导出
+函数 编码_exp_mrt0(en, compr, done, vm) { 返回 rdna3_导出(en,0,compr,done,vm) }
+函数 编码_exp_mrt1(en, compr, done, vm) { 返回 rdna3_导出(en,1,compr,done,vm) }
+函数 编码_exp_mrt2(en, compr, done, vm) { 返回 rdna3_导出(en,2,compr,done,vm) }
+函数 编码_exp_mrt3(en, compr, done, vm) { 返回 rdna3_导出(en,3,compr,done,vm) }
+函数 编码_exp_mrt4(en, compr, done, vm) { 返回 rdna3_导出(en,4,compr,done,vm) }
+函数 编码_exp_mrt5(en, compr, done, vm) { 返回 rdna3_导出(en,5,compr,done,vm) }
+函数 编码_exp_mrt6(en, compr, done, vm) { 返回 rdna3_导出(en,6,compr,done,vm) }
+函数 编码_exp_mrt7(en, compr, done, vm) { 返回 rdna3_导出(en,7,compr,done,vm) }
+函数 编码_exp_mrtz(en, compr, done, vm) { 返回 rdna3_导出(en,8,compr,done,vm) }
+函数 编码_exp_null(en, compr, done, vm) { 返回 rdna3_导出(en,9,compr,done,vm) }
+函数 编码_exp_pos0(en, compr, done, vm) { 返回 rdna3_导出(en,12,compr,done,vm) }
+函数 编码_exp_pos1(en, compr, done, vm) { 返回 rdna3_导出(en,13,compr,done,vm) }
+函数 编码_exp_pos2(en, compr, done, vm) { 返回 rdna3_导出(en,14,compr,done,vm) }
+函数 编码_exp_pos3(en, compr, done, vm) { 返回 rdna3_导出(en,15,compr,done,vm) }
+函数 编码_exp_param0(en, compr, done, vm) { 返回 rdna3_导出(en,32,compr,done,vm) }
+函数 编码_exp_param1(en, compr, done, vm) { 返回 rdna3_导出(en,33,compr,done,vm) }
+函数 编码_exp_param2(en, compr, done, vm) { 返回 rdna3_导出(en,34,compr,done,vm) }
+函数 编码_exp_param3(en, compr, done, vm) { 返回 rdna3_导出(en,35,compr,done,vm) }
+函数 编码_exp_param4(en, compr, done, vm) { 返回 rdna3_导出(en,36,compr,done,vm) }
+函数 编码_exp_prim(en, compr, done, vm) { 返回 rdna3_导出(en,20,compr,done,vm) }
+
+// VOP3P — Packed FP16/BF16/INT8运算 (RDNA3 VOPD双发射)
+函数 编码_v_pk_add_f16(d, s0, s1) { 返回 rdna3_向量三操作(768, d, s0, s1, 0) }
+函数 编码_v_pk_mul_f16(d, s0, s1) { 返回 rdna3_向量三操作(769, d, s0, s1, 0) }
+函数 编码_v_pk_fma_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(770,d,s0,s1,s2) }
+函数 编码_v_pk_add_i16(d, s0, s1) { 返回 rdna3_向量三操作(771, d, s0, s1, 0) }
+函数 编码_v_pk_add_u16(d, s0, s1) { 返回 rdna3_向量三操作(772, d, s0, s1, 0) }
+函数 编码_v_pk_sub_i16(d, s0, s1) { 返回 rdna3_向量三操作(773, d, s0, s1, 0) }
+函数 编码_v_pk_sub_u16(d, s0, s1) { 返回 rdna3_向量三操作(774, d, s0, s1, 0) }
+函数 编码_v_pk_mul_lo_u16(d, s0, s1) { 返回 rdna3_向量三操作(775, d, s0, s1, 0) }
+函数 编码_v_pk_min_f16(d, s0, s1) { 返回 rdna3_向量三操作(776, d, s0, s1, 0) }
+函数 编码_v_pk_max_f16(d, s0, s1) { 返回 rdna3_向量三操作(777, d, s0, s1, 0) }
+函数 编码_v_pk_min_i16(d, s0, s1) { 返回 rdna3_向量三操作(778, d, s0, s1, 0) }
+函数 编码_v_pk_max_i16(d, s0, s1) { 返回 rdna3_向量三操作(779, d, s0, s1, 0) }
+函数 编码_v_pk_min_u16(d, s0, s1) { 返回 rdna3_向量三操作(780, d, s0, s1, 0) }
+函数 编码_v_pk_max_u16(d, s0, s1) { 返回 rdna3_向量三操作(781, d, s0, s1, 0) }
+函数 编码_v_pk_lshlrev_b16(d, s0, s1) { 返回 rdna3_向量三操作(782, d, s0, s1, 0) }
+函数 编码_v_pk_lshrrev_b16(d, s0, s1) { 返回 rdna3_向量三操作(783, d, s0, s1, 0) }
+函数 编码_v_pk_ashrrev_i16(d, s0, s1) { 返回 rdna3_向量三操作(784, d, s0, s1, 0) }
+函数 编码_v_pk_mad_i16(d, s0, s1, s2) { 返回 rdna3_向量三操作(785,d,s0,s1,s2) }
+函数 编码_v_pk_mad_u16(d, s0, s1, s2) { 返回 rdna3_向量三操作(786,d,s0,s1,s2) }
+函数 编码_v_pk_fma_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(787,d,s0,s1,s2) }
+函数 编码_v_pk_add_f32(d, s0, s1) { 返回 rdna3_向量三操作(788, d, s0, s1, 0) }
+函数 编码_v_pk_mul_f32(d, s0, s1) { 返回 rdna3_向量三操作(789, d, s0, s1, 0) }
+函数 编码_v_pk_mov_b32(d, s0, s1) { 返回 rdna3_向量三操作(790, d, s0, s1, 0) }
+// BF16 packed ops
+函数 编码_v_pk_add_bf16(d, s0, s1) { 返回 rdna3_向量三操作(791, d, s0, s1, 0) }
+函数 编码_v_pk_mul_bf16(d, s0, s1) { 返回 rdna3_向量三操作(792, d, s0, s1, 0) }
+函数 编码_v_pk_fma_bf16(d, s0, s1, s2) { 返回 rdna3_向量三操作(793,d,s0,s1,s2) }
+函数 编码_v_pk_min_bf16(d, s0, s1) { 返回 rdna3_向量三操作(794, d, s0, s1, 0) }
+函数 编码_v_pk_max_bf16(d, s0, s1) { 返回 rdna3_向量三操作(795, d, s0, s1, 0) }
+// DOT product instructions
+函数 编码_v_dot2c_f32_f16(d, s0, s1) { 返回 rdna3_向量三操作(796, d, s0, s1, 0) }
+函数 编码_v_dot2c_i32_i16(d, s0, s1) { 返回 rdna3_向量三操作(797, d, s0, s1, 0) }
+函数 编码_v_dot4c_i32_i8(d, s0, s1) { 返回 rdna3_向量三操作(798, d, s0, s1, 0) }
+函数 编码_v_dot8c_i32_i4(d, s0, s1) { 返回 rdna3_向量三操作(799, d, s0, s1, 0) }
+
+// VINTERP — 向量插值 (像素着色器)
+函数 编码_v_interp_p1_f32(d, s, attr, ch) { 返回 rdna3_向量三操作(600,d,s,attr,ch) }
+函数 编码_v_interp_p2_f32(d, s, attr, ch) { 返回 rdna3_向量三操作(601,d,s,attr,ch) }
+函数 编码_v_interp_mov_f32(d, s, attr, ch) { 返回 rdna3_向量三操作(602,d,s,attr,ch) }
+函数 编码_v_interp_p1ll_f16(d, s, attr, ch) { 返回 rdna3_向量三操作(603,d,s,attr,ch) }
+函数 编码_v_interp_p1lv_f16(d, s, attr, ch) { 返回 rdna3_向量三操作(604,d,s,attr,ch) }
+函数 编码_v_interp_p2_f16(d, s, attr, ch) { 返回 rdna3_向量三操作(605,d,s,attr,ch) }
+函数 编码_v_interp_p10_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(606,d,s0,s1,s2) }
+函数 编码_v_interp_p2_f32_new(d, s0, s1, s2) { 返回 rdna3_向量三操作(607,d,s0,s1,s2) }
+函数 编码_v_interp_p10_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(608,d,s0,s1,s2) }
+函数 编码_v_interp_p2_f16_new(d, s0, s1, s2) { 返回 rdna3_向量三操作(609,d,s0,s1,s2) }
+函数 编码_v_interp_p10_rtz_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(610,d,s0,s1,s2) }
+函数 编码_v_interp_p2_rtz_f16(d, s0, s1, s2) { 返回 rdna3_向量三操作(611,d,s0,s1,s2) }
+
+// WMMA — 波前矩阵乘法累加 (RDNA3)
+函数 编码_v_wmma_f32_16x16x16_f16(d, a, b, c) { 返回 rdna3_向量三操作(900,d,a,b,c) }
+函数 编码_v_wmma_f32_16x16x16_bf16(d, a, b, c) { 返回 rdna3_向量三操作(901,d,a,b,c) }
+函数 编码_v_wmma_f16_16x16x16_f16(d, a, b, c) { 返回 rdna3_向量三操作(902,d,a,b,c) }
+函数 编码_v_wmma_bf16_16x16x16_bf16(d, a, b, c) { 返回 rdna3_向量三操作(903,d,a,b,c) }
+函数 编码_v_wmma_i32_16x16x16_iu8(d, a, b, c) { 返回 rdna3_向量三操作(904,d,a,b,c) }
+函数 编码_v_wmma_i32_16x16x16_iu4(d, a, b, c) { 返回 rdna3_向量三操作(905,d,a,b,c) }
+函数 编码_v_wmma_f32_16x16x16_fp8_fp8(d, a, b, c) { 返回 rdna3_向量三操作(906,d,a,b,c) }
+函数 编码_v_wmma_f32_16x16x16_fp8_bf8(d, a, b, c) { 返回 rdna3_向量三操作(907,d,a,b,c) }
+函数 编码_v_wmma_f32_16x16x16_bf8_fp8(d, a, b, c) { 返回 rdna3_向量三操作(908,d,a,b,c) }
+函数 编码_v_wmma_f32_16x16x16_bf8_bf8(d, a, b, c) { 返回 rdna3_向量三操作(909,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_f16(d, a, b, c, idx) { 返回 rdna3_向量三操作(910,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_bf16(d, a, b, c, idx) { 返回 rdna3_向量三操作(911,d,a,b,c) }
+函数 编码_v_swmmac_f16_16x16x32_f16(d, a, b, c, idx) { 返回 rdna3_向量三操作(912,d,a,b,c) }
+函数 编码_v_swmmac_bf16_16x16x32_bf16(d, a, b, c, idx) { 返回 rdna3_向量三操作(913,d,a,b,c) }
+函数 编码_v_swmmac_i32_16x16x32_iu8(d, a, b, c, idx) { 返回 rdna3_向量三操作(914,d,a,b,c) }
+函数 编码_v_swmmac_i32_16x16x32_iu4(d, a, b, c, idx) { 返回 rdna3_向量三操作(915,d,a,b,c) }
+函数 编码_v_swmmac_i32_16x16x64_iu4(d, a, b, c, idx) { 返回 rdna3_向量三操作(916,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_fp8_fp8(d, a, b, c, idx) { 返回 rdna3_向量三操作(917,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_fp8_bf8(d, a, b, c, idx) { 返回 rdna3_向量三操作(918,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_bf8_fp8(d, a, b, c, idx) { 返回 rdna3_向量三操作(919,d,a,b,c) }
+函数 编码_v_swmmac_f32_16x16x32_bf8_bf8(d, a, b, c, idx) { 返回 rdna3_向量三操作(920,d,a,b,c) }
+
+// MTBUF — 类型化缓冲区
+函数 编码_tbuffer_load_format_x(off) { 返回 rdna3_缓冲内存(100,0,off) }
+函数 编码_tbuffer_load_format_xy(off) { 返回 rdna3_缓冲内存(101,0,off) }
+函数 编码_tbuffer_load_format_xyz(off) { 返回 rdna3_缓冲内存(102,0,off) }
+函数 编码_tbuffer_load_format_xyzw(off) { 返回 rdna3_缓冲内存(103,0,off) }
+函数 编码_tbuffer_store_format_x(off) { 返回 rdna3_缓冲内存(104,0,off) }
+函数 编码_tbuffer_store_format_xy(off) { 返回 rdna3_缓冲内存(105,0,off) }
+函数 编码_tbuffer_store_format_xyz(off) { 返回 rdna3_缓冲内存(106,0,off) }
+函数 编码_tbuffer_store_format_xyzw(off) { 返回 rdna3_缓冲内存(107,0,off) }
+
+// DPP — 数据并行原语
+函数 编码_v_mov_b32_dpp_quad_perm(d, s, perm) { 返回 rdna3_向量三操作(700, d, s, perm, 0) }
+函数 编码_v_mov_b32_dpp_row_sl(d, s, n) { 返回 rdna3_向量三操作(701, d, s, n, 0) }
+函数 编码_v_mov_b32_dpp_row_sr(d, s, n) { 返回 rdna3_向量三操作(702, d, s, n, 0) }
+函数 编码_v_mov_b32_dpp_row_rr(d, s, n) { 返回 rdna3_向量三操作(703, d, s, n, 0) }
+函数 编码_v_mov_b32_dpp_wf_sl1(d, s) { 返回 rdna3_向量三操作(704, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_wf_sr1(d, s) { 返回 rdna3_向量三操作(705, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_wf_rl1(d, s) { 返回 rdna3_向量三操作(706, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_wf_rr1(d, s) { 返回 rdna3_向量三操作(707, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_mirror(d, s) { 返回 rdna3_向量三操作(708, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_half_mirror(d, s) { 返回 rdna3_向量三操作(709, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_bcast15(d, s) { 返回 rdna3_向量三操作(710, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_bcast31(d, s) { 返回 rdna3_向量三操作(711, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_share0(d, s) { 返回 rdna3_向量三操作(712, d, s, 0, 0) }
+函数 编码_v_mov_b32_dpp_row_xmask(d, s, mask) { 返回 rdna3_向量三操作(713, d, s, mask, 0) }
+函数 编码_v_add_f32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(714,d,s0,s1,ctrl) }
+函数 编码_v_sub_f32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(715,d,s0,s1,ctrl) }
+函数 编码_v_mul_f32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(716,d,s0,s1,ctrl) }
+函数 编码_v_min_f32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(717,d,s0,s1,ctrl) }
+函数 编码_v_max_f32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(718,d,s0,s1,ctrl) }
+函数 编码_v_add_u32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(719,d,s0,s1,ctrl) }
+函数 编码_v_and_b32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(720,d,s0,s1,ctrl) }
+函数 编码_v_or_b32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(721,d,s0,s1,ctrl) }
+函数 编码_v_xor_b32_dpp(d, s0, s1, ctrl) { 返回 rdna3_向量三操作(722,d,s0,s1,ctrl) }
+
+// VOPD — 双发射 (RDNA3特有)
+函数 编码_vopd_add_f32_add_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(950, dx, sx0, sx1, 0) }
+函数 编码_vopd_mul_f32_add_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(951, dx, sx0, sx1, 0) }
+函数 编码_vopd_add_f32_mul_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(952, dx, sx0, sx1, 0) }
+函数 编码_vopd_mul_f32_mul_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(953, dx, sx0, sx1, 0) }
+函数 编码_vopd_add_f32_mov_b32(dx, dy, sx0, sx1, sy0) { 返回 rdna3_向量三操作(954, dx, sx0, sx1, 0) }
+函数 编码_vopd_mul_f32_mov_b32(dx, dy, sx0, sx1, sy0) { 返回 rdna3_向量三操作(955, dx, sx0, sx1, 0) }
+函数 编码_vopd_mov_b32_add_f32(dx, dy, sx0, sy0, sy1) { 返回 rdna3_向量三操作(956, dx, sx0, 0, 0) }
+函数 编码_vopd_mov_b32_mul_f32(dx, dy, sx0, sy0, sy1) { 返回 rdna3_向量三操作(957, dx, sx0, 0, 0) }
+函数 编码_vopd_mov_b32_mov_b32(dx, dy, sx0, sy0) { 返回 rdna3_向量三操作(958, dx, sx0, 0, 0) }
+函数 编码_vopd_add_u32_add_u32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(959, dx, sx0, sx1, 0) }
+函数 编码_vopd_fmac_f32_fmac_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(960, dx, sx0, sx1, 0) }
+函数 编码_vopd_fmac_f32_mov_b32(dx, dy, sx0, sx1, sy0) { 返回 rdna3_向量三操作(961, dx, sx0, sx1, 0) }
+函数 编码_vopd_cndmask_add_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(962, dx, sx0, sx1, 0) }
+函数 编码_vopd_cndmask_mul_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(963, dx, sx0, sx1, 0) }
+函数 编码_vopd_add_f32_fmac_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(964, dx, sx0, sx1, 0) }
+函数 编码_vopd_mul_f32_fmac_f32(dx, dy, sx0, sx1, sy0, sy1) { 返回 rdna3_向量三操作(965, dx, sx0, sx1, 0) }
+
+// 更多VOP3 补全 (ldexp/cvt/readlane/writelane等)
+函数 编码_v_ldexp_f32(d, s0, s1) { 返回 rdna3_向量三操作(534, d, s0, s1, 0) }
+函数 编码_v_ldexp_f64(d, s0, s1) { 返回 rdna3_向量三操作(535, d, s0, s1, 0) }
+函数 编码_v_readlane_b32(d, s0, s1) { 返回 rdna3_向量三操作(536, d, s0, s1, 0) }
+函数 编码_v_writelane_b32(d, s0, s1) { 返回 rdna3_向量三操作(537, d, s0, s1, 0) }
+函数 编码_v_bcnt_u32_b32(d, s0, s1) { 返回 rdna3_向量三操作(538, d, s0, s1, 0) }
+函数 编码_v_mbcnt_lo_u32_b32(d, s0, s1) { 返回 rdna3_向量三操作(539, d, s0, s1, 0) }
+函数 编码_v_mbcnt_hi_u32_b32(d, s0, s1) { 返回 rdna3_向量三操作(540, d, s0, s1, 0) }
+函数 编码_v_cvt_pk_u16_u32(d, s0, s1) { 返回 rdna3_向量三操作(541, d, s0, s1, 0) }
+函数 编码_v_cvt_pk_i16_i32(d, s0, s1) { 返回 rdna3_向量三操作(542, d, s0, s1, 0) }
+函数 编码_v_cvt_pk_f16_f32(d, s0, s1) { 返回 rdna3_向量三操作(543, d, s0, s1, 0) }
+函数 编码_v_cvt_pk_u8_f32_src(d, s0, s1, s2) { 返回 rdna3_向量三操作(544,d,s0,s1,s2) }
+函数 编码_v_div_scale_f32(d, s0, s1, s2) { 返回 rdna3_向量三操作(545,d,s0,s1,s2) }
+函数 编码_v_div_scale_f64(d, s0, s1, s2) { 返回 rdna3_向量三操作(546,d,s0,s1,s2) }
+函数 编码_v_mul_lo_u32(d, s0, s1) { 返回 rdna3_向量三操作(547, d, s0, s1, 0) }
+函数 编码_v_mul_hi_u32(d, s0, s1) { 返回 rdna3_向量三操作(548, d, s0, s1, 0) }
+函数 编码_v_mul_hi_i32(d, s0, s1) { 返回 rdna3_向量三操作(549, d, s0, s1, 0) }
+函数 编码_v_lshlrev_b64(d, s0, s1) { 返回 rdna3_向量三操作(550, d, s0, s1, 0) }
+函数 编码_v_lshrrev_b64(d, s0, s1) { 返回 rdna3_向量三操作(551, d, s0, s1, 0) }
+函数 编码_v_ashrrev_i64(d, s0, s1) { 返回 rdna3_向量三操作(552, d, s0, s1, 0) }
+函数 编码_v_trig_preop_f64(d, s0, s1) { 返回 rdna3_向量三操作(553, d, s0, s1, 0) }
+函数 编码_v_add_f64(d, s0, s1) { 返回 rdna3_向量三操作(554, d, s0, s1, 0) }
+函数 编码_v_mul_f64(d, s0, s1) { 返回 rdna3_向量三操作(555, d, s0, s1, 0) }
+函数 编码_v_min_f64(d, s0, s1) { 返回 rdna3_向量三操作(556, d, s0, s1, 0) }
+函数 编码_v_max_f64(d, s0, s1) { 返回 rdna3_向量三操作(557, d, s0, s1, 0) }
+函数 编码_v_ldexp_f16_vop3(d, s0, s1) { 返回 rdna3_向量三操作(558, d, s0, s1, 0) }
+函数 编码_v_add_nc_u16(d, s0, s1) { 返回 rdna3_向量三操作(559, d, s0, s1, 0) }
+函数 编码_v_sub_nc_u16(d, s0, s1) { 返回 rdna3_向量三操作(560, d, s0, s1, 0) }
+函数 编码_v_mul_lo_u16(d, s0, s1) { 返回 rdna3_向量三操作(561, d, s0, s1, 0) }
+函数 编码_v_lshrrev_b16(d, s0, s1) { 返回 rdna3_向量三操作(562, d, s0, s1, 0) }
+函数 编码_v_ashrrev_i16(d, s0, s1) { 返回 rdna3_向量三操作(563, d, s0, s1, 0) }
+函数 编码_v_lshlrev_b16(d, s0, s1) { 返回 rdna3_向量三操作(564, d, s0, s1, 0) }
+函数 编码_v_max_u16(d, s0, s1) { 返回 rdna3_向量三操作(565, d, s0, s1, 0) }
+函数 编码_v_min_u16(d, s0, s1) { 返回 rdna3_向量三操作(566, d, s0, s1, 0) }
+函数 编码_v_max_i16(d, s0, s1) { 返回 rdna3_向量三操作(567, d, s0, s1, 0) }
+函数 编码_v_min_i16(d, s0, s1) { 返回 rdna3_向量三操作(568, d, s0, s1, 0) }
+函数 编码_v_add_i16(d, s0, s1) { 返回 rdna3_向量三操作(569, d, s0, s1, 0) }
+函数 编码_v_sub_i16(d, s0, s1) { 返回 rdna3_向量三操作(570, d, s0, s1, 0) }
+函数 编码_v_add_i32(d, s0, s1) { 返回 rdna3_向量三操作(571, d, s0, s1, 0) }
+函数 编码_v_sub_i32(d, s0, s1) { 返回 rdna3_向量三操作(572, d, s0, s1, 0) }

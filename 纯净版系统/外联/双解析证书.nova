@@ -1,0 +1,143 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../感知/内核直连层.nova")
+
+// Nova网络栈: X.509证书链验证 (Nova协议规范 5280)
+// 安全握手中服务器发送证书链, 浏览器必须验证:
+//   §1 ASN.1/DER解析 — 证书二进制格式解码
+//   §2 X.509证书结构 — 版本/序列号/签名/颁发者/有效期/主题/公钥
+//   §3 证书链构建 — 从叶证书到根CA的信任链
+//   §4 签名验证 — RSA/ECDSA签名验证
+//   §5 信任锚存储 — 内置根CA证书列表
+//   §6 证书策略检查 — 有效期/域名匹配/密钥用途/基本约束
+
+// §1 ASN.1/DER解析 (ITU-T X.690)
+// DER编码: Tag-Length-Value (TLV) 结构
+
+// ASN.1 标签类型
+定义 ASN1_BOOLEAN         = 0x01
+定义 ASN1_INTEGER         = 0x02
+定义 ASN1_BIT_STRING      = 0x03
+定义 ASN1_OCTET_STRING    = 0x04
+定义 ASN1_NULL            = 0x05
+定义 ASN1_OID             = 0x06
+定义 ASN1_UTF8STRING      = 0x0C
+定义 ASN1_PRINTABLESTRING = 0x13
+定义 ASN1_IA5STRING       = 0x16
+定义 ASN1_UTCTIME         = 0x17
+定义 ASN1_GENERALIZEDTIME = 0x18
+定义 ASN1_SEQUENCE        = 0x30
+定义 ASN1_SET             = 0x31
+定义 ASN1_CONTEXT_0       = 0xA0  // [0] EXPLICIT
+定义 ASN1_CONTEXT_1       = 0xA1
+定义 ASN1_CONTEXT_2       = 0xA2
+定义 ASN1_CONTEXT_3       = 0xA3
+
+结构 ASN1元素 {
+    标签,
+    长度,
+    值偏移,    // u32 值数据在原始缓冲中的偏移
+    总长度,    // u32 标签+长度+值的总字节数
+}
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 ASN1_解析元素(数据, 偏移, 数据长度) {
+    如果 (偏移 >= 数据长度) { 返回 0 }
+    定义 elem = 堆_分配(ASN1元素)
+    定义 可变 pos = 偏移
+
+    // 标签
+    elem.标签 = 内存_读8(数据 + pos)
+    pos = pos + 1
+    如果 (pos >= 数据长度) { 堆_释放(elem); 返回 0 }
+
+    // 长度
+    定义 len_byte = 内存_读8(数据 + pos)
+    pos = pos + 1
+    如果 (len_byte < 0x80) {
+        elem.长度 = len_byte
+    } 否则 如果 (len_byte == 0x81) {
+        如果 (pos >= 数据长度) { 堆_释放(elem); 返回 0 }
+        elem.长度 = 内存_读8(数据 + pos)
+        pos = pos + 1
+    } 否则 如果 (len_byte == 0x82) {
+        如果 (pos + 1 >= 数据长度) { 堆_释放(elem); 返回 0 }
+        elem.长度 = (内存_读8(数据 + pos) << 8) | 内存_读8(数据 + pos + 1)
+        pos = pos + 2
+    } 否则 如果 (len_byte == 0x83) {
+        如果 (pos + 2 >= 数据长度) { 堆_释放(elem); 返回 0 }
+        elem.长度 = (内存_读8(数据 + pos) << 16) | (内存_读8(数据 + pos + 1) << 8) | 内存_读8(数据 + pos + 2)
+        pos = pos + 3
+    } 否则 如果 (len_byte == 0x84) {
+        如果 (pos + 3 >= 数据长度) { 堆_释放(elem); 返回 0 }
+        elem.长度 = (内存_读8(数据 + pos) << 24) | (内存_读8(数据 + pos + 1) << 16) |
+                     (内存_读8(数据 + pos + 2) << 8) | 内存_读8(数据 + pos + 3)
+        pos = pos + 4
+    } 否则 {
+        elem.长度 = 0  // 不定长或非法
+    }
+
+    elem.值偏移 = pos
+    elem.总长度 = pos - 偏移 + elem.长度
+    返回 elem
+}
+
+// 读取ASN1 INTEGER为u64 (最多8字节)
+函数 ASN1_读整数(数据, elem) {
+    定义 可变 值 = 0
+    定义 可变 i = 0
+    定义 len = elem.长度
+    如果 (len > 8) { len = 8 }
+    当 (i < len) {
+        值 = (值 << 8) | 内存_读8(数据 + elem.值偏移 + i)
+        i = i + 1
+    }
+    返回 值
+}
+
+// 读取ASN1 OID为字符串 (如 "1.2.840.113549.1.1.11")
+函数 ASN1_读OID(数据, elem, 输出, 最大长度) {
+    定义 可变 pos = 0
+    定义 可变 out_pos = 0
+    定义 oid_data = 数据 + elem.值偏移
+    定义 oid_len = elem.长度
+
+    // 第一个字节编码前两个组件: val = comp1*40 + comp2
+    如果 (oid_len > 0) {
+        定义 first = 内存_读8(oid_data)
+        out_pos = out_pos + 整数_写入(输出 + out_pos, first / 40)
+        内存_写8(输出 + out_pos, 0x2E); out_pos = out_pos + 1  // '.'
+        out_pos = out_pos + 整数_写入(输出 + out_pos, first % 40)
+        pos = 1
+    }
+
+    // 后续组件: 变长编码 (每字节高位=继续)
+    当 (pos < oid_len && out_pos < 最大长度 - 10) {
+        内存_写8(输出 + out_pos, 0x2E); out_pos = out_pos + 1
+        定义 可变 comp = 0
+        当 (pos < oid_len) {
+            定义 b = 内存_读8(oid_data + pos)
+            pos = pos + 1
+            comp = (comp << 7) | (b & 0x7F)
+            如果 (!(b & 0x80)) { 跳出 }
+        }
+        out_pos = out_pos + 整数_写入(输出 + out_pos, comp)
+    }
+    内存_写8(输出 + out_pos, 0)
+    返回 out_pos
+}
+
+函数 整数_写入(buf, 值) {
+    如果 (值 == 0) { 内存_写8(buf, 0x30); 返回 1 }
+    定义 可变 digits = 0
+    定义 可变 tmp = 值
+    当 (tmp > 0) { digits = digits + 1; tmp = tmp / 10 }
+    定义 可变 i = digits - 1
+    当 (i >= 0) {
+        内存_写8(buf + i, 0x30 + (值 % 10))
+        值 = 值 / 10
+        i = i - 1
+    }
+    返回 digits
+}

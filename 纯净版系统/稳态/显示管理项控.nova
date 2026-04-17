@@ -1,0 +1,451 @@
+// NovaOS DRM/KMS框架 — Linux图形栈的内核基础
+// DRM(Direct 渲染ing Manager) + KMS(Kernel Mode Setting)
+// 是Linux图形的核心: Wayland/X11/Mesa都依赖它
+// 没有DRM = 没有图处加速 = 所有GUI程序只能软件渲染(极慢)
+// 架构:
+//   Wayland合成器 / X11 / Mesa(OpenGL/Vulkan)
+//        ↓ /dev/dri/card0 + Nova设备控制
+//   DRM核心(本文件) — 模式设置/缓冲管理/页面翻转
+//        ↓
+//   DRM驱动(i915/amdgpu/nouveau) — 图处特定实现
+//        ↓
+//   图处硬件
+
+导入("../中枢/日志中枢.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §1 DRM Nova设备控制命令 
+
+定义 DRM_Nova设备控制_VERSION          = 0x00
+定义 DRM_Nova设备控制_GET_CAP          = 0x0C
+定义 DRM_Nova设备控制_SET_MASTER       = 0x1E
+定义 DRM_Nova设备控制_DROP_MASTER      = 0x1F
+定义 DRM_Nova设备控制_MODE_GETRESOURCES = 0xA0
+定义 DRM_Nova设备控制_MODE_GETCRTC     = 0xA1
+定义 DRM_Nova设备控制_MODE_SETCRTC     = 0xA2
+定义 DRM_Nova设备控制_MODE_GETENCODER  = 0xA6
+定义 DRM_Nova设备控制_MODE_GETCONNECTOR = 0xA7
+定义 DRM_Nova设备控制_MODE_GETPROPERTY = 0xAA
+定义 DRM_Nova设备控制_MODE_GETFB       = 0xAD
+定义 DRM_Nova设备控制_MODE_ADDFB       = 0xAE
+定义 DRM_Nova设备控制_MODE_ADDFB2      = 0xB8
+定义 DRM_Nova设备控制_MODE_RMFB        = 0xAF
+定义 DRM_Nova设备控制_MODE_PAGE_FLIP   = 0xB0
+定义 DRM_Nova设备控制_MODE_CREATE_DUMB = 0xB2
+定义 DRM_Nova设备控制_MODE_MAP_DUMB    = 0xB3
+定义 DRM_Nova设备控制_MODE_DESTROY_DUMB = 0xB4
+定义 DRM_Nova设备控制_MODE_ATOMIC      = 0xBC
+定义 DRM_Nova设备控制_PRIME_HANDLE_TO_FD = 0x2D
+定义 DRM_Nova设备控制_PRIME_FD_TO_HANDLE = 0x2E
+
+// DRM能力
+定义 DRM_CAP_DUMB_BUFFER       = 0x01
+定义 DRM_CAP_PRIME             = 0x05
+定义 DRM_CAP_TIMESTAMP_MONOTONIC = 0x06
+定义 DRM_CAP_ATOMIC            = 0x10
+定义 DRM_CAP_ADDFB2_MODIFIERS  = 0x12
+
+// 连接器状态
+定义 DRM_MODE_CONNECTED         = 1
+定义 DRM_MODE_DISCONNECTED      = 2
+定义 DRM_MODE_UNKNOWNCONNECTION = 3
+
+// 连接器类型
+定义 DRM_MODE_CONNECTOR_显基      = 1
+定义 DRM_MODE_CONNECTOR_DVII     = 2
+定义 DRM_MODE_CONNECTOR_DVID     = 3
+定义 DRM_MODE_CONNECTOR_HDMIA    = 11
+定义 DRM_MODE_CONNECTOR_HDMIB    = 12
+定义 DRM_MODE_CONNECTOR_DisplayPort = 14
+定义 DRM_MODE_CONNECTOR_eDP      = 15
+
+// 像素格式 (fourcc)
+定义 DRM_FORMAT_XRGB8888 = 0x34325258    // 'XR24'
+定义 DRM_FORMAT_ARGB8888 = 0x34325241    // 'AR24'
+定义 DRM_FORMAT_RGB565   = 0x36314752    // 'RG16'
+
+// §2 KMS核心对象
+
+结构 DRM设备 {
+    名称,    // 字符串 "card0"
+    驱动名,    // 字符串 "i915" / "amdgpu" / "nouveau"
+    CRTC列表,    // [] 显示控制器
+    编码器列表,    // []
+    连接器列表,    // [] 物理输出(HDMI/DP/eDP)
+    帧缓冲列表,    // []
+    GEM对象列表,    // [] 图形内存对象
+    下一个对象ID,
+    支持原子,
+    支持PRIME,
+    VRAM大小,    // u64 显存大小
+}
+
+结构 DRM_CRTC {
+    ID,
+    X,
+    Y,
+    当前FB,    // u32 当前帧缓冲ID
+    模式,    // DRM显示模式
+    已启用,
+    伽马大小,
+}
+
+结构 DRM连接器 {
+    ID,
+    类型,    // u32 HDMI/DP/显基/eDP
+    状态,    // u32 连接/断开
+    编码器ID,    // u32 当前绑定的编码器
+    模式列表,    // [] 支持的显示模式
+    EDID,    // [] EDID数据(128/256字节)
+    物理宽mm,
+    物理高mm,
+}
+
+结构 DRM编码器 {
+    ID,
+    类型,    // u32 TMDS/LVDS/DAC/DSI
+    CRTC_ID,
+    可用CRTC位图,
+}
+
+结构 DRM显示模式 {
+    时钟,    // u32 像素时钟(kHz)
+    水平显示,    // u16 水平分辨率
+    水平同步起,
+    水平同步止,
+    水平总,
+    垂直显示,    // u16 垂直分辨率
+    垂直同步起,
+    垂直同步止,
+    垂直总,
+    刷新率,    // u32 Hz
+    标志,
+    类型,
+    名称,    // 字符串 "1920x1080"
+}
+
+结构 DRM帧缓冲 {
+    ID,
+    宽,
+    高,
+    跨距,    // u32 stride(字节/行)
+    像素格式,    // u32 DRM_FORMAT_*
+    GEM句柄,
+    偏移,
+}
+
+结构 GEM对象 {
+    句柄,
+    大小,
+    物理地址,    // u64 VRAM或GTT中的地址
+    映射地址,    // u64 Nova内存映射映射的用户空间地址
+    引用计数,
+}
+
+// §3 DRM设备初始化与管理
+
+定义 可变 全局DRM设备 = 0
+
+函数 DRM_初始化(驱动名) {
+    全局DRM设备 = DRM设备 {}
+    全局DRM设备.名称 = "card0"
+    全局DRM设备.驱动名 = 驱动名
+    全局DRM设备.CRTC列表 = []
+    全局DRM设备.编码器列表 = []
+    全局DRM设备.连接器列表 = []
+    全局DRM设备.帧缓冲列表 = []
+    全局DRM设备.GEM对象列表 = []
+    全局DRM设备.下一个对象ID = 1
+    全局DRM设备.支持原子 = 真
+    全局DRM设备.支持PRIME = 真
+    全局DRM设备.VRAM大小 = 256 * 1024 * 1024
+    内核信息("DRM: 初始化 驱动=" + 驱动名 + " VRAM=" +
+             整数转字符串(全局DRM设备.VRAM大小 / 1024 / 1024) + "MB")
+    返回 0
+}
+
+函数 DRM_分配ID() {
+    如果 (全局DRM设备 == 0) { 返回 0 }
+    定义 id = 全局DRM设备.下一个对象ID
+    全局DRM设备.下一个对象ID = 全局DRM设备.下一个对象ID + 1
+    返回 id
+}
+
+// §4 CRTC操作
+
+函数 DRM_添加CRTC() {
+    如果 (全局DRM设备 == 0) { 返回 0 }
+    定义 crtc = DRM_CRTC {}
+    crtc.ID = DRM_分配ID()
+    crtc.X = 0
+    crtc.Y = 0
+    crtc.当前FB = 0
+    crtc.已启用 = 假
+    crtc.伽马大小 = 256
+    追加(全局DRM设备.CRTC列表, crtc)
+    返回 crtc.ID
+}
+
+函数 DRM_获取CRTC(id) {
+    如果 (全局DRM设备 == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(全局DRM设备.CRTC列表)) {
+        如果 (全局DRM设备.CRTC列表[i].ID == id) { 返回 全局DRM设备.CRTC列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 DRM_设置CRTC(crtc_id, fb_id, x, y) {
+    定义 crtc = DRM_获取CRTC(crtc_id)
+    如果 (crtc == 空) { 返回 -1 }
+    crtc.当前FB = fb_id
+    crtc.X = x
+    crtc.Y = y
+    crtc.已启用 = 真
+    返回 0
+}
+
+// §5 连接器操作
+
+函数 DRM_添加连接器(类型) {
+    如果 (全局DRM设备 == 0) { 返回 0 }
+    定义 conn = DRM连接器 {}
+    conn.ID = DRM_分配ID()
+    conn.类型 = 类型
+    conn.状态 = DRM_MODE_DISCONNECTED
+    conn.编码器ID = 0
+    conn.模式列表 = []
+    conn.EDID = 0
+    conn.物理宽mm = 0
+    conn.物理高mm = 0
+    追加(全局DRM设备.连接器列表, conn)
+    返回 conn.ID
+}
+
+函数 DRM_获取连接器(id) {
+    如果 (全局DRM设备 == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(全局DRM设备.连接器列表)) {
+        如果 (全局DRM设备.连接器列表[i].ID == id) { 返回 全局DRM设备.连接器列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 DRM_连接器类型名(类型) {
+    如果 (类型 == DRM_MODE_CONNECTOR_显基) { 返回 "VGA" }
+    如果 (类型 == DRM_MODE_CONNECTOR_DVII) { 返回 "DVI-I" }
+    如果 (类型 == DRM_MODE_CONNECTOR_DVID) { 返回 "DVI-D" }
+    如果 (类型 == DRM_MODE_CONNECTOR_HDMIA) { 返回 "HDMI-A" }
+    如果 (类型 == DRM_MODE_CONNECTOR_HDMIB) { 返回 "HDMI-B" }
+    如果 (类型 == DRM_MODE_CONNECTOR_DisplayPort) { 返回 "DP" }
+    如果 (类型 == DRM_MODE_CONNECTOR_eDP) { 返回 "eDP" }
+    返回 "Unknown"
+}
+
+函数 DRM_连接状态名(状态) {
+    如果 (状态 == DRM_MODE_CONNECTED) { 返回 "connected" }
+    如果 (状态 == DRM_MODE_DISCONNECTED) { 返回 "disconnected" }
+    返回 "unknown"
+}
+
+函数 DRM_连接器_添加模式(conn, 模式) {
+    如果 (conn == 空) { 返回 }
+    追加(conn.模式列表, 模式)
+}
+
+函数 DRM_连接器_最佳模式(conn) {
+    如果 (conn == 空 || 计数(conn.模式列表) == 0) { 返回 空 }
+    定义 可变 最佳 = conn.模式列表[0]
+    定义 可变 i = 1
+    当 (i < 计数(conn.模式列表)) {
+        定义 m = conn.模式列表[i]
+        如果 (m.水平显示 * m.垂直显示 > 最佳.水平显示 * 最佳.垂直显示) {
+            最佳 = m
+        }
+        i = i + 1
+    }
+    返回 最佳
+}
+
+// §6 帧缓冲操作
+
+函数 DRM_创建帧缓冲(宽, 高, 格式) {
+    如果 (全局DRM设备 == 0) { 返回 0 }
+    定义 fb = DRM帧缓冲 {}
+    fb.ID = DRM_分配ID()
+    fb.宽 = 宽
+    fb.高 = 高
+    fb.像素格式 = 格式
+    定义 bpp = 4
+    如果 (格式 == DRM_FORMAT_RGB565) { bpp = 2 }
+    fb.跨距 = 宽 * bpp
+    fb.GEM句柄 = 0
+    fb.偏移 = 0
+    追加(全局DRM设备.帧缓冲列表, fb)
+    返回 fb.ID
+}
+
+函数 DRM_删除帧缓冲(fb_id) {
+    如果 (全局DRM设备 == 0) { 返回 }
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    当 (i < 计数(全局DRM设备.帧缓冲列表)) {
+        如果 (全局DRM设备.帧缓冲列表[i].ID != fb_id) {
+            追加(新列表, 全局DRM设备.帧缓冲列表[i])
+        }
+        i = i + 1
+    }
+    全局DRM设备.帧缓冲列表 = 新列表
+}
+
+函数 DRM_获取帧缓冲(id) {
+    如果 (全局DRM设备 == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(全局DRM设备.帧缓冲列表)) {
+        如果 (全局DRM设备.帧缓冲列表[i].ID == id) { 返回 全局DRM设备.帧缓冲列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+// §7 GEM (Graphics Execution Manager)
+
+函数 DRM_GEM_创建(大小) {
+    如果 (全局DRM设备 == 0) { 返回 0 }
+    定义 gem = GEM对象 {}
+    gem.句柄 = DRM_分配ID()
+    gem.大小 = 大小
+    gem.物理地址 = 0
+    gem.映射地址 = 0
+    gem.引用计数 = 1
+    追加(全局DRM设备.GEM对象列表, gem)
+    返回 gem.句柄
+}
+
+函数 DRM_GEM_获取(句柄) {
+    如果 (全局DRM设备 == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(全局DRM设备.GEM对象列表)) {
+        如果 (全局DRM设备.GEM对象列表[i].句柄 == 句柄) { 返回 全局DRM设备.GEM对象列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 DRM_GEM_引用(gem) {
+    如果 (gem == 空) { 返回 }
+    gem.引用计数 = gem.引用计数 + 1
+}
+
+函数 DRM_GEM_释放(gem) {
+    如果 (gem == 空) { 返回 }
+    gem.引用计数 = gem.引用计数 - 1
+}
+
+// §8 页面翻转
+
+定义 可变 DRM_翻转总数 = 0
+定义 可变 DRM_翻转丢帧数 = 0
+
+函数 DRM_页面翻转(crtc_id, fb_id) {
+    定义 crtc = DRM_获取CRTC(crtc_id)
+    如果 (crtc == 空) { 返回 -1 }
+    crtc.当前FB = fb_id
+    DRM_翻转总数 = DRM_翻转总数 + 1
+    返回 0
+}
+
+// §9 Nova设备控制处理
+
+函数 DRM_Nova设备控制(命令, 参数) {
+    如果 (命令 == DRM_Nova设备控制_VERSION) { 返回 DRM_获取版本(参数) }
+    如果 (命令 == DRM_Nova设备控制_GET_CAP) { 返回 DRM_获取能力(参数) }
+    如果 (命令 == DRM_Nova设备控制_MODE_GETRESOURCES) { 返回 DRM_获取资源(参数) }
+    如果 (命令 == DRM_Nova设备控制_MODE_ADDFB) { 返回 0 }
+    如果 (命令 == DRM_Nova设备控制_MODE_RMFB) { 返回 0 }
+    如果 (命令 == DRM_Nova设备控制_MODE_PAGE_FLIP) { 返回 0 }
+    如果 (命令 == DRM_Nova设备控制_MODE_CREATE_DUMB) { 返回 DRM_创建Dumb缓冲(参数) }
+    返回 -1
+}
+
+函数 DRM_获取版本(参数) {
+    返回 [1, 0, 0]  // DRM版本1.0.0
+    返回 0
+}
+
+函数 DRM_获取能力(参数) {
+    返回 0x0F  // 支持Dumb缓冲+模式设置
+    返回 0
+}
+
+函数 DRM_获取资源(参数) {
+    如果 (全局DRM设备 == 0) { 返回 -1 }
+    返回 0
+}
+
+函数 DRM_创建Dumb缓冲(参数) {
+    返回 堆_分配(宽 * 高 * 4)  // ARGB32
+    返回 0
+}
+
+// §10 DRM统计与健康检查
+
+函数 DRM_统计() {
+    如果 (全局DRM设备 == 0) { 返回 空 }
+    返回 {
+        驱动: 全局DRM设备.驱动名,
+        CRTC数: 计数(全局DRM设备.CRTC列表),
+        连接器数: 计数(全局DRM设备.连接器列表),
+        编码器数: 计数(全局DRM设备.编码器列表),
+        帧缓冲数: 计数(全局DRM设备.帧缓冲列表),
+        GEM对象数: 计数(全局DRM设备.GEM对象列表),
+        VRAM_MB: 全局DRM设备.VRAM大小 / 1024 / 1024,
+        翻转总数: DRM_翻转总数,
+        丢帧: DRM_翻转丢帧数,
+    }
+}
+
+函数 DRM_健康检查() {
+    定义 可变 问题 = []
+    如果 (全局DRM设备 == 0) { 追加(问题, "DRM设备未初始化"); 返回 问题 }
+    如果 (计数(全局DRM设备.连接器列表) == 0) {
+        追加(问题, "无显示连接器")
+    }
+    如果 (DRM_翻转丢帧数 > DRM_翻转总数 / 10 && DRM_翻转总数 > 100) {
+        追加(问题, "DRM丢帧率过高")
+    }
+    如果 (计数(问题) == 0) { 返回 "DRM/KMS健康" }
+    返回 问题
+}
+
+函数 DRM_重置统计() {
+    DRM_翻转总数 = 0
+    DRM_翻转丢帧数 = 0
+}
+
+函数 DRM_完整统计() {
+    返回 [DRM_翻转总数, DRM_翻转丢帧数, 计数(全局DRM设备.帧缓冲列表), 计数(全局DRM设备.GEM对象列表)]
+}
+
+函数 DRM_像素格式名(格式) {
+    如果 (格式 == DRM_FORMAT_XRGB8888) { 返回 "XRGB8888" }
+    如果 (格式 == DRM_FORMAT_ARGB8888) { 返回 "ARGB8888" }
+    如果 (格式 == DRM_FORMAT_RGB565) { 返回 "RGB565" }
+    返回 "Unknown(0x" + 十六进制(格式) + ")"
+}
+
+定义 可变 AI_显示管理项_运行指标 = 0
+定义 可变 AI_显示管理项_异常指标 = 0
+
+函数 AI_显示管理项_自诊断() {
+    AI_显示管理项_运行指标 = DRM_翻转总数
+    返回 AI_显示管理项_运行指标
+}
+
+函数 AI_显示管理项_优化建议() {
+    定义 指标 = AI_显示管理项_自诊断()
+    如果 (AI_显示管理项_运行指标 > 10000) { 返回 "显示管理项控负载较高" }
+    返回 "显示管理项控状态正常"
+}

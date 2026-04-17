@@ -1,0 +1,456 @@
+// §3 ToString (JS语言规范 §7.1.12)
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("../推理/运行时异常处.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内存初始化.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/字符串替换.nova")
+
+函数 JSValue_ToString(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    定义 类型 = 内存_读32(值)
+
+    如果 (类型 == JS类型_Undefined) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    如果 (类型 == JS类型_Null) { 返回 Nova值_创建_String(Nova运行时实例, "null") }
+    如果 (类型 == JS类型_Boolean) {
+        如果 (内存_读64(值 + 8) != 0) { 返回 Nova值_创建_String(Nova运行时实例, "true") }
+        返回 Nova值_创建_String(Nova运行时实例, "false")
+    }
+    如果 (类型 == JS类型_Number) {
+        定义 n = 内存_读64(值 + 8)
+        返回 Nova值_创建_String(Nova运行时实例, 整数转字符串(n))
+    }
+    如果 (类型 == JS类型_String) { 返回 值 }
+    如果 (类型 == JS类型_符号) {
+        Nova运行时_抛出异常(Nova运行时实例, Nova值_创建_String(Nova运行时实例, "Type错误: Cannot convert a 符号 value to a string"))
+        返回 Nova值_创建_String(Nova运行时实例, "")
+    }
+
+    // 对象: ToPrimitive(string) → ToString
+    如果 (类型 >= JS类型_Object) {
+        如果 (类型 == JS类型_数组) { 返回 Nova数组_ToString(Nova运行时实例, 值) }
+        如果 (类型 == JS类型_Function) { 返回 Nova值_创建_String(Nova运行时实例, "function() { [native code] }") }
+        返回 Nova值_创建_String(Nova运行时实例, "[object Object]")
+    }
+
+    返回 Nova值_创建_String(Nova运行时实例, "")
+}
+
+函数 Nova数组_ToString(Nova运行时实例, arr) {
+    // 数组.prototype.toString = 数组.prototype.join(",")
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 Nova值_创建_String(Nova运行时实例, "") }
+    定义 长度 = 内存_读32(obj数据 + 40)
+    如果 (长度 == 0) { 返回 Nova值_创建_String(Nova运行时实例, "") }
+
+    定义 可变 结果 = ""
+    定义 元素存储 = 内存_读64(obj数据 + 32)
+    定义 可变 i = 0
+    当 (i < 长度) {
+        如果 (i > 0) { 结果 = 字符串_连接(结果, ",") }
+        定义 elem = 内存_读64(元素存储 + i * 8)
+        如果 (elem != 0 && !JSValue_IsNull(elem) && !JSValue_IsUndefined(elem)) {
+            定义 str = JSValue_ToString(Nova运行时实例, elem)
+            结果 = 字符串_连接(结果, JSValue_获取字符串(str))
+        }
+        i = i + 1
+    }
+    返回 Nova值_创建_String(Nova运行时实例, 结果)
+}
+
+// §4 ToBoolean (JS语言规范 §7.1.2)
+// Falsy值: undefined, null, false, 0, -0, NaN, ""
+
+函数 JSValue_ToBoolean(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 假 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined) { 返回 假 }
+    如果 (类型 == JS类型_Null) { 返回 假 }
+    如果 (类型 == JS类型_Boolean) { 返回 内存_读64(值 + 8) != 0 }
+    如果 (类型 == JS类型_Number) {
+        定义 n = 内存_读64(值 + 8)
+        返回 n != 0    // 0和NaN为false
+    }
+    如果 (类型 == JS类型_String) {
+        返回 内存_读32(值 + 32) > 0    // 空字符串为false
+    }
+    // 对象/函数/数组等: 总是true (包括空对象{})
+    返回 真
+}
+
+函数 JSValue_IsTrue(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 假 }
+    如果 (值 == Nova运行时实例.true值) { 返回 真 }
+    如果 (值 == Nova运行时实例.false值) { 返回 假 }
+    返回 JSValue_ToBoolean(Nova运行时实例, 值)
+}
+
+// §5 ToInt32 / ToUint32 (JS语言规范 §7.1.5/6)
+
+函数 JSValue_ToInt32(Nova运行时实例, 值) {
+    定义 n = Nova值_转数值(Nova运行时实例, 值)
+    // ES规范: ToInt32 = n modulo 2^32, 然后转为有符号
+    定义 n32 = n & 0xFFFFFFFF
+    如果 (n32 >= 0x80000000) { n32 = n32 - 0x100000000 }    // 转有符号
+    返回 n32
+}
+
+函数 JSValue_ToUint32(Nova运行时实例, 值) {
+    定义 n = Nova值_转数值(Nova运行时实例, 值)
+    返回 n & 0xFFFFFFFF
+}
+
+函数 JSValue_ToPropertyKey(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 "undefined" }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_String) { 返回 JSValue_获取字符串(值) }
+    如果 (类型 == JS类型_符号) { 返回 值 }    // 符号保持原样
+    如果 (类型 == JS类型_Number) {
+        返回 整数转字符串(内存_读64(值 + 8))
+    }
+    定义 str = JSValue_ToString(Nova运行时实例, 值)
+    返回 JSValue_获取字符串(str)
+}
+
+函数 JSValue_ToObject(Nova运行时实例, 值) {
+    如果 (值 == 0) {
+        Nova运行时_抛出异常(Nova运行时实例, Nova值_创建_String(Nova运行时实例, "Type错误: Cannot convert undefined to object"))
+        返回 Nova运行时实例.undefined值
+    }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined || 类型 == JS类型_Null) {
+        Nova运行时_抛出异常(Nova运行时实例, Nova值_创建_String(Nova运行时实例, "Type错误: Cannot convert undefined or null to object"))
+        返回 Nova运行时实例.undefined值
+    }
+    // 原始值包装: new Number(n) / new String(s) / new Boolean(b)
+    如果 (类型 == JS类型_Number) {
+        定义 wrapper = Nova对象_创建(Nova运行时实例, Nova运行时实例.Number原型)
+        Nova对象_设置属性(Nova运行时实例, wrapper, "[[PrimitiveValue]]", 值)
+        返回 wrapper
+    }
+    如果 (类型 == JS类型_String) {
+        定义 wrapper = Nova对象_创建(Nova运行时实例, Nova运行时实例.String原型)
+        Nova对象_设置属性(Nova运行时实例, wrapper, "[[PrimitiveValue]]", 值)
+        返回 wrapper
+    }
+    如果 (类型 == JS类型_Boolean) {
+        定义 wrapper = Nova对象_创建(Nova运行时实例, Nova运行时实例.Boolean原型)
+        Nova对象_设置属性(Nova运行时实例, wrapper, "[[PrimitiveValue]]", 值)
+        返回 wrapper
+    }
+    // 已经是对象
+    返回 值
+}
+
+// §6 JS类型常量
+
+定义 JS类型_Undefined = 0
+定义 JS类型_Null = 1
+定义 JS类型_Boolean = 2
+定义 JS类型_Number = 3
+定义 JS类型_String = 4
+定义 JS类型_符号 = 5
+定义 JS类型_BigInt = 6
+定义 JS类型_Object = 10
+定义 JS类型_数组 = 11
+定义 JS类型_Function = 12
+定义 JS类型_RegExp = 13
+定义 JS类型_Date = 14
+定义 JS类型_Error = 15
+定义 JS类型_Map = 16
+定义 JS类型_Set = 17
+定义 JS类型_WeakMap = 18
+定义 JS类型_WeakSet = 19
+定义 JS类型_Promise = 20
+定义 JS类型_Proxy = 21
+定义 JS类型_ArrayBuffer = 22
+定义 JS类型_TypedArray = 23
+
+函数 JS类型_名称(类型) {
+    如果 (类型 == JS类型_Undefined) { 返回 "undefined" }
+    如果 (类型 == JS类型_Null) { 返回 "object" }
+    如果 (类型 == JS类型_Boolean) { 返回 "boolean" }
+    如果 (类型 == JS类型_Number) { 返回 "number" }
+    如果 (类型 == JS类型_String) { 返回 "string" }
+    如果 (类型 == JS类型_符号) { 返回 "symbol" }
+    如果 (类型 == JS类型_BigInt) { 返回 "bigint" }
+    如果 (类型 == JS类型_Function) { 返回 "function" }
+    如果 (类型 >= JS类型_Object) { 返回 "object" }
+    返回 "unknown"
+}
+
+函数 JS类型_是原始值(类型) {
+    返回 类型 < JS类型_Object
+}
+
+函数 JS类型_是对象(类型) {
+    返回 类型 >= JS类型_Object
+}
+
+函数 JS类型_是数值类型(类型) {
+    返回 类型 == JS类型_Number || 类型 == JS类型_BigInt
+}
+
+// §7 typeof操作符
+
+函数 JSValue_TypeOf(值) {
+    如果 (值 == 0) { 返回 "undefined" }
+    定义 类型 = 内存_读32(值)
+    返回 JS类型_名称(类型)
+}
+
+// §8 ToNumber (JS语言规范 §7.1.4)
+
+函数 Nova值_转数值(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 0 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined) { 返回 0 }
+    如果 (类型 == JS类型_Null) { 返回 0 }
+    如果 (类型 == JS类型_Boolean) {
+        如果 (内存_读64(值 + 8) != 0) { 返回 1 }
+        返回 0
+    }
+    如果 (类型 == JS类型_Number) { 返回 内存_读64(值 + 8) }
+    如果 (类型 == JS类型_String) {
+        定义 s = JSValue_获取字符串(值)
+        返回 字符串转整数(s)
+    }
+    如果 (类型 == JS类型_符号) {
+        Nova运行时_抛出异常(Nova运行时实例, Nova值_创建_String(Nova运行时实例, "Type错误: Cannot convert a Symbol value to a number"))
+        返回 0
+    }
+    如果 (类型 >= JS类型_Object) {
+        定义 prim = JSValue_ToPrimitive_Number(Nova运行时实例, 值)
+        返回 Nova值_转数值(Nova运行时实例, prim)
+    }
+    返回 0
+}
+
+// §9 ToPrimitive (JS语言规范 §7.1.1)
+
+函数 JSValue_ToPrimitive_Number(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 值 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 < JS类型_Object) { 返回 值 }
+    定义 valueOf = Nova对象_获取属性(Nova运行时实例, 值, "valueOf")
+    如果 (valueOf != 0 && 内存_读32(valueOf) == JS类型_Function) {
+        定义 结果 = Nova函数_调用(Nova运行时实例, valueOf, 值, [])
+        如果 (结果 != 0 && 内存_读32(结果) < JS类型_Object) { 返回 结果 }
+    }
+    定义 toString = Nova对象_获取属性(Nova运行时实例, 值, "toString")
+    如果 (toString != 0 && 内存_读32(toString) == JS类型_Function) {
+        定义 结果 = Nova函数_调用(Nova运行时实例, toString, 值, [])
+        如果 (结果 != 0 && 内存_读32(结果) < JS类型_Object) { 返回 结果 }
+    }
+    返回 Nova值_创建_Number(Nova运行时实例, 0)
+}
+
+函数 JSValue_ToPrimitive_String(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 值 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 < JS类型_Object) { 返回 值 }
+    定义 toString = Nova对象_获取属性(Nova运行时实例, 值, "toString")
+    如果 (toString != 0 && 内存_读32(toString) == JS类型_Function) {
+        定义 结果 = Nova函数_调用(Nova运行时实例, toString, 值, [])
+        如果 (结果 != 0 && 内存_读32(结果) < JS类型_Object) { 返回 结果 }
+    }
+    定义 valueOf = Nova对象_获取属性(Nova运行时实例, 值, "valueOf")
+    如果 (valueOf != 0 && 内存_读32(valueOf) == JS类型_Function) {
+        定义 结果 = Nova函数_调用(Nova运行时实例, valueOf, 值, [])
+        如果 (结果 != 0 && 内存_读32(结果) < JS类型_Object) { 返回 结果 }
+    }
+    返回 Nova值_创建_String(Nova运行时实例, "[object Object]")
+}
+
+// §10 相等比较 (JS语言规范 §7.2)
+
+函数 JSValue_StrictEquals(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 类型a = 内存_读32(a)
+    定义 类型b = 内存_读32(b)
+    如果 (类型a != 类型b) { 返回 假 }
+    如果 (类型a == JS类型_Undefined) { 返回 真 }
+    如果 (类型a == JS类型_Null) { 返回 真 }
+    如果 (类型a == JS类型_Boolean) { 返回 内存_读64(a + 8) == 内存_读64(b + 8) }
+    如果 (类型a == JS类型_Number) { 返回 内存_读64(a + 8) == 内存_读64(b + 8) }
+    如果 (类型a == JS类型_String) {
+        返回 字符串_相等(JSValue_获取字符串(a), JSValue_获取字符串(b))
+    }
+    返回 a == b
+}
+
+函数 JSValue_AbstractEquals(Nova运行时实例, a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 类型a = 内存_读32(a)
+    定义 类型b = 内存_读32(b)
+    如果 (类型a == 类型b) { 返回 JSValue_StrictEquals(a, b) }
+    如果 (类型a == JS类型_Null && 类型b == JS类型_Undefined) { 返回 真 }
+    如果 (类型a == JS类型_Undefined && 类型b == JS类型_Null) { 返回 真 }
+    如果 (类型a == JS类型_Number && 类型b == JS类型_String) {
+        定义 bn = Nova值_转数值(Nova运行时实例, b)
+        返回 内存_读64(a + 8) == bn
+    }
+    如果 (类型a == JS类型_String && 类型b == JS类型_Number) {
+        定义 an = Nova值_转数值(Nova运行时实例, a)
+        返回 an == 内存_读64(b + 8)
+    }
+    如果 (类型a == JS类型_Boolean) {
+        定义 an = Nova值_转数值(Nova运行时实例, a)
+        返回 JSValue_AbstractEquals(Nova运行时实例, Nova值_创建_Number(Nova运行时实例, an), b)
+    }
+    如果 (类型b == JS类型_Boolean) {
+        定义 bn = Nova值_转数值(Nova运行时实例, b)
+        返回 JSValue_AbstractEquals(Nova运行时实例, a, Nova值_创建_Number(Nova运行时实例, bn))
+    }
+    返回 假
+}
+
+// §11 值判断辅助
+
+函数 JSValue_IsNull(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Null
+}
+
+函数 JSValue_IsUndefined(值) {
+    如果 (值 == 0) { 返回 真 }
+    返回 内存_读32(值) == JS类型_Undefined
+}
+
+函数 JSValue_IsNullOrUndefined(值) {
+    返回 JSValue_IsNull(值) || JSValue_IsUndefined(值)
+}
+
+函数 JSValue_IsNumber(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Number
+}
+
+函数 JSValue_IsString(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_String
+}
+
+函数 JSValue_IsBoolean(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Boolean
+}
+
+函数 JSValue_IsObject(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) >= JS类型_Object
+}
+
+函数 JSValue_IsFunction(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Function
+}
+
+函数 JSValue_IsArray(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_数组
+}
+
+函数 JSValue_IsSymbol(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_符号
+}
+
+函数 JSValue_IsBigInt(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_BigInt
+}
+
+// §12 值创建辅助
+
+函数 Nova值_创建_String(Nova运行时实例, s) {
+    定义 值 = 堆_分配(48)
+    内存_写32(值, JS类型_String)
+    内存_写64(值 + 8, s)
+    定义 长度 = 字符串_长度(s)
+    内存_写32(值 + 32, 长度)
+    返回 值
+}
+
+函数 Nova值_创建_Number(Nova运行时实例, n) {
+    定义 值 = 堆_分配(16)
+    内存_写32(值, JS类型_Number)
+    内存_写64(值 + 8, n)
+    返回 值
+}
+
+函数 Nova值_创建_Boolean(Nova运行时实例, b) {
+    定义 值 = 堆_分配(16)
+    内存_写32(值, JS类型_Boolean)
+    内存_写64(值 + 8, b ? 1 : 0)
+    返回 值
+}
+
+函数 Nova值_创建_Null(Nova运行时实例) {
+    定义 值 = 堆_分配(8)
+    内存_写32(值, JS类型_Null)
+    返回 值
+}
+
+函数 Nova值_创建_Undefined(Nova运行时实例) {
+    定义 值 = 堆_分配(8)
+    内存_写32(值, JS类型_Undefined)
+    返回 值
+}
+
+函数 JSValue_获取字符串(值) {
+    如果 (值 == 0) { 返回 "" }
+    如果 (内存_读32(值) != JS类型_String) { 返回 "" }
+    返回 内存_读64(值 + 8)
+}
+
+函数 JSValue_获取数值(值) {
+    如果 (值 == 0) { 返回 0 }
+    如果 (内存_读32(值) != JS类型_Number) { 返回 0 }
+    返回 内存_读64(值 + 8)
+}
+
+函数 JSValue_获取布尔(值) {
+    如果 (值 == 0) { 返回 假 }
+    如果 (内存_读32(值) != JS类型_Boolean) { 返回 假 }
+    返回 内存_读64(值 + 8) != 0
+}
+
+// §13 值操作统计
+
+定义 可变 值操作_ToString总数 = 0
+定义 可变 值操作_ToNumber总数 = 0
+定义 可变 值操作_ToBoolean总数 = 0
+定义 可变 值操作_比较总数 = 0
+定义 可变 值操作_类型检查总数 = 0
+
+函数 值操作_统计() {
+    返回 {
+        ToString: 值操作_ToString总数,
+        ToNumber: 值操作_ToNumber总数,
+        ToBoolean: 值操作_ToBoolean总数,
+        比较: 值操作_比较总数,
+        类型检查: 值操作_类型检查总数,
+    }
+}
+
+函数 值操作_健康检查() {
+    返回 "值操作子系统健康"
+}
+
+函数 值操作_重置统计() {
+    值操作_ToString总数 = 0
+    值操作_ToNumber总数 = 0
+    值操作_ToBoolean总数 = 0
+    值操作_比较总数 = 0
+    值操作_类型检查总数 = 0
+}
+
+函数 值操作_完整统计() {
+    返回 [值操作_ToString总数, 值操作_ToNumber总数, 值操作_ToBoolean总数, 值操作_比较总数]
+}

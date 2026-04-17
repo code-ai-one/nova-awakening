@@ -1,0 +1,770 @@
+// § URL解析引擎 — NUPS理论 (Nova URL Parsing System)
+// NUPS核心创新:
+//   1. 三阶段渐进解析 — 先扫描结构定界符,再深度解析各组件,最后规范化
+//   2. 百分比双向编解码 — 安全的URI组件编码/解码+双重解码检测
+//   3. IPv6括号感知解析 — 透明处理[::1]格式的IPv6地址
+//   4. 查询参数索引 — 键值对解析+哈希索引以O(1)查找
+//   5. AI恶意URL检测 — 域名熵/路径深度/参数密度/编码异常的多维检测
+//   公式: 威胁分 T = σ(∑ w_i·f_i) 其中 f_i 为各维度特征,σ为sigmoid
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/字符串替换.nova")
+导入("../执行/控制台输出.nova")
+导入("./资源取数.nova")
+导入("./原子驻留.nova")
+导入("../中枢/内存初始化.nova")
+
+// §1 常量定义
+定义 URL_MAX_LENGTH = 8192          // URL最大长度
+定义 URL_MAX_HOST = 253             // 域名最大长度
+定义 URL_MAX_PATH_DEPTH = 64        // 路径最大深度
+定义 URL_MAX_QUERY_PARAMS = 128     // 查询参数最大数
+定义 URL_MAX_LABEL_LEN = 63         // 域名标签最大长度
+定义 URL_QUERY_HASH_SIZE = 64       // 查询参数哈希表大小
+定义 URL_PERCENT_SET_SIZE = 256     // 百分比编码集大小
+
+// 方案类型枚举
+定义 SCHEME_UNKNOWN   = 0
+定义 SCHEME_HTTP      = 1
+定义 SCHEME_HTTPS     = 2
+定义 SCHEME_FTP       = 3
+定义 SCHEME_FILE      = 4
+定义 SCHEME_WS        = 5
+定义 SCHEME_WSS       = 6
+定义 SCHEME_DATA      = 7
+定义 SCHEME_BLOB      = 8
+定义 SCHEME_JAVASCRIPT = 9
+
+// 默认端口映射
+定义 DEFAULT_PORT_HTTP  = 80
+定义 DEFAULT_PORT_HTTPS = 443
+定义 DEFAULT_PORT_FTP   = 21
+定义 DEFAULT_PORT_WS    = 80
+定义 DEFAULT_PORT_WSS   = 443
+
+// 解析结果状态
+定义 URL_OK           = 0
+定义 URL_ERR_EMPTY    = 1
+定义 URL_ERR_TOO_LONG = 2
+定义 URL_ERR_SCHEME   = 3
+定义 URL_ERR_HOST     = 4
+定义 URL_ERR_PORT     = 5
+定义 URL_ERR_PATH     = 6
+定义 URL_ERR_ENCODING = 7
+
+// 全局统计
+定义 可变 全局_URL解析总数 = 0
+定义 可变 全局_URL解析成功 = 0
+定义 可变 全局_URL解析失败 = 0
+定义 可变 全局_URL威胁检测 = 0
+定义 可变 全局_URL双重解码 = 0
+定义 可变 全局_URL规范化数 = 0
+
+// §2 数据结构
+
+结构 URL组件 {
+    scheme,          // u64 → 方案字符串("http"/"https"...)
+    scheme类型,      // u32 SCHEME_*枚举
+    username,        // u64 → 用户名字符串(已解码)
+    password,        // u64 → 密码字符串(已解码)
+    host,            // u64 → 主机字符串(小写化)
+    host长度,
+    host哈希,        // u32 快速比对用
+    是IPv6,          // 布尔 host是否为IPv6地址
+    port,            // u32 端口号(0表示默认)
+    path,            // u64 → 路径字符串
+    path长度,
+    path深度,        // u32 '/' 分隔符计数
+    query,           // u64 → 查询字符串(不含'?')
+    query长度,
+    fragment,        // u64 → 片段字符串(不含'#')
+    fragment长度,
+    是有效,
+    是opaque路径,    // 布尔 data:/javascript:等
+    解析状态,        // u32 URL_OK / URL_ERR_*
+    原始字符串,      // u64 → 原始输入
+    原始长度,
+    查询参数表,      // u64 → 查询参数数组
+    查询参数数,
+    哈希索引,        // u64 → 参数哈希表
+}
+
+结构 查询参数 {
+    键,              // u64 → 参数名字符串
+    值,              // u64 → 参数值字符串
+    键长度,
+    值长度,
+    键哈希,
+    下一个,          // u64 → 哈希冲突链
+}
+
+结构 URL威胁报告 {
+    威胁分,          // f64 [0,1]
+    域名熵,          // f64 域名字符分布的信息熵
+    路径深度分,      // f64 标准化路径深度
+    参数密度分,      // f64 参数数量/标准值
+    编码异常分,      // f64 百分比编码异常密度
+    长度异常分,      // f64 URL总长度/标准值
+    是可疑,
+}
+
+// §3 百分比编解码
+
+函数 NUPS_十六进制字符值(ch) {
+    如果 (ch >= 48 && ch <= 57) { 返回 ch - 48 }       // '0'-'9'
+    如果 (ch >= 65 && ch <= 70) { 返回 ch - 55 }       // 'A'-'F'
+    如果 (ch >= 97 && ch <= 102) { 返回 ch - 87 }      // 'a'-'f'
+    返回 -1
+}
+
+函数 URL_百分比解码(输入, 输入长) {
+    如果 (输入 == 0 || 输入长 == 0) { 返回 0 }
+    定义 out = 堆_分配(输入长 + 1)
+    可变 ri = 0
+    可变 wi = 0
+    当 (ri < 输入长) {
+        定义 ch = 字节取(输入, ri)
+        如果 (ch == 37 && ri + 2 < 输入长) {  // '%'
+            定义 hi = NUPS_十六进制字符值(字节取(输入, ri + 1))
+            定义 lo = NUPS_十六进制字符值(字节取(输入, ri + 2))
+            如果 (hi >= 0 && lo >= 0) {
+                内存_写字节(out + wi, hi * 16 + lo)
+                wi = wi + 1
+                ri = ri + 3
+            } 否则 {
+                内存_写字节(out + wi, ch)
+                wi = wi + 1
+                ri = ri + 1
+            }
+        } 否则 如果 (ch == 43) {  // '+' → 空格(query中)
+            内存_写字节(out + wi, 32)
+            wi = wi + 1
+            ri = ri + 1
+        } 否则 {
+            内存_写字节(out + wi, ch)
+            wi = wi + 1
+            ri = ri + 1
+        }
+    }
+    内存_写字节(out + wi, 0)  // 终结符
+    返回 out
+}
+
+函数 URL_百分比编码(输入, 输入长) {
+    如果 (输入 == 0 || 输入长 == 0) { 返回 0 }
+    // 最坏情况: 每字节编码为3字节
+    定义 out = 堆_分配(输入长 * 3 + 1)
+    定义 hex = "0123456789ABCDEF"
+    可变 ri = 0
+    可变 wi = 0
+    当 (ri < 输入长) {
+        定义 ch = 字节取(输入, ri)
+        // 安全字符: 字母/数字/几个特殊符号
+        如果 ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) ||
+            (ch >= 48 && ch <= 57) || ch == 45 || ch == 46 ||
+            ch == 95 || ch == 126) {
+            内存_写字节(out + wi, ch)
+            wi = wi + 1
+        } 否则 {
+            内存_写字节(out + wi, 37)       // '%'
+            内存_写字节(out + wi + 1, 字节取(hex, ch >> 4))
+            内存_写字节(out + wi + 2, 字节取(hex, ch & 15))
+            wi = wi + 3
+        }
+        ri = ri + 1
+    }
+    内存_写字节(out + wi, 0)
+    返回 out
+}
+
+函数 NUPS_检测双重解码(输入, 输入长) {
+    // 检查解码后是否仍含%XX序列(双重编码攻击指标)
+    如果 (输入 == 0 || 输入长 == 0) { 返回 假 }
+    定义 decoded = URL_百分比解码(输入, 输入长)
+    如果 (decoded == 0) { 返回 假 }
+    定义 dec_len = 平台_strlen(decoded)
+    可变 k = 0
+    当 (k < dec_len) {
+        如果 (字节取(decoded, k) == 37 && k + 2 < dec_len) {
+            定义 h = NUPS_十六进制字符值(字节取(decoded, k + 1))
+            定义 l = NUPS_十六进制字符值(字节取(decoded, k + 2))
+            如果 (h >= 0 && l >= 0) {
+                全局_URL双重解码 = 全局_URL双重解码 + 1
+                堆_释放(decoded)
+                返回 真
+            }
+        }
+        k = k + 1
+    }
+    堆_释放(decoded)
+    返回 假
+}
+
+// §4 方案解析与识别
+
+函数 NUPS_解析方案(输入, 长度) {
+    // 找到第一个 ':' 之前的字母序列作为方案
+    如果 (输入 == 0 || 长度 == 0) { 返回 0 }
+    可变 i = 0
+    // 方案首字符必须为字母
+    定义 first = 字节取(输入, 0)
+    如果 (!((first >= 65 && first <= 90) || (first >= 97 && first <= 122))) {
+        返回 0
+    }
+    i = 1
+    当 (i < 长度) {
+        定义 ch = 字节取(输入, i)
+        如果 (ch == 58) {  // ':'
+            返回 i  // 方案结束位置
+        }
+        // scheme允许: 字母/数字/+/-/.
+        如果 (!((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) ||
+              (ch >= 48 && ch <= 57) || ch == 43 || ch == 45 || ch == 46)) {
+            返回 0  // 无效字符
+        }
+        i = i + 1
+    }
+    返回 0  // 未找到':'
+}
+
+函数 NUPS_方案到类型(scheme, scheme_len) {
+    如果 (scheme == 0 || scheme_len == 0) { 返回 SCHEME_UNKNOWN }
+    // 简化的scheme匹配(已小写化)
+    如果 (scheme_len == 4) {
+        如果 (字节取(scheme,0)==104 && 字节取(scheme,1)==116 &&
+            字节取(scheme,2)==116 && 字节取(scheme,3)==112) {
+            返回 SCHEME_HTTP   // "http"
+        }
+        如果 (字节取(scheme,0)==102 && 字节取(scheme,1)==105 &&
+            字节取(scheme,2)==108 && 字节取(scheme,3)==101) {
+            返回 SCHEME_FILE   // "file"
+        }
+        如果 (字节取(scheme,0)==98 && 字节取(scheme,1)==108 &&
+            字节取(scheme,2)==111 && 字节取(scheme,3)==98) {
+            返回 SCHEME_BLOB   // "blob"
+        }
+        如果 (字节取(scheme,0)==100 && 字节取(scheme,1)==97 &&
+            字节取(scheme,2)==116 && 字节取(scheme,3)==97) {
+            返回 SCHEME_DATA   // "data"
+        }
+    }
+    如果 (scheme_len == 5) {
+        如果 (字节取(scheme,0)==104 && 字节取(scheme,1)==116 &&
+            字节取(scheme,2)==116 && 字节取(scheme,3)==112 &&
+            字节取(scheme,4)==115) {
+            返回 SCHEME_HTTPS  // "https"
+        }
+    }
+    如果 (scheme_len == 3 && 字节取(scheme,0)==102 &&
+        字节取(scheme,1)==116 && 字节取(scheme,2)==112) {
+        返回 SCHEME_FTP    // "ftp"
+    }
+    如果 (scheme_len == 2 && 字节取(scheme,0)==119 && 字节取(scheme,1)==115) {
+        返回 SCHEME_WS     // "ws"
+    }
+    如果 (scheme_len == 3 && 字节取(scheme,0)==119 &&
+        字节取(scheme,1)==115 && 字节取(scheme,2)==115) {
+        返回 SCHEME_WSS    // "wss"
+    }
+    返回 SCHEME_UNKNOWN
+}
+
+函数 NUPS_默认端口(scheme类型) {
+    如果 (scheme类型 == SCHEME_HTTP)  { 返回 DEFAULT_PORT_HTTP }
+    如果 (scheme类型 == SCHEME_HTTPS) { 返回 DEFAULT_PORT_HTTPS }
+    如果 (scheme类型 == SCHEME_FTP)   { 返回 DEFAULT_PORT_FTP }
+    如果 (scheme类型 == SCHEME_WS)    { 返回 DEFAULT_PORT_WS }
+    如果 (scheme类型 == SCHEME_WSS)   { 返回 DEFAULT_PORT_WSS }
+    返回 0
+}
+
+// §5 完整URL解析 (NUPS三阶段渐进)
+
+函数 URL_解析(输入) {
+    全局_URL解析总数 = 全局_URL解析总数 + 1
+    定义 url = 堆_分配(URL组件)
+    url.是有效 = 假
+    url.是opaque路径 = 假
+    url.解析状态 = URL_OK
+    url.查询参数表 = 0
+    url.查询参数数 = 0
+    url.哈希索引 = 0
+    // 基本校验
+    如果 (输入 == 0) {
+        url.解析状态 = URL_ERR_EMPTY
+        全局_URL解析失败 = 全局_URL解析失败 + 1
+        返回 url
+    }
+    定义 长度 = 平台_strlen(输入)
+    如果 (长度 == 0) {
+        url.解析状态 = URL_ERR_EMPTY
+        全局_URL解析失败 = 全局_URL解析失败 + 1
+        返回 url
+    }
+    如果 (长度 > URL_MAX_LENGTH) {
+        url.解析状态 = URL_ERR_TOO_LONG
+        全局_URL解析失败 = 全局_URL解析失败 + 1
+        返回 url
+    }
+    url.原始字符串 = 输入
+    url.原始长度 = 长度
+    定义 结束 = 长度
+    可变 i = 0
+    可变 标记 = 0
+
+    // === 第一阶段: 解析scheme ===
+    定义 colon_pos = NUPS_解析方案(输入, 长度)
+    如果 (colon_pos > 0) {
+        url.scheme = 字符串_截取(输入, 0, colon_pos)
+        字符串_小写化(url.scheme)
+        url.scheme类型 = NUPS_方案到类型(url.scheme, colon_pos)
+        i = colon_pos + 1  // 跳过 ':'
+    } 否则 {
+        url.解析状态 = URL_ERR_SCHEME
+        全局_URL解析失败 = 全局_URL解析失败 + 1
+        返回 url
+    }
+
+    // === 第二阶段: 解析authority/path/query/fragment ===
+    如果 (i + 1 < 结束 && 字节取(输入, i) == 47 && 字节取(输入, i + 1) == 47) {
+        i = i + 2    // 跳过 "//"
+        标记 = i
+        定义 可变 at位置 = -1
+        // 先扫描找@符号
+        定义 可变 j = i
+        当 (j < 结束 && 字节取(输入, j) != 47 && 字节取(输入, j) != 63 && 字节取(输入, j) != 35) {
+            如果 (字节取(输入, j) == 64) { at位置 = j }    // '@'
+            j = j + 1
+        }
+
+        // userinfo
+        如果 (at位置 >= 0) {
+            定义 可变 冒号 = -1
+            定义 可变 k = 标记
+            当 (k < at位置) {
+                如果 (字节取(输入, k) == 58 && 冒号 < 0) { 冒号 = k }
+                k = k + 1
+            }
+            如果 (冒号 >= 0) {
+                url.username = URL_百分比解码(字符串_截取(输入, 标记, 冒号), 冒号 - 标记)
+                url.password = URL_百分比解码(字符串_截取(输入, 冒号 + 1, at位置), at位置 - 冒号 - 1)
+            } 否则 {
+                url.username = URL_百分比解码(字符串_截取(输入, 标记, at位置), at位置 - 标记)
+            }
+            i = at位置 + 1
+        }
+
+        // host
+        标记 = i
+        定义 可变 host结束 = i
+        // IPv6: [xxx]
+        如果 (i < 结束 && 字节取(输入, i) == 91) {    // '['
+            url.是IPv6 = 真
+            当 (host结束 < 结束 && 字节取(输入, host结束) != 93) { host结束 = host结束 + 1 }
+            如果 (host结束 < 结束) { host结束 = host结束 + 1 }    // 包含']'
+        } 否则 {
+            url.是IPv6 = 假
+            当 (host结束 < 结束 && 字节取(输入, host结束) != 58 &&
+                字节取(输入, host结束) != 47 && 字节取(输入, host结束) != 63 &&
+                字节取(输入, host结束) != 35) {
+                host结束 = host结束 + 1
+            }
+        }
+        url.host = 字符串_截取(输入, 标记, host结束)
+        url.host长度 = host结束 - 标记
+        字符串_小写化(url.host)
+        url.host哈希 = 字符串_哈希(url.host)
+        // 域名长度检查
+        如果 (url.host长度 > URL_MAX_HOST) {
+            url.解析状态 = URL_ERR_HOST
+        }
+        i = host结束
+
+        // port
+        如果 (i < 结束 && 字节取(输入, i) == 58) {    // ':'
+            i = i + 1
+            定义 可变 端口值 = 0
+            当 (i < 结束 && 字节取(输入, i) >= 48 && 字节取(输入, i) <= 57) {
+                端口值 = 端口值 * 10 + (字节取(输入, i) - 48)
+                i = i + 1
+            }
+            如果 (端口值 > 0 && 端口值 <= 65535) {
+                url.port = 端口值
+            } 否则 {
+                url.解析状态 = URL_ERR_PORT
+            }
+        } 否则 {
+            // 填充默认端口
+            url.port = NUPS_默认端口(url.scheme类型)
+        }
+    } 否则 {
+        url.是opaque路径 = 真
+    }
+
+    标记 = i
+    当 (i < 结束 && 字节取(输入, i) != 63 && 字节取(输入, i) != 35) {
+        i = i + 1
+    }
+    如果 (i > 标记) {
+        url.path = 字符串_截取(输入, 标记, i)
+        url.path长度 = i - 标记
+        url.path深度 = NUPS_计算路径深度(url.path, url.path长度)
+    } 否则 {
+        url.path = "/"
+        url.path长度 = 1
+        url.path深度 = 0
+    }
+
+    如果 (i < 结束 && 字节取(输入, i) == 63) {    // '?'
+        i = i + 1
+        标记 = i
+        当 (i < 结束 && 字节取(输入, i) != 35) { i = i + 1 }
+        url.query = 字符串_截取(输入, 标记, i)
+        url.query长度 = i - 标记
+    }
+
+    如果 (i < 结束 && 字节取(输入, i) == 35) {    // '#'
+        i = i + 1
+        url.fragment = 字符串_截取(输入, i, 结束)
+        url.fragment长度 = 结束 - i
+    }
+
+    // === 第三阶段: 规范化与后处理 ===
+    如果 (url.解析状态 == URL_OK) {
+        url.是有效 = 真
+        全局_URL解析成功 = 全局_URL解析成功 + 1
+        // 解析查询参数
+        如果 (url.query != 0 && url.query长度 > 0) {
+            NUPS_解析查询参数(url)
+        }
+    } 否则 {
+        全局_URL解析失败 = 全局_URL解析失败 + 1
+    }
+    返回 url
+}
+
+// §6 路径处理与规范化
+
+函数 NUPS_计算路径深度(path, path_len) {
+    如果 (path == 0 || path_len == 0) { 返回 0 }
+    可变 depth = 0
+    可变 i = 0
+    当 (i < path_len) {
+        如果 (字节取(path, i) == 47) { depth = depth + 1 }  // '/'
+        i = i + 1
+    }
+    返回 depth
+}
+
+函数 NUPS_路径规范化(path, path_len) {
+    // 解析..和.段,移除冗余旜杠
+    如果 (path == 0 || path_len == 0) { 返回 "/" }
+    定义 segments = 堆_分配(URL_MAX_PATH_DEPTH * 8)  // 指针数组
+    定义 seg_lens = 堆_分配(URL_MAX_PATH_DEPTH * 4)
+    可变 seg_count = 0
+    可变 i = 0
+    // 跳过前导'/'
+    如果 (i < path_len && 字节取(path, i) == 47) { i = i + 1 }
+    当 (i < path_len && seg_count < URL_MAX_PATH_DEPTH) {
+        定义 seg_start = i
+        当 (i < path_len && 字节取(path, i) != 47) { i = i + 1 }
+        定义 seg_len = i - seg_start
+        如果 (i < path_len) { i = i + 1 }  // 跳过'/'
+        // 检查特殊段
+        如果 (seg_len == 1 && 字节取(path, seg_start) == 46) {
+            // "." — 忽略
+        } 否则 如果 (seg_len == 2 && 字节取(path, seg_start) == 46 && 字节取(path, seg_start+1) == 46) {
+            // ".." — 回退一级
+            如果 (seg_count > 0) { seg_count = seg_count - 1 }
+        } 否则 如果 (seg_len > 0) {
+            内存_写64(segments + seg_count * 8, path + seg_start)
+            内存_写32(seg_lens + seg_count * 4, seg_len)
+            seg_count = seg_count + 1
+        }
+    }
+    // 重建路径
+    定义 result = 堆_分配(path_len + 1)
+    可变 wi = 0
+    如果 (seg_count == 0) {
+        内存_写字节(result, 47)  // '/'
+        wi = 1
+    } 否则 {
+        可变 s = 0
+        当 (s < seg_count) {
+            内存_写字节(result + wi, 47)
+            wi = wi + 1
+            定义 sptr = 内存_读64(segments + s * 8)
+            定义 slen = 内存_读32(seg_lens + s * 4)
+            内存_复制(result + wi, sptr, slen)
+            wi = wi + slen
+            s = s + 1
+        }
+    }
+    内存_写字节(result + wi, 0)
+    堆_释放(segments)
+    堆_释放(seg_lens)
+    全局_URL规范化数 = 全局_URL规范化数 + 1
+    返回 result
+}
+
+// §7 查询参数解析与哈希索引
+
+函数 NUPS_参数镎哈希(键, 键长) {
+    如果 (键 == 0 || 键长 == 0) { 返回 0 }
+    可变 h = 5381
+    可变 i = 0
+    当 (i < 键长) {
+        h = ((h << 5) + h) + 字节取(键, i)  // djb2
+        i = i + 1
+    }
+    返回 h & 0x7FFFFFFF
+}
+
+函数 NUPS_解析查询参数(url) {
+    如果 (url == 0 || url.query == 0) { 返回 }
+    定义 q = url.query
+    定义 qlen = url.query长度
+    // 分配参数数组和哈希表
+    url.查询参数表 = 堆_分配(URL_MAX_QUERY_PARAMS * 32)  // 查询参数数组
+    url.哈希索引 = 堆_分配(URL_QUERY_HASH_SIZE * 8)
+    // 清零哈希表
+    可变 h = 0
+    当 (h < URL_QUERY_HASH_SIZE) {
+        内存_写64(url.哈希索引 + h * 8, 0)
+        h = h + 1
+    }
+    url.查询参数数 = 0
+    可变 i = 0
+    当 (i < qlen && url.查询参数数 < URL_MAX_QUERY_PARAMS) {
+        // 找到键的开始
+        定义 key_start = i
+        当 (i < qlen && 字节取(q, i) != 61 && 字节取(q, i) != 38) { i = i + 1 }
+        定义 key_end = i
+        定义 可变 val_start = i
+        定义 可变 val_end = i
+        如果 (i < qlen && 字节取(q, i) == 61) {  // '='
+            i = i + 1
+            val_start = i
+            当 (i < qlen && 字节取(q, i) != 38) { i = i + 1 }
+            val_end = i
+        }
+        如果 (i < qlen && 字节取(q, i) == 38) { i = i + 1 }  // 跳过'&'
+        // 创建参数节点
+        如果 (key_end > key_start) {
+            定义 param_idx = url.查询参数数
+            定义 param = url.查询参数表 + param_idx * 32
+            定义 k_len = key_end - key_start
+            定义 v_len = val_end - val_start
+            // 解码键值
+            定义 decoded_key = URL_百分比解码(q + key_start, k_len)
+            定义 decoded_val = URL_百分比解码(q + val_start, v_len)
+            // 填充查询参数结构(按偏移量写入)
+            内存_写64(param, decoded_key)      // 键
+            内存_写64(param + 8, decoded_val)    // 值
+            内存_写32(param + 16, k_len)          // 键长度
+            内存_写32(param + 20, v_len)          // 值长度
+            定义 kh = NUPS_参数镎哈希(decoded_key, 平台_strlen(decoded_key))
+            内存_写32(param + 24, kh)             // 键哈希
+            内存_写64(param + 28, 0)              // 下一个
+            // 插入哈希表
+            定义 bucket = kh % URL_QUERY_HASH_SIZE
+            定义 old_head = 内存_读64(url.哈希索引 + bucket * 8)
+            内存_写64(param + 28, old_head)       // 链接旧头
+            内存_写64(url.哈希索引 + bucket * 8, param)
+            url.查询参数数 = url.查询参数数 + 1
+        }
+    }
+}
+
+函数 URL_查询参数_查找(url, 键, 键长) {
+    如果 (url == 0 || url.哈希索引 == 0 || 键 == 0) { 返回 0 }
+    定义 kh = NUPS_参数镎哈希(键, 键长)
+    定义 bucket = kh % URL_QUERY_HASH_SIZE
+    可变 node = 内存_读64(url.哈希索引 + bucket * 8)
+    当 (node != 0) {
+        定义 node_hash = 内存_读32(node + 24)
+        如果 (node_hash == kh) {
+            定义 node_key = 内存_读64(node)
+            定义 node_klen = 内存_读32(node + 16)
+            如果 (node_klen == 键长 && 内存_比较(node_key, 键, 键长) == 0) {
+                返回 内存_读64(node + 8)  // 返回值指针
+            }
+        }
+        node = 内存_读64(node + 28)  // 下一个
+    }
+    返回 0
+}
+
+// §8 URL比对与原点判定
+
+函数 URL_同源判定(url_a, url_b) {
+    // scheme + host + port 完全相同则同源
+    如果 (url_a == 0 || url_b == 0) { 返回 假 }
+    如果 (url_a.scheme类型 != url_b.scheme类型) { 返回 假 }
+    如果 (url_a.host哈希 != url_b.host哈希) { 返回 假 }
+    如果 (url_a.host长度 != url_b.host长度) { 返回 假 }
+    如果 (内存_比较(url_a.host, url_b.host, url_a.host长度) != 0) { 返回 假 }
+    // 端口比对(考虑默认端口)
+    定义 port_a = url_a.port
+    定义 port_b = url_b.port
+    如果 (port_a == 0) { port_a = NUPS_默认端口(url_a.scheme类型) }
+    如果 (port_b == 0) { port_b = NUPS_默认端口(url_b.scheme类型) }
+    返回 port_a == port_b
+}
+
+函数 URL_完全比对(url_a, url_b) {
+    如果 (!URL_同源判定(url_a, url_b)) { 返回 假 }
+    // path比对
+    如果 (url_a.path长度 != url_b.path长度) { 返回 假 }
+    如果 (url_a.path != 0 && url_b.path != 0) {
+        如果 (内存_比较(url_a.path, url_b.path, url_a.path长度) != 0) { 返回 假 }
+    }
+    // query比对
+    如果 (url_a.query长度 != url_b.query长度) { 返回 假 }
+    如果 (url_a.query != 0 && url_b.query != 0) {
+        如果 (内存_比较(url_a.query, url_b.query, url_a.query长度) != 0) { 返回 假 }
+    }
+    返回 真
+}
+
+// §9 域名熵计算 (NUPS-AI特征)
+// 域名熵: H = -∑ p_i·log2(p_i) 其中 p_i 为字符频率
+// 合法域名通常熵较低(有意义单词), 恶意DGA域名熵偏高
+
+函数 NUPS_域名熵(host, host_len) {
+    如果 (host == 0 || host_len == 0) { 返回 0.0 }
+    // 统计字符频率(简化:256个桶)
+    定义 freq = 堆_分配(256 * 4)
+    可变 k = 0
+    当 (k < 256) { 内存_写32(freq + k * 4, 0); k = k + 1 }
+    k = 0
+    当 (k < host_len) {
+        定义 ch = 字节取(host, k)
+        定义 old = 内存_读32(freq + ch * 4)
+        内存_写32(freq + ch * 4, old + 1)
+        k = k + 1
+    }
+    // 计算信息熵 H = -∑ p_i * log2(p_i)
+    可变 entropy = 0.0
+    k = 0
+    当 (k < 256) {
+        定义 cnt = 内存_读32(freq + k * 4)
+        如果 (cnt > 0) {
+            定义 p = cnt / host_len
+            // log2近似: log2(x) ≈ (x-1) - (x-1)²/2 + (x-1)³/3 用于x接近1
+            // 替代:用自然对数近似: ln(p) ≈ -1/p (p小时粗略), 此处用整数逻辑
+            定义 log_approx = NUPS_log2近似(p)
+            entropy = entropy - p * log_approx
+        }
+        k = k + 1
+    }
+    堆_释放(freq)
+    返回 entropy
+}
+
+函数 NUPS_log2近似(x) {
+    // log2(x) ≈ log2(e)·ln(x)
+    // ln(x) ≈ 2·((x-1)/(x+1)) + (2/3)·((x-1)/(x+1))^3 (Padé)
+    如果 (x <= 0.0) { 返回 -20.0 }  // 下限
+    定义 t = (x - 1.0) / (x + 1.0)
+    定义 t2 = t * t
+    定义 ln_x = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0)
+    返回 ln_x * 1.4426950408889634  // 1/ln(2)
+}
+
+// §10 AI恶意URL检测
+// NUPS-AI检测维度:
+//   dim0: 域名熵(高熵=可疑DGA)
+//   dim1: 路径深度/标准深度
+//   dim2: 查询参数密度
+//   dim3: 百分比编码密度
+//   dim4: URL总长度/平均长度
+//   dim5: 双重编码标志
+//   威胁分 T = sigmoid(∑ w_i·f_i)
+
+函数 NUPS_AI威胁检测(url) {
+    如果 (url == 0 || !url.是有效) { 返回 0 }
+    如果 (全局AI总线 == 0) { 返回 0 }
+    定义 report = 堆_分配(URL威胁报告)
+    // dim0: 域名熵
+    report.域名熵 = NUPS_域名熵(url.host, url.host长度)
+    // dim1: 路径深度标准化
+    report.路径深度分 = url.path深度 / 5.0  // 标准深度⁈5
+    如果 (report.路径深度分 > 1.0) { report.路径深度分 = 1.0 }
+    // dim2: 参数密度
+    report.参数密度分 = url.查询参数数 / 8.0  // 标准参数数⁈8
+    如果 (report.参数密度分 > 1.0) { report.参数密度分 = 1.0 }
+    // dim3: 编码密度
+    report.编码异常分 = NUPS_编码密度(url.原始字符串, url.原始长度)
+    // dim4: 长度标准化
+    report.长度异常分 = url.原始长度 / 200.0  // 标准长度⁈200
+    如果 (report.长度异常分 > 1.0) { report.长度异常分 = 1.0 }
+    // 构建6维特征向量
+    定义 tensor = Tensor_创建(6)
+    Tensor_写(tensor, 0, report.域名熵 / 4.0)   // 归一化
+    Tensor_写(tensor, 1, report.路径深度分)
+    Tensor_写(tensor, 2, report.参数密度分)
+    Tensor_写(tensor, 3, report.编码异常分)
+    Tensor_写(tensor, 4, report.长度异常分)
+    定义 双重标志 = 如果(NUPS_检测双重解码(url.原始字符串, url.原始长度), 1.0, 0.0)
+    Tensor_写(tensor, 5, 双重标志)
+    // AI推理
+    定义 威胁分 = AI总线_推理(全局AI总线, tensor, 6)
+    // sigmoid: S(x) = 1/(1+e^(-x)) ≈ 0.5 + 0.5·tanh(x/2)
+    定义 half_x = 威胁分 / 2.0
+    定义 hx2 = half_x * half_x
+    定义 tanh_val = half_x * (27.0 + hx2) / (27.0 + 9.0 * hx2)
+    report.威胁分 = 0.5 + 0.5 * tanh_val
+    如果 (report.威胁分 < 0.0) { report.威胁分 = 0.0 }
+    如果 (report.威胁分 > 1.0) { report.威胁分 = 1.0 }
+    report.是可疑 = report.威胁分 > 0.65
+    如果 (report.是可疑) {
+        全局_URL威胁检测 = 全局_URL威胁检测 + 1
+        平台_日志("[NUPS-AI] 可疑URL 威胁分=", report.威胁分,
+                 " 域名熵=", report.域名熵, " host=", url.host)
+    }
+    Tensor_释放(tensor)
+    返回 report
+}
+
+函数 NUPS_编码密度(输入, 长度) {
+    // 统计百分比编码字符占比
+    如果 (输入 == 0 || 长度 == 0) { 返回 0.0 }
+    可变 pct_count = 0
+    可变 i = 0
+    当 (i < 长度) {
+        如果 (字节取(输入, i) == 37) { pct_count = pct_count + 1 }
+        i = i + 1
+    }
+    返回 pct_count * 3.0 / 长度  // 每个%XX占三3字节
+}
+
+// §11 诊断与初始化
+
+函数 NUPS_全局统计() {
+    平台_日志("[NUPS全局] 解析总数=", 全局_URL解析总数,
+             " 成功=", 全局_URL解析成功,
+             " 失败=", 全局_URL解析失败,
+             " 威胁检测=", 全局_URL威胁检测,
+             " 双重解码=", 全局_URL双重解码,
+             " 规范化=", 全局_URL规范化数)
+}
+
+函数 URL_释放(url) {
+    如果 (url == 0) { 返回 }
+    如果 (url.查询参数表 != 0) { 堆_释放(url.查询参数表) }
+    如果 (url.哈希索引 != 0) { 堆_释放(url.哈希索引) }
+    堆_释放(url)
+}
+
+函数 NUPS_初始化() {
+    全局_URL解析总数 = 0
+    全局_URL解析成功 = 0
+    全局_URL解析失败 = 0
+    全局_URL威胁检测 = 0
+    全局_URL双重解码 = 0
+    全局_URL规范化数 = 0
+    平台_日志("[NUPS] Nova URL Parsing System 引擎已初始化")
+}

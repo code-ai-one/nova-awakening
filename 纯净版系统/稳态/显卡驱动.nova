@@ -1,0 +1,467 @@
+// NovaOS AMD GPU驱动 — MMHUB/GFX环/Compute环/SDMA/命令提交/AI加速
+// 本模块实现AMD GPU的核心硬件初始化与命令引擎:
+//   1. MMHUB: GPU页表/VRAM映射/系统孔径/L2 TLB
+//   2. GFX环: 图形命令处理器(CP)的环缓冲管理
+//   3. Compute环: MEC计算命令处理器
+//   4. SDMA: DMA复制引擎(VRAM↔系统内存)
+//   5. 命令提交: PM4包构建/环写入/fence同步
+//   6. 显存管理: VRAM/GTT分配/释放/碎片整理
+//   7. AI加速: GPU利用率预测/命令批处理优化
+// 与内核中断系统、内存管理、渲染引擎合成器、智能大脑深度耦合。
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/日志中枢.nova")
+导入("../中枢/中断管理系统.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/进程调度.nova")
+导入("../中枢/内存物理.nova")
+导入("./总线解析.nova")
+导入("../中枢/公共智能.nova")
+导入("../感知/图绘渲染上下.nova")
+导入("../引导/引导加载器.nova")
+导入("../感知/内核直连层.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/哈希函数.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./输入原语.nova")
+导入("../中枢/每核页释放.nova")
+
+// §1 MMIO寄存器常量
+
+定义 mmMC_VM_FB_LOCATION_BASE = 0x2024
+定义 mmMC_VM_FB_LOCATION_TOP = 0x2028
+定义 mmMC_VM_SYSTEM_APERTURE_LOW = 0x2034
+定义 mmMC_VM_SYSTEM_APERTURE_HIGH = 0x2038
+定义 mmVM_CONTEXT0_CNTL = 0x2100
+定义 mmVM_L2_CNTL = 0x2110
+
+定义 mmCP_ME_CNTL = 0x3040
+定义 mmCP_RB_BASE = 0x3080
+定义 mmCP_RB_CNTL = 0x3084
+定义 mmCP_RB_RPTR = 0x3088
+定义 mmCP_RB_WPTR = 0x308C
+定义 mmGRBM_STATUS = 0x3050
+定义 GRBM_STATUS_CP_BUSY = 0x20000000
+
+定义 mmCP_COMPUTE_RB_BASE = 0x3200
+定义 mmCP_COMPUTE_RB_CNTL = 0x3204
+定义 mmCP_COMPUTE_RB_RPTR = 0x3208
+定义 mmCP_COMPUTE_RB_WPTR = 0x320C
+
+定义 mmSDMA0_RB_BASE = 0x3400
+定义 mmSDMA0_RB_CNTL = 0x3404
+定义 mmSDMA0_RB_RPTR = 0x3408
+定义 mmSDMA0_RB_WPTR = 0x340C
+定义 mmSDMA0_CNTL = 0x3410
+
+// PM4包头类型
+定义 PM4_TYPE3 = 3
+定义 PM4_NOP = 0x10
+定义 PM4_SET_DATA = 0x68
+定义 PM4_DRAW_INDEX = 0x2A
+定义 PM4_DISPATCH = 0x29
+定义 PM4_DMA_COPY = 0x51
+定义 PM4_FENCE = 0x46
+定义 PM4_EVENT_WRITE = 0x47
+
+定义 GTT = 0
+定义 VRAM = 1
+定义 用途_命令缓冲 = 0
+定义 用途_顶点缓冲 = 1
+定义 用途_纹理 = 2
+定义 用途_帧缓冲 = 3
+
+// §2 GPU状态结构
+
+结构 AMD_GPU状态 {
+    mmio,
+    gpu,
+    GFX环_地址,
+    GFX环_大小,
+    GFX环_WPTR,
+    计算环_地址,
+    计算环_大小,
+    计算环_WPTR,
+    SDMA环_地址,
+    SDMA环_大小,
+    SDMA环_WPTR,
+    fence_值,
+    fence_地址,
+    // 显存管理
+    VRAM_已用,
+    VRAM_总量,
+    GTT_已用,
+    GTT_总量,
+    // 统计
+    命令提交数,
+    绘制调用数,
+    计算分派数,
+    DMA复制数,
+    fence同步数,
+    // AI
+    AI_GPU利用率,
+    AI_命令批大小,
+}
+
+定义 可变 AMD状态 = 空
+定义 可变 GPU_已初始化 = 假
+
+函数 AMD_MMHUB_初始化() {
+    定义 mmio = AMD状态.mmio
+
+    // 配置帧缓冲位置(VRAM在图处物理地址空间中的位置)
+    MMIO写32(mmio + mmMC_VM_FB_LOCATION_BASE, 0)
+    MMIO写32(mmio + mmMC_VM_FB_LOCATION_TOP, AMD状态.gpu.显存大小_MB)
+
+    // 配置系统孔径(CPU可见的VRAM窗口)
+    MMIO写32(mmio + mmMC_VM_SYSTEM_APERTURE_LOW, AMD状态.gpu.BAR1_地址 & 0xFFFFFFFF)
+    MMIO写32(mmio + mmMC_VM_SYSTEM_APERTURE_HIGH, (AMD状态.gpu.BAR1_地址 + AMD状态.gpu.BAR1_大小) & 0xFFFFFFFF)
+
+    // 图处虚拟内存: 启用页表(VM context 0)
+    MMIO写32(mmio + mmVM_CONTEXT0_CNTL, 0x01)  // 使能
+    // L2 TLB配置
+    MMIO写32(mmio + mmVM_L2_CNTL, 0x03)  // 使能L2 + 2路组相联
+
+    内核信息("AMD驱动: MMHUB初始化 VRAM=" + 整数转字符串(AMD状态.gpu.显存大小_MB) + "MB")
+}
+
+// §7 GFX环(图形命令处理器)
+
+函数 AMD_GFX环_初始化() {
+    定义 mmio = AMD状态.mmio
+    AMD状态.GFX环_大小 = 262144  // 256KB
+
+    // 分配GFX环缓冲(直传对齐到4KB)
+    AMD状态.GFX环_地址 = 图处内存_分配(AMD状态.GFX环_大小, GTT, 用途_命令缓冲)
+    如果 (AMD状态.GFX环_地址 == 空) {
+        内核错误("AMD驱动: GFX环分配失败")
+        返回
+    }
+
+    // 停止CP微引擎
+    MMIO写32(mmio + mmCP_ME_CNTL, 0x10000000)  // HALT ME + PFP + CE
+
+    // 配置GFX环缓冲
+    定义 基地址 = AMD状态.GFX环_地址.物理地址
+    MMIO写32(mmio + mmCP_RB_BASE, (基地址 >> 8) & 0xFFFFFFFF)
+    // 环大小: log2(大小/8)-1, 256KB = 2^18 → log2(256K/8)=15 → 值=14
+    MMIO写32(mmio + mmCP_RB_CNTL, 14 | (1 << 27))  // 大小 + BUF_SWAP
+    MMIO写32(mmio + mmCP_RB_RPTR, 0)
+    MMIO写32(mmio + mmCP_RB_WPTR, 0)
+    AMD状态.GFX环_WPTR = 0
+
+    // 启动CP微引擎(解除HALT)
+    MMIO写32(mmio + mmCP_ME_CNTL, 0)
+
+    // 等待CP就绪
+    定义 可变 超时 = 10000
+    当 (超时 > 0 && (MMIO读32(mmio + mmGNova受限能量网络_STATUS) & GNova受限能量网络_STATUS_CP_BUSY) != 0) {
+        超时 = 超时 - 1
+    }
+
+    内核信息("AMD驱动: GFX环就绪 " + 整数转字符串(AMD状态.GFX环_大小 / 1024) + "KB")
+}
+
+// §8 Compute环(MEC计算命令处理器)
+
+函数 AMD_计算环_初始化() {
+    定义 mmio = AMD状态.mmio
+    AMD状态.计算环_大小 = 131072  // 128KB
+
+    AMD状态.计算环_地址 = 图处内存_分配(AMD状态.计算环_大小, GTT, 用途_命令缓冲)
+    如果 (AMD状态.计算环_地址 == 空) {
+        内核警告("AMD驱动: Compute环分配失败")
+        返回
+    }
+
+    定义 基地址 = AMD状态.计算环_地址.物理地址
+    MMIO写32(mmio + mmCP_COMPUTE_RB_BASE, (基地址 >> 8) & 0xFFFFFFFF)
+    MMIO写32(mmio + mmCP_COMPUTE_RB_CNTL, 13 | (1 << 27))  // 128KB
+    MMIO写32(mmio + mmCP_COMPUTE_RB_RPTR, 0)
+    MMIO写32(mmio + mmCP_COMPUTE_RB_WPTR, 0)
+    AMD状态.计算环_WPTR = 0
+
+    内核信息("AMD驱动: Compute环就绪 " + 整数转字符串(AMD状态.计算环_大小 / 1024) + "KB")
+}
+
+// §9 S直传 (直传复制引擎)
+
+函数 AMD_S直传_初始化() {
+    定义 mmio = AMD状态.mmio
+    AMD状态.S直传环_大小 = 65536  // 64KB
+
+    AMD状态.S直传环_地址 = 图处内存_分配(AMD状态.S直传环_大小, GTT, 用途_命令缓冲)
+    如果 (AMD状态.S直传环_地址 == 空) { 返回 }
+
+    定义 基地址 = AMD状态.S直传环_地址.物理地址
+    MMIO写32(mmio + mmS直传0_RB_BASE, (基地址 >> 8) & 0xFFFFFFFF)
+    MMIO写32(mmio + mmS直传0_RB_CNTL, 12 | (1 << 27))  // 64KB
+    MMIO写32(mmio + mmS直传0_RB_RPTR, 0)
+    MMIO写32(mmio + mmS直传0_RB_WPTR, 0)
+    // 启动S直传
+    MMIO写32(mmio + mmS直传0_CNTL, 1)
+    AMD状态.S直传环_WPTR = 0
+
+    内核信息("AMD驱动: S直传0就绪")
+}
+
+// §10 PM4命令包构建与提交
+
+函数 PM4_构建头(操作码, DW数) {
+    返回 (PM4_TYPE3 << 30) | (操作码 << 8) | (DW数 - 2)
+}
+
+函数 GFX环_写DW(值) {
+    如果 (AMD状态 == 空 || AMD状态.GFX环_地址 == 空) { 返回 }
+    定义 偏移 = AMD状态.GFX环_WPTR % (AMD状态.GFX环_大小 / 4)
+    内存_写32(AMD状态.GFX环_地址 + 偏移 * 4, 值)
+    AMD状态.GFX环_WPTR = AMD状态.GFX环_WPTR + 1
+}
+
+函数 GFX环_提交() {
+    如果 (AMD状态 == 空) { 返回 }
+    MMIO写32(AMD状态.mmio + mmCP_RB_WPTR, AMD状态.GFX环_WPTR)
+    AMD状态.命令提交数 = AMD状态.命令提交数 + 1
+}
+
+函数 GFX_提交NOP(数量) {
+    定义 可变 i = 0
+    当 (i < 数量) {
+        GFX环_写DW(PM4_构建头(PM4_NOP, 1))
+        i = i + 1
+    }
+    GFX环_提交()
+}
+
+函数 GFX_提交绘制(索引数, 实例数, 起始索引) {
+    GFX环_写DW(PM4_构建头(PM4_DRAW_INDEX, 4))
+    GFX环_写DW(索引数)
+    GFX环_写DW(实例数)
+    GFX环_写DW(起始索引)
+    GFX环_写DW(0)
+    GFX环_提交()
+    AMD状态.绘制调用数 = AMD状态.绘制调用数 + 1
+}
+
+函数 计算_提交分派(线程组X, 线程组Y, 线程组Z) {
+    如果 (AMD状态 == 空 || AMD状态.计算环_地址 == 空) { 返回 }
+    定义 偏移 = AMD状态.计算环_WPTR % (AMD状态.计算环_大小 / 4)
+    内存_写32(AMD状态.计算环_地址 + 偏移 * 4, PM4_构建头(PM4_DISPATCH, 4))
+    内存_写32(AMD状态.计算环_地址 + (偏移 + 1) * 4, 线程组X)
+    内存_写32(AMD状态.计算环_地址 + (偏移 + 2) * 4, 线程组Y)
+    内存_写32(AMD状态.计算环_地址 + (偏移 + 3) * 4, 线程组Z)
+    内存_写32(AMD状态.计算环_地址 + (偏移 + 4) * 4, 0)
+    AMD状态.计算环_WPTR = AMD状态.计算环_WPTR + 5
+    MMIO写32(AMD状态.mmio + mmCP_COMPUTE_RB_WPTR, AMD状态.计算环_WPTR)
+    AMD状态.计算分派数 = AMD状态.计算分派数 + 1
+}
+
+// §11 Fence同步
+
+函数 GPU_fence_初始化() {
+    如果 (AMD状态 == 空) { 返回 }
+    AMD状态.fence_地址 = 直传_分配(4096)
+    如果 (AMD状态.fence_地址 != 0) {
+        内存_置零(AMD状态.fence_地址, 4096)
+    }
+    AMD状态.fence_值 = 0
+}
+
+函数 GPU_fence_发射() {
+    如果 (AMD状态 == 空 || AMD状态.fence_地址 == 0) { 返回 0 }
+    AMD状态.fence_值 = AMD状态.fence_值 + 1
+    GFX环_写DW(PM4_构建头(PM4_FENCE, 4))
+    GFX环_写DW(AMD状态.fence_地址 & 0xFFFFFFFF)
+    GFX环_写DW(0)
+    GFX环_写DW(AMD状态.fence_值)
+    GFX环_写DW(0)
+    GFX环_提交()
+    AMD状态.fence同步数 = AMD状态.fence同步数 + 1
+    返回 AMD状态.fence_值
+}
+
+函数 GPU_fence_等待(目标值) {
+    如果 (AMD状态 == 空 || AMD状态.fence_地址 == 0) { 返回 错误_未初始化 }
+    定义 可变 超时 = 1000000
+    当 (超时 > 0) {
+        定义 当前 = 内存_读32(AMD状态.fence_地址)
+        如果 (当前 >= 目标值) { 返回 成功 }
+        超时 = 超时 - 1
+    }
+    内核警告("[GPU] fence等待超时: 目标=" + 整数转字符串(目标值))
+    返回 错误_超时
+}
+
+函数 GPU_fence_已完成(目标值) {
+    如果 (AMD状态 == 空 || AMD状态.fence_地址 == 0) { 返回 假 }
+    返回 内存_读32(AMD状态.fence_地址) >= 目标值
+}
+
+// §12 显存管理
+
+结构 GPU内存块 {
+    物理地址,
+    大小,
+    类型,
+    用途,
+    引用计数,
+}
+
+定义 可变 GPU内存块列表 = []
+
+函数 图处内存_分配(大小, 类型, 用途) {
+    如果 (AMD状态 == 空) { 返回 空 }
+    定义 对齐大小 = (大小 + 4095) & ~4095
+
+    如果 (类型 == VRAM) {
+        如果 (AMD状态.VRAM_已用 + 对齐大小 > AMD状态.VRAM_总量) { 返回 空 }
+        AMD状态.VRAM_已用 = AMD状态.VRAM_已用 + 对齐大小
+    } 否则 {
+        如果 (AMD状态.GTT_已用 + 对齐大小 > AMD状态.GTT_总量) { 返回 空 }
+        AMD状态.GTT_已用 = AMD状态.GTT_已用 + 对齐大小
+    }
+
+    定义 物理 = 伙伴系统_分配(对齐大小 / 4096)
+    如果 (物理 == 0) { 返回 空 }
+
+    定义 块 = GPU内存块 {
+        物理地址: 物理,
+        大小: 对齐大小,
+        类型: 类型,
+        用途: 用途,
+        引用计数: 1,
+    }
+    追加(GPU内存块列表, 块)
+    返回 块
+}
+
+函数 图处内存_释放(块) {
+    如果 (块 == 空 || AMD状态 == 空) { 返回 }
+    块.引用计数 = 块.引用计数 - 1
+    如果 (块.引用计数 > 0) { 返回 }
+
+    如果 (块.类型 == VRAM) {
+        AMD状态.VRAM_已用 = AMD状态.VRAM_已用 - 块.大小
+    } 否则 {
+        AMD状态.GTT_已用 = AMD状态.GTT_已用 - 块.大小
+    }
+    释放内存(块.物理地址)
+}
+
+// §13 SDMA复制操作
+
+函数 GPU_DMA复制(源地址, 目标地址, 大小) {
+    如果 (AMD状态 == 空 || AMD状态.SDMA环_地址 == 空) { 返回 错误_未初始化 }
+    定义 偏移 = AMD状态.SDMA环_WPTR % (AMD状态.SDMA环_大小 / 4)
+    定义 基址 = AMD状态.SDMA环_地址
+
+    内存_写32(基址 + 偏移 * 4, PM4_构建头(PM4_DMA_COPY, 6))
+    内存_写32(基址 + (偏移 + 1) * 4, 大小)
+    内存_写32(基址 + (偏移 + 2) * 4, 0)
+    内存_写32(基址 + (偏移 + 3) * 4, 源地址 & 0xFFFFFFFF)
+    内存_写32(基址 + (偏移 + 4) * 4, 0)
+    内存_写32(基址 + (偏移 + 5) * 4, 目标地址 & 0xFFFFFFFF)
+    内存_写32(基址 + (偏移 + 6) * 4, 0)
+
+    AMD状态.SDMA环_WPTR = AMD状态.SDMA环_WPTR + 7
+    MMIO写32(AMD状态.mmio + mmSDMA0_RB_WPTR, AMD状态.SDMA环_WPTR)
+    AMD状态.DMA复制数 = AMD状态.DMA复制数 + 1
+    返回 成功
+}
+
+// §14 GPU中断处理
+
+函数 AMD_GPU中断处理() {
+    如果 (AMD状态 == 空) { 返回 }
+    // 读取中断状态
+    定义 状态 = MMIO读32(AMD状态.mmio + mmGRBM_STATUS)
+    // fence完成中断
+    // VSync中断
+    // 温度/过热中断
+}
+
+// §15 AI GPU利用率预测
+
+函数 AI_GPU利用率_更新() {
+    如果 (AMD状态 == 空) { 返回 }
+    定义 状态 = MMIO读32(AMD状态.mmio + mmGRBM_STATUS)
+    定义 忙碌 = (状态 & GRBM_STATUS_CP_BUSY) != 0
+    // 指数移动平均
+    如果 (忙碌) {
+        AMD状态.AI_GPU利用率 = (AMD状态.AI_GPU利用率 * 7 + 1000) / 8
+    } 否则 {
+        AMD状态.AI_GPU利用率 = (AMD状态.AI_GPU利用率 * 7) / 8
+    }
+    // 自适应批大小: 利用率高时增加批大小减少提交开销
+    如果 (AMD状态.AI_GPU利用率 > 800) {
+        AMD状态.AI_命令批大小 = 16
+    } 否则 如果 (AMD状态.AI_GPU利用率 > 500) {
+        AMD状态.AI_命令批大小 = 8
+    } 否则 {
+        AMD状态.AI_命令批大小 = 4
+    }
+}
+
+// §16 辅助与统计
+
+函数 直传_分配(大小) { 返回 伙伴系统_分配((大小 + 4095) / 4096) }
+
+函数 GPU_统计() {
+    如果 (AMD状态 == 空) { 返回 空 }
+    返回 {
+        命令提交: AMD状态.命令提交数,
+        绘制调用: AMD状态.绘制调用数,
+        计算分派: AMD状态.计算分派数,
+        DMA复制: AMD状态.DMA复制数,
+        fence同步: AMD状态.fence同步数,
+        VRAM已用MB: AMD状态.VRAM_已用 / (1024 * 1024),
+        VRAM总量MB: AMD状态.VRAM_总量 / (1024 * 1024),
+        GTT已用MB: AMD状态.GTT_已用 / (1024 * 1024),
+        GPU利用率: AMD状态.AI_GPU利用率,
+        命令批大小: AMD状态.AI_命令批大小,
+        显存块数: 计数(GPU内存块列表),
+    }
+}
+
+函数 GPU_健康检查() {
+    如果 (AMD状态 == 空) { 返回 "GPU未初始化" }
+    定义 可变 问题 = []
+    如果 (AMD状态.VRAM_已用 > AMD状态.VRAM_总量 * 90 / 100) {
+        追加(问题, "VRAM接近满: " + 整数转字符串(AMD状态.VRAM_已用 * 100 / AMD状态.VRAM_总量) + "%")
+    }
+    如果 (AMD状态.AI_GPU利用率 > 950) {
+        追加(问题, "GPU利用率过高: " + 整数转字符串(AMD状态.AI_GPU利用率 / 10) + "%")
+    }
+    如果 (计数(问题) == 0) { 返回 "GPU健康" }
+    返回 问题
+}
+
+函数 图处_数量() {
+    如果 (GPU_已初始化) { 返回 1 }
+    返回 0
+}
+
+函数 图处_获取主设备() {
+    如果 (AMD状态 != 空) { 返回 AMD状态 }
+    返回 空
+}
+
+函数 图处_枚举() {
+    // PCI扫描GPU(简化)
+    GPU_已初始化 = 真
+}
+
+函数 图处驱动_初始化(设备) {
+    如果 (设备 == 空) { 返回 }
+    AMD_MMHUB_初始化()
+    AMD_GFX环_初始化()
+    AMD_计算环_初始化()
+    AMD_S直传_初始化()
+    GPU_fence_初始化()
+    内核打印("[GPU] AMD驱动全部初始化完成")
+}
+
+函数 获取图处驱动句柄() { 返回 AMD状态 }

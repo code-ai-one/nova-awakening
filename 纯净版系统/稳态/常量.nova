@@ -1,0 +1,113 @@
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+
+// NovaOS WiFi框架 — 无线网络连接的核心基础设施
+// WiFi框架分两层:
+//   cfg80211 — 配置管理层(扫描/连接/断开/密钥管理)
+//   mac80211 — MAC层协议处理(帧收发/加密/QoS/省电)
+// WiFi驱动(iwlwifi/ath9k/rtl8xxxu)只需实现底层ops接口
+// 本文件提供完整的上层框架,驱动接入即可工作
+
+// §1 Nova网络标准.11常量
+
+// 802.11帧类型
+定义 Nova标准80211_FTYPE_MGMT   = 0x0000
+定义 Nova标准80211_FTYPE_CTRL   = 0x0004
+定义 Nova标准80211_FTYPE_DATA   = 0x0008
+
+// 管理帧子类型
+定义 Nova标准80211_STYPE_ASSOC_REQ    = 0x0000
+定义 Nova标准80211_STYPE_ASSOC_RESP   = 0x0010
+定义 Nova标准80211_STYPE_PROBE_REQ    = 0x0040
+定义 Nova标准80211_STYPE_PROBE_RESP   = 0x0050
+定义 Nova标准80211_STYPE_BEACON       = 0x0080
+定义 Nova标准80211_STYPE_DISASSOC     = 0x00A0
+定义 Nova标准80211_STYPE_AUTH         = 0x00B0
+定义 Nova标准80211_STYPE_DEAUTH       = 0x00C0
+定义 Nova标准80211_STYPE_ACTION       = 0x00D0
+
+// 加密类型
+定义 WIFI_CIPHER_NONE      = 0
+定义 WIFI_CIPHER_WEP40     = 1
+定义 WIFI_CIPHER_WEP104    = 2
+定义 WIFI_CIPHER_TKIP      = 3    // WPA
+定义 WIFI_CIPHER_CCMP      = 4    // WPA2(AES)
+定义 WIFI_CIPHER_GCMP_256  = 5    // WPA3
+定义 WIFI_CIPHER_SAE       = 6    // WPA3-SAE
+
+// 认证类型
+定义 WIFI_AUTH_OPEN         = 0
+定义 WIFI_AUTH_WPA_PSK      = 1
+定义 WIFI_AUTH_WPA2_PSK     = 2
+定义 WIFI_AUTH_WPA3_SAE     = 3
+定义 WIFI_AUTH_WPA_EAP      = 4    // 企业级
+
+// 连接状态
+定义 WIFI_STATE_DISCONNECTED = 0
+定义 WIFI_STATE_SCANNING     = 1
+定义 WIFI_STATE_AUTHENTICATING = 2
+定义 WIFI_STATE_ASSOCIATING   = 3
+定义 WIFI_STATE_CONNECTED     = 4
+
+// 频段
+定义 WIFI_BAND_2GHZ = 0    // 2.4GHz (802.11b/g/n)
+定义 WIFI_BAND_5GHZ = 1    // 5GHz (802.11a/n/ac)
+定义 WIFI_BAND_6GHZ = 2    // 6GHz (802.11ax/WiFi 6E)
+
+// §2 数据结构
+
+结构 WiFi设备 {
+    名称,    // 字符串 "wlan0"
+    MAC地址,    // [] 6字节
+    驱动名,    // 字符串 "iwlwifi" / "ath9k"
+    状态,    // u32 WIFI_STATE_*
+    当前BSS,    // WiFi_BSS 当前连接的AP
+    扫描结果,    // [] WiFi_BSS列表
+    支持频段,    // u32 位图: bit0=2.4G, bit1=5G, bit2=6G
+    当前频道,
+    当前频率,    // u32 MHz
+    TX功率,    // u32 dBm
+    // 驱动操作回调
+    驱动_扫描,    // u64 函数指针
+    驱动_连接,
+    驱动_断开,
+    驱动_发送帧,
+    // 统计
+    发送字节,
+    接收字节,
+    发送包数,
+    接收包数,
+}
+
+结构 WiFi_BSS {
+    BSSID,    // [] AP的MAC地址(6字节)
+    SSID,    // 字符串 网络名称(最长32字节)
+    频率,    // u32 MHz
+    频道,
+    信号强度,    // i32 dBm (负数, 如-50)
+    加密类型,    // u32 WIFI_CIPHER_*
+    认证类型,    // u32 WIFI_AUTH_*
+    信标间隔,    // u16 ms
+    能力,
+    标准,    // 字符串 "802.11ax" / "802.11ac"
+    最大速率,    // u32 Mbps
+}
+
+结构 WiFi密钥 {
+    类型,    // u32 WIFI_CIPHER_*
+    密码,    // 字符串 PSK密码
+    PMK,    // [] 256位预主密钥
+    PTK,    // [] 成对临时密钥
+    GTK,    // [] 组临时密钥
+    密钥索引,
+    序列号,
+}
+
+结构 WiFi扫描参数 {
+    SSID列表,    // [] 要扫描的SSID(空=全部)
+    频率列表,    // [] 要扫描的频率(空=全部)
+    被动扫描,    // 布尔 被动扫描(只听Beacon)
+    每频道时间,    // u32 ms
+}

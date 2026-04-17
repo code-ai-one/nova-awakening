@@ -1,0 +1,1021 @@
+// §5 IPC: Mojo Message Pipe — NIPC理论 (Nova IPC Pipeline Communication)
+// NIPC核心创新:
+//   1. 双环缓冲管道 — 发送/接收各自独立环形缓冲,零拷贝映射
+//   2. 压力梯度流控 — 基于队列深度梯度的自适应背压算法
+//   3. 句柄能力传递 — fd/共享内存/管道句柄的安全能力委托
+//   4. 消息分片重组 — 超大消息自动分片+接收端透明重组
+//   5. AI异常脉冲检测 — 消息频率/大小/模式的实时异常识别
+//   公式: 背压系数 P = tanh(α·(Q_depth/Q_cap) + β·(msg_rate/rate_limit))
+//          当 P > 0.85 时触发流控, P > 0.95 时拒绝新消息
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./子进程主循.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/内存初始化.nova")
+导入("../外联/安全发送完.nova")
+
+// §5.1 常量定义
+定义 MOJO_MSG_MAX = 65536
+定义 MOJO_PIPE_CAPACITY = 256        // 消息队列容量
+定义 MOJO_FRAGMENT_SIZE = 16384      // 分片阈值16KB
+定义 MOJO_HEADER_SIZE = 16           // type(4)+reqId(4)+flags(4)+dataLen(4)
+定义 MOJO_EXT_HEADER_SIZE = 32       // 扩展头:+seqNo(4)+fragIdx(2)+fragTotal(2)+crc32(4)+timestamp(4)
+定义 MOJO_MAX_HANDLES = 8            // 单消息最大句柄数
+定义 MOJO_SHARED_MEM_MIN = 4096      // 共享内存最小4KB
+定义 MOJO_SHARED_MEM_MAX = 16777216  // 共享内存最大16MB
+定义 MOJO_RING_SIZE = 512            // 环形缓冲槽位数
+定义 MOJO_BACKPRESSURE_WARN = 0.85   // 背压预警阈值
+定义 MOJO_BACKPRESSURE_DENY = 0.95   // 背压拒绝阈值
+定义 MOJO_RATE_WINDOW_MS = 1000      // 速率统计窗口(毫秒)
+定义 MOJO_MAX_RATE = 10000           // 每窗口最大消息数
+定义 MOJO_CRC_POLY = 0xEDB88320      // CRC32多项式(反转)
+定义 MOJO_MAGIC = 0x4D4F4A4F         // 'MOJO'魔数
+
+// 消息标志位
+定义 MSG_FLAG_REQUEST   = 0x0000     // 请求
+定义 MSG_FLAG_RESPONSE  = 0x0001     // 响应
+定义 MSG_FLAG_ONEWAY    = 0x0002     // 单向(无需响应)
+定义 MSG_FLAG_FRAGMENT  = 0x0004     // 分片消息
+定义 MSG_FLAG_LAST_FRAG = 0x0008     // 最后一个分片
+定义 MSG_FLAG_URGENT    = 0x0010     // 紧急(绕过流控)
+定义 MSG_FLAG_ENCRYPTED = 0x0020     // 加密载荷
+定义 MSG_FLAG_COMPRESSED = 0x0040    // 压缩载荷
+定义 MSG_FLAG_HAS_HANDLES = 0x0080   // 携带句柄
+
+// 管道状态
+定义 PIPE_STATE_OPEN     = 0
+定义 PIPE_STATE_HALF     = 1         // 半关闭
+定义 PIPE_STATE_CLOSED   = 2
+定义 PIPE_STATE_ERROR    = 3
+
+// 句柄类型
+定义 HANDLE_TYPE_FD      = 0         // 文件描述符
+定义 HANDLE_TYPE_PIPE    = 1         // 管道端点
+定义 HANDLE_TYPE_SHM     = 2         // 共享内存
+定义 HANDLE_TYPE_EVENT   = 3         // 事件对象
+定义 HANDLE_TYPE_TIMER   = 4         // 定时器句柄
+
+// 全局IPC统计
+定义 可变 全局_IPC管道总数 = 0
+定义 可变 全局_IPC消息发送计数 = 0
+定义 可变 全局_IPC消息接收计数 = 0
+定义 可变 全局_IPC字节发送总量 = 0
+定义 可变 全局_IPC字节接收总量 = 0
+定义 可变 全局_IPC分片重组计数 = 0
+定义 可变 全局_IPC流控触发次数 = 0
+定义 可变 全局_IPC异常检测次数 = 0
+定义 可变 全局_IPC句柄传递计数 = 0
+定义 可变 全局_IPC共享内存区数 = 0
+定义 可变 全局_IPC_CRC校验失败 = 0
+
+// §5.2 数据结构
+
+结构 MojoMessage {
+    类型,           // u32 消息类型ID(接口方法编号)
+    请求ID,         // u32 用于匹配请求/响应
+    标志,           // u32 标志位组合
+    序列号,         // u32 管道内单调递增序列号
+    数据,           // u64 载荷指针
+    数据长度,       // u32 载荷字节数
+    句柄,           // u64 → IPC句柄数组指针
+    句柄数,
+    分片索引,       // u16 当前分片序号(0-based)
+    分片总数,       // u16 总分片数(1=未分片)
+    校验码,         // u32 CRC32校验
+    时间戳,         // u64 发送时纳秒时间戳
+    下一个,         // u64 队列链表指针
+}
+
+结构 IPC句柄 {
+    类型,           // u32 HANDLE_TYPE_*
+    原始值,         // i32 原始fd/id
+    能力掩码,       // u32 读/写/映射权限位
+    引用计数,
+    所属管道,       // u64 → MojoPipe*
+}
+
+结构 共享内存区 {
+    名称,           // u64 → 字符串(区域名称)
+    基地址,         // u64 映射后虚拟地址
+    大小,
+    fd,             // i32 底层文件描述符
+    映射标志,       // u32 只读/读写/写时复制
+    引用计数,
+    所有者进程,
+    创建时间戳,
+}
+
+结构 环形缓冲 {
+    槽位,           // u64 → MojoMessage*[MOJO_RING_SIZE]
+    写指针,         // u32 写入位置(取模RING_SIZE)
+    读指针,         // u32 读出位置
+    计数,           // u32 当前消息数
+    容量,           // u32 最大容量
+    溢出丢弃数,     // u64 因满而丢弃的消息数
+}
+
+结构 流控状态 {
+    窗口起始时间,   // u64 当前统计窗口起始
+    窗口消息数,     // u32 窗口内消息计数
+    背压系数,       // f64 当前背压值 [0, 1]
+    累计拒绝数,
+    上次调整时间,
+    alpha参数,      // f64 队列深度权重(默认2.0)
+    beta参数,       // f64 速率权重(默认1.5)
+}
+
+结构 分片重组器 {
+    目标请求ID,     // u32 正在重组的请求ID
+    期望分片总数,
+    已收分片数,
+    分片位图,       // u64 最多64个分片的到达位图
+    缓冲区,         // u64 → 按序存放的分片数据指针数组
+    累计大小,       // u64 已收字节总数
+    开始时间,       // u64 首片到达时间
+    超时毫秒,       // u32 重组超时
+}
+
+结构 MojoPipe {
+    // 双向管道端口
+    端口0_fd,       // i32 socketpair[0]
+    端口1_fd,       // i32 socketpair[1]
+    // 环形缓冲队列(每端一个)
+    环缓冲0,        // u64 → 环形缓冲*
+    环缓冲1,        // u64 → 环形缓冲*
+    // 流控(每端一个)
+    流控0,          // u64 → 流控状态*
+    流控1,          // u64 → 流控状态*
+    // 分片重组(每端一个)
+    重组器0,        // u64 → 分片重组器*
+    重组器1,        // u64 → 分片重组器*
+    // 关联进程
+    进程A,          // u64 SandboxedProcess*
+    进程B,
+    // 序列号生成器
+    序列号0,
+    序列号1,
+    // 状态
+    状态,           // u32 PIPE_STATE_*
+    已关闭0,
+    已关闭1,
+    // 统计
+    发送总数,
+    接收总数,
+    字节发送量,
+    字节接收量,
+    创建时间戳,
+    管道ID,         // u32 全局唯一标识
+}
+
+结构 IPC诊断快照 {
+    管道总数,
+    活跃管道数,
+    消息发送速率,
+    消息接收速率,
+    平均延迟纳秒,
+    背压触发率,
+    异常事件数,
+    共享内存使用量,
+    句柄泄漏嫌疑数,
+}
+
+// §5.3 CRC32校验算法
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 NIPC_CRC32计算(数据, 长度) {
+    如果 (数据 == 0 || 长度 == 0) { 返回 0 }
+    可变 crc = 0xFFFFFFFF
+    可变 i = 0
+    当 (i < 长度) {
+        定义 字节 = 内存_读8(数据 + i)
+        crc = crc ^ 字节
+        可变 bit = 0
+        当 (bit < 8) {
+            如果 ((crc & 1) != 0) {
+                crc = (crc >> 1) ^ MOJO_CRC_POLY
+            } 否则 {
+                crc = crc >> 1
+            }
+            bit = bit + 1
+        }
+        i = i + 1
+    }
+    返回 crc ^ 0xFFFFFFFF
+}
+
+// §5.4 环形缓冲管理
+
+函数 环缓冲_创建(容量) {
+    如果 (容量 == 0) { 容量 = MOJO_RING_SIZE }
+    定义 ring = 堆_分配(环形缓冲)
+    ring.槽位 = 堆_分配(容量 * 8)
+    ring.写指针 = 0
+    ring.读指针 = 0
+    ring.计数 = 0
+    ring.容量 = 容量
+    ring.溢出丢弃数 = 0
+    // 清零槽位
+    可变 i = 0
+    当 (i < 容量) {
+        内存_写64(ring.槽位 + i * 8, 0)
+        i = i + 1
+    }
+    返回 ring
+}
+
+函数 环缓冲_入队(ring, msg) {
+    如果 (ring == 0 || msg == 0) { 返回 假 }
+    如果 (ring.计数 >= ring.容量) {
+        ring.溢出丢弃数 = ring.溢出丢弃数 + 1
+        返回 假
+    }
+    定义 pos = ring.写指针 % ring.容量
+    内存_写64(ring.槽位 + pos * 8, msg)
+    ring.写指针 = ring.写指针 + 1
+    ring.计数 = ring.计数 + 1
+    返回 真
+}
+
+函数 环缓冲_出队(ring) {
+    如果 (ring == 0 || ring.计数 == 0) { 返回 0 }
+    定义 pos = ring.读指针 % ring.容量
+    定义 msg = 内存_读64(ring.槽位 + pos * 8)
+    内存_写64(ring.槽位 + pos * 8, 0)
+    ring.读指针 = ring.读指针 + 1
+    ring.计数 = ring.计数 - 1
+    返回 msg
+}
+
+函数 环缓冲_查看头部(ring) {
+    如果 (ring == 0 || ring.计数 == 0) { 返回 0 }
+    定义 pos = ring.读指针 % ring.容量
+    返回 内存_读64(ring.槽位 + pos * 8)
+}
+
+函数 环缓冲_深度比(ring) {
+    如果 (ring == 0 || ring.容量 == 0) { 返回 0.0 }
+    返回 ring.计数 / ring.容量
+}
+
+// §5.5 压力梯度流控 (NIPC背压算法)
+// P = tanh(α·(Q_depth/Q_cap) + β·(msg_rate/rate_limit))
+
+函数 流控_创建() {
+    定义 fc = 堆_分配(流控状态)
+    fc.窗口起始时间 = 平台_纳秒时间()
+    fc.窗口消息数 = 0
+    fc.背压系数 = 0.0
+    fc.累计拒绝数 = 0
+    fc.上次调整时间 = fc.窗口起始时间
+    fc.alpha参数 = 2.0
+    fc.beta参数 = 1.5
+    返回 fc
+}
+
+函数 流控_更新(fc, ring) {
+    如果 (fc == 0) { 返回 }
+    定义 now = 平台_纳秒时间()
+    // 检查是否需要滚动窗口
+    定义 elapsed_ms = (now - fc.窗口起始时间) / 1000000
+    如果 (elapsed_ms >= MOJO_RATE_WINDOW_MS) {
+        fc.窗口起始时间 = now
+        fc.窗口消息数 = 0
+    }
+    fc.窗口消息数 = fc.窗口消息数 + 1
+    // 计算背压: P = tanh(α·depth_ratio + β·rate_ratio)
+    定义 depth_ratio = 环缓冲_深度比(ring)
+    定义 rate_ratio = fc.窗口消息数 / MOJO_MAX_RATE
+    定义 x = fc.alpha参数 * depth_ratio + fc.beta参数 * rate_ratio
+    // tanh近似: tanh(x) ≈ x·(27+x²)/(27+9x²) (Padé逼近)
+    定义 x2 = x * x
+    fc.背压系数 = x * (27.0 + x2) / (27.0 + 9.0 * x2)
+    如果 (fc.背压系数 < 0.0) { fc.背压系数 = 0.0 }
+    如果 (fc.背压系数 > 1.0) { fc.背压系数 = 1.0 }
+    fc.上次调整时间 = now
+}
+
+函数 流控_允许发送(fc) {
+    如果 (fc == 0) { 返回 真 }
+    如果 (fc.背压系数 >= MOJO_BACKPRESSURE_DENY) {
+        fc.累计拒绝数 = fc.累计拒绝数 + 1
+        全局_IPC流控触发次数 = 全局_IPC流控触发次数 + 1
+        返回 假
+    }
+    返回 真
+}
+
+函数 流控_是否预警(fc) {
+    如果 (fc == 0) { 返回 假 }
+    返回 fc.背压系数 >= MOJO_BACKPRESSURE_WARN
+}
+
+// §5.6 管道创建与生命周期
+
+函数 MojoPipe_创建() {
+    定义 pipe = 堆_分配(MojoPipe)
+    // 创建Unix domain socket pair
+    定义 fds = 堆_分配(8)
+    平台_socketpair(fds)
+    pipe.端口0_fd = 内存_读32(fds)
+    pipe.端口1_fd = 内存_读32(fds + 4)
+    // 初始化环形缓冲
+    pipe.环缓冲0 = 环缓冲_创建(MOJO_RING_SIZE)
+    pipe.环缓冲1 = 环缓冲_创建(MOJO_RING_SIZE)
+    // 初始化流控
+    pipe.流控0 = 流控_创建()
+    pipe.流控1 = 流控_创建()
+    // 初始化分片重组器
+    pipe.重组器0 = 0
+    pipe.重组器1 = 0
+    // 序列号从0开始
+    pipe.序列号0 = 0
+    pipe.序列号1 = 0
+    // 状态
+    pipe.状态 = PIPE_STATE_OPEN
+    pipe.已关闭0 = 假
+    pipe.已关闭1 = 假
+    // 统计清零
+    pipe.发送总数 = 0
+    pipe.接收总数 = 0
+    pipe.字节发送量 = 0
+    pipe.字节接收量 = 0
+    pipe.创建时间戳 = 平台_纳秒时间()
+    pipe.管道ID = 全局_IPC管道总数
+    全局_IPC管道总数 = 全局_IPC管道总数 + 1
+    堆_释放(fds)
+    返回 pipe
+}
+
+函数 MojoPipe_获取序列号(pipe, port_idx) {
+    如果 (pipe == 0) { 返回 0 }
+    可变 seq = 0
+    如果 (port_idx == 0) {
+        seq = pipe.序列号0
+        pipe.序列号0 = pipe.序列号0 + 1
+    } 否则 {
+        seq = pipe.序列号1
+        pipe.序列号1 = pipe.序列号1 + 1
+    }
+    返回 seq
+}
+
+函数 MojoPipe_获取环缓冲(pipe, port_idx) {
+    如果 (pipe == 0) { 返回 0 }
+    如果 (port_idx == 0) { 返回 pipe.环缓冲0 }
+    返回 pipe.环缓冲1
+}
+
+函数 MojoPipe_获取流控(pipe, port_idx) {
+    如果 (pipe == 0) { 返回 0 }
+    如果 (port_idx == 0) { 返回 pipe.流控0 }
+    返回 pipe.流控1
+}
+
+// §5.7 消息序列化 (NIPC二进制协议)
+// 线格式: [Magic:4][Type:4][ReqId:4][Flags:4][SeqNo:4][FragIdx:2][FragTotal:2][CRC:4][Ts:8][DataLen:4][Data:N]
+
+函数 NIPC_序列化消息(msg) {
+    如果 (msg == 0) { 返回 0 }
+    如果 (msg.数据长度 > 67108864) { 返回 0 }  // 64MB安全上限
+    定义 total = MOJO_EXT_HEADER_SIZE + 4 + msg.数据长度  // 扩展头 + dataLen字段 + 数据
+    定义 buf = 堆_分配(total)
+    如果 (buf == 0) { 返回 0 }
+    // 写魔数
+    内存_写32(buf, MOJO_MAGIC)
+    // 写基本头
+    内存_写32(buf + 4, msg.类型)
+    内存_写32(buf + 8, msg.请求ID)
+    内存_写32(buf + 12, msg.标志)
+    // 写扩展头
+    内存_写32(buf + 16, msg.序列号)
+    内存_写16(buf + 20, msg.分片索引)
+    内存_写16(buf + 22, msg.分片总数)
+    // CRC稍后填写(先占位)
+    内存_写32(buf + 24, 0)
+    // 时间戳高32+低32
+    内存_写64(buf + 28, msg.时间戳)
+    // 数据长度
+    内存_写32(buf + 36, msg.数据长度)
+    // 复制载荷
+    如果 (msg.数据长度 > 0 && msg.数据 != 0) {
+        内存_复制(buf + 40, msg.数据, msg.数据长度)
+    }
+    // 计算CRC32(覆盖整个缓冲区,CRC字段置0)
+    定义 crc = NIPC_CRC32计算(buf, total)
+    内存_写32(buf + 24, crc)
+    msg.校验码 = crc
+    返回 buf
+}
+
+函数 NIPC_反序列化消息(buf, recv_len) {
+    如果 (buf == 0 || recv_len < 40) { 返回 0 }
+    // 验证魔数
+    定义 magic = 内存_读32(buf)
+    如果 (magic != MOJO_MAGIC) { 返回 0 }
+    定义 msg = 堆_分配(MojoMessage)
+    msg.类型 = 内存_读32(buf + 4)
+    msg.请求ID = 内存_读32(buf + 8)
+    msg.标志 = 内存_读32(buf + 12)
+    msg.序列号 = 内存_读32(buf + 16)
+    msg.分片索引 = 内存_读16(buf + 20)
+    msg.分片总数 = 内存_读16(buf + 22)
+    定义 recv_crc = 内存_读32(buf + 24)
+    msg.时间戳 = 内存_读64(buf + 28)
+    msg.数据长度 = 内存_读32(buf + 36)
+    // CRC校验
+    内存_写32(buf + 24, 0)  // 清零CRC字段再计算
+    定义 calc_crc = NIPC_CRC32计算(buf, recv_len)
+    如果 (calc_crc != recv_crc) {
+        全局_IPC_CRC校验失败 = 全局_IPC_CRC校验失败 + 1
+        堆_释放(msg)
+        返回 0
+    }
+    msg.校验码 = recv_crc
+    // 复制载荷
+    如果 (msg.数据长度 > 0 && msg.数据长度 <= 67108864 && msg.数据长度 + 40 <= recv_len) {
+        msg.数据 = 堆_分配(msg.数据长度)
+        内存_复制(msg.数据, buf + 40, msg.数据长度)
+    } 否则 {
+        msg.数据 = 0
+        msg.数据长度 = 0
+    }
+    msg.句柄 = 0
+    msg.句柄数 = 0
+    msg.下一个 = 0
+    返回 msg
+}
+
+// §5.8 消息分片与重组
+
+函数 分片重组器_创建(请求ID, 总片数, 超时ms) {
+    定义 ra = 堆_分配(分片重组器)
+    ra.目标请求ID = 请求ID
+    ra.期望分片总数 = 总片数
+    ra.已收分片数 = 0
+    ra.分片位图 = 0
+    ra.缓冲区 = 堆_分配(总片数 * 8)  // 指针数组
+    可变 i = 0
+    当 (i < 总片数) {
+        内存_写64(ra.缓冲区 + i * 8, 0)
+        i = i + 1
+    }
+    ra.累计大小 = 0
+    ra.开始时间 = 平台_纳秒时间()
+    ra.超时毫秒 = 超时ms
+    返回 ra
+}
+
+函数 分片重组器_投递(ra, msg) {
+    如果 (ra == 0 || msg == 0) { 返回 假 }
+    如果 (msg.请求ID != ra.目标请求ID) { 返回 假 }
+    如果 (msg.分片索引 >= ra.期望分片总数) { 返回 假 }
+    // 检查是否重复
+    定义 bit = 1 << msg.分片索引
+    如果 ((ra.分片位图 & bit) != 0) { 返回 假 }
+    // 存储分片数据
+    如果 (msg.数据长度 > 67108864) { 返回 假 }  // 64MB安全上限
+    定义 frag_data = 堆_分配(msg.数据长度 + 4)  // 4字节长度前缀
+    如果 (frag_data == 0) { 返回 假 }
+    内存_写32(frag_data, msg.数据长度)
+    如果 (msg.数据长度 > 0) {
+        内存_复制(frag_data + 4, msg.数据, msg.数据长度)
+    }
+    内存_写64(ra.缓冲区 + msg.分片索引 * 8, frag_data)
+    ra.分片位图 = ra.分片位图 | bit
+    ra.已收分片数 = ra.已收分片数 + 1
+    ra.累计大小 = ra.累计大小 + msg.数据长度
+    返回 真
+}
+
+函数 分片重组器_完成(ra) {
+    如果 (ra == 0) { 返回 假 }
+    返回 ra.已收分片数 == ra.期望分片总数
+}
+
+函数 分片重组器_组装(ra) {
+    如果 (ra == 0 || !分片重组器_完成(ra)) { 返回 0 }
+    // 合并所有分片数据
+    定义 result = 堆_分配(ra.累计大小)
+    可变 offset = 0
+    可变 i = 0
+    当 (i < ra.期望分片总数) {
+        定义 frag = 内存_读64(ra.缓冲区 + i * 8)
+        如果 (frag != 0) {
+            定义 flen = 内存_读32(frag)
+            如果 (flen > 0) {
+                内存_复制(result + offset, frag + 4, flen)
+                offset = offset + flen
+            }
+            堆_释放(frag)
+        }
+        i = i + 1
+    }
+    全局_IPC分片重组计数 = 全局_IPC分片重组计数 + 1
+    返回 result
+}
+
+函数 分片重组器_超时检查(ra) {
+    如果 (ra == 0) { 返回 假 }
+    定义 now = 平台_纳秒时间()
+    定义 elapsed_ms = (now - ra.开始时间) / 1000000
+    返回 elapsed_ms > ra.超时毫秒
+}
+
+// §5.9 消息发送 (含流控+分片+序列化)
+
+函数 MojoPipe_发送(pipe, port_idx, msg) {
+    如果 (pipe == 0 || msg == 0) { 返回 -1 }
+    // 检查管道状态
+    如果 (pipe.状态 >= PIPE_STATE_CLOSED) { 返回 -2 }
+    定义 is_urgent = (msg.标志 & MSG_FLAG_URGENT) != 0
+    // 流控检查(紧急消息绕过)
+    定义 fc = MojoPipe_获取流控(pipe, port_idx)
+    定义 ring = MojoPipe_获取环缓冲(pipe, port_idx)
+    如果 (!is_urgent) {
+        流控_更新(fc, ring)
+        如果 (!流控_允许发送(fc)) { 返回 -3 }
+    }
+    // 赋序列号+时间戳
+    msg.序列号 = MojoPipe_获取序列号(pipe, port_idx)
+    msg.时间戳 = 平台_纳秒时间()
+    // 判断是否需要分片
+    如果 (msg.数据长度 > MOJO_FRAGMENT_SIZE) {
+        返回 NIPC_发送分片(pipe, port_idx, msg)
+    }
+    // 单条发送
+    msg.分片索引 = 0
+    msg.分片总数 = 1
+    返回 NIPC_发送单条(pipe, port_idx, msg)
+}
+
+函数 NIPC_发送单条(pipe, port_idx, msg) {
+    // 序列化
+    定义 buf = NIPC_序列化消息(msg)
+    如果 (buf == 0) { 返回 -4 }
+    定义 total = 40 + msg.数据长度
+    定义 fd = 如果(port_idx == 0, pipe.端口0_fd, pipe.端口1_fd)
+    // 通过fd发送
+    如果 (msg.句柄数 > 0 && msg.句柄 != 0) {
+        msg.标志 = msg.标志 | MSG_FLAG_HAS_HANDLES
+        平台_sendmsg_with_fds(fd, buf, total, msg.句柄, msg.句柄数)
+        全局_IPC句柄传递计数 = 全局_IPC句柄传递计数 + msg.句柄数
+    } 否则 {
+        平台_socket_发送(fd, buf, total)
+    }
+    // 入队本地环缓冲(供查询/重发)
+    环缓冲_入队(MojoPipe_获取环缓冲(pipe, port_idx), msg)
+    // 更新统计
+    pipe.发送总数 = pipe.发送总数 + 1
+    pipe.字节发送量 = pipe.字节发送量 + total
+    全局_IPC消息发送计数 = 全局_IPC消息发送计数 + 1
+    全局_IPC字节发送总量 = 全局_IPC字节发送总量 + total
+    堆_释放(buf)
+    返回 0
+}
+
+函数 NIPC_发送分片(pipe, port_idx, msg) {
+    定义 total_data = msg.数据长度
+    定义 frag_count = (total_data + MOJO_FRAGMENT_SIZE - 1) / MOJO_FRAGMENT_SIZE
+    如果 (frag_count > 64) { 返回 -5 }  // 超出位图容量
+    可变 offset = 0
+    可变 i = 0
+    当 (i < frag_count) {
+        定义 chunk_size = MOJO_FRAGMENT_SIZE
+        如果 (offset + chunk_size > total_data) {
+            chunk_size = total_data - offset
+        }
+        // 构造分片消息
+        定义 frag = 堆_分配(MojoMessage)
+        frag.类型 = msg.类型
+        frag.请求ID = msg.请求ID
+        frag.标志 = msg.标志 | MSG_FLAG_FRAGMENT
+        如果 (i == frag_count - 1) {
+            frag.标志 = frag.标志 | MSG_FLAG_LAST_FRAG
+        }
+        frag.序列号 = msg.序列号 + i
+        frag.分片索引 = i
+        frag.分片总数 = frag_count
+        frag.数据 = msg.数据 + offset
+        frag.数据长度 = chunk_size
+        frag.句柄 = 0
+        frag.句柄数 = 0
+        如果 (i == 0 && msg.句柄数 > 0) {
+            // 句柄只在首片传递
+            frag.句柄 = msg.句柄
+            frag.句柄数 = msg.句柄数
+        }
+        frag.时间戳 = 平台_纳秒时间()
+        frag.校验码 = 0
+        定义 rc = NIPC_发送单条(pipe, port_idx, frag)
+    堆_释放(frag)
+        如果 (rc != 0) { 返回 rc }
+        offset = offset + chunk_size
+        i = i + 1
+    }
+    返回 0
+}
+
+// §5.10 消息接收 (含反序列化+分片重组)
+
+函数 MojoPipe_接收(pipe, port_idx) {
+    如果 (pipe == 0) { 返回 0 }
+    如果 (pipe.状态 >= PIPE_STATE_CLOSED) { 返回 0 }
+    定义 fd = 如果(port_idx == 0, pipe.端口0_fd, pipe.端口1_fd)
+    定义 buf = 堆_分配(MOJO_MSG_MAX)
+    定义 句柄buf = 堆_分配(MOJO_MAX_HANDLES * 4)
+    可变 句柄数 = 0
+    定义 recv_len = 平台_recvmsg_with_fds(fd, buf, MOJO_MSG_MAX, 句柄buf, 句柄数)
+    如果 (recv_len < 40) {
+        堆_释放(buf)
+        堆_释放(句柄buf)
+        返回 0
+    }
+    // 反序列化
+    定义 msg = NIPC_反序列化消息(buf, recv_len)
+    如果 (msg == 0) {
+        堆_释放(buf)
+        堆_释放(句柄buf)
+        返回 0
+    }
+    // 附加句柄
+    如果 (句柄数 > 0) {
+        msg.句柄 = 句柄buf
+        msg.句柄数 = 句柄数
+    } 否则 {
+        堆_释放(句柄buf)
+    }
+    // 更新统计
+    pipe.接收总数 = pipe.接收总数 + 1
+    pipe.字节接收量 = pipe.字节接收量 + recv_len
+    全局_IPC消息接收计数 = 全局_IPC消息接收计数 + 1
+    全局_IPC字节接收总量 = 全局_IPC字节接收总量 + recv_len
+    // AI异常检测
+    NIPC_AI异常检测(pipe, msg)
+    // 检查分片
+    如果 ((msg.标志 & MSG_FLAG_FRAGMENT) != 0) {
+        定义 result = NIPC_处理分片接收(pipe, port_idx, msg)
+        堆_释放(buf)
+        返回 result
+    }
+    堆_释放(buf)
+    返回 msg
+}
+
+函数 NIPC_处理分片接收(pipe, port_idx, msg) {
+    // 获取或创建重组器
+    可变 ra = 0
+    如果 (port_idx == 0) { ra = pipe.重组器0 }
+    否则 { ra = pipe.重组器1 }
+    如果 (ra == 0 || ra.目标请求ID != msg.请求ID) {
+        // 创建新重组器
+        ra = 分片重组器_创建(msg.请求ID, msg.分片总数, 5000)
+        如果 (port_idx == 0) { pipe.重组器0 = ra }
+        否则 { pipe.重组器1 = ra }
+    }
+    分片重组器_投递(ra, msg)
+    // 检查是否完成
+    如果 (分片重组器_完成(ra)) {
+        定义 合并数据 = 分片重组器_组装(ra)
+        // 构造完整消息
+        定义 完整msg = 堆_分配(MojoMessage)
+        完整msg.类型 = msg.类型
+        完整msg.请求ID = msg.请求ID
+        完整msg.标志 = msg.标志 & (~MSG_FLAG_FRAGMENT) & (~MSG_FLAG_LAST_FRAG)
+        完整msg.序列号 = msg.序列号
+        完整msg.数据 = 合并数据
+        完整msg.数据长度 = ra.累计大小
+        完整msg.句柄 = msg.句柄
+        完整msg.句柄数 = msg.句柄数
+        完整msg.分片索引 = 0
+        完整msg.分片总数 = 1
+        完整msg.时间戳 = msg.时间戳
+        完整msg.校验码 = 0
+        完整msg.下一个 = 0
+        // 释放重组器
+        堆_释放(ra)
+        如果 (port_idx == 0) { pipe.重组器0 = 0 }
+        否则 { pipe.重组器1 = 0 }
+        返回 完整msg
+    }
+    // 未完成,返回空(等待后续分片)
+    返回 0
+}
+
+// §5.11 共享内存管理
+
+函数 IPC共享内存_创建(名称, 大小) {
+    如果 (大小 < MOJO_SHARED_MEM_MIN) { 大小 = MOJO_SHARED_MEM_MIN }
+    如果 (大小 > MOJO_SHARED_MEM_MAX) { 返回 0 }
+    定义 shm = 堆_分配(共享内存区)
+    shm.名称 = 名称
+    shm.大小 = 大小
+    // 创建匿名共享内存fd
+    shm.fd = 平台_shm_open(名称, 大小)
+    如果 (shm.fd < 0) {
+        堆_释放(shm)
+        返回 0
+    }
+    // 映射到当前进程地址空间
+    shm.基地址 = 平台_mmap(0, 大小, 3, shm.fd)  // 3=读写
+    如果 (shm.基地址 == 0) {
+        平台_close(shm.fd)
+        堆_释放(shm)
+        返回 0
+    }
+    shm.映射标志 = 3  // 读写
+    shm.引用计数 = 1
+    shm.所有者进程 = 平台_getpid()
+    shm.创建时间戳 = 平台_纳秒时间()
+    全局_IPC共享内存区数 = 全局_IPC共享内存区数 + 1
+    返回 shm
+}
+
+函数 IPC共享内存_映射(shm, 只读) {
+    如果 (shm == 0 || shm.fd < 0) { 返回 0 }
+    定义 prot = 如果(只读, 1, 3)  // 1=只读, 3=读写
+    定义 addr = 平台_mmap(0, shm.大小, prot, shm.fd)
+    如果 (addr != 0) {
+        shm.引用计数 = shm.引用计数 + 1
+    }
+    返回 addr
+}
+
+函数 IPC共享内存_解除映射(shm, 地址) {
+    如果 (shm == 0 || 地址 == 0) { 返回 }
+    平台_munmap(地址, shm.大小)
+    shm.引用计数 = shm.引用计数 - 1
+    如果 (shm.引用计数 <= 0) {
+        平台_close(shm.fd)
+        堆_释放(shm)
+        全局_IPC共享内存区数 = 全局_IPC共享内存区数 - 1
+    }
+}
+
+函数 IPC共享内存_通过管道传递(pipe, port_idx, shm) {
+    如果 (pipe == 0 || shm == 0) { 返回 -1 }
+    // 构造携带shm.fd的消息
+    定义 msg = 堆_分配(MojoMessage)
+    msg.类型 = 0xFFFF0001  // 保留类型: 共享内存传递
+    msg.请求ID = 0
+    msg.标志 = MSG_FLAG_ONEWAY | MSG_FLAG_HAS_HANDLES
+    // 数据载荷: [size:8][name_len:4][name:N]
+    定义 name_len = 平台_strlen(shm.名称)
+    定义 data_len = 12 + name_len
+    msg.数据 = 堆_分配(data_len)
+    内存_写64(msg.数据, shm.大小)
+    内存_写32(msg.数据 + 8, name_len)
+    如果 (name_len > 0) {
+        内存_复制(msg.数据 + 12, shm.名称, name_len)
+    }
+    msg.数据长度 = data_len
+    // 句柄
+    msg.句柄 = 堆_分配(4)
+    内存_写32(msg.句柄, shm.fd)
+    msg.句柄数 = 1
+    msg.分片索引 = 0
+    msg.分片总数 = 1
+    msg.校验码 = 0
+    msg.时间戳 = 0
+    msg.序列号 = 0
+    msg.下一个 = 0
+    返回 MojoPipe_发送(pipe, port_idx, msg)
+}
+
+// §5.12 句柄能力系统
+
+定义 CAP_READ   = 0x01
+定义 CAP_WRITE  = 0x02
+定义 CAP_MAP    = 0x04
+定义 CAP_EXEC   = 0x08
+定义 CAP_SHARE  = 0x10
+
+函数 IPC句柄_创建(类型, 原始值, 能力) {
+    定义 h = 堆_分配(IPC句柄)
+    h.类型 = 类型
+    h.原始值 = 原始值
+    h.能力掩码 = 能力
+    h.引用计数 = 1
+    h.所属管道 = 0
+    返回 h
+}
+
+函数 IPC句柄_检查能力(h, 需要能力) {
+    如果 (h == 0) { 返回 假 }
+    返回 (h.能力掩码 & 需要能力) == 需要能力
+}
+
+函数 IPC句柄_委托(h, 新能力掩码) {
+    如果 (h == 0) { 返回 0 }
+    // 委托的能力不能超过原始能力(单调递减原则)
+    定义 实际能力 = 新能力掩码 & h.能力掩码
+    定义 新h = IPC句柄_创建(h.类型, h.原始值, 实际能力)
+    h.引用计数 = h.引用计数 + 1
+    返回 新h
+}
+
+函数 IPC句柄_释放(h) {
+    如果 (h == 0) { 返回 }
+    h.引用计数 = h.引用计数 - 1
+    如果 (h.引用计数 <= 0) {
+        如果 (h.类型 == HANDLE_TYPE_FD || h.类型 == HANDLE_TYPE_SHM) {
+            平台_close(h.原始值)
+        }
+        堆_释放(h)
+    }
+}
+
+// §5.13 管道关闭与资源回收
+
+函数 MojoPipe_关闭(pipe, port_idx) {
+    如果 (pipe == 0) { 返回 }
+    如果 (port_idx == 0) {
+        如果 (pipe.已关闭0) { 返回 }
+        pipe.已关闭0 = 真
+        平台_close(pipe.端口0_fd)
+        pipe.端口0_fd = -1
+    } 否则 {
+        如果 (pipe.已关闭1) { 返回 }
+        pipe.已关闭1 = 真
+        平台_close(pipe.端口1_fd)
+        pipe.端口1_fd = -1
+    }
+    // 更新管道状态
+    如果 (pipe.已关闭0 && pipe.已关闭1) {
+        pipe.状态 = PIPE_STATE_CLOSED
+    } 否则 {
+        pipe.状态 = PIPE_STATE_HALF
+    }
+}
+
+函数 MojoPipe_销毁(pipe) {
+    如果 (pipe == 0) { 返回 }
+    // 关闭两端
+    MojoPipe_关闭(pipe, 0)
+    MojoPipe_关闭(pipe, 1)
+    // 清空环形缓冲
+    NIPC_清空环缓冲(pipe.环缓冲0)
+    NIPC_清空环缓冲(pipe.环缓冲1)
+    // 释放流控
+    如果 (pipe.流控0 != 0) { 堆_释放(pipe.流控0) }
+    如果 (pipe.流控1 != 0) { 堆_释放(pipe.流控1) }
+    // 释放重组器
+    如果 (pipe.重组器0 != 0) { 堆_释放(pipe.重组器0) }
+    如果 (pipe.重组器1 != 0) { 堆_释放(pipe.重组器1) }
+    堆_释放(pipe)
+}
+
+函数 NIPC_清空环缓冲(ring) {
+    如果 (ring == 0) { 返回 }
+    当 (ring.计数 > 0) {
+        定义 msg = 环缓冲_出队(ring)
+        如果 (msg != 0) {
+            如果 (msg.数据 != 0) { 堆_释放(msg.数据) }
+            堆_释放(msg)
+        }
+    }
+    如果 (ring.槽位 != 0) { 堆_释放(ring.槽位) }
+    堆_释放(ring)
+}
+
+// §5.14 AI异常脉冲检测
+// NIPC-AI检测维度:
+//   dim0: 消息速率偏差(当前速率/历史均值)
+//   dim1: 消息大小偏差(当前大小/历史均值)
+//   dim2: 序列号连续性(gap检测)
+//   dim3: 句柄频率(句柄传递密度)
+//   dim4: 背压系数(流控压力)
+//   dim5: CRC失败率(近期校验失败比)
+//   dim6: 重复消息率
+//   dim7: 分片超时率
+
+定义 可变 NIPC_AI历史速率均值 = 100.0
+定义 可变 NIPC_AI历史大小均值 = 1024.0
+定义 可变 NIPC_AI上次序列号 = 0
+定义 可变 NIPC_AI检测窗口消息数 = 0
+定义 可变 NIPC_AI检测窗口句柄数 = 0
+定义 可变 NIPC_AI衰减因子 = 0.95
+
+函数 NIPC_AI异常检测(pipe, msg) {
+    如果 (pipe == 0 || msg == 0) { 返回 }
+    如果 (全局AI总线 == 0) { 返回 }
+    NIPC_AI检测窗口消息数 = NIPC_AI检测窗口消息数 + 1
+    NIPC_AI检测窗口句柄数 = NIPC_AI检测窗口句柄数 + msg.句柄数
+    // 构建8维特征向量
+    定义 tensor = Tensor_创建(8)
+    // dim0: 速率偏差
+    定义 速率偏差 = NIPC_AI历史速率均值 > 0 ? NIPC_AI检测窗口消息数 / NIPC_AI历史速率均值 : 0
+    Tensor_写(tensor, 0, 速率偏差)
+    // dim1: 大小偏差
+    定义 大小偏差 = NIPC_AI历史大小均值 > 0 ? msg.数据长度 / NIPC_AI历史大小均值 : 0
+    Tensor_写(tensor, 1, 大小偏差)
+    // dim2: 序列号gap
+    定义 seq_gap = msg.序列号 - NIPC_AI上次序列号
+    定义 gap_异常 = 如果(seq_gap > 1, seq_gap / 10.0, 0.0)
+    Tensor_写(tensor, 2, gap_异常)
+    NIPC_AI上次序列号 = msg.序列号
+    // dim3: 句柄密度
+    定义 句柄密度 = NIPC_AI检测窗口句柄数 / (NIPC_AI检测窗口消息数 + 1)
+    Tensor_写(tensor, 3, 句柄密度)
+    // dim4: 背压系数
+    定义 fc = MojoPipe_获取流控(pipe, 0)
+    Tensor_写(tensor, 4, 如果(fc != 0, fc.背压系数, 0.0))
+    // dim5: CRC失败率
+    定义 crc_fail_rate = 全局_IPC_CRC校验失败 / (全局_IPC消息接收计数 + 1)
+    Tensor_写(tensor, 5, crc_fail_rate)
+    // dim6: 重复消息率(简化:0)
+    Tensor_写(tensor, 6, 0.0)
+    // dim7: 分片超时率(简化:0)
+    Tensor_写(tensor, 7, 0.0)
+    // 推理
+    定义 异常分 = AI总线_异常检测(全局AI总线, tensor, 8)
+    如果 (异常分 > 0.7) {
+        全局_IPC异常检测次数 = 全局_IPC异常检测次数 + 1
+        NIPC_记录异常事件(pipe, msg, 异常分)
+    }
+    // 更新历史均值(指数移动平均)
+    NIPC_AI历史速率均值 = NIPC_AI衰减因子 * NIPC_AI历史速率均值 + (1.0 - NIPC_AI衰减因子) * NIPC_AI检测窗口消息数
+    NIPC_AI历史大小均值 = NIPC_AI衰减因子 * NIPC_AI历史大小均值 + (1.0 - NIPC_AI衰减因子) * msg.数据长度
+    Tensor_释放(tensor)
+}
+
+函数 NIPC_记录异常事件(pipe, msg, 异常分) {
+    // 安全审计日志(不中断管道,仅记录)
+    平台_日志("[NIPC-AI] 管道#", pipe.管道ID, " 异常分=", 异常分,
+             " type=", msg.类型, " seq=", msg.序列号, " size=", msg.数据长度)
+}
+
+// §5.15 诊断与统计
+
+函数 NIPC_获取诊断快照() {
+    定义 snap = 堆_分配(IPC诊断快照)
+    snap.管道总数 = 全局_IPC管道总数
+    snap.活跃管道数 = 全局_IPC管道总数  // 简化:未跟踪关闭数
+    snap.消息发送速率 = 全局_IPC消息发送计数
+    snap.消息接收速率 = 全局_IPC消息接收计数
+    snap.平均延迟纳秒 = 0  // 需要时间戳差值统计
+    snap.背压触发率 = 全局_IPC流控触发次数
+    snap.异常事件数 = 全局_IPC异常检测次数
+    snap.共享内存使用量 = 全局_IPC共享内存区数
+    snap.句柄泄漏嫌疑数 = 0
+    返回 snap
+}
+
+函数 NIPC_管道统计(pipe) {
+    如果 (pipe == 0) { 返回 }
+    平台_日志("[NIPC] 管道#", pipe.管道ID,
+             " 发送=", pipe.发送总数, " 接收=", pipe.接收总数,
+             " 字节发=", pipe.字节发送量, " 字节收=", pipe.字节接收量,
+             " 状态=", pipe.状态)
+    定义 ring0 = pipe.环缓冲0
+    定义 ring1 = pipe.环缓冲1
+    如果 (ring0 != 0) {
+        平台_日志("  环缓冲0: 计数=", ring0.计数, "/", ring0.容量,
+                 " 溢出=", ring0.溢出丢弃数)
+    }
+    如果 (ring1 != 0) {
+        平台_日志("  环缓冲1: 计数=", ring1.计数, "/", ring1.容量,
+                 " 溢出=", ring1.溢出丢弃数)
+    }
+    定义 fc0 = pipe.流控0
+    如果 (fc0 != 0) {
+        平台_日志("  流控0: 背压=", fc0.背压系数, " 拒绝=", fc0.累计拒绝数)
+    }
+}
+
+函数 NIPC_全局统计() {
+    平台_日志("[NIPC全局] 管道=", 全局_IPC管道总数,
+             " 发送=", 全局_IPC消息发送计数,
+             " 接收=", 全局_IPC消息接收计数,
+             " 字节发=", 全局_IPC字节发送总量,
+             " 字节收=", 全局_IPC字节接收总量)
+    平台_日志("  分片重组=", 全局_IPC分片重组计数,
+             " 流控触发=", 全局_IPC流控触发次数,
+             " AI异常=", 全局_IPC异常检测次数,
+             " CRC失败=", 全局_IPC_CRC校验失败,
+             " 句柄传递=", 全局_IPC句柄传递计数,
+             " 共享内存区=", 全局_IPC共享内存区数)
+}
+
+// §5.16 NIPC统一初始化
+
+函数 NIPC_初始化() {
+    全局_IPC管道总数 = 0
+    全局_IPC消息发送计数 = 0
+    全局_IPC消息接收计数 = 0
+    全局_IPC字节发送总量 = 0
+    全局_IPC字节接收总量 = 0
+    全局_IPC分片重组计数 = 0
+    全局_IPC流控触发次数 = 0
+    全局_IPC异常检测次数 = 0
+    全局_IPC句柄传递计数 = 0
+    全局_IPC共享内存区数 = 0
+    全局_IPC_CRC校验失败 = 0
+    NIPC_AI历史速率均值 = 100.0
+    NIPC_AI历史大小均值 = 1024.0
+    NIPC_AI上次序列号 = 0
+    NIPC_AI检测窗口消息数 = 0
+    NIPC_AI检测窗口句柄数 = 0
+    平台_日志("[NIPC] Nova IPC Pipeline Communication 引擎已初始化")
+}

@@ -1,0 +1,100 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// 实现: HTML5解析规范 §13.2.5 (令牌ization)
+// https://html.spec.whatwg.org/multipage/parsing.html#令牌ization
+// HTML5 令牌izer是一个状态机，逐字符读取输入，产生令牌流:
+//   DOCTYPE / StaNova往返时间ag / EndTag / Comment / Character / EndOfFile
+
+// HTML 令牌类型 
+
+定义 令牌类型_未初始化 = 0
+定义 令牌类型_DOCTYPE = 1
+定义 令牌类型_开始标签 = 2
+定义 令牌类型_结束标签 = 3
+定义 令牌类型_注释 = 4
+定义 令牌类型_字符 = 5
+定义 令牌类型_文件结束 = 6
+
+// HTML令牌 — 单个令牌 
+
+结构 HTML令牌 {
+ 类型,
+ // 标签相关 (StaNova往返时间ag / EndTag)
+ 标签名,    // u64 字符串指针
+ 标签名长度,
+ 自闭合,    // 布尔 <br/> 的 /
+
+ // 属性列表
+ 属性列表,    // u64 令牌Attribute数组指针
+ 属性数量,
+ 属性容量,
+ // DOCTYPE相关
+ DOCTYPE名称,
+ DOCTYPE公共ID,
+ DOCTYPE系统ID,
+ 强制怪异模式,
+ // 注释/字符数据
+ 数据,    // u64 字符串指针
+ 数据长度,
+}
+
+结构 令牌Attribute {
+ 名称,    // u64 属性名字符串
+ 名称长度,
+ 值,    // u64 属性值字符串
+ 值长度,
+}
+
+// 令牌izer状态 (HTML规范 §13.2.5 — 80个状态)
+// 仅列出核心状态，完整实现需全部80个
+
+定义 状态_数据 = 0 // Data state (初始/默认)
+定义 状态_字符引用 = 1 // Character reference (&...)
+定义 状态_标签开始 = 2 // Tag open (<)
+定义 状态_结束标签开始 = 3 // End tag open (</)
+定义 状态_标签名 = 4 // Tag name (<div)
+定义 状态_属性名前 = 5 // Before attribute name
+定义 状态_属性名 = 6 // Attribute name
+定义 状态_属性名后 = 7 // After attribute name
+定义 状态_属性值前 = 8 // Before attribute value
+定义 状态_属性值_双引号 = 9 // Attribute value (double-quoted)
+定义 状态_属性值_单引号 = 10 // Attribute value (single-quoted)
+定义 状态_属性值_无引号 = 11 // Attribute value (unquoted)
+定义 状态_属性值后 = 12 // After attribute value (quoted)
+定义 状态_自闭合开始标签 = 13 // Self-closing start tag (/>)
+定义 状态_伪注释 = 14 // Bogus comment
+定义 状态_标记声明开始 = 15 // Markup declaration open (<!)
+定义 状态_注释开始 = 16 // Comment start (<!--)
+定义 状态_注释开始破折号 = 17 // Comment start dash
+定义 状态_注释 = 18 // Comment
+定义 状态_注释小于号 = 19 // Comment less-than sign
+定义 状态_注释结束破折号 = 20 // Comment end dash
+定义 状态_注释结束 = 21 // Comment end (-->)
+定义 状态_DOCTYPE = 22 // DOCTYPE
+定义 状态_DOCTYPE前 = 23 // Before DOCTYPE name
+定义 状态_DOCTYPE名称 = 24 // DOCTYPE name
+定义 状态_DOCTYPE名称后 = 25 // After DOCTYPE name
+定义 状态_RCDATA = 26 // RCDATA (<textarea>/<title>内容)
+定义 状态_RAWTEXT = 27 // RAWTEXT (<style>/<script>等)
+定义 状态_脚本数据 = 28 // Script data (<script>内容)
+定义 状态_PLAINTEXT = 29 // PLAINTEXT
+定义 状态_RCDATA小于号 = 30
+定义 状态_RCDATA结束标签开始 = 31
+定义 状态_RCDATA结束标签名 = 32
+定义 状态_RAWTEXT小于号 = 33
+定义 状态_RAWTEXT结束标签开始 = 34
+定义 状态_RAWTEXT结束标签名 = 35
+定义 状态_脚本数据小于号 = 36
+定义 状态_脚本数据结束标签开始 = 37
+定义 状态_脚本数据结束标签名 = 38
+定义 状态_脚本数据转义开始 = 39
+定义 状态_脚本数据转义开始破折号 = 40
+定义 状态_脚本数据已转义 = 41
+定义 状态_脚本数据已转义破折号 = 42
+定义 状态_脚本数据已转义破折号破折号 = 43
+定义 状态_脚本数据已转义小于号 = 44
+定义 状态_脚本数据已转义结束标签开始 = 45
+定义 状态_脚本数据已转义结束标签名 = 46
+定义 状态_脚本数据双重转义开始 = 47
+定义 状态_脚本数据双重已转义 = 48

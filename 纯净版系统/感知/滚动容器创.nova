@@ -1,0 +1,119 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+//       scrolling/snap_coordinator.cc (~800行)
+// CSS Scroll Snap:
+//   scroll-snap-type: x mandatory | y proximity | both mandatory
+//   scroll-snap-align: start | center | end | none
+//   scroll-snap-stop: normal | always
+//   scroll-padding: 10px 20px
+//   scroll-margin: 5px
+// CSS Overscroll Behavior:
+//   overscroll-behavior: auto | contain | none
+//   overscroll-behavior-x / overscroll-behavior-y
+// Smooth Scrolling:
+//   scroll-behavior: auto | smooth
+//   元素.scrollTo({ top, left, behavior: 'smooth' })
+// 本文件实现:
+//   1. Snap属性解析
+//   2. Snap点收集(从子元素)
+//   3. 最近snap点计算(mandatory/proximity)
+//   4. 平滑滚动动画
+//   5. Overscroll行为控制
+
+// §1 Scroll Snap类型
+
+定义 SNAP_AXIS_NONE   = 0
+定义 SNAP_AXIS_X      = 1
+定义 SNAP_AXIS_Y      = 2
+定义 SNAP_AXIS_BOTH   = 3
+定义 SNAP_AXIS_BLOCK  = 4
+定义 SNAP_AXIS_INLINE = 5
+
+定义 SNAP_STRICT_NONE       = 0
+定义 SNAP_STRICT_PROXIMITY  = 1    // 接近snap点时吸附
+定义 SNAP_STRICT_MANDATORY  = 2    // 必须停在snap点
+
+定义 SNAP_ALIGN_NONE    = 0
+定义 SNAP_ALIGN_START   = 1
+定义 SNAP_ALIGN_CENTER  = 2
+定义 SNAP_ALIGN_END     = 3
+
+定义 SNAP_STOP_NORMAL  = 0    // 可以跳过
+定义 SNAP_STOP_ALWAYS  = 1    // 必须停在此点
+
+定义 OVERSCROLL_AUTO    = 0    // 默认(冒泡到父)
+定义 OVERSCROLL_CONTAIN = 1    // 不冒泡,保留弹性效果
+定义 OVERSCROLL_NONE    = 2    // 不冒泡,无弹性效果
+
+定义 SCROLL_BEHAVIOR_AUTO   = 0
+定义 SCROLL_BEHAVIOR_SMOOTH = 1
+
+// §2 Snap容器 + Snap点
+
+结构 SnapPoint {
+    x,    // i32 snap点坐标(×100)
+    y,
+    对齐x,    // u32 SNAP_ALIGN_xxx
+    对齐y,
+    停止,    // u32 SNAP_STOP_xxx
+    元素,    // u64 对应的DOM元素
+}
+
+结构 ScrollSnapContainer {
+    轴,    // u32 SNAP_AXIS_xxx
+    严格度,    // u32 SNAP_STRICT_xxx
+    // scroll-padding
+    padding_上,
+    padding_右,
+    padding_下,
+    padding_左,
+    // snap点列表
+    snap点列表,    // u64 SnapPoint*数组
+    snap点数量,
+    snap点容量,
+    // 容器尺寸
+    视口宽,
+    视口高,
+    内容宽,
+    内容高,
+    // 当前滚动位置
+    滚动x,
+    滚动y,
+    // 目标snap点
+    目标x,
+    目标y,
+    // overscroll
+    overscroll_x,    // u32 OVERSCROLL_xxx
+    overscroll_y,
+    // scroll-behavior
+    滚动行为,    // u32 SCROLL_BEHAVIOR_xxx
+    // 平滑滚动动画
+    正在动画,
+    动画起始x,
+    动画起始y,
+    动画目标x,
+    动画目标y,
+    动画起始时间,
+    动画持续时间,    // u32 毫秒
+}
+
+函数 ScrollSnapContainer_创建() {
+    定义 ssc = 堆_分配(ScrollSnapContainer)
+    ssc.轴 = SNAP_AXIS_NONE
+    ssc.严格度 = SNAP_STRICT_NONE
+    ssc.padding_上 = 0; ssc.padding_右 = 0; ssc.padding_下 = 0; ssc.padding_左 = 0
+    ssc.snap点容量 = 64
+    ssc.snap点列表 = 堆_分配_数组(64 * 8)
+    ssc.snap点数量 = 0
+    ssc.视口宽 = 0; ssc.视口高 = 0
+    ssc.内容宽 = 0; ssc.内容高 = 0
+    ssc.滚动x = 0; ssc.滚动y = 0
+    ssc.目标x = 0; ssc.目标y = 0
+    ssc.overscroll_x = OVERSCROLL_AUTO
+    ssc.overscroll_y = OVERSCROLL_AUTO
+    ssc.滚动行为 = SCROLL_BEHAVIOR_AUTO
+    ssc.正在动画 = 假
+    ssc.动画持续时间 = 300    // 默认300ms
+    返回 ssc
+}

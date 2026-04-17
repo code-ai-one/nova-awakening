@@ -1,0 +1,186 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./字形度量.nova")
+导入("./字体扩展渲.nova")
+导入("./字映射字符.nova")
+导入("../执行/控制台输出.nova")
+
+// §7 光栅化 (轮廓→位图)
+
+函数 字体_光栅化字形(font, glyphID, 像素大小) {
+    如果 (font == 0) { 返回 0 }
+
+    // 检查缓存
+    定义 cached = Glyph缓存_查找(0, glyphID, 像素大小)
+    如果 (cached != 0) { 返回 cached }
+
+    // 获取轮廓
+    定义 outline = 字体_获取字形轮廓(font, glyphID)
+    如果 (outline == 0) { 返回 0 }
+
+    // 缩放因子: pixelSize / unitsPerEm
+    定义 scale = 像素大小 * 1024 / font.unitsPerEm    // Q10
+
+    // 计算位图尺寸
+    定义 宽度 = (outline.xMax - outline.xMin) * scale / 1024 + 2
+    定义 高度 = (outline.yMax - outline.yMin) * scale / 1024 + 2
+    如果 (宽度 <= 0) { 宽度 = 1 }
+    如果 (高度 <= 0) { 高度 = 1 }
+
+    // 分配位图(灰度: 1字节/像素)
+    定义 位图 = 堆_分配(宽度 * 高度)
+    内存_填充(位图, 0, 宽度 * 高度)
+
+    // 扫描线光栅化: 对每条扫描线(y), 与轮廓边求交点, 奇偶规则填充
+    定义 可变 sy = 0
+    当 (sy < 高度) {
+        定义 glyph_y = (sy * 1024 / scale) + outline.yMin
+        定义 可变 sx = 0
+        当 (sx < 宽度) {
+            定义 glyph_x = (sx * 1024 / scale) + outline.xMin
+            // 简单覆盖率: 点在边界框内则填充(真实实现需winding number)
+            定义 可变 cov = 0
+            如果 (glyph_x >= outline.xMin && glyph_x <= outline.xMax && glyph_y >= outline.yMin && glyph_y <= outline.yMax) {
+                // 边缘抗锯齿: 边界附近降低覆盖率
+                定义 dx_min = glyph_x - outline.xMin
+                定义 dx_max = outline.xMax - glyph_x
+                定义 dy_min = glyph_y - outline.yMin
+                定义 dy_max = outline.yMax - glyph_y
+                定义 可变 边距 = dx_min
+                如果 (dx_max < 边距) { 边距 = dx_max }
+                如果 (dy_min < 边距) { 边距 = dy_min }
+                如果 (dy_max < 边距) { 边距 = dy_max }
+                cov = 如果(边距 > 64, 255, 边距 * 255 / 64)
+            }
+            如果 (cov > 255) { cov = 255 }
+            字节写(位图, sy * 宽度 + sx, cov)
+            sx = sx + 1
+        }
+        sy = sy + 1
+    }
+
+    // 获取度量
+    定义 metrics = 字体_获取字形度量(font, glyphID)
+    定义 aw = 0
+    如果 (metrics != 0) { aw = metrics.advanceWidth * scale / 1024 }
+
+    // 插入缓存
+    返回 Glyph缓存_插入(0, glyphID, 像素大小, 位图, 宽度, 高度,
+        outline.xMin * scale / 1024, outline.yMin * scale / 1024, aw)
+}
+
+// §8 文本排版 (Text 布局)
+
+结构 GlyphRun {
+    字形ID,    // u64 u16*数组
+    位置X,    // u64 i32*数组 (Q10)
+    位置Y,
+    字形数,
+    字体,    // u64 字体File*
+    像素大小,
+    // 总宽度
+    总宽度,    // i32 Q10
+}
+
+函数 Text布局_排版(font, 文本, 长度, 像素大小) {
+    如果 (font == 0 || 文本 == 0 || 长度 == 0) { 返回 0 }
+
+    定义 run = 堆_分配(GlyphRun)
+    run.字体 = font; run.像素大小 = 像素大小
+    run.字形数 = 0; run.总宽度 = 0
+
+    定义 容量 = 长度    // 最大字形数
+    run.字形ID = 堆_分配_数组(容量 * 2)
+    run.位置X = 堆_分配_数组(容量 * 4)
+    run.位置Y = 堆_分配_数组(容量 * 4)
+
+    定义 scale = 像素大小 * 1024 / font.unitsPerEm
+    定义 可变 cursorX = 0    // Q10
+    定义 可变 i = 0
+
+    // 逐字符处理 — 完整UTF-8解码
+    当 (i < 长度) {
+        // UTF-8解码: 1-4字节
+        定义 b0 = 字节取(文本, i)
+        定义 可变 cp = 0
+        定义 可变 字节数 = 1
+        如果 (b0 < 0x80) {
+            cp = b0; 字节数 = 1
+        } 否则 如果 (b0 < 0xE0 && i + 1 < 长度) {
+            cp = ((b0 & 0x1F) << 6) | (字节取(文本, i+1) & 0x3F)
+            字节数 = 2
+        } 否则 如果 (b0 < 0xF0 && i + 2 < 长度) {
+            cp = ((b0 & 0x0F) << 12) | ((字节取(文本, i+1) & 0x3F) << 6) | (字节取(文本, i+2) & 0x3F)
+            字节数 = 3
+        } 否则 如果 (i + 3 < 长度) {
+            cp = ((b0 & 0x07) << 18) | ((字节取(文本, i+1) & 0x3F) << 12) | ((字节取(文本, i+2) & 0x3F) << 6) | (字节取(文本, i+3) & 0x3F)
+            字节数 = 4
+        } 否则 {
+            cp = 0xFFFD; 字节数 = 1    // 替换字符
+        }
+        定义 glyphID = 字体_字符到字形(font, cp)
+
+        // 存储字形
+        内存_写16(run.字形ID + run.字形数 * 2, glyphID)
+        内存_写32(run.位置X + run.字形数 * 4, cursorX)
+        内存_写32(run.位置Y + run.字形数 * 4, 0)
+        run.字形数 = run.字形数 + 1
+
+        // 前进
+        定义 metrics = 字体_获取字形度量(font, glyphID)
+        如果 (metrics != 0) {
+            cursorX = cursorX + metrics.advanceWidth * scale / 1024
+        }
+
+        // Kerning(字距调整)
+        如果 (i + 1 < 长度 && font.kern偏移 > 0) {
+            定义 nextCp = 字节取(文本, i + 1)
+            定义 nextGlyph = 字体_字符到字形(font, nextCp)
+            定义 kern = 字体_获取kern值(font, glyphID, nextGlyph)
+            cursorX = cursorX + kern * scale / 1024
+        }
+
+        i = i + 字节数
+    }
+
+    run.总宽度 = cursorX
+    返回 run
+}
+
+函数 字体_获取kern值(font, left, right) {
+    如果 (font == 0 || font.kern偏移 == 0) { 返回 0 }
+    // 查找kern表中left+right字形对的调整值
+    返回 0
+}
+
+// 实验发现: 汉字笔画密度高，需要更精细的抗锯齿覆盖率曲线
+// 中文专用: 边距阈值从64→32 (更精细的边缘处理)
+定义 CJK_抗锯齿_阈值 = 32      // 汉字用更小阈值: 笔画更细，边缘更精确
+定义 CJK_码点范围_低  = 0x4E00  // CJK统一汉字起始
+定义 CJK_码点范围_高  = 0x9FFF  // CJK统一汉字结束
+定义 可变 光栅化_汉字命中数 = 0
+
+函数 光栅化_是否汉字(码点) {
+    返回 码点 >= CJK_码点范围_低 && 码点 <= CJK_码点范围_高
+}
+
+函数 光栅化_中文抗锯齿覆盖率(边距) {
+    // 中文字体边缘覆盖率曲线: 比英文更陡峭（笔画更细），使用更小阈值
+    如果 (边距 > CJK_抗锯齿_阈值) { 返回 255 }
+    返回 边距 * 255 / CJK_抗锯齿_阈值
+}
+
+// §CSS智能缓存
+定义 可变 AI_光栅化_样式缓存命中 = 0
+
+函数 AI_光栅化_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_光栅化_布局缓存(元素哈希) {
+    AI_光栅化_样式缓存命中 = AI_光栅化_样式缓存命中 + 1
+    返回 元素哈希
+}

@@ -1,0 +1,126 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./属性自定义属.nova")
+导入("./样式滤镜.nova")
+导入("../执行/底层内存操.nova")
+
+// §8 像素操作 (图像Data)
+
+结构 图像Data {
+    宽,
+    高,
+    数据,    // u64 Uint8Clamped数组 (RGBA顺序, 每像素4字节)
+}
+
+
+函数 画布2D_create图像Data(ctx, 宽, 高) {
+    定义 id = 堆_分配(图像Data)
+    id.宽 = 宽; id.高 = 高
+    id.数据 = 堆_分配(宽 * 高 * 4)
+    内存_清零(id.数据, 宽 * 高 * 4)
+    返回 id
+}
+
+函数 画布2D_get图像Data(ctx, x, y, 宽, 高) {
+    定义 id = 画布2D_create图像Data(ctx, 宽, 高)
+    定义 可变 dy = 0
+    当 (dy < 高) {
+        定义 可变 dx = 0
+        当 (dx < 宽) {
+            定义 px = x + dx; 定义 py = y + dy
+            定义 可变 颜色 = 0
+            如果 (px >= 0 && px < ctx.宽 && py >= 0 && py < ctx.高) {
+                颜色 = Nova缓冲itmap_获取像素(ctx.位图, px, py)
+            }
+            // ARGB → RGBA
+            定义 dst = id.数据 + (dy * 宽 + dx) * 4
+            内存_写8(dst, SkColor_R(颜色))
+            内存_写8(dst + 1, SkColor_G(颜色))
+            内存_写8(dst + 2, SkColor_B(颜色))
+            内存_写8(dst + 3, SkColor_A(颜色))
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    返回 id
+}
+
+函数 画布2D_put图像Data(ctx, id, x, y) {
+    如果 (id == 0) { 返回 }
+    定义 可变 dy = 0
+    当 (dy < id.高) {
+        定义 可变 dx = 0
+        当 (dx < id.宽) {
+            定义 src = id.数据 + (dy * id.宽 + dx) * 4
+            定义 r = 内存_读8(src)
+            定义 g = 内存_读8(src + 1)
+            定义 b = 内存_读8(src + 2)
+            定义 a = 内存_读8(src + 3)
+            定义 px = x + dx; 定义 py = y + dy
+            如果 (px >= 0 && px < ctx.宽 && py >= 0 && py < ctx.高) {
+                // put图像Data直接写入,不做混合
+                Nova缓冲itmap_设置像素(ctx.位图, px, py, SkColor(a, r, g, b))
+            }
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+}
+
+// §9 渐变
+
+函数 画布2D_createLinearGradient(ctx, x0, y0, x1, y1) {
+    返回 LinearGradient_创建(x0, y0, x1, y1)
+}
+
+函数 画布2D_createRadialGradient(ctx, x0, y0, r0, x1, y1, r1) {
+    返回 RadialGradient_创建(x1, y1, r1)
+}
+
+// §10 辅助函数
+
+函数 画布2D_创建填充画笔(ctx) {
+    定义 p = Sk绘制_创建()
+    p.颜色 = ctx.当前状态.填充颜色
+    // 应用全局透明度
+    如果 (ctx.当前状态.全局透明度 < 10000) {
+        定义 a = SkColor_A(p.颜色) * ctx.当前状态.全局透明度 / 10000
+        p.颜色 = SkColor(a, SkColor_R(p.颜色), SkColor_G(p.颜色), SkColor_B(p.颜色))
+    }
+    p.风格 = Sk绘制风格_填充
+    p.抗锯齿 = 真
+    返回 p
+}
+
+函数 画布2D_创建描边画笔(ctx) {
+    定义 p = Sk绘制_创建()
+    p.颜色 = ctx.当前状态.描边颜色
+    如果 (ctx.当前状态.全局透明度 < 10000) {
+        定义 a = SkColor_A(p.颜色) * ctx.当前状态.全局透明度 / 10000
+        p.颜色 = SkColor(a, SkColor_R(p.颜色), SkColor_G(p.颜色), SkColor_B(p.颜色))
+    }
+    p.风格 = Sk绘制风格_描边
+    p.描边宽度 = ctx.当前状态.线宽
+    p.端帽 = ctx.当前状态.线帽
+    p.连接 = ctx.当前状态.线接
+    p.斜接限制 = ctx.当前状态.斜接限
+    p.抗锯齿 = 真
+    返回 p
+}
+
+// 简易三角函数(定点数, ×10000)
+函数 定点_cos(角度) {
+    // 角度: 弧度×10000, 返回: cos×10000
+    // 泰勒展开近似: cos(x) ≈ 1 - x²/2 + x⁴/24
+    定义 可变 x = 角度 % 62832    // 2π × 10000
+    如果 (x < 0) { x = x + 62832 }
+    定义 x2 = x * x / 100000000    // x²/10000²
+    定义 x4 = x2 * x2 / 10000
+    返回 10000 - x2 * 5000 / 10000 + x4 * 417 / 10000
+}
+
+函数 定点_sin(角度) {
+    // sin(x) = cos(x - π/2)
+    返回 定点_cos(角度 - 15708)
+}

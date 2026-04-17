@@ -1,0 +1,149 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../感知/内核直连层.nova")
+导入("./双解析证书.nova")
+
+函数 X509_解析公钥(数据, elem, cert) {
+    定义 可变 pos = elem.值偏移
+    // 算法 SEQUENCE { OID, params }
+    定义 algo = ASN1_解析元素(数据, pos, pos + elem.长度)
+    如果 (algo != 0 && algo.标签 == ASN1_SEQUENCE) {
+        定义 oid = ASN1_解析元素(数据, algo.值偏移, pos + elem.长度)
+        如果 (oid != 0) {
+            cert.公钥算法 = 堆_分配(128)
+            ASN1_读OID(数据, oid, cert.公钥算法, 128)
+        }
+        pos = pos + algo.总长度
+    }
+    // 公钥 BIT STRING
+    定义 pk = ASN1_解析元素(数据, pos, pos + elem.长度)
+    如果 (pk != 0 && pk.标签 == ASN1_BIT_STRING) {
+        cert.公钥数据 = 数据 + pk.值偏移 + 1
+        cert.公钥长度 = pk.长度 - 1
+    }
+}
+
+函数 X509_解析扩展(数据, ctx3, cert) {
+    // [3] EXPLICIT → SEQUENCE of Extension
+    定义 exts_seq = ASN1_解析元素(数据, ctx3.值偏移, ctx3.值偏移 + ctx3.长度)
+    如果 (exts_seq == 0 || exts_seq.标签 != ASN1_SEQUENCE) { 返回 }
+
+    定义 可变 pos = exts_seq.值偏移
+    定义 end = exts_seq.值偏移 + exts_seq.长度
+
+    当 (pos < end) {
+        定义 ext = ASN1_解析元素(数据, pos, end)
+        如果 (ext == 0) { 跳出 }
+        如果 (ext.标签 == ASN1_SEQUENCE) {
+            X509_解析单个扩展(数据, ext, cert)
+        }
+        pos = pos + ext.总长度
+    }
+}
+
+函数 X509_解析单个扩展(数据, ext_seq, cert) {
+    定义 可变 pos = ext_seq.值偏移
+    定义 end = ext_seq.值偏移 + ext_seq.长度
+
+    // OID
+    定义 oid = ASN1_解析元素(数据, pos, end)
+    如果 (oid == 0 || oid.标签 != ASN1_OID) { 返回 }
+    pos = pos + oid.总长度
+
+    // Critical BOOLEAN (可选)
+    定义 next = ASN1_解析元素(数据, pos, end)
+    如果 (next.标签 == ASN1_BOOLEAN) { pos = pos + next.总长度 }
+
+    // Value OCTET STRING
+    定义 val = ASN1_解析元素(数据, pos, end)
+    如果 (val == 0 || val.标签 != ASN1_OCTET_STRING) { 返回 }
+
+    // 基本约束 OID: 2.5.29.19 = 55 1D 13
+    如果 (oid.长度 == 3 && 内存_读8(数据 + oid.值偏移) == 0x55 &&
+        内存_读8(数据 + oid.值偏移 + 1) == 0x1D && 内存_读8(数据 + oid.值偏移 + 2) == 0x13) {
+        定义 bc_seq = ASN1_解析元素(数据, val.值偏移, end)
+        如果 (bc_seq != 0 && bc_seq.标签 == ASN1_SEQUENCE) {
+            定义 ca_bool = ASN1_解析元素(数据, bc_seq.值偏移, end)
+            如果 (ca_bool != 0 && ca_bool.标签 == ASN1_BOOLEAN && ca_bool.长度 == 1) {
+                cert.是CA = 内存_读8(数据 + ca_bool.值偏移) != 0
+            }
+        }
+    }
+
+    // SAN (Subject Alternative Name) OID: 2.5.29.17 = 55 1D 11
+    如果 (oid.长度 == 3 && 内存_读8(数据 + oid.值偏移) == 0x55 &&
+        内存_读8(数据 + oid.值偏移 + 1) == 0x1D && 内存_读8(数据 + oid.值偏移 + 2) == 0x11) {
+        X509_解析SAN(数据, val, cert)
+    }
+}
+
+函数 X509_解析SAN(数据, val_elem, cert) {
+    定义 san_seq = ASN1_解析元素(数据, val_elem.值偏移, val_elem.值偏移 + val_elem.长度)
+    如果 (san_seq == 0 || san_seq.标签 != ASN1_SEQUENCE) { 返回 }
+
+    // 分配SAN列表 (最多32个)
+    cert.SAN列表 = 堆_分配(32 * 8)
+    cert.SAN数量 = 0
+
+    定义 可变 pos = san_seq.值偏移
+    定义 end = san_seq.值偏移 + san_seq.长度
+    当 (pos < end && cert.SAN数量 < 32) {
+        定义 name = ASN1_解析元素(数据, pos, end)
+        如果 (name == 0) { 跳出 }
+        // [2] dNSName (context tag 2)
+        如果 ((name.标签 & 0x1F) == 2) {
+            定义 dns = 堆_分配(name.长度 + 1)
+            内存_复制(dns, 数据 + name.值偏移, name.长度)
+            内存_写8(dns + name.长度, 0)
+            内存_写64(cert.SAN列表 + cert.SAN数量 * 8, dns)
+            cert.SAN数量 = cert.SAN数量 + 1
+        }
+        pos = pos + name.总长度
+    }
+}
+
+函数 ASN1_解析时间(数据, time_elem) {
+    // UTCTime: YYMMDDHHMMSSZ  或 GeneralizedTime: YYYYMMDDHHMMSSZ
+    如果 (time_elem == 0) { 返回 0 }
+    定义 最小长度 = 13
+    如果 (time_elem.标签 != ASN1_UTCTIME) { 最小长度 = 15 }
+    如果 (time_elem.长度 < 最小长度) { 返回 0 }
+    定义 可变 pos = time_elem.值偏移
+    定义 可变 year = 0; 定义 可变 month = 0; 定义 可变 day = 0
+    定义 可变 hour = 0; 定义 可变 min = 0; 定义 可变 sec = 0
+
+    如果 (time_elem.标签 == ASN1_UTCTIME) {
+        year = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30)
+        如果 (year < 50) { year = year + 2000 } 否则 { year = year + 1900 }
+        pos = pos + 2
+    } 否则 {
+        year = (内存_读8(数据 + pos) - 0x30) * 1000 + (内存_读8(数据 + pos + 1) - 0x30) * 100 +
+               (内存_读8(数据 + pos + 2) - 0x30) * 10 + (内存_读8(数据 + pos + 3) - 0x30)
+        pos = pos + 4
+    }
+    month = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30); pos = pos + 2
+    day = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30); pos = pos + 2
+    hour = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30); pos = pos + 2
+    min = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30); pos = pos + 2
+    sec = (内存_读8(数据 + pos) - 0x30) * 10 + (内存_读8(数据 + pos + 1) - 0x30)
+
+    // 转Unix时间戳
+    返回 日期_转时间戳(year, month, day, hour, min, sec)
+}
+
+函数 日期_转时间戳(年, 月, 日, 时, 分, 秒) {
+    // 从2000年开始计算
+    定义 可变 days = 0
+    定义 可变 y = 1970
+    当 (y < 年) {
+        如果 ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { days = days + 366 }
+        否则 { days = days + 365 }
+        y = y + 1
+    }
+    定义 月天数 = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    如果 ((年 % 4 == 0 && 年 % 100 != 0) || 年 % 400 == 0) { 月天数[2] = 29 }
+    定义 可变 m = 1
+    当 (m < 月) { days = days + 月天数[m]; m = m + 1 }
+    days = days + 日 - 1
+    返回 days * 86400 + 时 * 3600 + 分 * 60 + 秒
+}

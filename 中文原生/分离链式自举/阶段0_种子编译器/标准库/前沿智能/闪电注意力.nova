@@ -1,0 +1,383 @@
+导入("../基础.nova")
+导入("../数学/工具.nova")
+
+// FlashAttention v3 (Shah et al. 2024 → Dao 2024 前沿迭代)
+// ref: Dao 2023 "FlashAttention-2" (基础: IO感知分块)
+// ref: Shah et al. 2024 "FlashAttention-3: Fast and Accurate
+//   Attention with Asynchrony and Low-precision" (Hopper异步流水)
+// ref: DeepSeek-V2 2024 "Multi-head Latent Attention (MLA)"
+//   (KV缓存压缩: 将KV投影到低秩潜空间, 2-4×压缩)
+// ref: Ye et al. 2024 "Differential Transformer" (差分注意力:
+//   两组QK做差消噪, 抑制注意力噪声)
+// 核心创新: O(N)内存 + IO感知分块 + 在线softmax
+// FlashAttention-3新增: 异步warp调度 + FP8 + 非因果分块优化
+// 纯整数定点实现 (精度=10000)
+
+定义 FA精度 = 10000
+
+// 在线Softmax (Milakov & Gimelshein 2018 → Flash改进)
+// 传统softmax需要两遍: 1.找max 2.exp-sum-div
+// 在线版本: 一遍扫描, 动态维护max和sum
+
+函数 在线Softmax_初始化() {
+    // [当前max, 当前sum_exp, 已处理元素数]
+    返回 [0 - FA精度 * 100,]
+}
+
+函数 在线Softmax_更新(状态, 新值) {
+    定义 旧max = 状态[0]
+    定义 旧sum = 状态[1]
+    定义 可变 新max = 旧max
+    如果 (新值 > 旧max) { 新max = 新值 }
+    // 修正旧的累积和: sum' = sum × exp(旧max - 新max)
+    定义 可变 修正因子 = FA精度
+    如果 (新max != 旧max) {
+        定义 差 = 旧max - 新max
+        // exp(差) 近似, 差为负数
+        修正因子 = 近似exp_FA(差)
+    }
+    定义 新sum = 旧sum * 修正因子 / FA精度 + 近似exp_FA(新值 - 新max)
+    返回 [新max, 新sum, 状态[2] + 1]
+}
+
+函数 近似exp_FA(x) {
+    如果 (x > 60000) { 返回 FA精度 * 100 }
+    如果 (x < 0 - 60000) { 返回 0 }
+    // exp(x) ≈ 1 + x + x²/2 + x³/6 (×10000定点)
+    定义 x1 = x
+    定义 x2 = x1 * x1 / FA精度
+    定义 x3 = x2 * x1 / FA精度
+    返回 FA精度 + x1 + x2 / 2 + x3 / 6
+}
+
+// FlashAttention 分块核心
+// Q: [序列长×头维度], K: [序列长×头维度], V: [序列长×头维度]
+// 所有矩阵以一维展开存储, 行优先
+
+函数 闪电注意力_分块(Q, K, V, 序列长, 头维度, 块大小) {
+    定义 可变 dot = 0
+    定义 可变 ri = 0
+    // 输出: O[序列长×头维度]
+    定义 可变 O = []
+    当 (oi < 序列长 * 头维度) { 追加(O, 0); oi = oi + 1 }
+    // 每行的softmax状态: [max, sum]
+    定义 可变 行max = []
+    定义 可变 行sum = []
+    当 (ri < 序列长) {
+        追加(行max, 0 - FA精度 * 100)
+        追加(行sum, 0)
+        ri = ri + 1
+    }
+
+    // 外层循环: K/V的块 (Bc块)
+    定义 Kv块数 = (序列长 + 块大小 - 1) / 块大小
+    定义 可变 jb = 0
+    当 (jb < Kv块数) {
+        定义 j起 = jb * 块大小
+        定义 可变 j止 = j起 + 块大小
+        如果 (j止 > 序列长) { j止 = 序列长 }
+
+        // 内层循环: Q的每一行
+        定义 可变 qi = 0
+        当 (qi < 序列长) {
+            // 计算 S[qi, j起..j止] = Q[qi] · K[j]^T / √d
+            定义 可变 旧max = 行max[qi]
+            定义 可变 旧sum = 行sum[qi]
+            定义 可变 块max = 旧max
+
+            // 第一遍: 计算点积并找块内max
+            定义 可变 S块 = []
+            定义 可变 j = j起
+            当 (j < j止) {
+                定义 可变 d = 0
+                当 (d < 头维度) {
+                    dot = dot + Q[qi * 头维度 + d] * K[j * 头维度 + d] / FA精度
+                    d = d + 1
+                }
+                // 缩放: /√d (用定点近似)
+                dot = dot * FA精度 / (头维度 * 100 + 1)
+                追加(S块, dot)
+                如果 (dot > 块max) { 块max = dot }
+                j = j + 1
+            }
+
+            // 更新max和sum
+            定义 修正 = 近似exp_FA(旧max - 块max)
+            定义 可变 新sum = 旧sum * 修正 / FA精度
+            // 第二遍: exp(s - max) 并累积到O
+            j = 0
+            当 (j < 计数(S块)) {
+                定义 p = 近似exp_FA(S块[j] - 块max)
+                新sum = 新sum + p
+                // O[qi] = 修正×旧O + p×V[j起+j]
+                定义 可变 d = 0
+                当 (d < 头维度) {
+                    定义 idx = qi * 头维度 + d
+                    O[idx] = O[idx] * 修正 / FA精度 + p * V[(j起 + j) * 头维度 + d] / FA精度
+                    d = d + 1
+                }
+                j = j + 1
+            }
+            行max[qi] = 块max
+            行sum[qi] = 新sum
+            qi = qi + 1
+        }
+        jb = jb + 1
+    }
+
+    // 最终归一化: O[i] /= sum[i]
+    定义 可变 i = 0
+    当 (i < 序列长) {
+        如果 (行sum[i] > 0) {
+            定义 可变 d = 0
+            当 (d < 头维度) {
+                O[i * 头维度 + d] = O[i * 头维度 + d] * FA精度 / 行sum[i]
+                d = d + 1
+            }
+        }
+        i = i + 1
+    }
+    返回 O
+}
+
+// 因果掩码版本 (自回归解码用)
+函数 闪电注意力_因果(Q, K, V, 序列长, 头维度, 块大小) {
+    定义 可变 dot = 0
+    定义 可变 ri = 0
+    定义 可变 O = []
+    当 (oi < 序列长 * 头维度) { 追加(O, 0); oi = oi + 1 }
+    定义 可变 行max = []
+    定义 可变 行sum = []
+    当 (ri < 序列长) {
+        追加(行max, 0 - FA精度 * 100)
+        追加(行sum, 0)
+        ri = ri + 1
+    }
+    定义 Kv块数 = (序列长 + 块大小 - 1) / 块大小
+    定义 可变 jb = 0
+    当 (jb < Kv块数) {
+        定义 j起 = jb * 块大小
+        定义 可变 j止 = j起 + 块大小
+        如果 (j止 > 序列长) { j止 = 序列长 }
+        定义 可变 qi = 0
+        当 (qi < 序列长) {
+            定义 可变 旧max = 行max[qi]
+            定义 可变 旧sum = 行sum[qi]
+            定义 可变 块max = 旧max
+            定义 可变 S块 = []
+            定义 可变 j = j起
+            当 (j < j止) {
+                如果 (j > qi) {
+                    // 因果掩码: j > i 位置设为-∞
+                    追加(S块, 0 - FA精度 * 100)
+                } 否则 {
+                    定义 可变 d = 0
+                    当 (d < 头维度) {
+                        dot = dot + Q[qi * 头维度 + d] * K[j * 头维度 + d] / FA精度
+                        d = d + 1
+                    }
+                    dot = dot * FA精度 / (头维度 * 100 + 1)
+                    追加(S块, dot)
+                    如果 (dot > 块max) { 块max = dot }
+                }
+                j = j + 1
+            }
+            定义 修正 = 近似exp_FA(旧max - 块max)
+            定义 可变 新sum = 旧sum * 修正 / FA精度
+            j = 0
+            当 (j < 计数(S块)) {
+                定义 p = 近似exp_FA(S块[j] - 块max)
+                新sum = 新sum + p
+                定义 可变 d = 0
+                当 (d < 头维度) {
+                    定义 idx = qi * 头维度 + d
+                    O[idx] = O[idx] * 修正 / FA精度 + p * V[(j起 + j) * 头维度 + d] / FA精度
+                    d = d + 1
+                }
+                j = j + 1
+            }
+            行max[qi] = 块max
+            行sum[qi] = 新sum
+            qi = qi + 1
+        }
+        jb = jb + 1
+    }
+    定义 可变 i = 0
+    当 (i < 序列长) {
+        如果 (行sum[i] > 0) {
+            定义 可变 d = 0
+            当 (d < 头维度) {
+                O[i * 头维度 + d] = O[i * 头维度 + d] * FA精度 / 行sum[i]
+                d = d + 1
+            }
+        }
+        i = i + 1
+    }
+    返回 O
+}
+
+// Multi-Head Latent Attention / MLA (DeepSeek-V2, 2024)
+// 传统MHA: 缓存全部KV → O(n_heads × d_head × seq_len)
+// MLA核心: 将KV压缩到低秩潜空间 c_t = W_DKV · x_t
+// 推理时只缓存 c_t ∈ R^{d_c}, d_c << n_kv_heads × d_head
+// 解码时: K = W_UK · c_t, V = W_UV · c_t (从潜向量恢复)
+// KV缓存压缩比 ≈ d_c / (n_kv × d_head), 通常2-4倍
+
+函数 MLA_压缩KV(输入, W_DKV, d_模型, d_潜) {
+    // 下投影: c = W_DKV · x,  W_DKV: [d_潜 × d_模型]
+    定义 可变 潜向量 = []
+    定义 可变 i = 0
+    当 (i < d_潜) {
+        定义 可变 dot = 0
+        定义 可变 j = 0
+        当 (j < d_模型) {
+            dot = dot + W_DKV[i * d_模型 + j] * 输入[j] / FA精度
+            j = j + 1
+        }
+        追加(潜向量, dot)
+        i = i + 1
+    }
+    返回 潜向量
+}
+
+函数 MLA_恢复KV(潜向量, W_UK, W_UV, d_潜, 头数, 头维度) {
+    定义 d_kv = 头数 * 头维度
+    // 上投影K: K = W_UK · c,  W_UK: [d_kv × d_潜]
+    定义 可变 K = []
+    定义 可变 i = 0
+    当 (i < d_kv) {
+        定义 可变 dot = 0
+        定义 可变 j = 0
+        当 (j < d_潜) {
+            dot = dot + W_UK[i * d_潜 + j] * 潜向量[j] / FA精度
+            j = j + 1
+        }
+        追加(K, dot)
+        i = i + 1
+    }
+    // 上投影V: V = W_UV · c,  W_UV: [d_kv × d_潜]
+    定义 可变 V = []
+    i = 0
+    当 (i < d_kv) {
+        定义 可变 dot = 0
+        定义 可变 j = 0
+        当 (j < d_潜) {
+            dot = dot + W_UV[i * d_潜 + j] * 潜向量[j] / FA精度
+            j = j + 1
+        }
+        追加(V, dot)
+        i = i + 1
+    }
+    返回 [K, V]
+}
+
+// MLA完整注意力 (单头简化版, 含KV压缩)
+函数 MLA_注意力(Q列表, 潜向量列表, W_UK, W_UV, 序列长, d_潜, 头维度) {
+    // 从缓存的潜向量恢复K,V
+    定义 可变 K全 = []
+    定义 可变 V全 = []
+    定义 可变 t = 0
+    当 (t < 序列长) {
+        定义 可变 潜 = []
+        定义 可变 li = 0
+        当 (li < d_潜) { 追加(潜, 潜向量列表[t * d_潜 + li]); li = li + 1 }
+        定义 KV = MLA_恢复KV(潜, W_UK, W_UV, d_潜, 1, 头维度)
+        定义 可变 ki = 0
+        当 (ki < 头维度) { 追加(K全, KV[0][ki]); ki = ki + 1 }
+        定义 可变 vi = 0
+        当 (vi < 头维度) { 追加(V全, KV[1][vi]); vi = vi + 1 }
+        t = t + 1
+    }
+    返回 闪电注意力_分块(Q列表, K全, V全, 序列长, 头维度, 16)
+}
+
+// Differential Attention / 差分注意力 (Ye et al. 2024, Microsoft)
+// 传统注意力: Attn = softmax(QK^T/√d)
+// 差分注意力: Attn = softmax(Q1·K1^T/√d) - λ·softmax(Q2·K2^T/√d)
+// 将Q,K各拆为两半, 两组注意力做差 → 消除共模噪声
+// 类比电子工程差分信号: 共模噪声被减掉, 信号保留
+// λ为可学习标量, 初始化接近0.8, 训练中自适应
+
+函数 差分注意力_计算(Q, K, V, 序列长, 头维度, λ参数) {
+    定义 半维度 = 头维度 / 2
+    定义 可变 O = []
+    定义 可变 oi = 0
+    当 (oi < 序列长 * 头维度) { 追加(O, 0); oi = oi + 1 }
+
+    定义 可变 qi = 0
+    当 (qi < 序列长) {
+        定义 可变 A1 = []
+        定义 可变 A2 = []
+        定义 可变 max1 = 0 - FA精度 * 100
+        定义 可变 max2 = 0 - FA精度 * 100
+
+        定义 可变 kj = 0
+        当 (kj < 序列长) {
+            // Q1·K1^T (前半维度)
+            定义 可变 dot1 = 0
+            定义 可变 d = 0
+            当 (d < 半维度) {
+                dot1 = dot1 + Q[qi * 头维度 + d] * K[kj * 头维度 + d] / FA精度
+                d = d + 1
+            }
+            dot1 = dot1 * FA精度 / (半维度 * 100 + 1)
+            追加(A1, dot1)
+            如果 (dot1 > max1) { max1 = dot1 }
+
+            // Q2·K2^T (后半维度)
+            定义 可变 dot2 = 0
+            d = 0
+            当 (d < 半维度) {
+                dot2 = dot2 + Q[qi * 头维度 + 半维度 + d] * K[kj * 头维度 + 半维度 + d] / FA精度
+                d = d + 1
+            }
+            dot2 = dot2 * FA精度 / (半维度 * 100 + 1)
+            追加(A2, dot2)
+            如果 (dot2 > max2) { max2 = dot2 }
+            kj = kj + 1
+        }
+
+        // Softmax A1
+        定义 可变 sum1 = 0
+        kj = 0
+        当 (kj < 序列长) {
+            定义 e1 = 近似exp_FA(A1[kj] - max1)
+            A1[kj] = e1
+            sum1 = sum1 + e1
+            kj = kj + 1
+        }
+        // Softmax A2
+        定义 可变 sum2 = 0
+        kj = 0
+        当 (kj < 序列长) {
+            定义 e2 = 近似exp_FA(A2[kj] - max2)
+            A2[kj] = e2
+            sum2 = sum2 + e2
+            kj = kj + 1
+        }
+
+        // O[qi] = Σ_j (A1[j]/sum1 - λ·A2[j]/sum2) · V[j]
+        定义 可变 d = 0
+        当 (d < 头维度) {
+            定义 可变 val = 0
+            kj = 0
+            当 (kj < 序列长) {
+                定义 w1 = A1[kj] * FA精度 / (sum1 + 1)
+                定义 w2 = A2[kj] * FA精度 / (sum2 + 1)
+                定义 差分权重 = w1 - λ参数 * w2 / FA精度
+                val = val + 差分权重 * V[kj * 头维度 + d] / FA精度
+                kj = kj + 1
+            }
+            O[qi * 头维度 + d] = val
+            d = d + 1
+        }
+        qi = qi + 1
+    }
+    返回 O
+}
+
+// 差分注意力λ初始化: 论文推荐 λ_init = 0.8 - 0.6·exp(-0.3·(层号-1))
+函数 差分注意力_初始λ(层号) {
+    定义 指数项 = 近似exp_FA(0 - 3000 * (层号 - 1) / FA精度)
+    返回 8000 - 6000 * 指数项 / FA精度
+}

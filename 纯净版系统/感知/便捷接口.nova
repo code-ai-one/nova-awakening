@@ -1,0 +1,134 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档事件.nova")
+
+// §4 便捷接口
+
+
+函数 事件Dispatch_click(target, x, y) {
+    定义 evt = Mouse事件_创建("click", x, y, 0, 0)
+    evt.基类.是可信的 = 真
+    定义 et = 堆_分配(事件Target)
+    et.节点 = target; et.监听器Map = 0
+    如果 (target != 0) { et.监听器Map = target.事件监听器数据 }
+    事件Dispatch_分发(et, evt.基类)
+    堆_释放(et)
+}
+
+函数 事件Dispatch_keydown(target, key, code, keyCode, 修饰键) {
+    定义 evt = Keyboard事件_创建("keydown", key, code, keyCode, 修饰键)
+    evt.基类.是可信的 = 真
+    定义 et = 堆_分配(事件Target)
+    et.节点 = target; et.监听器Map = 0
+    如果 (target != 0) { et.监听器Map = target.事件监听器数据 }
+    定义 允许默认 = 事件Dispatch_分发(et, evt.基类)
+    堆_释放(et)
+    如果 (允许默认 && keyCode == 9 && target != 0) {
+        定义 起点 = 当前焦点元素
+        如果 (起点 == 0) { 起点 = target }
+        Focus_Tab处理(起点, (修饰键 & MOD_SHIFT) != 0)
+    }
+    返回 允许默认
+}
+
+函数 事件Dispatch_keyup(target, key, code, keyCode, 修饰键) {
+    定义 evt = Keyboard事件_创建("keyup", key, code, keyCode, 修饰键)
+    evt.基类.是可信的 = 真
+    定义 et = 堆_分配(事件Target)
+    et.节点 = target; et.监听器Map = 0
+    如果 (target != 0) { et.监听器Map = target.事件监听器数据 }
+    定义 _r = 事件Dispatch_分发(et, evt.基类)
+    堆_释放(et)
+    返回 _r
+}
+
+函数 事件Dispatch_scroll(target, deltaX, deltaY) {
+    定义 evt = 事件_创建2("scroll", 假, 假)    // scroll不冒泡
+    evt.是可信的 = 真
+    定义 et = 堆_分配(事件Target)
+    et.节点 = target; et.监听器Map = 0
+    如果 (target != 0) { et.监听器Map = target.事件监听器数据 }
+    事件Dispatch_分发(et, evt)
+    堆_释放(et)
+}
+
+函数 事件Dispatch_自定义事件(target, 类型, detail) {
+    定义 evt = 堆_分配(Custom事件)
+    evt.基类 = 事件_创建2(类型, 真, 真)
+    evt.detail = detail
+    定义 et = 堆_分配(事件Target)
+    et.节点 = target; et.监听器Map = 0
+    如果 (target != 0) { et.监听器Map = target.事件监听器数据 }
+    事件Dispatch_分发(et, evt.基类)
+    堆_释放(et)
+    堆_释放(evt)
+}
+
+// §5 事件节流/防抖(高频事件优化)
+
+结构 事件Throttle {
+    最小间隔,    // u64 毫秒
+    上次触发,
+    待处理事件,    // u64 事件*
+    事件类型ID,
+}
+
+定义 可变 scroll节流 = 0
+定义 可变 mousemove节流 = 0
+
+函数 事件Throttle_创建(间隔ms, 类型ID) {
+    定义 t = 堆_分配(事件Throttle)
+    t.最小间隔 = 间隔ms
+    t.上次触发 = 0
+    t.待处理事件 = 0
+    t.事件类型ID = 类型ID
+    返回 t
+}
+
+函数 事件Throttle_应该触发(throttle, 当前时间) {
+    如果 (throttle == 0) { 返回 真 }
+    如果 (当前时间 - throttle.上次触发 >= throttle.最小间隔) {
+        throttle.上次触发 = 当前时间
+        返回 真
+    }
+    返回 假
+}
+
+函数 事件Throttle_初始化() {
+    scroll节流 = 事件Throttle_创建(16, EVT_SCROLL)       // ~60fps
+    mousemove节流 = 事件Throttle_创建(8, EVT_MOUSEMOVE)  // ~120fps
+}
+
+// §6 命中测试 — 确定事件目标
+
+函数 HitTest_在点(document, x, y) {
+    // 从渲染树的根开始, 找到(x,y)处最顶层的可见元素
+    // 遍历顺序: z-index从高到低, 后绘制的优先
+    如果 (document == 0) { 返回 0 }
+
+    定义 可变 结果 = 0
+    定义 可变 最高z = -999999
+
+    // 递归遍历所有布局对象
+    HitTest_递归(document, x, y, 结果, 最高z)
+    返回 结果
+}
+
+函数 HitTest_递归(节点, x, y, 结果, 最高z) {
+    如果 (节点 == 0) { 返回 }
+    // 检查此节点的布局对象是否包含(x,y)
+    如果 (节点.布局对象 != 0) {
+        定义 lo = 节点.布局对象
+        如果 (x >= lo.x && x < lo.x + lo.宽度 &&
+            y >= lo.y && y < lo.y + lo.高度) {
+            // 在此元素的边界内
+            结果 = 节点
+        }
+    }
+    // 递归子节点
+    定义 可变 child = 节点.第一子节点
+    当 (child != 0) {
+        HitTest_递归(child, x, y, 结果, 最高z)
+        child = child.后一兄弟
+    }
+}

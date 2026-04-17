@@ -1,0 +1,487 @@
+// §4 CSP执行检查(核心)
+
+// 检查URL是否被CSP允许
+// 返回: 真=允许, 假=阻止
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/底层内存操.nova")
+导入("../中枢/字符串替换.nova")
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 CSP_检查(state, 指令类型, url, 文档URL) {
+    如果 (state == 0 || state.策略数 == 0) { 返回 真 }    // 无CSP=全部允许
+
+    // 所有策略都必须通过(多个CSP取交集)
+    定义 可变 policy = state.策略头
+    当 (policy != 0) {
+        如果 (!CSP_策略检查(policy, 指令类型, url, 文档URL)) {
+            // 违规!
+            如果 (policy.模式 == CSP_ENFORCE) {
+                CSP_记录违规(state, 指令类型, url, 文档URL)
+                返回 假    // 阻止
+            } 否则 {
+                // Report-Only: 报告但不阻止
+                CSP_记录违规(state, 指令类型, url, 文档URL)
+            }
+        }
+        policy = policy.下一个
+    }
+    返回 真
+}
+
+函数 CSP_策略检查(policy, 指令类型, url, 文档URL) {
+    如果 (policy == 0) { 返回 真 }
+    // 查找对应指令
+    定义 dir = policy.指令[指令类型]
+    如果 (dir == 0) {
+        // 回退到default-src
+        dir = policy.指令[CSP_DEFAULT_SRC]
+        如果 (dir == 0) { 返回 真 }    // 无指令=允许
+    }
+    // 检查源表达式
+    返回 CSP_源匹配(dir.源, url, 文档URL)
+}
+
+函数 CSP_源匹配(src, url, 文档URL) {
+    如果 (src == 0) { 返回 真 }
+    // 'none' → 禁止所有
+    如果 (src.标志 & SRC_NONE) { 返回 假 }
+    // '*' → 允许所有(除了data:/blob:)
+    如果 (src.标志 & SRC_WILDCARD) { 返回 真 }
+    // 'self' → 同源检查
+    如果 (src.标志 & SRC_SELF) {
+        如果 (CSP_同源(url, 文档URL)) { 返回 真 }
+    }
+    // https: → 任何HTTPS
+    如果 ((src.标志 & SRC_HTTPS) && URL_是HTTPS(url)) { 返回 真 }
+    // data:
+    如果 ((src.标志 & SRC_DATA) && URL_是Data(url)) { 返回 真 }
+    // blob:
+    如果 ((src.标志 & SRC_BLOB) && URL_是Blob(url)) { 返回 真 }
+    // 主机匹配
+    定义 可变 i = 0
+    当 (i < src.主机数) {
+        如果 (CSP_主机匹配(src.主机[i], url)) { 返回 真 }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 CSP_同源(url_a, url_b) {
+    // 同源: scheme + host + port 完全相同
+    如果 (url_a == 0 || url_b == 0) { 返回 假 }
+    // 比较CSP源表达式与请求URL的主机名部分
+    返回 字符串_相等(url_a, url_b)
+}
+
+函数 CSP_主机匹配(模式, url) {
+    如果 (模式 == 0 || url == 0) { 返回 假 }
+    定义 模式长 = 字节长度(模式)
+    // 通配符: *.example.com 匹配 sub.example.com
+    如果 (模式长 >= 2 && 字节取(模式, 0) == 0x2A && 字节取(模式, 1) == 0x2E) {
+        // 提取url的主机名, 检查是否以模式的域结尾
+        // *.example.com 匹配 foo.example.com 但不匹配 example.com
+        返回 字符串_结尾匹配(url, 模式 + 1, 模式长 - 1)
+    }
+    // 精确匹配
+    返回 字符串_包含(url, 模式)
+}
+
+// §5 内联脚本/样式检查(nonce/hash)
+
+函数 CSP_检查内联脚本(state, nonce, 内容哈希) {
+    如果 (state == 0 || state.策略数 == 0) { 返回 真 }
+    定义 可变 policy = state.策略头
+    当 (policy != 0) {
+        定义 dir = policy.指令[CSP_SCRIPT_SRC]
+        如果 (dir == 0) { dir = policy.指令[CSP_DEFAULT_SRC] }
+        如果 (dir != 0 && dir.源 != 0) {
+            定义 src = dir.源
+            // 'unsafe-inline' → 允许所有内联
+            如果 (src.标志 & SRC_UNSAFE_INLINE) { /* 通过 */ }
+            否则 {
+                // 检查nonce
+                定义 可变 nonce_ok = 假
+                如果 (nonce != 0) {
+                    定义 可变 i = 0
+                    当 (i < src.nonce数) {
+                        如果 (字符串_相等(nonce, src.nonce[i])) { nonce_ok = 真; 跳出 }
+                        i = i + 1
+                    }
+                }
+                // 检查hash
+                定义 可变 hash_ok = 假
+                如果 (内容哈希 != 0) {
+                    定义 可变 i = 0
+                    当 (i < src.hash数) {
+                        如果 (字符串_相等(内容哈希, src.hash[i])) { hash_ok = 真; 跳出 }
+                        i = i + 1
+                    }
+                }
+                如果 (!nonce_ok && !hash_ok) {
+                    如果 (policy.模式 == CSP_ENFORCE) { 返回 假 }
+                }
+            }
+        }
+        policy = policy.下一个
+    }
+    返回 真
+}
+
+函数 CSP_检查eval(state) {
+    如果 (state == 0 || state.策略数 == 0) { 返回 真 }
+    定义 可变 policy = state.策略头
+    当 (policy != 0) {
+        定义 dir = policy.指令[CSP_SCRIPT_SRC]
+        如果 (dir == 0) { dir = policy.指令[CSP_DEFAULT_SRC] }
+        如果 (dir != 0 && dir.源 != 0) {
+            如果 (!(dir.源.标志 & SRC_UNSAFE_EVAL)) {
+                如果 (policy.模式 == CSP_ENFORCE) { 返回 假 }
+            }
+        }
+        policy = policy.下一个
+    }
+    返回 真
+}
+
+// §6 CSP常量
+
+定义 CSP_ENFORCE = 0
+定义 CSP_REPORT_ONLY = 1
+
+定义 CSP_DEFAULT_SRC = 0
+定义 CSP_SCRIPT_SRC = 1
+定义 CSP_STYLE_SRC = 2
+定义 CSP_IMG_SRC = 3
+定义 CSP_FONT_SRC = 4
+定义 CSP_CONNECT_SRC = 5
+定义 CSP_MEDIA_SRC = 6
+定义 CSP_OBJECT_SRC = 7
+定义 CSP_FRAME_SRC = 8
+定义 CSP_CHILD_SRC = 9
+定义 CSP_WORKER_SRC = 10
+定义 CSP_MANIFEST_SRC = 11
+定义 CSP_BASE_URI = 12
+定义 CSP_FORM_ACTION = 13
+定义 CSP_FRAME_ANCESTORS = 14
+定义 CSP_NAVIGATE_TO = 15
+定义 CSP_指令数 = 16
+
+定义 SRC_NONE = 0x0001
+定义 SRC_WILDCARD = 0x0002
+定义 SRC_SELF = 0x0004
+定义 SRC_HTTPS = 0x0008
+定义 SRC_DATA = 0x0010
+定义 SRC_BLOB = 0x0020
+定义 SRC_UNSAFE_INLINE = 0x0040
+定义 SRC_UNSAFE_EVAL = 0x0080
+定义 SRC_STRICT_DYNAMIC = 0x0100
+定义 SRC_UNSAFE_HASHES = 0x0200
+定义 SRC_WASM_UNSAFE_EVAL = 0x0400
+
+函数 CSP_指令名(类型) {
+    如果 (类型 == CSP_DEFAULT_SRC) { 返回 "default-src" }
+    如果 (类型 == CSP_SCRIPT_SRC) { 返回 "script-src" }
+    如果 (类型 == CSP_STYLE_SRC) { 返回 "style-src" }
+    如果 (类型 == CSP_IMG_SRC) { 返回 "img-src" }
+    如果 (类型 == CSP_FONT_SRC) { 返回 "font-src" }
+    如果 (类型 == CSP_CONNECT_SRC) { 返回 "connect-src" }
+    如果 (类型 == CSP_MEDIA_SRC) { 返回 "media-src" }
+    如果 (类型 == CSP_OBJECT_SRC) { 返回 "object-src" }
+    如果 (类型 == CSP_FRAME_SRC) { 返回 "frame-src" }
+    如果 (类型 == CSP_CHILD_SRC) { 返回 "child-src" }
+    如果 (类型 == CSP_WORKER_SRC) { 返回 "worker-src" }
+    如果 (类型 == CSP_BASE_URI) { 返回 "base-uri" }
+    如果 (类型 == CSP_FORM_ACTION) { 返回 "form-action" }
+    如果 (类型 == CSP_FRAME_ANCESTORS) { 返回 "frame-ancestors" }
+    返回 "unknown"
+}
+
+// §7 CSP结构定义
+
+结构 CSP状态 {
+    策略头,
+    策略数,
+}
+
+结构 CSP策略 {
+    模式,
+    指令,
+    下一个,
+    原始头,
+}
+
+结构 CSP指令 {
+    类型,
+    源,
+}
+
+结构 CSP源表达式 {
+    标志,
+    主机,
+    主机数,
+    nonce,
+    nonce数,
+    hash,
+    hash数,
+}
+
+函数 CSP状态_创建() {
+    定义 state = CSP状态 {}
+    state.策略头 = 0
+    state.策略数 = 0
+    返回 state
+}
+
+函数 CSP策略_创建(模式) {
+    定义 policy = CSP策略 {}
+    policy.模式 = 模式
+    policy.指令 = 堆_分配(CSP_指令数 * 8)
+    定义 可变 i = 0
+    当 (i < CSP_指令数) {
+        内存_写64(policy.指令 + i * 8, 0)
+        i = i + 1
+    }
+    policy.下一个 = 0
+    policy.原始头 = 0
+    返回 policy
+}
+
+函数 CSP状态_添加策略(state, policy) {
+    如果 (state == 0 || policy == 0) { 返回 }
+    policy.下一个 = state.策略头
+    state.策略头 = policy
+    state.策略数 = state.策略数 + 1
+}
+
+// §8 CSP解析
+
+函数 CSP_解析头(头字符串, 模式) {
+    如果 (头字符串 == 0) { 返回 0 }
+    定义 policy = CSP策略_创建(模式)
+    policy.原始头 = 头字符串
+    定义 长度 = 字节长度(头字符串)
+    定义 可变 位置 = 0
+    当 (位置 < 长度) {
+        当 (位置 < 长度 && (字节取(头字符串, 位置) == 32 || 字节取(头字符串, 位置) == 59)) {
+            位置 = 位置 + 1
+        }
+        如果 (位置 >= 长度) { 跳出 }
+        定义 指令开始 = 位置
+        当 (位置 < 长度 && 字节取(头字符串, 位置) != 59) {
+            位置 = 位置 + 1
+        }
+        CSP_解析指令(policy, 头字符串 + 指令开始, 位置 - 指令开始)
+    }
+    返回 policy
+}
+
+函数 CSP_解析指令(policy, 指令文本, 长度) {
+    如果 (policy == 0 || 长度 == 0) { 返回 }
+    定义 可变 位置 = 0
+    当 (位置 < 长度 && 字节取(指令文本, 位置) == 32) { 位置 = 位置 + 1 }
+    定义 名称开始 = 位置
+    当 (位置 < 长度 && 字节取(指令文本, 位置) != 32) { 位置 = 位置 + 1 }
+    定义 名称长 = 位置 - 名称开始
+    定义 类型 = CSP_解析指令名(指令文本 + 名称开始, 名称长)
+    如果 (类型 < 0) { 返回 }
+    定义 src = CSP源表达式 {}
+    src.标志 = 0
+    src.主机 = []
+    src.主机数 = 0
+    src.nonce = []
+    src.nonce数 = 0
+    src.hash = []
+    src.hash数 = 0
+    当 (位置 < 长度) {
+        当 (位置 < 长度 && 字节取(指令文本, 位置) == 32) { 位置 = 位置 + 1 }
+        如果 (位置 >= 长度) { 跳出 }
+        定义 值开始 = 位置
+        当 (位置 < 长度 && 字节取(指令文本, 位置) != 32) { 位置 = 位置 + 1 }
+        CSP_解析源值(src, 指令文本 + 值开始, 位置 - 值开始)
+    }
+    定义 dir = CSP指令 {}
+    dir.类型 = 类型
+    dir.源 = src
+    内存_写64(policy.指令 + 类型 * 8, dir)
+}
+
+函数 CSP_解析指令名(名, 长度) {
+    如果 (字符串_等于N(名, 长度, "default-src")) { 返回 CSP_DEFAULT_SRC }
+    如果 (字符串_等于N(名, 长度, "script-src")) { 返回 CSP_SCRIPT_SRC }
+    如果 (字符串_等于N(名, 长度, "style-src")) { 返回 CSP_STYLE_SRC }
+    如果 (字符串_等于N(名, 长度, "img-src")) { 返回 CSP_IMG_SRC }
+    如果 (字符串_等于N(名, 长度, "font-src")) { 返回 CSP_FONT_SRC }
+    如果 (字符串_等于N(名, 长度, "connect-src")) { 返回 CSP_CONNECT_SRC }
+    如果 (字符串_等于N(名, 长度, "media-src")) { 返回 CSP_MEDIA_SRC }
+    如果 (字符串_等于N(名, 长度, "object-src")) { 返回 CSP_OBJECT_SRC }
+    如果 (字符串_等于N(名, 长度, "frame-src")) { 返回 CSP_FRAME_SRC }
+    如果 (字符串_等于N(名, 长度, "child-src")) { 返回 CSP_CHILD_SRC }
+    如果 (字符串_等于N(名, 长度, "worker-src")) { 返回 CSP_WORKER_SRC }
+    如果 (字符串_等于N(名, 长度, "base-uri")) { 返回 CSP_BASE_URI }
+    如果 (字符串_等于N(名, 长度, "form-action")) { 返回 CSP_FORM_ACTION }
+    如果 (字符串_等于N(名, 长度, "frame-ancestors")) { 返回 CSP_FRAME_ANCESTORS }
+    返回 -1
+}
+
+函数 CSP_解析源值(src, 值, 长度) {
+    如果 (字符串_等于N(值, 长度, "'none'")) { src.标志 = src.标志 | SRC_NONE }
+    否则 如果 (字符串_等于N(值, 长度, "*")) { src.标志 = src.标志 | SRC_WILDCARD }
+    否则 如果 (字符串_等于N(值, 长度, "'self'")) { src.标志 = src.标志 | SRC_SELF }
+    否则 如果 (字符串_等于N(值, 长度, "https:")) { src.标志 = src.标志 | SRC_HTTPS }
+    否则 如果 (字符串_等于N(值, 长度, "data:")) { src.标志 = src.标志 | SRC_DATA }
+    否则 如果 (字符串_等于N(值, 长度, "blob:")) { src.标志 = src.标志 | SRC_BLOB }
+    否则 如果 (字符串_等于N(值, 长度, "'unsafe-inline'")) { src.标志 = src.标志 | SRC_UNSAFE_INLINE }
+    否则 如果 (字符串_等于N(值, 长度, "'unsafe-eval'")) { src.标志 = src.标志 | SRC_UNSAFE_EVAL }
+    否则 如果 (字符串_等于N(值, 长度, "'strict-dynamic'")) { src.标志 = src.标志 | SRC_STRICT_DYNAMIC }
+    否则 如果 (字符串_等于N(值, 长度, "'wasm-unsafe-eval'")) { src.标志 = src.标志 | SRC_WASM_UNSAFE_EVAL }
+    否则 如果 (长度 > 8 && 字符串_等于N(值, 7, "'nonce-")) {
+        定义 nonce值 = 字符串_子串(值 + 7, 0, 长度 - 8)
+        追加(src.nonce, nonce值)
+        src.nonce数 = src.nonce数 + 1
+    }
+    否则 如果 (长度 > 8 && 字符串_等于N(值, 5, "'sha")) {
+        追加(src.hash, 字符串_子串(值, 0, 长度))
+        src.hash数 = src.hash数 + 1
+    }
+    否则 {
+        追加(src.主机, 字符串_子串(值, 0, 长度))
+        src.主机数 = src.主机数 + 1
+    }
+}
+
+// §9 违规报告
+
+定义 可变 CSP_违规记录 = []
+定义 可变 CSP_违规总数 = 0
+定义 最大违规记录 = 1000
+
+结构 CSP违规 {
+    指令类型,
+    阻止URL,
+    文档URL,
+    时间戳,
+    已报告,
+}
+
+函数 CSP_记录违规(state, 指令类型, url, 文档URL) {
+    CSP_违规总数 = CSP_违规总数 + 1
+    如果 (计数(CSP_违规记录) >= 最大违规记录) { 返回 }
+    定义 记录 = CSP违规 {}
+    记录.指令类型 = 指令类型
+    记录.阻止URL = url
+    记录.文档URL = 文档URL
+    记录.时间戳 = 0
+    记录.已报告 = 假
+    追加(CSP_违规记录, 记录)
+}
+
+函数 CSP_获取违规数() {
+    返回 CSP_违规总数
+}
+
+函数 CSP_获取最近违规(数量) {
+    定义 总 = 计数(CSP_违规记录)
+    如果 (数量 > 总) { 数量 = 总 }
+    定义 可变 结果 = []
+    定义 可变 i = 总 - 数量
+    当 (i < 总) {
+        追加(结果, CSP_违规记录[i])
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 CSP_清空违规() {
+    CSP_违规记录 = []
+    CSP_违规总数 = 0
+}
+
+// §10 CSP统计与健康检查
+
+定义 可变 CSP_检查总数 = 0
+定义 可变 CSP_阻止总数 = 0
+定义 可变 CSP_通过总数 = 0
+
+函数 CSP_统计() {
+    返回 {
+        检查总数: CSP_检查总数,
+        阻止: CSP_阻止总数,
+        通过: CSP_通过总数,
+        违规记录数: 计数(CSP_违规记录),
+        违规总数: CSP_违规总数,
+    }
+}
+
+函数 CSP_健康检查() {
+    定义 可变 问题 = []
+    如果 (CSP_阻止总数 > CSP_检查总数 / 3 && CSP_检查总数 > 100) {
+        追加(问题, "CSP阻止率过高: " + 整数转字符串(CSP_阻止总数 * 100 / CSP_检查总数) + "%")
+    }
+    如果 (CSP_违规总数 > 1000) {
+        追加(问题, "CSP违规记录过多")
+    }
+    如果 (计数(问题) == 0) { 返回 "CSP安全策略健康" }
+    返回 问题
+}
+
+函数 CSP_重置统计() {
+    CSP_检查总数 = 0
+    CSP_阻止总数 = 0
+    CSP_通过总数 = 0
+    CSP_违规记录 = []
+    CSP_违规总数 = 0
+}
+
+函数 CSP_完整统计() {
+    返回 [CSP_检查总数, CSP_阻止总数, CSP_通过总数, CSP_违规总数]
+}
+
+// §11 URL辅助
+
+函数 URL_是HTTPS(url) {
+    如果 (url == 0) { 返回 假 }
+    返回 字符串_以开头(url, "https://")
+}
+
+函数 URL_是Data(url) {
+    如果 (url == 0) { 返回 假 }
+    返回 字符串_以开头(url, "data:")
+}
+
+函数 URL_是Blob(url) {
+    如果 (url == 0) { 返回 假 }
+    返回 字符串_以开头(url, "blob:")
+}
+
+函数 URL_是HTTP(url) {
+    如果 (url == 0) { 返回 假 }
+    返回 字符串_以开头(url, "http://")
+}
+
+函数 URL_是安全上下文(url) {
+    返回 URL_是HTTPS(url) || 字符串_以开头(url, "wss://") || 字符串_包含(url, "localhost")
+}
+
+定义 可变 AI_安全策执行_带宽估计 = 0
+定义 可变 AI_安全策执行_丢包窗口 = []
+
+函数 AI_安全策执行_带宽预测(发送字节, 耗时毫秒) {
+    如果 (耗时毫秒 == 0) { 返回 AI_安全策执行_带宽估计 }
+    定义 当前 = 发送字节 * 1000 / 耗时毫秒
+    AI_安全策执行_带宽估计 = AI_安全策执行_带宽估计 * 700 / 1000 + 当前 * 300 / 1000
+    返回 AI_安全策执行_带宽估计
+}
+
+函数 AI_安全策执行_拥塞建议(丢包率) {
+    追加(AI_安全策执行_丢包窗口, 丢包率)
+    如果 (计数(AI_安全策执行_丢包窗口) > 10) { 列表_移除(AI_安全策执行_丢包窗口, 0) }
+    如果 (丢包率 > 50) { 返回 "减半窗口" }
+    如果 (丢包率 < 5) { 返回 "增大窗口" }
+    返回 "保持"
+}

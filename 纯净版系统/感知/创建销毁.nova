@@ -1,0 +1,105 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §1 创建/销毁
+
+
+函数 布局Object_创建(类型, dom节点, 样式) {
+    定义 lo = 堆_分配(布局Object)
+    lo.类型 = 类型
+    lo.标志 = 布局标志_需要布局
+    lo.DOM节点 = dom节点
+    lo.样式 = 样式
+
+    lo.父 = 0; lo.第一子 = 0; lo.最后子 = 0
+    lo.前兄 = 0; lo.后兄 = 0
+
+    lo.x = 0; lo.y = 0
+    lo.内容宽 = 0; lo.内容高 = 0
+    lo.绝对x = 0; lo.绝对y = 0
+    lo.子数量 = 0
+
+    // 设置标志
+    如果 (样式 != 0) {
+        如果 (样式.float_val != 浮动_none) {
+            lo.标志 = lo.标志 | 布局标志_是浮动
+        }
+        如果 (样式.position != Position_static) {
+            lo.标志 = lo.标志 | 布局标志_是定位
+        }
+    }
+
+    // 将布局对象关联到DOM节点
+    如果 (dom节点 != 0) {
+        dom节点.布局对象 = lo
+        dom节点.节点标志 = dom节点.节点标志 | 节点标志_有渲染对象
+    }
+
+    lo.预测宽 = 0
+    lo.预测高 = 0
+    lo.预测置信度 = 0
+    lo.布局版本 = 0
+    lo.父布局版本 = 0
+    lo.布局精度 = 2        // 默认标准精度
+    lo.布局优先级 = 128    // 默认中等优先级
+    lo.上次布局耗时 = 0
+    lo.累计布局次数 = 0
+
+    返回 lo
+}
+
+函数 布局Object_添加子(父lo, 子lo) {
+    子lo.父 = 父lo
+    子lo.前兄 = 父lo.最后子
+    子lo.后兄 = 0
+    如果 (父lo.最后子 != 0) {
+        父lo.最后子.后兄 = 子lo
+    } 否则 {
+        父lo.第一子 = 子lo
+    }
+    父lo.最后子 = 子lo
+    父lo.子数量 = 父lo.子数量 + 1
+}
+
+// §2 盒模型计算辅助
+// (对应 布局Box)
+
+函数 布局Object_边框盒宽(lo) {
+ 如果 (lo.样式 == 0) { 返回 lo.内容宽 }
+ 定义 s = lo.样式
+ 如果 (s.box_sizing == BoxSizing_border) {
+ 返回 lo.内容宽
+ }
+ 返回 lo.内容宽 + s.padding_left.值 + s.padding_right.值 + s.border_left_width + s.border_right_width
+}
+
+函数 布局Object_边框盒高(lo) {
+ 如果 (lo.样式 == 0) { 返回 lo.内容高 }
+ 定义 s = lo.样式
+ 如果 (s.box_sizing == BoxSizing_border) {
+ 返回 lo.内容高
+ }
+ 返回 lo.内容高 + s.padding_top.值 + s.padding_bottom.值 + s.border_top_width + s.border_bottom_width
+}
+
+函数 布局Object_外边距盒宽(lo) {
+ 如果 (lo.样式 == 0) { 返回 布局Object_边框盒宽(lo) }
+ 定义 s = lo.样式
+ 返回 布局Object_边框盒宽(lo) + s.margin_left.值 + s.margin_right.值
+}
+
+函数 布局Object_外边距盒高(lo) {
+ 如果 (lo.样式 == 0) { 返回 布局Object_边框盒高(lo) }
+ 定义 s = lo.样式
+ 返回 布局Object_边框盒高(lo) + s.margin_top.值 + s.margin_bottom.值
+}
+
+函数 布局Object_内边距盒宽(lo) {
+ 如果 (lo.样式 == 0) { 返回 lo.内容宽 }
+ 返回 lo.内容宽 + lo.样式.padding_left.值 + lo.样式.padding_right.值
+}
+
+函数 布局Object_内边距盒高(lo) {
+ 如果 (lo.样式 == 0) { 返回 lo.内容高 }
+ 返回 lo.内容高 + lo.样式.padding_top.值 + lo.样式.padding_bottom.值
+}

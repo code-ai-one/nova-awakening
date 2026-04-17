@@ -1,0 +1,37 @@
+kernel_root	/home/cch/视频/新觉醒/原生编译器
+stage0_root	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器
+output_root	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动
+build_root	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build
+write_scope	stage0_root|output_root
+read_only_scope	kernel_root
+kernel_root_write	forbidden
+stage0_materialization	stage0_root/**
+stage1_build_artifacts	build_root/**
+stage1_binary_target	output_root/stage1_binary
+stage2_binary_target	output_root/stage2_binary
+stage3_binary_target	output_root/stage3_binary
+stage2_stage3_cleanup_scope	output_root/stage2_binary|output_root/stage3_binary
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器/_manifest.txt	owner=stage0
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器/nova_manifest.txt	owner=stage0
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器/nova_files_tmp.txt	owner=stage0
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段0_种子编译器/.__nova_files_tmp.txt	owner=stage0
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/_manifest.stage1.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/entry_module.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_ast_index.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_symbol_index.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_import_contract_report.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_link_plan.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_codegen_request.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_codegen_units.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_symbol_merge_plan.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_abi_request.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_emission_request.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_start_stub_request.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_start_stub_template.bin	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_blob.bin	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_blob_symbols.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_module_object_index.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage_isolation_report.txt	owner=stage1_build
+artifact	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_coverage_report.txt	owner=stage1_build
+artifact_dir	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/module_objects	owner=stage1_build
+conclusion	all helper writes are confined to stage0_root/output_root; kernel_root is read-only input

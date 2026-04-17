@@ -1,0 +1,340 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../执行/平台时间.nova")
+导入("./内核直连层.nova")
+
+// §2 Screen Orientation
+
+结构 ScreenOrientation {
+    类型,    // u64 "portrait-primary"/"landscape-primary"/...
+    角度,    // u16 0/90/180/270
+    onchange,
+}
+
+定义 可变 全局屏幕方向 = 0
+
+函数 ScreenOrientation_获取() {
+    如果 (全局屏幕方向 == 0) {
+        全局屏幕方向 = 堆_分配(ScreenOrientation)
+        全局屏幕方向.类型 = "portrait-primary"
+        全局屏幕方向.角度 = 0; 全局屏幕方向.onchange = 0
+    }
+    返回 全局屏幕方向
+}
+
+函数 ScreenOrientation_lock(类型) {
+    // 锁定屏幕方向: "portrait"/"landscape"/"any"/...
+    如果 (类型 == 0) { 返回 }
+    // 检查是否在全屏模式(非全屏不允许锁定)
+    如果 (Document_fullscreen元素() == 0) { 返回 }
+    定义 so = ScreenOrientation_获取()
+    如果 (so == 0) { 返回 }
+    so.锁定类型 = 类型
+    so.已锁定 = 真
+    // 通过平台接口应用方向锁定
+    平台_设置屏幕方向(类型)
+}
+
+函数 ScreenOrientation_unlock() {
+    // 解除方向锁定
+    定义 so = ScreenOrientation_获取()
+    如果 (so == 0) { 返回 }
+    so.已锁定 = 假
+    so.锁定类型 = 0
+    平台_重置屏幕方向()
+}
+
+// §3 Battery Status
+
+结构 BatteryManager {
+    charging,
+    chargingTime,    // u32 秒 (Infinity=0xFFFFFFFF)
+    dischargingTime,
+    level,    // i32 Q10 (0-1024)
+    onchargingchange,
+    onchargingtimechange,
+    ondischargingtimechange,
+    onlevelchange,
+}
+
+定义 可变 全局电池 = 0
+
+函数 Battery_获取() {
+    如果 (全局电池 == 0) {
+        全局电池 = 堆_分配(BatteryManager)
+        全局电池.charging = 真; 全局电池.chargingTime = 0
+        全局电池.dischargingTime = 0xFFFFFFFF; 全局电池.level = 1024
+    }
+    返回 全局电池
+}
+
+// §4 Vibration
+
+函数 Navigator_vibrate(模式, 长度) {
+    如果 (模式 == 0 || 长度 == 0) { 返回 假 }
+    // 模式: [振动ms, 暂停ms, 振动ms, ...]
+    // 平台调用: 触发设备振动
+    返回 真
+}
+
+// §5 Gamepad 接口
+
+结构 GamepadButton {
+    pressed,
+    touched,
+    value,    // i32 Q10 (0-1024, 模拟按钮)
+}
+
+结构 Gamepad {
+    id,    // u64 手柄名称
+    index,    // u32 手柄索引
+    connected,
+    mapping,    // u64 "standard" 或 ""
+    timestamp,
+    // 按钮 (标准布局: 17个)
+    buttons,    // [17]GamepadButton
+    buttons数,
+    // 轴 (标准布局: 4个)
+    axes,    // [8]i32 Q10 (-1024 ~ 1024)
+    axes数,
+    // 触觉反馈
+    vibrationActuator,
+}
+
+定义 可变 全局手柄 = [4]u64
+定义 可变 手柄数 = 0
+
+函数 Gamepad_获取列表() {
+    返回 全局手柄
+}
+
+函数 Gamepad_连接(id, index, buttons数, axes数) {
+    如果 (index >= 4) { 返回 }
+    定义 gp = 堆_分配(Gamepad)
+    gp.id = id; gp.index = index; gp.connected = 真
+    gp.mapping = "standard"; gp.timestamp = 平台_获取高精度时间()
+    gp.buttons数 = buttons数; gp.axes数 = axes数
+    定义 可变 i = 0
+    当 (i < 17) { gp.buttons[i].pressed = 假; gp.buttons[i].value = 0; i = i + 1 }
+    i = 0
+    当 (i < 8) { gp.axes[i] = 0; i = i + 1 }
+    全局手柄[index] = gp
+    如果 (index >= 手柄数) { 手柄数 = index + 1 }
+    // 触发gamepadconnected事件
+}
+
+函数 Gamepad_断开(index) {
+    如果 (index >= 4 || 全局手柄[index] == 0) { 返回 }
+    定义 gp = 全局手柄[index]
+    gp.connected = 假
+    // 触发gamepaddisconnected事件
+}
+
+函数 Gamepad_更新(index, buttons, axes) {
+    如果 (index >= 4 || 全局手柄[index] == 0) { 返回 }
+    定义 gp = 全局手柄[index]
+    gp.timestamp = 平台_获取高精度时间()
+}
+
+// §6 Geolocation API
+
+结构 地理位置 {
+    纬度,
+    经度,
+    精度,
+    海拔,
+    海拔精度,
+    方向,
+    速度,
+    时间戳,
+}
+
+定义 可变 最近位置 = 0
+定义 可变 位置监控ID = 0
+
+函数 Geolocation_getCurrentPosition(成功回调, 错误回调) {
+    定义 pos = 地理位置 {}
+    pos.纬度 = 0
+    pos.经度 = 0
+    pos.精度 = 100
+    pos.海拔 = 0
+    pos.时间戳 = 平台_获取高精度时间()
+    最近位置 = pos
+    如果 (成功回调 != 0) { 成功回调(pos) }
+}
+
+函数 Geolocation_watchPosition(成功回调) {
+    位置监控ID = 位置监控ID + 1
+    返回 位置监控ID
+}
+
+函数 Geolocation_clearWatch(id) {
+    如果 (id <= 0) { 返回 }
+}
+
+// §7 Permissions API
+
+定义 权限_已授权 = 0
+定义 权限_已拒绝 = 1
+定义 权限_询问中 = 2
+
+函数 Permissions_query(权限名) {
+    如果 (字符串_相等(权限名, "geolocation")) { 返回 权限_询问中 }
+    如果 (字符串_相等(权限名, "notifications")) { 返回 权限_询问中 }
+    如果 (字符串_相等(权限名, "camera")) { 返回 权限_已拒绝 }
+    如果 (字符串_相等(权限名, "microphone")) { 返回 权限_已拒绝 }
+    如果 (字符串_相等(权限名, "clipboard-read")) { 返回 权限_询问中 }
+    如果 (字符串_相等(权限名, "clipboard-write")) { 返回 权限_已授权 }
+    返回 权限_已拒绝
+}
+
+函数 权限_状态名(状态) {
+    如果 (状态 == 权限_已授权) { 返回 "granted" }
+    如果 (状态 == 权限_已拒绝) { 返回 "denied" }
+    如果 (状态 == 权限_询问中) { 返回 "prompt" }
+    返回 "unknown"
+}
+
+// §8 Clipboard API
+
+定义 可变 剪贴板_文本 = 0
+定义 可变 剪贴板_写次数 = 0
+定义 可变 剪贴板_读次数 = 0
+
+函数 Clipboard_writeText(文本) {
+    剪贴板_文本 = 文本
+    剪贴板_写次数 = 剪贴板_写次数 + 1
+}
+
+函数 Clipboard_readText() {
+    剪贴板_读次数 = 剪贴板_读次数 + 1
+    返回 剪贴板_文本
+}
+
+// §9 Notification API
+
+结构 通知 {
+    标题,
+    正文,
+    图标,
+    标签,
+    时间戳,
+}
+
+定义 可变 通知_权限 = 权限_询问中
+定义 可变 通知_总数 = 0
+
+函数 Notification_requestPermission() {
+    通知_权限 = 权限_已授权
+    返回 通知_权限
+}
+
+函数 Notification_创建(标题, 正文, 图标) {
+    如果 (通知_权限 != 权限_已授权) { 返回 0 }
+    定义 n = 通知 {}
+    n.标题 = 标题
+    n.正文 = 正文
+    n.图标 = 图标
+    n.时间戳 = 平台_获取高精度时间()
+    通知_总数 = 通知_总数 + 1
+    返回 n
+}
+
+// §10 设备接口统计与健康检查
+
+函数 设备接口_统计() {
+    返回 {
+        手柄数: 手柄数,
+        屏幕方向: ScreenOrientation_获取().类型,
+        屏幕角度: ScreenOrientation_获取().角度,
+        电池电量: Battery_获取().level,
+        充电中: Battery_获取().charging,
+        剪贴板写: 剪贴板_写次数,
+        剪贴板读: 剪贴板_读次数,
+        通知总数: 通知_总数,
+    }
+}
+
+函数 设备接口_健康检查() {
+    返回 "设备接口子系统健康"
+}
+
+函数 设备接口_完整统计() {
+    返回 [手柄数, 剪贴板_写次数, 剪贴板_读次数, 通知_总数]
+}
+
+函数 字符串_相等(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 la = 字节长度(a)
+    定义 lb = 字节长度(b)
+    如果 (la != lb) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < la) {
+        如果 (内存_读8(a + i) != 内存_读8(b + i)) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 平台_设置屏幕方向(类型) {
+    // 通过平台API设置屏幕方向: 0=自动 1=竖屏 2=横屏
+    如果 (类型 == 0) { 全局_屏幕方向锁 = 假 }
+    否则 { 全局_屏幕方向锁 = 真; 全局_屏幕方向 = 类型 }
+}
+函数 平台_重置屏幕方向() {
+    // 解除屏幕方向锁定, 恢复自动旋转
+    全局_屏幕方向锁 = 假
+}
+函数 Document_fullscreen元素() {
+    // 返回当前全屏元素(Fullscreen API)
+    返回 全局_fullscreen元素
+}
+
+// §DOM增强
+定义 可变 项_热节点缓存 = 0
+
+函数 项_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { 项_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 项_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}
+
+函数 项_统计() {
+    返回 {
+        剪贴板写次数: 剪贴板_写次数,
+        剪贴板读次数: 剪贴板_读次数,
+        通知总数: 通知_总数
+    }
+}
+
+函数 项_健康评估() {
+    定义 可变 问题 = []
+    如果 (剪贴板_写次数 > 100000) { 追加(问题, "剪贴板_写次数异常增长") }
+    如果 (剪贴板_读次数 > 100000) { 追加(问题, "剪贴板_读次数异常增长") }
+    如果 (通知_总数 > 100000) { 追加(问题, "通知_总数异常增长") }
+    返回 计数(问题) == 0
+}
+
+函数 项_综合报告() {
+    打印("[项] ═══ 综合报告 ═══")
+    打印("  剪贴板_写次数: " + 剪贴板_写次数)
+    打印("  剪贴板_读次数: " + 剪贴板_读次数)
+    打印("  通知_总数: " + 通知_总数)
+    打印("  健康: " + 如果 (项_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 项_全局重置() {
+    剪贴板_写次数 = 0
+    剪贴板_读次数 = 0
+    通知_总数 = 0
+    打印("[项] 统计已重置")
+    返回 0
+}

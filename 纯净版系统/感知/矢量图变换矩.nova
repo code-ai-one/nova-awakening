@@ -1,0 +1,488 @@
+// §6 SVG变换矩阵
+// SVG变换: transform="translate(10,20) rotate(45) scale(2)"
+// 表示为2D仿射矩阵(Q10定点):
+//   [a c e]
+//   [b d f]
+//   [0 0 1]
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("./边界框计算.nova")
+导入("../中枢/内核打印.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/内存初始化.nova")
+
+结构 SVGTransform {
+    a,    // i32, b: i32, c: i32, d: i32, e: i32, f: i32
+}
+
+
+函数 SVGTransform_单位() {
+    定义 t = 堆_分配(SVGTransform)
+    t.a = 1024; t.b = 0; t.c = 0; t.d = 1024; t.e = 0; t.f = 0
+    返回 t
+}
+
+函数 SVGTransform_平移(tx, ty) {
+    定义 t = SVGTransform_单位()
+    t.e = tx; t.f = ty
+    返回 t
+}
+
+函数 SVGTransform_缩放(sx, sy) {
+    定义 t = SVGTransform_单位()
+    t.a = sx; t.d = sy
+    返回 t
+}
+
+函数 SVGTransform_旋转(角度_度数) {
+    // 角度→弧度, cos/sin查表(Q10)
+    定义 弧度 = 角度_度数 * 18 / 1024    // π/180 ≈ 18/1024 in Q10 rough
+    定义 cos = SVG_cos(弧度)
+    定义 sin = SVG_sin(弧度)
+    定义 t = 堆_分配(SVGTransform)
+    t.a = cos; t.b = sin; t.c = -sin; t.d = cos; t.e = 0; t.f = 0
+    返回 t
+}
+
+// 矩阵乘法: C = A × B
+函数 SVGTransform_乘(A, B) {
+    定义 t = 堆_分配(SVGTransform)
+    t.a = (A.a * B.a + A.c * B.b) / 1024
+    t.b = (A.b * B.a + A.d * B.b) / 1024
+    t.c = (A.a * B.c + A.c * B.d) / 1024
+    t.d = (A.b * B.c + A.d * B.d) / 1024
+    t.e = (A.a * B.e + A.c * B.f) / 1024 + A.e
+    t.f = (A.b * B.e + A.d * B.f) / 1024 + A.f
+    返回 t
+}
+
+// 变换一个点
+函数 SVGTransform_点(t, x, y) {
+    定义 tx = (t.a * x + t.c * y) / 1024 + t.e
+    定义 ty = (t.b * x + t.d * y) / 1024 + t.f
+    返回 (tx, ty)
+}
+
+// 解析transform属性
+函数 SVGTransform_解析(字符串) {
+    如果 (字符串 == 0) { 返回 SVGTransform_单位() }
+    定义 可变 结果 = SVGTransform_单位()
+    // 解析: translate(x,y) rotate(angle) scale(sx,sy) matrix(a,b,c,d,e,f)
+    // 按顺序乘: 结果 = 结果 × 每个变换
+    定义 长度 = 字节长度(字符串)
+    定义 可变 i = 0
+    当 (i < 长度) {
+        // 跳过空白
+        当 (i < 长度 && (字节取(字符串, i) == 32 || 字节取(字符串, i) == 44)) { i = i + 1 }
+        如果 (i >= 长度) { 跳出 }
+
+        如果 (字符串_区间匹配(字符串, i, "translate")) {
+            i = i + 10    // "translate("
+            定义 tx = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 ty = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            i = i + 1    // ')'
+            结果 = SVGTransform_乘(结果, SVGTransform_平移(tx, ty))
+        }
+        否则 如果 (字符串_区间匹配(字符串, i, "rotate")) {
+            i = i + 7    // "rotate("
+            定义 角度 = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            i = i + 1
+            结果 = SVGTransform_乘(结果, SVGTransform_旋转(角度))
+        }
+        否则 如果 (字符串_区间匹配(字符串, i, "scale")) {
+            i = i + 6    // "scale("
+            定义 sx = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 sy = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            如果 (sy == 0) { sy = sx }
+            i = i + 1
+            结果 = SVGTransform_乘(结果, SVGTransform_缩放(sx, sy))
+        }
+        否则 如果 (字符串_区间匹配(字符串, i, "skewX")) {
+            i = i + 6; 定义 角 = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            i = i + 1; 结果 = SVGTransform_乘(结果, SVGTransform_斜切X(角))
+        }
+        否则 如果 (字符串_区间匹配(字符串, i, "skewY")) {
+            i = i + 6; 定义 角 = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            i = i + 1; 结果 = SVGTransform_乘(结果, SVGTransform_斜切Y(角))
+        }
+        否则 如果 (字符串_区间匹配(字符串, i, "matrix")) {
+            i = i + 7  // "matrix("
+            定义 ma = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 mb = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 mc = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 md = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 me = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            定义 mf = SVG_读数字_从(字符串, i); i = SVG_跳过数字(字符串, i)
+            i = i + 1
+            定义 m = 堆_分配(SVGTransform)
+            m.a = ma; m.b = mb; m.c = mc; m.d = md; m.e = me; m.f = mf
+            结果 = SVGTransform_乘(结果, m)
+        }
+        否则 { i = i + 1 }
+    }
+    返回 结果
+}
+
+// §2 NSTM理论 — Nova矢量变换矩阵统一架构
+// NSTM核心公式:
+//   定点乘法: (a*b)/Q = (a*b) >> 10
+//   行列式: det(M) = a*d - b*c
+//   逆矩阵: M⁻¹ = (1/det) * adj(M)
+//   插值: T(α) = (1-α)*T₀ + α*T₁
+
+定义 Q10 = 1024        // Q10定点基数
+定义 Q10_半 = 512    // 0.5 in Q10
+
+// 全局统计
+定义 可变 NSTM_变换计数 = 0
+定义 可变 NSTM_点变换计数 = 0
+定义 可变 NSTM_矩阵乘法计数 = 0
+定义 可变 NSTM_求逆计数 = 0
+定义 可变 NSTM_插值计数 = 0
+定义 可变 NSTM_AI检测计数 = 0
+
+// §3 斜切变换
+
+函数 SVGTransform_斜切X(角度_度数) {
+    定义 tan = SVG_tan(角度_度数 * 18 / 1024)
+    定义 t = SVGTransform_单位()
+    t.c = tan  // skewX: c = tan(θ)
+    NSTM_变换计数 = NSTM_变换计数 + 1
+    返回 t
+}
+
+函数 SVGTransform_斜切Y(角度_度数) {
+    定义 tan = SVG_tan(角度_度数 * 18 / 1024)
+    定义 t = SVGTransform_单位()
+    t.b = tan  // skewY: b = tan(θ)
+    NSTM_变换计数 = NSTM_变换计数 + 1
+    返回 t
+}
+
+// §4 矩阵逆变换
+// NSTM逆矩阵公式: M⁻¹ = (1/det) * [d, -c, -b, a, c*f-d*e, b*e-a*f]
+
+函数 SVGTransform_行列式(t) {
+    // det = a*d - b*c (定点乘法)
+    返回 (t.a * t.d - t.b * t.c) / Q10
+}
+
+函数 SVGTransform_是可逆(t) {
+    返回 SVGTransform_行列式(t) != 0
+}
+
+函数 SVGTransform_逆(t) {
+    NSTM_求逆计数 = NSTM_求逆计数 + 1
+    定义 det = SVGTransform_行列式(t)
+    如果 (det == 0) { 返回 SVGTransform_单位() }  // 不可逆
+    定义 inv = 堆_分配(SVGTransform)
+    // adj(M) / det, 定点除法
+    inv.a = (t.d * Q10) / det
+    inv.b = (-t.b * Q10) / det
+    inv.c = (-t.c * Q10) / det
+    inv.d = (t.a * Q10) / det
+    inv.e = ((t.c * t.f - t.d * t.e) / Q10 * Q10) / det
+    inv.f = ((t.b * t.e - t.a * t.f) / Q10 * Q10) / det
+    返回 inv
+}
+
+// 反向变换点: 给定变换后的坐标, 求原始坐标
+函数 SVGTransform_反向点(t, x, y) {
+    定义 inv = SVGTransform_逆(t)
+    返回 SVGTransform_点(inv, x, y)
+}
+
+// §5 矩阵插值与动画
+// NSTM插值公式: T(α) = (1-α)*T₀ + α*T₁ (Q10定点线性插值)
+
+函数 SVGTransform_插值(T0, T1, alpha_q10) {
+    NSTM_插值计数 = NSTM_插值计数 + 1
+    定义 反 = Q10 - alpha_q10  // (1-α)
+    定义 r = 堆_分配(SVGTransform)
+    r.a = (反 * T0.a + alpha_q10 * T1.a) / Q10
+    r.b = (反 * T0.b + alpha_q10 * T1.b) / Q10
+    r.c = (反 * T0.c + alpha_q10 * T1.c) / Q10
+    r.d = (反 * T0.d + alpha_q10 * T1.d) / Q10
+    r.e = (反 * T0.e + alpha_q10 * T1.e) / Q10
+    r.f = (反 * T0.f + alpha_q10 * T1.f) / Q10
+    返回 r
+}
+
+// §6 AABB包围盒变换
+
+结构 AABB {
+    最小X,    // i32 Q10
+    最小Y,    // i32 Q10
+    最大X,    // i32 Q10
+    最大Y,    // i32 Q10
+}
+
+函数 AABB_创建(x1, y1, x2, y2) {
+    定义 b = 堆_分配(AABB)
+    b.最小X = x1; b.最小Y = y1; b.最大X = x2; b.最大Y = y2
+    返回 b
+}
+
+函数 AABB_变换(t, box) {
+    // 变换4个角点, 取新的包围盒
+    定义 p1 = SVGTransform_点(t, box.最小X, box.最小Y)
+    定义 p2 = SVGTransform_点(t, box.最大X, box.最小Y)
+    定义 p3 = SVGTransform_点(t, box.最小X, box.最大Y)
+    定义 p4 = SVGTransform_点(t, box.最大X, box.最大Y)
+    定义 结果 = 堆_分配(AABB)
+    结果.最小X = NSTM_min4(p1[0], p2[0], p3[0], p4[0])
+    结果.最小Y = NSTM_min4(p1[1], p2[1], p3[1], p4[1])
+    结果.最大X = NSTM_max4(p1[0], p2[0], p3[0], p4[0])
+    结果.最大Y = NSTM_max4(p1[1], p2[1], p3[1], p4[1])
+    返回 结果
+}
+
+函数 NSTM_min4(a, b, c, d) {
+    定义 可变 m = a
+    如果 (b < m) { m = b }
+    如果 (c < m) { m = c }
+    如果 (d < m) { m = d }
+    返回 m
+}
+
+函数 NSTM_max4(a, b, c, d) {
+    定义 可变 m = a
+    如果 (b > m) { m = b }
+    如果 (c > m) { m = c }
+    如果 (d > m) { m = d }
+    返回 m
+}
+
+函数 AABB_相交(a, b) {
+    返回 a.最小X <= b.最大X && a.最大X >= b.最小X &&
+           a.最小Y <= b.最大Y && a.最大Y >= b.最小Y
+}
+
+函数 AABB_合并(a, b) {
+    定义 r = 堆_分配(AABB)
+    如果 (a.最小X < b.最小X) { r.最小X = a.最小X } 否则 { r.最小X = b.最小X }
+    如果 (a.最小Y < b.最小Y) { r.最小Y = a.最小Y } 否则 { r.最小Y = b.最小Y }
+    如果 (a.最大X > b.最大X) { r.最大X = a.最大X } 否则 { r.最大X = b.最大X }
+    如果 (a.最大Y > b.最大Y) { r.最大Y = a.最大Y } 否则 { r.最大Y = b.最大Y }
+    返回 r
+}
+
+// §7 矩阵分解与分析
+// 分解仿射矩阵为: 平移 * 旋转 * 缩放
+
+函数 SVGTransform_提取平移(t) {
+    返回 (t.e, t.f)
+}
+
+函数 SVGTransform_提取缩放(t) {
+    // sx = sqrt(a² + b²), sy = sqrt(c² + d²)
+    定义 sx2 = (t.a * t.a + t.b * t.b) / Q10
+    定义 sy2 = (t.c * t.c + t.d * t.d) / Q10
+    返回 (NSTM_isqrt(sx2), NSTM_isqrt(sy2))
+}
+
+函数 NSTM_isqrt(x) {
+    // 定点平方根 - 牛顿迭代
+    如果 (x <= 0) { 返回 0 }
+    定义 可变 g = x
+    定义 可变 i = 0
+    当 (i < 16) {
+        如果 (g == 0) { 返回 0 }
+        g = (g + x / g) / 2
+        i = i + 1
+    }
+    返回 g
+}
+
+函数 SVGTransform_提取旋转角度(t) {
+    // θ = atan2(b, a), 用Q10定点近似
+    返回 NSTM_atan2_q10(t.b, t.a)
+}
+
+函数 NSTM_atan2_q10(y, x) {
+    // 简化atan2: 返回角度(度数)的Q10表示
+    如果 (x == 0 && y == 0) { 返回 0 }
+    如果 (x == 0) {
+        如果 (y > 0) { 返回 90 * Q10 } 否则 { 返回 -90 * Q10 }
+    }
+    // 简化: atan(y/x) ≈ y*57/(x + |x|*0.28) 的Q10近似
+    定义 abs_x = x
+    如果 (abs_x < 0) { abs_x = -abs_x }
+    定义 角度 = (y * 57 * Q10) / (x + (abs_x * 287) / Q10)
+    返回 角度
+}
+
+// §8 变换栈管理器
+
+定义 变换栈最大深度 = 64
+
+结构 变换栈 {
+    元素,    // SVGTransform[64]
+    栈顶,
+}
+
+函数 变换栈_创建() {
+    定义 s = 堆_分配(变换栈)
+    s.元素 = 堆_分配_数组(变换栈最大深度 * 24)  // 每SVGTransform 24字节
+    s.栈顶 = 0
+    // 压入单位矩阵
+    定义 id = SVGTransform_单位()
+    内存_拷贝(s.元素, id, 24)
+    s.栈顶 = 1
+    返回 s
+}
+
+函数 变换栈_压入(栈, t) {
+    如果 (栈.栈顶 >= 变换栈最大深度) { 返回 假 }
+    // 新栈顶 = 当前栈顶 × t
+    定义 当前 = 变换栈_获取栈顶(栈)
+    定义 新 = SVGTransform_乘(当前, t)
+    内存_拷贝(栈.元素 + 栈.栈顶 * 24, 新, 24)
+    栈.栈顶 = 栈.栈顶 + 1
+    返回 真
+}
+
+函数 变换栈_弹出(栈) {
+    如果 (栈.栈顶 <= 1) { 返回 假 }  // 不能弹出单位矩阵
+    栈.栈顶 = 栈.栈顶 - 1
+    返回 真
+}
+
+函数 变换栈_获取栈顶(栈) {
+    如果 (栈.栈顶 == 0) { 返回 SVGTransform_单位() }
+    定义 偏移 = (栈.栈顶 - 1) * 24
+    定义 t = 堆_分配(SVGTransform)
+    内存_拷贝(t, 栈.元素 + 偏移, 24)
+    返回 t
+}
+
+// §9 AI智能变换优化
+// NSTM-AI: 利用AI评估变换复杂度,预测性能瓶颈
+
+函数 NSTM_AI初始化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    定义 t = Tensor_创建(6)
+    Tensor_写(t, 0, NSTM_变换计数)
+    Tensor_写(t, 1, NSTM_点变换计数)
+    Tensor_写(t, 2, NSTM_矩阵乘法计数)
+    Tensor_写(t, 3, NSTM_求逆计数)
+    Tensor_写(t, 4, NSTM_插值计数)
+    Tensor_写(t, 5, NSTM_AI检测计数)
+    AI总线_推理(bus, "NSTM_模块注册", t)
+    Tensor_释放(t)
+}
+
+函数 NSTM_AI变换复杂度评估(t) {
+    NSTM_AI检测计数 = NSTM_AI检测计数 + 1
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+    定义 feat = Tensor_创建(6)
+    Tensor_写(feat, 0, t.a)
+    Tensor_写(feat, 1, t.b)
+    Tensor_写(feat, 2, t.c)
+    Tensor_写(feat, 3, t.d)
+    Tensor_写(feat, 4, t.e)
+    Tensor_写(feat, 5, t.f)
+    定义 复杂度 = AI总线_推理(bus, "NSTM_复杂度", feat)
+    Tensor_释放(feat)
+    返回 复杂度
+}
+
+// §10 诊断与统计
+
+函数 NSTM_获取统计() {
+    定义 s = 堆_分配_数组(48)
+    内存_写64(s + 0, NSTM_变换计数)
+    内存_写64(s + 8, NSTM_点变换计数)
+    内存_写64(s + 16, NSTM_矩阵乘法计数)
+    内存_写64(s + 24, NSTM_求逆计数)
+    内存_写64(s + 32, NSTM_插值计数)
+    内存_写64(s + 40, NSTM_AI检测计数)
+    返回 s
+}
+
+函数 NSTM_诊断打印() {
+    内核打印("[NSTM] 变换=", NSTM_变换计数, " 点变换=", NSTM_点变换计数)
+    内核打印("[NSTM] 矩阵乘=", NSTM_矩阵乘法计数, " 求逆=", NSTM_求逆计数)
+    内核打印("[NSTM] 插值=", NSTM_插值计数, " AI=", NSTM_AI检测计数)
+}
+
+函数 NSTM_初始化() {
+    内核打印("[NSTM] Nova矢量变换矩阵 v1.0 启动")
+    NSTM_AI初始化()
+    返回 真
+}
+
+// §11 Q10三角函数查表
+// NSTM三角公式: cos/sin查表, 256项覆盖0°-90°
+// cos(θ) = cos_table[θ * 256 / 90]
+
+函数 SVG_cos(弧度_q10) {
+    // 用泰勒级数近似: cos(x) ≈ 1 - x²/2 + x⁴/24
+    定义 x2 = (弧度_q10 * 弧度_q10) / Q10
+    定义 x4 = (x2 * x2) / Q10
+    返回 Q10 - x2 / 2 + x4 / 24
+}
+
+函数 SVG_sin(弧度_q10) {
+    // sin(x) ≈ x - x³/6
+    定义 x2 = (弧度_q10 * 弧度_q10) / Q10
+    定义 x3 = (x2 * 弧度_q10) / Q10
+    返回 弧度_q10 - x3 / 6
+}
+
+函数 SVG_tan(弧度_q10) {
+    定义 c = SVG_cos(弧度_q10)
+    如果 (c == 0) { 返回 0x7FFFFFFF }  // 溢出保护
+    返回 (SVG_sin(弧度_q10) * Q10) / c
+}
+
+// §12 批量点变换
+
+函数 SVGTransform_批量点(变换, 点数组, 点数, 输出数组) {
+    // 点数组: [x0,y0, x1,y1, ...]
+    NSTM_点变换计数 = NSTM_点变换计数 + 点数
+    定义 可变 i = 0
+    当 (i < 点数) {
+        定义 偏 = i * 8  // 每点2个i32=8字节
+        定义 x = 内存_读32(点数组 + 偏)
+        定义 y = 内存_读32(点数组 + 偏 + 4)
+        定义 tx = (变换.a * x + 变换.c * y) / Q10 + 变换.e
+        定义 ty = (变换.b * x + 变换.d * y) / Q10 + 变换.f
+        内存_写32(输出数组 + 偏, tx)
+        内存_写32(输出数组 + 偏 + 4, ty)
+        i = i + 1
+    }
+}
+
+// 矩阵是否为单位矩阵(无变换)
+函数 SVGTransform_是单位(t) {
+    返回 t.a == Q10 && t.d == Q10 && t.b == 0 && t.c == 0 && t.e == 0 && t.f == 0
+}
+
+// 矩阵是否仅为平移(无旋转缩放)
+函数 SVGTransform_仅平移(t) {
+    返回 t.a == Q10 && t.d == Q10 && t.b == 0 && t.c == 0
+}
+
+// 矩阵是否仅为缩放+平移(无旋转/斜切)
+函数 SVGTransform_仅缩放平移(t) {
+    返回 t.b == 0 && t.c == 0
+}
+
+// 复制矩阵
+函数 SVGTransform_复制(src) {
+    定义 dst = 堆_分配(SVGTransform)
+    dst.a = src.a; dst.b = src.b; dst.c = src.c
+    dst.d = src.d; dst.e = src.e; dst.f = src.f
+    返回 dst
+}
+
+// 矩阵相等判断
+函数 SVGTransform_相等(a, b) {
+    返回 a.a == b.a && a.b == b.b && a.c == b.c &&
+           a.d == b.d && a.e == b.e && a.f == b.f
+}

@@ -1,0 +1,155 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("./显示管理控.nova")
+导入("./软件混音器.nova")
+导入("./图处枚举.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../执行/特文模拟.nova")
+
+// §3 全局
+
+定义 可变 DRM设备列表 = []
+定义 可变 DRM_已初始化 = 假
+
+// §4 初始化
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 DRM_初始化() {
+    DRM设备列表 = []
+    内核信息("DRM: 初始化图形子系统...")
+
+    // 扫描PCI找图处(类代码0x0300=显基, 0x0302=3D)
+    定义 可变 总线 = 0
+    当 (总线 < 256) {
+        定义 可变 设备号 = 0
+        当 (设备号 < 32) {
+            定义 可变 功能号 = 0
+            当 (功能号 < 8) {
+                定义 vid_did = PCI_配置读32(总线, 设备号, 功能号, 0x00)
+                如果 (vid_did == 0xFFFFFFFF || vid_did == 0) {
+                    功能号 = 功能号 + 1
+                    继续
+                }
+                定义 类信息 = PCI_配置读32(总线, 设备号, 功能号, 0x08)
+                定义 类代码 = (类信息 >> 24) & 0xFF
+                定义 子类 = (类信息 >> 16) & 0xFF
+
+                如果 (类代码 == 0x03) {
+                    定义 vid = vid_did & 0xFFFF
+                    定义 did = (vid_did >> 16) & 0xFFFF
+                    DRM_注册图处(vid, did, 总线, 设备号, 功能号)
+                }
+                功能号 = 功能号 + 1
+            }
+            设备号 = 设备号 + 1
+        }
+        总线 = 总线 + 1
+    }
+
+    // 创建DRI设备节点
+    如果 (计数(DRM设备列表) > 0) {
+        确保目录存在("/dev/dri")
+        定义 可变 i = 0
+        当 (i < 计数(DRM设备列表)) {
+            devtmpfs_创建("/dev/dri/card" + 整数转字符串(i))
+            devtmpfs_创建("/dev/dri/renderD" + 整数转字符串(128 + i))
+            i = i + 1
+        }
+    }
+
+    DRM_已初始化 = 真
+    内核信息("DRM: 初始化完成 图处=" + 整数转字符串(计数(DRM设备列表)))
+}
+
+函数 DRM_注册图处(vid, did, 总线, 设备号, 功能号) {
+    定义 dev = DRM设备 {}
+    dev.下一个对象ID = 1
+    dev.支持原子 = 真
+    dev.支持PRIME = 真
+    dev.CRTC列表 = []
+    dev.编码器列表 = []
+    dev.连接器列表 = []
+    dev.帧缓冲列表 = []
+    dev.GEM对象列表 = []
+
+    // 识别图处厂商
+    如果 (vid == 0x8086) {
+        dev.驱动名 = "i915"
+        dev.名称 = "Intel HD/UHD Graphics"
+    } 否则 如果 (vid == 0x1002) {
+        dev.驱动名 = "amdgpu"
+        dev.名称 = "AMD Radeon"
+    } 否则 如果 (vid == 0x10DE) {
+        dev.驱动名 = "nouveau"
+        dev.名称 = "NVIDIA GeForce"
+    } 否则 如果 (vid == 0x1234) {
+        dev.驱动名 = "bochs"
+        dev.名称 = "QEMU Bochs 显基"
+    } 否则 如果 (vid == 0x1AF4) {
+        dev.驱动名 = "virtio-gpu"
+        dev.名称 = "Virtio 图处"
+    } 否则 {
+        dev.驱动名 = "generic"
+        dev.名称 = "图处 " + 整数转十六进制(vid) + ":" + 整数转十六进制(did)
+    }
+
+    // 读取VRAM大小(BAR0通常是VRAM)
+    定义 bar0 = PCI_读BAR(总线, 设备号, 功能号, 0)
+    dev.VRAM大小 = PCI_BAR大小(总线, 设备号, 功能号, 0)
+
+    内核信息("DRM: " + dev.名称 + " (" + dev.驱动名 + ")" +
+             " VRAM=" + 整数转字符串(dev.VRAM大小 / 1048576) + "MB")
+
+    // 创建默认KMS对象
+    DRM_创建默认对象(dev)
+
+    追加(DRM设备列表, dev)
+}
+
+函数 DRM_创建默认对象(dev) {
+    // CRTC(显示控制器)
+    定义 crtc = DRM_CRTC {}
+    crtc.ID = DRM_分配ID(dev)
+    crtc.已启用 = 假
+    crtc.伽马大小 = 256
+    追加(dev.CRTC列表, crtc)
+
+    // 编码器
+    定义 enc = DRM编码器 {}
+    enc.ID = DRM_分配ID(dev)
+    enc.类型 = 2    // TMDS(HDMI/DP)
+    enc.可用CRTC位图 = 1
+    追加(dev.编码器列表, enc)
+
+    // 连接器(检测显示器)
+    定义 conn = DRM连接器 {}
+    conn.ID = DRM_分配ID(dev)
+    conn.类型 = DRM_MODE_CONNECTOR_HDMIA
+    conn.状态 = DRM_MODE_CONNECTED    // 默认已连接
+    conn.编码器ID = enc.ID
+    conn.模式列表 = []
+    conn.物理宽mm = 530
+    conn.物理高mm = 300
+
+    // 添加常见分辨率
+    追加(conn.模式列表, DRM_创建模式(1920, 1080, 60, "1920x1080"))
+    追加(conn.模式列表, DRM_创建模式(2560, 1440, 60, "2560x1440"))
+    追加(conn.模式列表, DRM_创建模式(3840, 2160, 60, "3840x2160"))
+    追加(conn.模式列表, DRM_创建模式(1280, 720, 60, "1280x720"))
+    追加(conn.模式列表, DRM_创建模式(1024, 768, 60, "1024x768"))
+
+    追加(dev.连接器列表, conn)
+}
+
+函数 DRM_创建模式(宽, 高, hz, 名称) {
+    定义 m = DRM显示模式 {}
+    m.水平显示 = 宽
+    m.垂直显示 = 高
+    m.刷新率 = hz
+    m.名称 = 名称
+    m.时钟 = 宽 * 高 * hz / 1000   // 近似计算
+    m.水平总 = 宽 + 200
+    m.垂直总 = 高 + 40
+    返回 m
+}

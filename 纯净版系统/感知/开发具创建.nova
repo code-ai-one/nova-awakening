@@ -1,0 +1,121 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档观察.nova")
+导入("./域.nova")
+导入("./运行域.nova")
+导入("./文档域.nova")
+
+// 对应: content/browser/devtools/ (
+// (
+//  (
+// CDP域:
+// DOM: DOM树检查/修改/搜索/高亮
+// CSS: 样式检查/修改/计算样式/伪类
+// Page: 页面生命周期/截图/打印/导航
+// Network: 请求拦截/修改/模拟条件
+// Runtime: JS执行/对象检查/console
+// 调试ger: 断点/单步/调用栈/变量
+// Performance: 性能追踪/Timeline/内存
+// Console: 日志收集/过滤/清除
+// Emulation: 设备模拟/地理位置/传感器
+// 存储: Cookie/Local存储/IndexedDB/缓存检查
+// 通信: 长连接 序列-RPC
+// 请求: {id, method, params}
+// 响应: {id, result} / {id, error}
+// 事件: {method, params}
+// 【Nova特色】AI DevTools:
+// ① AI自动诊断性能瓶颈
+// ② AI建议CSS/DOM优化方案
+// ③ AI辅助调试(预测错误原因)
+
+// §1 CDP消息
+
+结构 CDPMessage {
+ id,    // i32 请求ID (-1=事件)
+ 方法,    // u64 "DOM.getDocument" 等
+ 参数,    // u64 序列字符串
+ // 响应
+ 结果,    // u64 序列字符串
+ 错误码,    // i32 0=成功
+ 错误消息,
+}
+
+结构 CDPSession {
+ // 长连接连接
+ 连接,
+ // 目标
+ 目标ID,
+ 目标类型,    // u8 0=page 1=worker 2=service_worker
+ // 消息队列
+ 发送队列,    // u64 CDPMessage*链表
+ 接收队列,
+ // 启用的域
+ dom启用,
+ css启用,
+ page启用,
+ network启用,
+ runtime启用,
+ debugger启用,
+ performance启用,
+ console启用,
+ // 断点
+ 断点列表,    // u64 Breakpoint*数组
+ 断点数,
+ // 暂停状态
+ 已暂停,
+ 暂停原因,    // u64 "breakpoint"/"exception"/"debugCommand"
+}
+
+// §2 CDP服务器
+
+结构 DevToolsServer {
+ 端口,    // u16 默认9222
+ 会话,    // [16]u64 CDPSession*
+ 会话数,
+ // 关联的浏览器
+ 浏览器,
+ // Console日志缓冲
+ console日志,    // u64 ConsoleMessage*链表
+ console日志数,
+}
+
+定义 可变 全局DevTools = 0
+
+函数 DevTools_创建(端口) {
+ 定义 dt = 堆_分配(DevToolsServer)
+ dt.端口 = 端口; dt.会话数 = 0; dt.浏览器 = 0
+ dt.console日志 = 0; dt.console日志数 = 0
+ 全局DevTools = dt
+ 返回 dt
+}
+
+函数 DevTools_处理消息(session, msg) {
+ 如果 (session == 0 || msg == 0) { 返回 }
+
+ // 解析method → domain.command
+ 定义 方法 = msg.方法
+ 如果 (方法 == 0) { 返回 }
+
+ // 路由到对应域处理器
+ 如果 (字符串_以开头(方法, "DOM.")) {
+ DevTools_DOM处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "CSS.")) {
+ DevTools_CSS处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Page.")) {
+ DevTools_Page处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Network.")) {
+ DevTools_Network处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Runtime.")) {
+ DevTools_Runtime处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "调试ger.")) {
+ DevTools_调试ger处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Performance.")) {
+ DevTools_Performance处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Console.")) {
+ DevTools_Console处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "Emulation.")) {
+ DevTools_Emulation处理(session, msg)
+ } 否则 如果 (字符串_以开头(方法, "存储.")) {
+ DevTools_存储处理(session, msg)
+ }
+}

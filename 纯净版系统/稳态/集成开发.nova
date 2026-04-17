@@ -1,0 +1,230 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./接收初始化.nova")
+导入("./磁控驱动辅.nova")
+导入("../中枢/高级中控设置.nova")
+导入("../引导/端口输入.nova")
+导入("./磁控驱动全局.nova")
+导入("./中断处理.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §7 IDENTIFY DEVICE (获取硬盘信息)
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 AHCI_识别设备(port) {
+    定义 缓冲 = 直传_分配(512)
+    内存填零(缓冲, 512)
+
+    // 构建IDENTIFY命令
+    定义 slot = AHCI_查找空闲槽(port)
+    如果 (slot < 0) { 返回 }
+
+    定义 cmd_header = port.命令列表 + slot * 32
+    // DW0: CFL=5(H2D FIS = 5 DWORDS), 不是写操作
+    内存写32(cmd_header, 5)
+    内存写32(cmd_header + 4, 0)  // PRDBC清零
+
+    // 设置命令表
+    定义 cmd_table = port.命令表[slot]
+    内存填零(cmd_table, 256)
+
+    // 构建H2D Register FIS (20字节 = 5 DWORDS)
+    内存写8(cmd_table + 0, FIS_TYPE_REG_H2D)
+    内存写8(cmd_table + 1, 0x80)               // C位=1(命令)
+    内存写8(cmd_table + 2, ATA_CMD_IDENTIFY)    // 命令
+    内存写8(cmd_table + 3, 0)                    // 特征
+
+    // PRDT: 1个条目, 指向512字节缓冲
+    定义 prdt = cmd_table + 0x80   // PRDT从偏移0x80开始
+    内存写32(prdt + 0, 缓冲 & 0xFFFFFFFF)         // DBA
+    内存写32(prdt + 4, (缓冲 >> 32) & 0xFFFFFFFF) // DBAU
+    内存写32(prdt + 8, 0)                           // 保留
+    内存写32(prdt + 12, 511)                         // DBC: 512-1=511字节
+
+    // 更新命令头的PRDTL
+    定义 dw0 = 内存读32(cmd_header)
+    内存写32(cmd_header, dw0 | (1 << 16))  // PRDTL=1
+
+    // 发射命令
+    MMIO写32(port.端口基址 + PORT_CI, 1 << slot)
+
+    // 等待完成
+    如果 (!AHCI_等待完成(port, slot)) {
+        内核警告("AHCI: IDENTIFY超时")
+        返回
+    }
+
+    // 解析IDENTIFY数据(512字节, 256个WORD)
+    port.设备信息 = SATA设备信息 {}
+    port.设备信息.型号 = AHCI_读ATA字符串(缓冲, 27, 46)
+    port.设备信息.序列号 = AHCI_读ATA字符串(缓冲, 10, 19)
+    port.设备信息.固件版本 = AHCI_读ATA字符串(缓冲, 23, 26)
+
+    // Word 100-103: 48位LBA扇区数
+    定义 lba_low = 内存读32(缓冲 + 100 * 2)
+    定义 lba_high = 内存读32(缓冲 + 102 * 2)
+    port.设备信息.扇区数 = lba_low | (lba_high << 32)
+
+    // Word 106: 扇区大小
+    定义 w106 = 内存读16(缓冲 + 106 * 2)
+    如果 ((w106 & 0x4000) != 0 && (w106 & 0x1000) != 0) {
+        定义 logical_per_phys = 1 << (w106 & 0xF)
+        port.设备信息.扇区大小 = logical_per_phys * 512
+    } 否则 {
+        port.设备信息.扇区大小 = 512
+    }
+
+    // Word 83: 48位LBA支持
+    定义 w83 = 内存读16(缓冲 + 83 * 2)
+    port.设备信息.支持48位LBA = ((w83 >> 10) & 1) != 0
+
+    // Word 76: NCQ支持
+    定义 w76 = 内存读16(缓冲 + 76 * 2)
+    port.设备信息.支持NCQ = ((w76 >> 8) & 1) != 0
+
+    // Word 169: TRIM支持
+    定义 w169 = 内存读16(缓冲 + 169 * 2)
+    port.设备信息.支持TRIM = (w169 & 1) != 0
+
+    // Word 217: 转速(RPM, 0=未知, 1=非旋转/SSD)
+    定义 rpm = 内存读16(缓冲 + 217 * 2)
+    port.设备信息.转速 = rpm
+
+    定义 容量MB = port.设备信息.扇区数 * port.设备信息.扇区大小 / 1048576
+    定义 类型 = "HDD"
+    如果 (rpm == 1 || rpm == 0) { 类型 = "SSD" }
+
+    内核信息("AHCI: " + 类型 + " " + port.设备信息.型号 +
+             " 容量=" + 整数转字符串(容量MB) + "MB" +
+             " 扇区=" + 整数转字符串(port.设备信息.扇区大小) + "B" +
+             " NCQ=" + (如果 (port.设备信息.支持NCQ) { "是" } 否则 { "否" }) +
+             " TRIM=" + (如果 (port.设备信息.支持TRIM) { "是" } 否则 { "否" }))
+}
+
+// §8 读写操作 — 块设备核心接口
+
+函数 AHCI_读扇区(port, LBA, 扇区数, 缓冲) {
+    如果 (!port.已连接) { 返回 错误_设备 }
+    如果 (扇区数 == 0) { 返回 0 }
+
+    定义 slot = AHCI_查找空闲槽(port)
+    如果 (slot < 0) { 返回 错误_设备忙 }
+
+    定义 cmd_header = port.命令列表 + slot * 32
+    // CFL=5, PRDTL=1, 读操作(W=0)
+    内存写32(cmd_header, 5 | (1 << 16))
+    内存写32(cmd_header + 4, 0)
+
+    // 命令表
+    定义 cmd_table = port.命令表[slot]
+    内存填零(cmd_table, 256)
+
+    // H2D Register FIS
+    内存写8(cmd_table + 0, FIS_TYPE_REG_H2D)
+    内存写8(cmd_table + 1, 0x80)                          // C=1
+    内存写8(cmd_table + 2, ATA_CMD_READ_直传_EXT)          // 命令
+    内存写8(cmd_table + 3, 0)                              // Features
+    // LBA (48位)
+    内存写8(cmd_table + 4, LBA & 0xFF)                    // LBA 7:0
+    内存写8(cmd_table + 5, (LBA >> 8) & 0xFF)             // LBA 15:8
+    内存写8(cmd_table + 6, (LBA >> 16) & 0xFF)            // LBA 23:16
+    内存写8(cmd_table + 7, 0x40)                           // Device: LBA模式
+    内存写8(cmd_table + 8, (LBA >> 24) & 0xFF)            // LBA 31:24
+    内存写8(cmd_table + 9, (LBA >> 32) & 0xFF)            // LBA 39:32
+    内存写8(cmd_table + 10, (LBA >> 40) & 0xFF)           // LBA 47:40
+    // 扇区数
+    内存写8(cmd_table + 12, 扇区数 & 0xFF)
+    内存写8(cmd_table + 13, (扇区数 >> 8) & 0xFF)
+
+    // PRDT
+    定义 prdt = cmd_table + 0x80
+    定义 字节数 = 扇区数 * port.设备信息.扇区大小
+    内存写32(prdt + 0, 缓冲 & 0xFFFFFFFF)
+    内存写32(prdt + 4, (缓冲 >> 32) & 0xFFFFFFFF)
+    内存写32(prdt + 8, 0)
+    内存写32(prdt + 12, (字节数 - 1) | 0x80000000)  // DBC + IOC(中断完成)
+
+    // 发射
+    MMIO写32(port.端口基址 + PORT_CI, 1 << slot)
+
+    如果 (!AHCI_等待完成(port, slot)) {
+        内核警告("AHCI: 读超时 LBA=" + 整数转字符串(LBA))
+        返回 错误_IO
+    }
+
+    AHCI_读扇区总数 = AHCI_读扇区总数 + 扇区数
+    返回 0
+}
+
+函数 AHCI_写扇区(port, LBA, 扇区数, 数据) {
+    如果 (!port.已连接) { 返回 错误_设备 }
+    如果 (扇区数 == 0) { 返回 0 }
+
+    定义 slot = AHCI_查找空闲槽(port)
+    如果 (slot < 0) { 返回 错误_设备忙 }
+
+    定义 cmd_header = port.命令列表 + slot * 32
+    // CFL=5, PRDTL=1, W=1(写操作)
+    内存写32(cmd_header, 5 | (1 << 16) | (1 << 6))
+    内存写32(cmd_header + 4, 0)
+
+    定义 cmd_table = port.命令表[slot]
+    内存填零(cmd_table, 256)
+
+    // H2D Register FIS
+    内存写8(cmd_table + 0, FIS_TYPE_REG_H2D)
+    内存写8(cmd_table + 1, 0x80)
+    内存写8(cmd_table + 2, ATA_CMD_WRITE_直传_EXT)
+    内存写8(cmd_table + 4, LBA & 0xFF)
+    内存写8(cmd_table + 5, (LBA >> 8) & 0xFF)
+    内存写8(cmd_table + 6, (LBA >> 16) & 0xFF)
+    内存写8(cmd_table + 7, 0x40)
+    内存写8(cmd_table + 8, (LBA >> 24) & 0xFF)
+    内存写8(cmd_table + 9, (LBA >> 32) & 0xFF)
+    内存写8(cmd_table + 10, (LBA >> 40) & 0xFF)
+    内存写8(cmd_table + 12, 扇区数 & 0xFF)
+    内存写8(cmd_table + 13, (扇区数 >> 8) & 0xFF)
+
+    // PRDT
+    定义 prdt = cmd_table + 0x80
+    定义 字节数 = 扇区数 * port.设备信息.扇区大小
+    内存写32(prdt + 0, 数据 & 0xFFFFFFFF)
+    内存写32(prdt + 4, (数据 >> 32) & 0xFFFFFFFF)
+    内存写32(prdt + 8, 0)
+    内存写32(prdt + 12, (字节数 - 1) | 0x80000000)
+
+    MMIO写32(port.端口基址 + PORT_CI, 1 << slot)
+
+    如果 (!AHCI_等待完成(port, slot)) {
+        内核警告("AHCI: 写超时 LBA=" + 整数转字符串(LBA))
+        返回 错误_IO
+    }
+
+    AHCI_写扇区总数 = AHCI_写扇区总数 + 扇区数
+    返回 0
+}
+
+函数 AHCI_刷新缓存(port) {
+    定义 slot = AHCI_查找空闲槽(port)
+    如果 (slot < 0) { 返回 }
+    定义 cmd_table = port.命令表[slot]
+    内存填零(cmd_table, 256)
+    内存写8(cmd_table + 0, FIS_TYPE_REG_H2D)
+    内存写8(cmd_table + 1, 0x80)
+    内存写8(cmd_table + 2, ATA_CMD_FLUSH_CACHE_EXT)
+    定义 cmd_header = port.命令列表 + slot * 32
+    内存写32(cmd_header, 5)
+    MMIO写32(port.端口基址 + PORT_CI, 1 << slot)
+    AHCI_等待完成(port, slot)
+}
+
+定义 可变 AI_集成开发_故障预警数 = 0
+
+函数 AI_集成开发_设备健康(错误率, 响应时间, 温度) {
+    定义 可变 分 = 1000
+    如果 (错误率 > 10) { 分 = 分 - 错误率 * 5 }
+    如果 (响应时间 > 1000) { 分 = 分 - 200 }
+    如果 (温度 > 80) { 分 = 分 - 300 }
+    如果 (分 < 300) { AI_集成开发_故障预警数 = AI_集成开发_故障预警数 + 1 }
+    返回 分
+}

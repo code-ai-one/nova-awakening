@@ -1,0 +1,503 @@
+// §8 AX Tree构建 — 从DOM树生成完整AX树
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档节点.nova")
+导入("../执行/平台时间.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("./原子驻留.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("../标准/原生字符串.nova")
+
+函数 AXTree_构建(文档根) {
+    如果 (文档根 == 0) { 返回 0 }
+    定义 cache = AXObject缓存_获取()
+    定义 根ax = AXObject缓存_获取或创建(文档根)
+    如果 (根ax != 0) { 根ax.角色 = AX_ROLE_ROOT_WEB_AREA }
+    cache.根 = 根ax
+    AXTree_构建递归(根ax, 文档根)
+    返回 根ax
+}
+
+函数 AXTree_构建递归(ax父, dom父) {
+    如果 (ax父 == 0 || dom父 == 0) { 返回 }
+    定义 可变 子 = dom父.第一子节点
+    定义 可变 前ax = 0
+    当 (子 != 0) {
+        // 跳过不可见/aria-hidden
+        如果 (!AX_应忽略(子)) {
+            定义 子ax = AXObject缓存_获取或创建(子)
+            如果 (子ax != 0) {
+                子ax.父 = ax父
+                如果 (前ax == 0) { ax父.第一子 = 子ax }
+                否则 { 前ax.后一兄弟 = 子ax }
+                ax父.子数量 = ax父.子数量 + 1
+                前ax = 子ax
+                // 递归
+                AXTree_构建递归(子ax, 子)
+            }
+        }
+        子 = 子.后一兄弟
+    }
+}
+
+函数 AX_应忽略(dom节点) {
+    如果 (dom节点 == 0) { 返回 真 }
+    // 忽略: 注释节点/处理指令
+    如果 (dom节点.节点类型 == 8) { 返回 真 }
+    // 忽略: aria-hidden="true"
+    如果 (dom节点.节点类型 == 1) {
+        定义 ah = 元素_getAttribute(dom节点, "aria-hidden")
+        如果 (ah != 0 && 字符串_相等(ah, "true")) { 返回 真 }
+        // 忽略: display:none (需要检查Computed样式)
+        // 忽略: role="none"/role="presentation"
+        定义 role = 元素_getAttribute(dom节点, "role")
+        如果 (role != 0 && (字符串_相等(role, "none") || 字符串_相等(role, "presentation"))) { 返回 真 }
+    }
+    返回 假
+}
+
+// §9 Live Region — 动态内容更新通知
+
+定义 AX_事件_LIVE_REGION_CHANGED = 1
+定义 AX_事件_FOCUS_CHANGED       = 2
+定义 AX_事件_SELECTION_CHANGED   = 3
+定义 AX_事件_VALUE_CHANGED       = 4
+定义 AX_事件_CHILDREN_CHANGED    = 5
+定义 AX_事件_TEXT_CHANGED        = 6
+定义 AX_事件_EXPANDED_CHANGED    = 7
+
+函数 AX_通知LiveRegion(ax节点, 变化文本) {
+    如果 (ax节点 == 0) { 返回 }
+    // 向上查找最近的live region祖先
+    定义 可变 当前 = ax节点
+    当 (当前 != 0) {
+        如果 (当前.live > 0) {
+            // 发送通知到屏幕阅读器
+            AX_发送事件(当前, AX_事件_LIVE_REGION_CHANGED, 变化文本)
+            返回
+        }
+        当前 = 当前.父
+    }
+}
+
+函数 AX_发送事件(ax节点, 事件类型, 数据) {
+    定义 cache = AXObject缓存_获取()
+    如果 (cache.事件数量 < 128) {
+        定义 偏移 = cache.事件队列 + cache.事件数量 * 16
+        内存_写64(偏移, ax节点)
+        内存_写32(偏移 + 8, 事件类型)
+        内存_写64(偏移 + 12, 数据)    // 注意: 12字节偏移非8字节对齐, 可接受
+        cache.事件数量 = cache.事件数量 + 1
+    }
+    // 通知平台层(如AT-SPI on Linux, UIA on Windows)
+}
+
+函数 AX_通知焦点变化(新焦点元素) {
+    定义 ax = AXObject缓存_获取或创建(新焦点元素)
+    如果 (ax != 0) {
+        AX_发送事件(ax, AX_事件_FOCUS_CHANGED, 0)
+    }
+}
+
+// NAXT理论 (Nova Accessibility eXtended Tree)
+// 创新点：「语义角色推断-属性继承链-关系图谱」三层无障碍模型，
+// 融合AI语义理解预测节点角色，增量式脏标记更新策略，
+// 以及AT-SPI/UIA双平台事件桥接。
+
+// §10 角色映射表 (Role Mapping)
+// NAXT角色推断: HTML元素→ARIA角色的确定性映射
+
+定义 AX_ROLE_ROOT_WEB_AREA = 1
+定义 AX_ROLE_DOCUMENT = 2
+定义 AX_ROLE_HEADING = 3
+定义 AX_ROLE_PARAGRAPH = 4
+定义 AX_ROLE_LINK = 5
+定义 AX_ROLE_BUTTON = 6
+定义 AX_ROLE_TEXT_FIELD = 7
+定义 AX_ROLE_IMAGE = 8
+定义 AX_ROLE_LIST = 9
+定义 AX_ROLE_LIST_ITEM = 10
+定义 AX_ROLE_TABLE = 11
+定义 AX_ROLE_ROW = 12
+定义 AX_ROLE_CELL = 13
+定义 AX_ROLE_CHECKBOX = 14
+定义 AX_ROLE_RADIO = 15
+定义 AX_ROLE_COMBOBOX = 16
+定义 AX_ROLE_SLIDER = 17
+定义 AX_ROLE_REGION = 18
+定义 AX_ROLE_NAVIGATION = 19
+定义 AX_ROLE_MAIN = 20
+定义 AX_ROLE_FORM = 21
+定义 AX_ROLE_GENERIC = 22
+定义 AX_ROLE_STATIC_TEXT = 23
+定义 AX_ROLE_TAB = 24
+定义 AX_ROLE_TABPANEL = 25
+定义 AX_ROLE_DIALOG = 26
+定义 AX_ROLE_ALERT = 27
+定义 AX_ROLE_MENU = 28
+定义 AX_ROLE_MENUITEM = 29
+定义 AX_ROLE_TREE = 30
+定义 AX_ROLE_TREEITEM = 31
+
+函数 NAXT_获取默认角色(dom节点) {
+    如果 (dom节点 == 0) { 返回 AX_ROLE_GENERIC }
+    定义 tag = dom节点.标签名
+    // 显式role属性优先
+    定义 role_attr = 元素_getAttribute(dom节点, "role")
+    如果 (role_attr != 0) {
+        如果 (字符串_相等(role_attr, "button")) { 返回 AX_ROLE_BUTTON }
+        如果 (字符串_相等(role_attr, "link")) { 返回 AX_ROLE_LINK }
+        如果 (字符串_相等(role_attr, "heading")) { 返回 AX_ROLE_HEADING }
+        如果 (字符串_相等(role_attr, "checkbox")) { 返回 AX_ROLE_CHECKBOX }
+        如果 (字符串_相等(role_attr, "radio")) { 返回 AX_ROLE_RADIO }
+        如果 (字符串_相等(role_attr, "tab")) { 返回 AX_ROLE_TAB }
+        如果 (字符串_相等(role_attr, "tabpanel")) { 返回 AX_ROLE_TABPANEL }
+        如果 (字符串_相等(role_attr, "dialog")) { 返回 AX_ROLE_DIALOG }
+        如果 (字符串_相等(role_attr, "alert")) { 返回 AX_ROLE_ALERT }
+        如果 (字符串_相等(role_attr, "navigation")) { 返回 AX_ROLE_NAVIGATION }
+        如果 (字符串_相等(role_attr, "main")) { 返回 AX_ROLE_MAIN }
+        如果 (字符串_相等(role_attr, "region")) { 返回 AX_ROLE_REGION }
+        如果 (字符串_相等(role_attr, "menu")) { 返回 AX_ROLE_MENU }
+        如果 (字符串_相等(role_attr, "menuitem")) { 返回 AX_ROLE_MENUITEM }
+        如果 (字符串_相等(role_attr, "tree")) { 返回 AX_ROLE_TREE }
+        如果 (字符串_相等(role_attr, "treeitem")) { 返回 AX_ROLE_TREEITEM }
+    }
+    // HTML元素隐式角色映射
+    如果 (字符串_相等(tag, "a")) { 返回 AX_ROLE_LINK }
+    如果 (字符串_相等(tag, "button")) { 返回 AX_ROLE_BUTTON }
+    如果 (字符串_相等(tag, "input")) { 返回 AX_ROLE_TEXT_FIELD }
+    如果 (字符串_相等(tag, "img")) { 返回 AX_ROLE_IMAGE }
+    如果 (字符串_相等(tag, "ul") || 字符串_相等(tag, "ol")) { 返回 AX_ROLE_LIST }
+    如果 (字符串_相等(tag, "li")) { 返回 AX_ROLE_LIST_ITEM }
+    如果 (字符串_相等(tag, "table")) { 返回 AX_ROLE_TABLE }
+    如果 (字符串_相等(tag, "tr")) { 返回 AX_ROLE_ROW }
+    如果 (字符串_相等(tag, "td") || 字符串_相等(tag, "th")) { 返回 AX_ROLE_CELL }
+    如果 (字符串_相等(tag, "h1") || 字符串_相等(tag, "h2") || 字符串_相等(tag, "h3") || 字符串_相等(tag, "h4") || 字符串_相等(tag, "h5") || 字符串_相等(tag, "h6")) { 返回 AX_ROLE_HEADING }
+    如果 (字符串_相等(tag, "p")) { 返回 AX_ROLE_PARAGRAPH }
+    如果 (字符串_相等(tag, "nav")) { 返回 AX_ROLE_NAVIGATION }
+    如果 (字符串_相等(tag, "main")) { 返回 AX_ROLE_MAIN }
+    如果 (字符串_相等(tag, "form")) { 返回 AX_ROLE_FORM }
+    如果 (字符串_相等(tag, "select")) { 返回 AX_ROLE_COMBOBOX }
+    如果 (dom节点.节点类型 == 3) { 返回 AX_ROLE_STATIC_TEXT }
+    返回 AX_ROLE_GENERIC
+}
+
+// §11 属性计算 (Property Computation)
+// NAXT属性继承链: accessible name计算算法
+// 优先级: aria-labelledby > aria-label > 原生属性 > 内容
+
+函数 NAXT_计算名称(ax节点, dom节点) {
+    如果 (ax节点 == 0 || dom节点 == 0) { 返回 }
+    // 1. aria-labelledby
+    定义 labelledby = 元素_getAttribute(dom节点, "aria-labelledby")
+    如果 (labelledby != 0) {
+        ax节点.名称 = NAXT_解析ID引用文本(dom节点, labelledby)
+        返回
+    }
+    // 2. aria-label
+    定义 label = 元素_getAttribute(dom节点, "aria-label")
+    如果 (label != 0 && 字符串_长度(label) > 0) {
+        ax节点.名称 = 字符串_复制(label)
+        返回
+    }
+    // 3. 原生属性 (alt, title, placeholder)
+    定义 alt = 元素_getAttribute(dom节点, "alt")
+    如果 (alt != 0) { ax节点.名称 = 字符串_复制(alt); 返回 }
+    定义 title = 元素_getAttribute(dom节点, "title")
+    如果 (title != 0) { ax节点.名称 = 字符串_复制(title); 返回 }
+    定义 ph = 元素_getAttribute(dom节点, "placeholder")
+    如果 (ph != 0) { ax节点.名称 = 字符串_复制(ph); 返回 }
+    // 4. 文本内容
+    如果 (dom节点.节点类型 == 3) {
+        ax节点.名称 = 字符串_复制(dom节点.文本内容)
+    }
+}
+
+函数 NAXT_解析ID引用文本(dom节点, id_list) {
+    // 空格分隔的ID列表，拼接对应元素的文本内容
+    定义 result = 字符串_创建(256)
+    定义 可变 pos = 0
+    定义 len = 字符串_长度(id_list)
+    当 (pos < len) {
+        // 跳过空格
+        当 (pos < len && id_list[pos] == 32) { pos = pos + 1 }
+        定义 start = pos
+        当 (pos < len && id_list[pos] != 32) { pos = pos + 1 }
+        如果 (pos > start) {
+            定义 id = 字符串_子串(id_list, start, pos - start)
+            定义 elem = 文档_getElementById(dom节点, id)
+            如果 (elem != 0) {
+                定义 text = 元素_获取文本内容(elem)
+                如果 (text != 0) {
+                    字符串_追加(result, text)
+                    字符串_追加字符(result, 32)  // 空格分隔
+                }
+            }
+        }
+    }
+    返回 result
+}
+
+函数 NAXT_计算描述(ax节点, dom节点) {
+    如果 (ax节点 == 0 || dom节点 == 0) { 返回 }
+    定义 desc = 元素_getAttribute(dom节点, "aria-describedby")
+    如果 (desc != 0) {
+        ax节点.描述 = NAXT_解析ID引用文本(dom节点, desc)
+    }
+}
+
+函数 NAXT_计算状态(ax节点, dom节点) {
+    如果 (ax节点 == 0 || dom节点 == 0) { 返回 }
+    // checked状态
+    定义 checked = 元素_getAttribute(dom节点, "aria-checked")
+    如果 (checked != 0 && 字符串_相等(checked, "true")) {
+        ax节点.已勾选 = 真
+    }
+    // expanded状态
+    定义 expanded = 元素_getAttribute(dom节点, "aria-expanded")
+    如果 (expanded != 0) {
+        ax节点.已展开 = 字符串_相等(expanded, "true")
+    }
+    // disabled状态
+    定义 disabled = 元素_getAttribute(dom节点, "aria-disabled")
+    如果 (disabled != 0 && 字符串_相等(disabled, "true")) {
+        ax节点.已禁用 = 真
+    }
+    // required状态
+    定义 required = 元素_getAttribute(dom节点, "aria-required")
+    如果 (required != 0 && 字符串_相等(required, "true")) {
+        ax节点.必填 = 真
+    }
+    // 数值状态 (slider/spinbutton)
+    定义 val_now = 元素_getAttribute(dom节点, "aria-valuenow")
+    如果 (val_now != 0) {
+        ax节点.当前值 = 字符串_转整数(val_now)
+    }
+    定义 val_min = 元素_getAttribute(dom节点, "aria-valuemin")
+    如果 (val_min != 0) { ax节点.最小值 = 字符串_转整数(val_min) }
+    定义 val_max = 元素_getAttribute(dom节点, "aria-valuemax")
+    如果 (val_max != 0) { ax节点.最大值 = 字符串_转整数(val_max) }
+}
+
+// §12 关系图谱 (Relationship Graph)
+// NAXT关系: aria-labelledby/describedby/owns/controls/flowto
+
+定义 NAXT_REL_LABELLEDBY = 0
+定义 NAXT_REL_DESCRIBEDBY = 1
+定义 NAXT_REL_OWNS = 2
+定义 NAXT_REL_CONTROLS = 3
+定义 NAXT_REL_FLOWTO = 4
+定义 NAXT_最大关系 = 256
+
+结构 NAXT_关系条目 {
+    类型: 0
+    源节点: 0
+    目标节点: 0
+}
+
+定义 可变 NAXT_关系表 = 0
+定义 可变 NAXT_关系数 = 0
+
+函数 NAXT_关系初始化() {
+    NAXT_关系表 = 堆_分配_数组(大小为(NAXT_关系条目) * NAXT_最大关系)
+    NAXT_关系数 = 0
+}
+
+函数 NAXT_添加关系(类型, 源, 目标) {
+    如果 (NAXT_关系数 >= NAXT_最大关系) { 返回 }
+    定义 idx = NAXT_关系数
+    NAXT_关系表[idx].类型 = 类型
+    NAXT_关系表[idx].源节点 = 源
+    NAXT_关系表[idx].目标节点 = 目标
+    NAXT_关系数 = NAXT_关系数 + 1
+}
+
+函数 NAXT_解析关系(ax节点, dom节点) {
+    如果 (ax节点 == 0 || dom节点 == 0) { 返回 }
+    // aria-owns
+    定义 owns = 元素_getAttribute(dom节点, "aria-owns")
+    如果 (owns != 0) {
+        NAXT_添加关系(NAXT_REL_OWNS, ax节点, owns)
+    }
+    // aria-controls
+    定义 controls = 元素_getAttribute(dom节点, "aria-controls")
+    如果 (controls != 0) {
+        NAXT_添加关系(NAXT_REL_CONTROLS, ax节点, controls)
+    }
+    // aria-flowto
+    定义 flowto = 元素_getAttribute(dom节点, "aria-flowto")
+    如果 (flowto != 0) {
+        NAXT_添加关系(NAXT_REL_FLOWTO, ax节点, flowto)
+    }
+}
+
+// §13 增量更新 (Incremental Update)
+// NAXT脏标记: 只更新变化的子树，避免全量重建
+
+定义 NAXT_DIRTY_ROLE = 1
+定义 NAXT_DIRTY_NAME = 2
+定义 NAXT_DIRTY_STATE = 4
+定义 NAXT_DIRTY_CHILDREN = 8
+定义 NAXT_DIRTY_VALUE = 16
+定义 NAXT_DIRTY_ALL = 31
+
+定义 可变 NAXT_脏节点队列 = 0
+定义 可变 NAXT_脏节点数 = 0
+定义 NAXT_最大脏节点 = 512
+
+函数 NAXT_脏队列初始化() {
+    NAXT_脏节点队列 = 堆_分配_数组(NAXT_最大脏节点 * 2)  // [ax节点, 脏标志]
+    NAXT_脏节点数 = 0
+}
+
+函数 NAXT_标记脏(ax节点, 脏标志) {
+    如果 (ax节点 == 0) { 返回 }
+    // 检查是否已在队列中
+    定义 可变 i = 0
+    当 (i < NAXT_脏节点数) {
+        如果 (NAXT_脏节点队列[i * 2] == ax节点) {
+            NAXT_脏节点队列[i * 2 + 1] = NAXT_脏节点队列[i * 2 + 1] | 脏标志
+            返回
+        }
+        i = i + 1
+    }
+    如果 (NAXT_脏节点数 < NAXT_最大脏节点) {
+        NAXT_脏节点队列[NAXT_脏节点数 * 2] = ax节点
+        NAXT_脏节点队列[NAXT_脏节点数 * 2 + 1] = 脏标志
+        NAXT_脏节点数 = NAXT_脏节点数 + 1
+    }
+}
+
+函数 NAXT_处理脏节点() {
+    定义 可变 i = 0
+    当 (i < NAXT_脏节点数) {
+        定义 ax = NAXT_脏节点队列[i * 2]
+        定义 flags = NAXT_脏节点队列[i * 2 + 1]
+        定义 dom = ax.dom节点
+        如果 (flags & NAXT_DIRTY_ROLE) {
+            ax.角色 = NAXT_获取默认角色(dom)
+        }
+        如果 (flags & NAXT_DIRTY_NAME) {
+            NAXT_计算名称(ax, dom)
+        }
+        如果 (flags & NAXT_DIRTY_STATE) {
+            NAXT_计算状态(ax, dom)
+        }
+        如果 (flags & NAXT_DIRTY_CHILDREN) {
+            AXTree_构建递归(ax, dom)
+            AX_发送事件(ax, AX_事件_CHILDREN_CHANGED, 0)
+        }
+        i = i + 1
+    }
+    NAXT_脏节点数 = 0
+}
+
+// §14 平台事件桥接 (Platform Bridge)
+// AT-SPI (Linux) / UIA (Windows) 双平台支持
+
+定义 NAXT_PLATFORM_ATSPI = 0
+定义 NAXT_PLATFORM_UIA = 1
+定义 可变 NAXT_平台类型 = 0
+
+函数 NAXT_设置平台(平台) {
+    NAXT_平台类型 = 平台
+}
+
+函数 NAXT_发送平台事件(ax节点, 事件类型) {
+    如果 (NAXT_平台类型 == NAXT_PLATFORM_ATSPI) {
+        // AT-SPI: D-Bus信号发送
+        系统调用(系统调用_ATSPI_发送事件, ax节点, 事件类型, 0, 0, 0)
+    } 否则 如果 (NAXT_平台类型 == NAXT_PLATFORM_UIA) {
+        // UIA: IRawElementProviderSimple事件
+        系统调用(系统调用_UIA_触发事件, ax节点, 事件类型, 0, 0, 0)
+    }
+}
+
+函数 NAXT_平台查询焦点() {
+    如果 (NAXT_平台类型 == NAXT_PLATFORM_ATSPI) {
+        返回 系统调用(系统调用_ATSPI_获取焦点, 0, 0, 0, 0, 0)
+    } 否则 如果 (NAXT_平台类型 == NAXT_PLATFORM_UIA) {
+        返回 系统调用(系统调用_UIA_获取焦点, 0, 0, 0, 0, 0)
+    }
+    返回 0
+}
+
+// §15 AI无障碍预测
+// AI推理预测节点角色和可访问性问题
+
+定义 可变 NAXT_总节点数 = 0
+定义 可变 NAXT_总事件数 = 0
+定义 可变 NAXT_总更新数 = 0
+
+函数 NAXT_AI角色预测(dom节点) {
+    // 当标准映射无法确定角色时，AI推理语义角色
+    定义 tensor = Tensor_创建(6)
+    Tensor_写(tensor, 0, dom节点.节点类型)
+    Tensor_写(tensor, 1, dom节点.子节点数)
+    定义 has_onclick = 元素_getAttribute(dom节点, "onclick") != 0
+    Tensor_写(tensor, 2, has_onclick)
+    定义 has_tabindex = 元素_getAttribute(dom节点, "tabindex") != 0
+    Tensor_写(tensor, 3, has_tabindex)
+    定义 has_href = 元素_getAttribute(dom节点, "href") != 0
+    Tensor_写(tensor, 4, has_href)
+    Tensor_写(tensor, 5, NAXT_总节点数)
+    定义 结果 = AI总线_推理(tensor, "NAXT_角色预测")
+    Tensor_释放(tensor)
+    返回 结果
+}
+
+函数 NAXT_AI可访问性检查(ax根) {
+    // 检查常见无障碍问题: 缺少alt/缺少label/低对比度
+    定义 tensor = Tensor_创建(4)
+    Tensor_写(tensor, 0, NAXT_总节点数)
+    Tensor_写(tensor, 1, NAXT_总事件数)
+    Tensor_写(tensor, 2, NAXT_关系数)
+    Tensor_写(tensor, 3, NAXT_脏节点数)
+    定义 异常 = AI总线_异常检测(tensor, "NAXT_可访问性")
+    Tensor_释放(tensor)
+    返回 异常
+}
+
+// §16 统计与诊断
+
+函数 NAXT_全局初始化() {
+    NAXT_关系初始化()
+    NAXT_脏队列初始化()
+    NAXT_总节点数 = 0
+    NAXT_总事件数 = 0
+    NAXT_总更新数 = 0
+}
+
+函数 NAXT_获取统计() {
+    返回 NAXT_总节点数 * 65536 + NAXT_总事件数
+}
+
+函数 NAXT_重置统计() {
+    NAXT_总节点数 = 0
+    NAXT_总事件数 = 0
+    NAXT_总更新数 = 0
+}
+
+// §17 Live Region策略计算
+
+定义 NAXT_LIVE_OFF = 0
+定义 NAXT_LIVE_POLITE = 1
+定义 NAXT_LIVE_ASSERTIVE = 2
+
+函数 NAXT_获取Live级别(dom节点) {
+    如果 (dom节点 == 0) { 返回 NAXT_LIVE_OFF }
+    定义 live = 元素_getAttribute(dom节点, "aria-live")
+    如果 (live == 0) { 返回 NAXT_LIVE_OFF }
+    如果 (字符串_相等(live, "polite")) { 返回 NAXT_LIVE_POLITE }
+    如果 (字符串_相等(live, "assertive")) { 返回 NAXT_LIVE_ASSERTIVE }
+    返回 NAXT_LIVE_OFF
+}
+
+函数 NAXT_获取Live原子性(dom节点) {
+    定义 atomic = 元素_getAttribute(dom节点, "aria-atomic")
+    如果 (atomic != 0 && 字符串_相等(atomic, "true")) { 返回 真 }
+    返回 假
+}

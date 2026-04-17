@@ -1,0 +1,115 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./控制台输出.nova")
+导入("./平台时间.nova")
+导入("../感知/程序入口.nova")
+导入("./命令写入.nova")
+
+// §5 着色器管理(图绘/CSS滤镜用)
+
+结构 图处着色器 {
+    shader_id,
+    类型,    // u32 0=顶点, 1=片段
+    源码,
+}
+
+结构 图处程序 {
+    program_id,
+    顶点着色器,
+    片段着色器,
+}
+
+// 内置着色器: 2D矩形绘制(浏览器合成器用)
+定义 内置_顶点着色器源 = "
+attribute vec2 a_position;
+attribute vec2 a_texCoord;
+uniform mat3 u_transform;
+varying vec2 v_texCoord;
+void main() {
+    vec3 pos = u_transform * vec3(a_position, 1.0);
+    gl_Position = vec4(pos.xy, 0.0, 1.0);
+    v_texCoord = a_texCoord;
+}"
+
+定义 内置_片段着色器源 = "
+precision mediump float;
+varying vec2 v_texCoord;
+uniform sampler2D u_texture;
+uniform float u_opacity;
+void main() {
+    vec4 color = texture2D(u_texture, v_texCoord);
+    gl_FragColor = color * u_opacity;
+}"
+
+函数 图处_创建内置程序(ctx) {
+    如果 (ctx == 0) { 返回 0 }
+    定义 vs = 系统调用(系统调用_图处_创建着色器, ctx.ctx_id, 0,
+                       内置_顶点着色器源, 字节长度(内置_顶点着色器源), 0)
+    定义 fs = 系统调用(系统调用_图处_创建着色器, ctx.ctx_id, 1,
+                       内置_片段着色器源, 字节长度(内置_片段着色器源), 0)
+    定义 程序 = 系统调用(系统调用_图处_创建程序, ctx.ctx_id, vs, fs, 0, 0)
+    返回 程序
+}
+
+// §6 纹理图集(Texture Atlas) — 减少纹理切换
+// 小纹理(图标/字形/小图片)合并到大纹理中
+// 减少图处状态切换次数 → 提升绘制性能
+
+结构 图集区域 {
+    x,
+    y,
+    w,
+    h,
+    已用,
+}
+
+结构 纹理图集 {
+    纹理ID,
+    宽,    // u32 通常2048或4096
+    高,
+    区域,    // [256]图集区域
+    区域数,
+    下一行y,    // u32 线性行分配
+    当前行h,
+    当前行x,
+}
+
+函数 纹理图集_创建(ctx, 宽, 高) {
+    定义 atlas = 堆_分配(纹理图集)
+    atlas.纹理ID = 图处_创建纹理(ctx, 宽, 高, 纹理格式_RGBA8)
+    atlas.宽 = 宽
+    atlas.高 = 高
+    atlas.区域数 = 0
+    atlas.下一行y = 0
+    atlas.当前行h = 0
+    atlas.当前行x = 0
+    返回 atlas
+}
+
+// 分配一个区域(简单行优先算法)
+函数 纹理图集_分配(atlas, w, h) {
+    如果 (atlas == 0 || atlas.区域数 >= 256) { 返回 -1 }
+
+    // 当前行放得下?
+    如果 (atlas.当前行x + w <= atlas.宽 && atlas.下一行y + h <= atlas.高) {
+        定义 idx = atlas.区域数
+        atlas.区域[idx].x = atlas.当前行x
+        atlas.区域[idx].y = atlas.下一行y
+        atlas.区域[idx].w = w
+        atlas.区域[idx].h = h
+        atlas.区域[idx].已用 = 真
+        atlas.当前行x = atlas.当前行x + w
+        如果 (h > atlas.当前行h) { atlas.当前行h = h }
+        atlas.区域数 = atlas.区域数 + 1
+        返回 idx
+    }
+
+    // 换行
+    atlas.下一行y = atlas.下一行y + atlas.当前行h
+    atlas.当前行x = 0
+    atlas.当前行h = 0
+
+    如果 (atlas.下一行y + h > atlas.高) { 返回 -1 }    // 满了
+
+    返回 纹理图集_分配(atlas, w, h)    // 重试
+}

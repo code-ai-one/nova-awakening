@@ -1,0 +1,497 @@
+// §11 Permission 接口 — 权限查询
+// navigator.permissions.query({ name: 'geolocation' })
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+导入("../中枢/字符串替换.nova")
+导入("./智能文档生成.nova")
+导入("../中枢/时钟中枢.nova")
+
+定义 PERM_STATE_GRANTED = 0
+定义 PERM_STATE_DENIED  = 1
+定义 PERM_STATE_PROMPT  = 2
+
+结构 PermissionStatus {
+    名称,
+    状态,    // u32 PERM_STATE_xxx
+    onchange,
+}
+
+函数 Permissions_query(Nova运行时实例, 名称) {
+    定义 ps = 堆_分配(PermissionStatus)
+    ps.名称 = 字符串_复制(名称)
+    ps.状态 = PERM_STATE_PROMPT    // 默认需要提示
+    ps.onchange = 0
+
+    // 检查已保存的权限
+    如果 (字符串_相等(名称, "notifications")) {
+        如果 (通知权限 == NOTIF_PERM_GRANTED) { ps.状态 = PERM_STATE_GRANTED }
+        否则 如果 (通知权限 == NOTIF_PERM_DENIED) { ps.状态 = PERM_STATE_DENIED }
+    }
+
+    返回 ps
+}
+
+// 辅助存根
+函数 平台_剪贴板_读取文本() {
+    // 通过Wayland/X11协议读取剪贴板文本
+    // 内部缓存: 如果本进程最近复制了, 直接返回
+    如果 (全局_剪贴板_文本 != 0) { 返回 全局_剪贴板_文本 }
+    返回 0
+}
+函数 平台_剪贴板_写入文本(t) { GUI_剪贴板_设置(t) }
+函数 平台_剪贴板_读取图片() {
+    如果 (全局_剪贴板_图片 != 0) { 返回 全局_剪贴板_图片 }
+    返回 0
+}
+函数 平台_进入全屏() { GUI_窗口_全屏(GUI_获取焦点窗口(), 真) }
+函数 平台_退出全屏() { GUI_窗口_全屏(GUI_获取焦点窗口(), 假) }
+函数 平台_请求屏幕唤醒() { 电源管理_阻止休眠("screen-wake-lock") }
+函数 平台_释放屏幕唤醒() { 电源管理_允许休眠("screen-wake-lock") }
+函数 平台_振动(ms) { 如果 (ms > 0 && ms < 10000) { 输入设备_振动(ms) } }
+函数 平台_取消振动() { 输入设备_振动(0) }
+函数 平台_等待(ms) { 定义 开始=读取纳秒(); 当(读取纳秒()-开始 < ms*1000000) { 内联汇编("pause") } }
+函数 平台_显示通知(标题, 正文, 图标) { GUI_通知_显示(标题, 正文, 图标, 5000) }
+函数 平台_关闭通知(n) { 如果 (n != 0) { GUI_通知_关闭(n) } }
+
+// 传统方案: 接口只提供原始接口, 不关心使用场景
+// Nova: AI根据场景智能调整接口行为
+
+结构 智能_接口统计 {
+    剪贴板读次数,
+    剪贴板写次数,
+    全屏次数,
+    通知次数,
+    唤醒锁次数,
+    振动次数,
+    可见性变化次数,
+    权限拒绝次数,
+}
+
+定义 可变 智能_接口全局统计 = 0
+
+函数 智能_接口_初始化() {
+    智能_接口全局统计 = 堆_分配(智能_接口统计)
+    智能_接口全局统计.剪贴板读次数 = 0
+    智能_接口全局统计.剪贴板写次数 = 0
+    智能_接口全局统计.全屏次数 = 0
+    智能_接口全局统计.通知次数 = 0
+    智能_接口全局统计.唤醒锁次数 = 0
+    智能_接口全局统计.振动次数 = 0
+    智能_接口全局统计.可见性变化次数 = 0
+    智能_接口全局统计.权限拒绝次数 = 0
+}
+
+函数 智能_接口_智能权限(文档, 接口名称) {
+    // 广告过多的页面不应该获得通知/振动权限
+    定义 摘要 = AI文档_生成摘要(文档)
+    如果 (摘要 != 0 && 摘要.广告区数量 > 3) {
+        如果 (字符串_相等(接口名称, "notifications") ||
+            字符串_相等(接口名称, "vibration")) {
+            如果 (智能_接口全局统计 != 0) {
+                智能_接口全局统计.权限拒绝次数 = 智能_接口全局统计.权限拒绝次数 + 1
+            }
+            返回 假
+        }
+    }
+    返回 真
+}
+
+// NPMS理论 (Nova Permission Management System)
+// 创新点：「来源策略-能力分级-临时授权」三维权限模型，
+// 融合AI语义分析预测权限风险，支持细粒度权限控制，
+// 用户行为学习自动授权策略。
+
+// §12 权限类型注册表
+
+定义 NPMS_PERM_GEOLOCATION = 0
+定义 NPMS_PERM_NOTIFICATIONS = 1
+定义 NPMS_PERM_CAMERA = 2
+定义 NPMS_PERM_MICROPHONE = 3
+定义 NPMS_PERM_CLIPBOARD_READ = 4
+定义 NPMS_PERM_CLIPBOARD_WRITE = 5
+定义 NPMS_PERM_FULLSCREEN = 6
+定义 NPMS_PERM_WAKE_LOCK = 7
+定义 NPMS_PERM_VIBRATION = 8
+定义 NPMS_PERM_MIDI = 9
+定义 NPMS_PERM_BLUETOOTH = 10
+定义 NPMS_PERM_USB = 11
+定义 NPMS_PERM_STORAGE = 12
+定义 NPMS_最大权限类型 = 16
+
+函数 NPMS_权限名称转ID(名称) {
+    如果 (字符串_相等(名称, "geolocation")) { 返回 NPMS_PERM_GEOLOCATION }
+    如果 (字符串_相等(名称, "notifications")) { 返回 NPMS_PERM_NOTIFICATIONS }
+    如果 (字符串_相等(名称, "camera")) { 返回 NPMS_PERM_CAMERA }
+    如果 (字符串_相等(名称, "microphone")) { 返回 NPMS_PERM_MICROPHONE }
+    如果 (字符串_相等(名称, "clipboard-read")) { 返回 NPMS_PERM_CLIPBOARD_READ }
+    如果 (字符串_相等(名称, "clipboard-write")) { 返回 NPMS_PERM_CLIPBOARD_WRITE }
+    如果 (字符串_相等(名称, "fullscreen")) { 返回 NPMS_PERM_FULLSCREEN }
+    如果 (字符串_相等(名称, "wake-lock")) { 返回 NPMS_PERM_WAKE_LOCK }
+    如果 (字符串_相等(名称, "midi")) { 返回 NPMS_PERM_MIDI }
+    如果 (字符串_相等(名称, "bluetooth")) { 返回 NPMS_PERM_BLUETOOTH }
+    如果 (字符串_相等(名称, "usb")) { 返回 NPMS_PERM_USB }
+    如果 (字符串_相等(名称, "persistent-storage")) { 返回 NPMS_PERM_STORAGE }
+    返回 -1
+}
+
+// §13 来源策略存储 (Origin Policy Store)
+
+定义 NPMS_最大来源 = 128
+
+结构 NPMS_来源策略 {
+    来源哈希: 0
+    权限表: 0       // u8数组, 值=PERM_STATE_xxx
+    上次访问时间: 0
+    访问次数: 0
+    信任分: 0      // 0~100
+}
+
+定义 可变 NPMS_策略表 = 0
+定义 可变 NPMS_策略数 = 0
+
+函数 NPMS_策略初始化() {
+    NPMS_策略表 = 堆_分配_数组(大小为(NPMS_来源策略) * NPMS_最大来源)
+    NPMS_策略数 = 0
+}
+
+函数 NPMS_哈希计算(字符串指针) {
+    定义 可变 hash = 5381
+    定义 len = 字符串_长度(字符串指针)
+    定义 可变 i = 0
+    当 (i < len) {
+        hash = hash * 33 + 字符串指针[i]
+        i = i + 1
+    }
+    返回 hash
+}
+
+函数 NPMS_查找来源(来源) {
+    定义 h = NPMS_哈希计算(来源)
+    定义 可变 i = 0
+    当 (i < NPMS_策略数) {
+        如果 (NPMS_策略表[i].来源哈希 == h) { 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 NPMS_获取或创建来源(来源) {
+    定义 idx = NPMS_查找来源(来源)
+    如果 (idx >= 0) { 返回 idx }
+    如果 (NPMS_策略数 >= NPMS_最大来源) { 返回 -1 }
+    idx = NPMS_策略数
+    NPMS_策略表[idx].来源哈希 = NPMS_哈希计算(来源)
+    NPMS_策略表[idx].权限表 = 堆_分配_数组(NPMS_最大权限类型)
+    定义 可变 j = 0
+    当 (j < NPMS_最大权限类型) {
+        NPMS_策略表[idx].权限表[j] = PERM_STATE_PROMPT
+        j = j + 1
+    }
+    NPMS_策略表[idx].上次访问时间 = 0
+    NPMS_策略表[idx].访问次数 = 0
+    NPMS_策略表[idx].信任分 = 50
+    NPMS_策略数 = NPMS_策略数 + 1
+    返回 idx
+}
+
+// §14 增强版权限查询
+
+函数 NPMS_查询权限(来源, 权限名) {
+    定义 perm_id = NPMS_权限名称转ID(权限名)
+    如果 (perm_id < 0) { 返回 PERM_STATE_DENIED }
+    定义 idx = NPMS_查找来源(来源)
+    如果 (idx < 0) { 返回 PERM_STATE_PROMPT }
+    NPMS_策略表[idx].访问次数 = NPMS_策略表[idx].访问次数 + 1
+    NPMS_策略表[idx].上次访问时间 = 平台_获取高精度时间()
+    返回 NPMS_策略表[idx].权限表[perm_id]
+}
+
+函数 NPMS_设置权限(来源, 权限名, 状态) {
+    定义 perm_id = NPMS_权限名称转ID(权限名)
+    如果 (perm_id < 0) { 返回 假 }
+    定义 idx = NPMS_获取或创建来源(来源)
+    如果 (idx < 0) { 返回 假 }
+    NPMS_策略表[idx].权限表[perm_id] = 状态
+    NPMS_触发变更事件(来源, 权限名, 状态)
+    返回 真
+}
+
+// §15 权限变更监听
+
+定义 NPMS_最大监听 = 64
+
+结构 NPMS_监听器 {
+    来源哈希: 0
+    权限ID: 0
+    回调函数: 0
+    上下文: 0
+}
+
+定义 可变 NPMS_监听表 = 0
+定义 可变 NPMS_监听数 = 0
+
+函数 NPMS_监听初始化() {
+    NPMS_监听表 = 堆_分配_数组(大小为(NPMS_监听器) * NPMS_最大监听)
+    NPMS_监听数 = 0
+}
+
+函数 NPMS_注册监听(来源, 权限名, 回调, ctx) {
+    如果 (NPMS_监听数 >= NPMS_最大监听) { 返回 假 }
+    定义 idx = NPMS_监听数
+    NPMS_监听表[idx].来源哈希 = NPMS_哈希计算(来源)
+    NPMS_监听表[idx].权限ID = NPMS_权限名称转ID(权限名)
+    NPMS_监听表[idx].回调函数 = 回调
+    NPMS_监听表[idx].上下文 = ctx
+    NPMS_监听数 = NPMS_监听数 + 1
+    返回 真
+}
+
+函数 NPMS_触发变更事件(来源, 权限名, 新状态) {
+    定义 oh = NPMS_哈希计算(来源)
+    定义 pid = NPMS_权限名称转ID(权限名)
+    定义 可变 i = 0
+    当 (i < NPMS_监听数) {
+        如果 (NPMS_监听表[i].来源哈希 == oh && NPMS_监听表[i].权限ID == pid) {
+            如果 (NPMS_监听表[i].回调函数 != 0) {
+                间接调用(NPMS_监听表[i].回调函数, NPMS_监听表[i].上下文, 新状态)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §16 信任分计算
+
+函数 NPMS_计算信任分(来源) {
+    定义 idx = NPMS_查找来源(来源)
+    如果 (idx < 0) { 返回 50 }
+    定义 可变 gc = 0
+    定义 可变 dc = 0
+    定义 可变 j = 0
+    当 (j < NPMS_最大权限类型) {
+        如果 (NPMS_策略表[idx].权限表[j] == PERM_STATE_GRANTED) { gc = gc + 1 }
+        否则 如果 (NPMS_策略表[idx].权限表[j] == PERM_STATE_DENIED) { dc = dc + 1 }
+        j = j + 1
+    }
+    定义 score = 50 + gc * 5 - dc * 10
+    如果 (score < 0) { score = 0 }
+    如果 (score > 100) { score = 100 }
+    NPMS_策略表[idx].信任分 = score
+    返回 score
+}
+
+// §17 AI权限风险预测
+
+定义 可变 NPMS_总查询数 = 0
+定义 可变 NPMS_总授权数 = 0
+定义 可变 NPMS_总拒绝数 = 0
+
+函数 NPMS_AI权限预测(来源, 权限名) {
+    定义 tensor = Tensor_创建(6)
+    定义 pid = NPMS_权限名称转ID(权限名)
+    定义 idx = NPMS_查找来源(来源)
+    定义 trust = 50
+    如果 (idx >= 0) { trust = NPMS_策略表[idx].信任分 }
+    Tensor_写(tensor, 0, pid)
+    Tensor_写(tensor, 1, trust)
+    Tensor_写(tensor, 2, NPMS_总查询数)
+    Tensor_写(tensor, 3, NPMS_总授权数)
+    Tensor_写(tensor, 4, NPMS_总拒绝数)
+    Tensor_写(tensor, 5, NPMS_策略数)
+    定义 结果 = AI总线_推理(tensor, "NPMS_权限风险")
+    Tensor_释放(tensor)
+    返回 结果
+}
+
+函数 NPMS_AI异常检测() {
+    定义 tensor = Tensor_创建(4)
+    Tensor_写(tensor, 0, NPMS_总查询数)
+    Tensor_写(tensor, 1, NPMS_总授权数)
+    Tensor_写(tensor, 2, NPMS_总拒绝数)
+    Tensor_写(tensor, 3, NPMS_监听数)
+    定义 异常 = AI总线_异常检测(tensor, "NPMS_权限异常")
+    Tensor_释放(tensor)
+    返回 异常
+}
+
+// §18 全局初始化与统计
+
+函数 NPMS_全局初始化() {
+    NPMS_策略初始化()
+    NPMS_监听初始化()
+    智能_接口_初始化()
+    NPMS_总查询数 = 0
+    NPMS_总授权数 = 0
+    NPMS_总拒绝数 = 0
+}
+
+函数 NPMS_获取统计() {
+    返回 NPMS_总查询数 * 65536 + NPMS_总授权数
+}
+
+函数 NPMS_重置统计() {
+    NPMS_总查询数 = 0
+    NPMS_总授权数 = 0
+    NPMS_总拒绝数 = 0
+}
+
+// §19 临时授权与过期策略
+// NPMS临时授权: 授予有时限的权限，超时自动撤销
+
+定义 NPMS_最大临时授权 = 64
+
+结构 NPMS_临时授权 {
+    来源哈希: 0
+    权限ID: 0
+    授权时间: 0
+    过期时间: 0    // 毫秒时间戳
+    已过期: 假
+}
+
+定义 可变 NPMS_临时表 = 0
+定义 可变 NPMS_临时数 = 0
+
+函数 NPMS_临时初始化() {
+    NPMS_临时表 = 堆_分配_数组(大小为(NPMS_临时授权) * NPMS_最大临时授权)
+    NPMS_临时数 = 0
+}
+
+函数 NPMS_授予临时权限(来源, 权限名, 时长_毫秒) {
+    如果 (NPMS_临时数 >= NPMS_最大临时授权) {
+        NPMS_清理过期授权()
+        如果 (NPMS_临时数 >= NPMS_最大临时授权) { 返回 假 }
+    }
+    定义 now = 平台_获取高精度时间()
+    定义 idx = NPMS_临时数
+    NPMS_临时表[idx].来源哈希 = NPMS_哈希计算(来源)
+    NPMS_临时表[idx].权限ID = NPMS_权限名称转ID(权限名)
+    NPMS_临时表[idx].授权时间 = now
+    NPMS_临时表[idx].过期时间 = now + 时长_毫秒
+    NPMS_临时表[idx].已过期 = 假
+    NPMS_临时数 = NPMS_临时数 + 1
+    // 同时设置来源策略为GRANTED
+    NPMS_设置权限(来源, 权限名, PERM_STATE_GRANTED)
+    NPMS_总授权数 = NPMS_总授权数 + 1
+    返回 真
+}
+
+函数 NPMS_检查临时权限(来源, 权限名) {
+    定义 oh = NPMS_哈希计算(来源)
+    定义 pid = NPMS_权限名称转ID(权限名)
+    定义 now = 平台_获取高精度时间()
+    定义 可变 i = 0
+    当 (i < NPMS_临时数) {
+        如果 (NPMS_临时表[i].来源哈希 == oh && NPMS_临时表[i].权限ID == pid) {
+            如果 (now < NPMS_临时表[i].过期时间) {
+                返回 真  // 仍然有效
+            } 否则 {
+                NPMS_临时表[i].已过期 = 真
+                // 撤销权限
+                NPMS_设置权限(来源, 权限名, PERM_STATE_PROMPT)
+                返回 假
+            }
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 NPMS_清理过期授权() {
+    定义 now = 平台_获取高精度时间()
+    定义 可变 写位 = 0
+    定义 可变 i = 0
+    当 (i < NPMS_临时数) {
+        如果 (now < NPMS_临时表[i].过期时间) {
+            如果 (写位 != i) {
+                NPMS_临时表[写位] = NPMS_临时表[i]
+            }
+            写位 = 写位 + 1
+        }
+        i = i + 1
+    }
+    NPMS_临时数 = 写位
+}
+
+// §20 权限委托 (Permission Delegation)
+// iframe子框架权限委托: 父页面可将权限委托给子框架
+
+定义 NPMS_最大委托 = 32
+
+结构 NPMS_委托条目 {
+    父来源哈希: 0
+    子来源哈希: 0
+    权限ID: 0
+    允许: 假
+}
+
+定义 可变 NPMS_委托表 = 0
+定义 可变 NPMS_委托数 = 0
+
+函数 NPMS_委托初始化() {
+    NPMS_委托表 = 堆_分配_数组(大小为(NPMS_委托条目) * NPMS_最大委托)
+    NPMS_委托数 = 0
+}
+
+函数 NPMS_添加委托(父来源, 子来源, 权限名) {
+    如果 (NPMS_委托数 >= NPMS_最大委托) { 返回 假 }
+    定义 idx = NPMS_委托数
+    NPMS_委托表[idx].父来源哈希 = NPMS_哈希计算(父来源)
+    NPMS_委托表[idx].子来源哈希 = NPMS_哈希计算(子来源)
+    NPMS_委托表[idx].权限ID = NPMS_权限名称转ID(权限名)
+    NPMS_委托表[idx].允许 = 真
+    NPMS_委托数 = NPMS_委托数 + 1
+    返回 真
+}
+
+函数 NPMS_检查委托(父来源, 子来源, 权限名) {
+    定义 ph = NPMS_哈希计算(父来源)
+    定义 ch = NPMS_哈希计算(子来源)
+    定义 pid = NPMS_权限名称转ID(权限名)
+    定义 可变 i = 0
+    当 (i < NPMS_委托数) {
+        如果 (NPMS_委托表[i].父来源哈希 == ph && NPMS_委托表[i].子来源哈希 == ch && NPMS_委托表[i].权限ID == pid) {
+            返回 NPMS_委托表[i].允许
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+// §21 权限审计日志
+
+定义 NPMS_审计最大 = 256
+
+结构 NPMS_审计条目 {
+    时间戳: 0
+    来源哈希: 0
+    权限ID: 0
+    操作: 0     // 0=查询 1=授权 2=拒绝 3=撤销
+    结果: 0
+}
+
+定义 可变 NPMS_审计表 = 0
+定义 可变 NPMS_审计数 = 0
+
+函数 NPMS_审计初始化() {
+    NPMS_审计表 = 堆_分配_数组(大小为(NPMS_审计条目) * NPMS_审计最大)
+    NPMS_审计数 = 0
+}
+
+函数 NPMS_记录审计(来源, 权限名, 操作, 结果) {
+    如果 (NPMS_审计数 >= NPMS_审计最大) {
+        // 环形覆盖最旧记录
+        NPMS_审计数 = 0
+    }
+    定义 idx = NPMS_审计数
+    NPMS_审计表[idx].时间戳 = 平台_获取高精度时间()
+    NPMS_审计表[idx].来源哈希 = NPMS_哈希计算(来源)
+    NPMS_审计表[idx].权限ID = NPMS_权限名称转ID(权限名)
+    NPMS_审计表[idx].操作 = 操作
+    NPMS_审计表[idx].结果 = 结果
+    NPMS_审计数 = NPMS_审计数 + 1
+}

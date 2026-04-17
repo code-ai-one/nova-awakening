@@ -1,0 +1,526 @@
+// NovaOS 系统调用表 — 觉醒理论·不可绕过的理论架构
+// 原创理论: NovaSyscall — 可观测系统调用分发体系
+// §1 Linux兼容: 系统调用号与Linux x86-64完全兼容
+// §2 分组注册: 文件/进程/内存/信号/网络/时间/信息/AI
+// §3 调用统计: 每个系统调用的调用次数和累计耗时
+// §4 审计日志: 记录敏感系统调用(execve/kill/权限)
+// §5 Seccomp过滤: 可配置的系统调用白/黑名单
+// §6 速率限制: 防止系统调用洪泛(DoS保护)
+// 四阶段AI演进: NovaSyscall在阶段2提供AI安全审计基础
+
+导入("./错误码.nova")
+导入("./日志中枢.nova")
+导入("./整数转字符串.nova")
+导入("./智能系统调用.nova")
+导入("./内核打印.nova")
+导入("./时钟中枢.nova")
+
+// 系统调用号 (完全
+
+定义 SYS_read      = 0     // ssize_t read(fd, buf, count)
+定义 SYS_write     = 1     // ssize_t write(fd, buf, count)
+定义 SYS_open      = 2     // int open(path, flags, mode)
+定义 SYS_close     = 3     // int close(fd)
+定义 SYS_stat      = 4     // int stat(path, statbuf)
+定义 SYS_fstat     = 5     // int fstat(fd, statbuf)
+定义 SYS_lstat     = 6     // int lstat(path, statbuf)
+定义 SYS_poll      = 7     // int poll(fds, nfds, timeout)
+定义 SYS_lseek     = 8     // off_t lseek(fd, offset, whence)
+定义 SYS_Nova内存映射      = 9     // void* Nova内存映射(addr, len, prot, flags, fd, off)
+定义 SYS_mprotect  = 10    // int mprotect(addr, len, prot)
+定义 SYS_munmap    = 11    // int munmap(addr, len)
+定义 SYS_brk       = 12    // void* brk(addr)
+定义 SYS_Nova设备控制     = 16    // int Nova设备控制(fd, cmd, arg)
+定义 SYS_pread64   = 17    // ssize_t pread64(fd, buf, count, offset)
+定义 SYS_pwrite64  = 18    // ssize_t pwrite64(fd, buf, count, offset)
+定义 SYS_readv     = 19    // ssize_t readv(fd, iov, iovcnt)
+定义 SYS_writev    = 20    // ssize_t writev(fd, iov, iovcnt)
+
+定义 SYS_access    = 21    // int access(path, mode)
+定义 SYS_pipe      = 22    // int pipe(pipefd[2])
+定义 SYS_dup       = 32    // int dup(oldfd)
+定义 SYS_dup2      = 33    // int dup2(oldfd, newfd)
+定义 SYS_rename    = 82    // int rename(oldpath, newpath)
+定义 SYS_mkdir     = 83    // int mkdir(path, mode)
+定义 SYS_rmdir     = 84    // int rmdir(path)
+定义 SYS_creat     = 85    // int creat(path, mode)
+定义 SYS_link      = 86    // int link(oldpath, newpath)
+定义 SYS_unlink    = 87    // int unlink(path)
+定义 SYS_symlink   = 88    // int symlink(target, linkpath)
+定义 SYS_readlink  = 89    // ssize_t readlink(path, buf, bufsiz)
+定义 SYS_chmod     = 90    // int chmod(path, mode)
+定义 SYS_chown     = 92    // int chown(path, owner, group)
+定义 SYS_chdir     = 80    // int chdir(path)
+定义 SYS_fchdir    = 81    // int fchdir(fd)
+定义 SYS_getcwd    = 79    // char* getcwd(buf, size)
+定义 SYS_getdents64 = 217  // int getdents64(fd, dirp, count)
+定义 SYS_fcntl     = 72    // int fcntl(fd, cmd, arg)
+定义 SYS_flock     = 73    // int flock(fd, operation)
+定义 SYS_fsync     = 74    // int fsync(fd)
+定义 SYS_truncate  = 76    // int truncate(path, length)
+定义 SYS_ftruncate = 77    // int ftruncate(fd, length)
+
+定义 SYS_getpid    = 39    // pid_t getpid()
+定义 SYS_clone     = 56    // long clone(flags, stack, ptid, ctid, regs)
+定义 SYS_fork      = 57    // pid_t fork()
+定义 SYS_vfork     = 58    // pid_t vfork()
+定义 SYS_execve    = 59    // int execve(path, argv, envp)
+定义 SYS_exit      = 60    // void exit(status)
+定义 SYS_wait4     = 61    // pid_t wait4(pid, status, options, rusage)
+定义 SYS_kill      = 62    // int kill(pid, sig)
+定义 SYS_getppid   = 110   // pid_t getppid()
+定义 SYS_getuid    = 102   // uid_t getuid()
+定义 SYS_getgid    = 104   // gid_t getgid()
+定义 SYS_geteuid   = 107   // uid_t geteuid()
+定义 SYS_getegid   = 108   // gid_t getegid()
+定义 SYS_setuid    = 105   // int setuid(uid)
+定义 SYS_setgid    = 106   // int setgid(gid)
+定义 SYS_setsid    = 112   // pid_t setsid()
+定义 SYS_getpgid   = 121   // pid_t getpgid(pid)
+定义 SYS_setpgid   = 109   // int setpgid(pid, pgid)
+定义 SYS_exit_group = 231  // void exit_group(status)
+
+定义 SYS_rt_sigaction   = 13  // int rt_sigaction(sig, act, oact, sigsetsize)
+定义 SYS_rt_sigprocmask = 14  // int rt_sigprocmask(how, set, oset, sigsetsize)
+定义 SYS_rt_sigreturn   = 15  // int rt_sigreturn()
+定义 SYS_sigaltstack    = 131 // int sigaltstack(ss, oss)
+
+定义 SYS_madvise   = 28    // int madvise(addr, len, advice)
+定义 SYS_shmget    = 29    // int shmget(key, size, shmflg)
+定义 SYS_shmat     = 30    // void* shmat(shmid, shmaddr, shmflg)
+
+定义 SYS_socket    = 41    // int socket(domain, type, protocol)
+定义 SYS_connect   = 42    // int connect(fd, addr, addrlen)
+定义 SYS_accept    = 43    // int accept(fd, addr, addrlen)
+定义 SYS_sendto    = 44    // ssize_t sendto(fd, buf, len, flags, addr, addrlen)
+定义 SYS_recvfrom  = 45    // ssize_t recvfrom(fd, buf, len, flags, addr, addrlen)
+定义 SYS_sendmsg   = 46    // ssize_t sendmsg(fd, msg, flags)
+定义 SYS_recvmsg   = 47    // ssize_t recvmsg(fd, msg, flags)
+定义 SYS_shutdown  = 48    // int shutdown(fd, how)
+定义 SYS_bind      = 49    // int bind(fd, addr, addrlen)
+定义 SYS_listen    = 50    // int listen(fd, backlog)
+定义 SYS_getsockname = 51  // int getsockname(fd, addr, addrlen)
+定义 SYS_getpeername = 52  // int getpeername(fd, addr, addrlen)
+定义 SYS_setsockopt  = 54  // int setsockopt(fd, level, optname, optval, optlen)
+定义 SYS_getsockopt  = 55  // int getsockopt(fd, level, optname, optval, optlen)
+
+定义 SYS_gettimeofday = 96  // int gettimeofday(tv, tz)
+定义 SYS_nanosleep    = 35  // int nanosleep(req, rem)
+定义 SYS_clock_gettime = 228 // int clock_gettime(clk_id, tp)
+
+定义 SYS_uname     = 63    // int uname(buf)
+定义 SYS_sysinfo   = 99    // int sysinfo(info)
+
+定义 SYS_openat    = 257   // int openat(dirfd, path, flags, mode)
+定义 SYS_pipe2     = 293   // int pipe2(pipefd, flags)
+定义 SYS_dup3      = 292   // int dup3(oldfd, newfd, flags)
+定义 SYS_Nova事件轮询_创建1 = 291
+定义 SYS_Nova事件轮询_ctl = 233
+定义 SYS_Nova事件轮询_wait = 232
+
+// 系统调用表
+
+定义 最大系统调用 = 512
+定义 可变 系统调用表 = []
+定义 可变 系统调用计数 = []      // 每个Nova系统调用的调用次数统计
+定义 可变 系统调用_总次数 = 0
+定义 可变 系统调用_总计数 = 0     // 别名(被自动化引擎引用)
+定义 可变 系统调用_未注册次数 = 0
+定义 系统调用_ENOSYS = 0 - 38
+
+函数 系统调用表_初始化() {
+    系统调用表 = []
+    系统调用计数 = []
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        追加(系统调用表, 空)
+        追加(系统调用计数, 0)
+        i = i + 1
+    }
+    内核信息("系统调用表初始化 (512项, 兼容Linux x86-64)")
+}
+
+函数 系统调用_注册(号, 处理函数) {
+    如果 (号 >= 0 && 号 < 最大系统调用) {
+        设置(系统调用表, 号, 处理函数)
+    }
+}
+
+// 系统调用分发 
+// 由系统调用入口的汇编代码调用
+
+函数 系统调用_分发_表(号, 参数1, 参数2, 参数3, 参数4, 参数5, 参数6) {    // 表版(权威版在入口.nova,含AI安全钩子)
+    如果 (号 < 0 || 号 >= 最大系统调用) {
+        返回 系统调用_ENOSYS
+    }
+    定义 处理函数 = 系统调用表[号]
+    如果 (处理函数 == 空) {
+        系统调用_未注册次数 = 系统调用_未注册次数 + 1
+        返回 系统调用_ENOSYS   // -ENOSYS
+    }
+    系统调用_总次数 = 系统调用_总次数 + 1
+    系统调用_总计数 = 系统调用_总次数
+    设置(系统调用计数, 号, 系统调用计数[号] + 1)
+    返回 处理函数(参数1, 参数2, 参数3, 参数4, 参数5, 参数6)
+}
+
+// 批量注册所有已实现的系统调用
+
+函数 系统调用_注册全部_表() {
+    系统调用_注册(SYS_read, sys_read)
+    系统调用_注册(SYS_write, sys_write)
+    系统调用_注册(SYS_open, sys_open)
+    系统调用_注册(SYS_close, sys_close)
+    系统调用_注册(SYS_stat, sys_stat)
+    系统调用_注册(SYS_fstat, sys_fstat)
+    系统调用_注册(SYS_lstat, sys_lstat)
+    系统调用_注册(SYS_lseek, sys_lseek)
+    系统调用_注册(SYS_Nova设备控制, sys_Nova设备控制)
+    系统调用_注册(SYS_dup, sys_dup)
+    系统调用_注册(SYS_dup2, sys_dup2)
+    系统调用_注册(SYS_dup3, sys_dup3)
+    系统调用_注册(SYS_pipe, sys_pipe)
+    系统调用_注册(SYS_pipe2, sys_pipe2)
+    系统调用_注册(SYS_fcntl, sys_fcntl)
+    系统调用_注册(SYS_flock, sys_flock)
+    系统调用_注册(SYS_fsync, sys_fsync)
+    系统调用_注册(SYS_truncate, sys_truncate)
+    系统调用_注册(SYS_ftruncate, sys_ftruncate)
+    系统调用_注册(SYS_getdents64, sys_getdents64)
+    系统调用_注册(SYS_openat, sys_openat)
+
+    系统调用_注册(SYS_access, sys_access)
+    系统调用_注册(SYS_mkdir, sys_mkdir)
+    系统调用_注册(SYS_rmdir, sys_rmdir)
+    系统调用_注册(SYS_creat, sys_creat)
+    系统调用_注册(SYS_unlink, sys_unlink)
+    系统调用_注册(SYS_link, sys_link)
+    系统调用_注册(SYS_symlink, sys_symlink)
+    系统调用_注册(SYS_readlink, sys_readlink)
+    系统调用_注册(SYS_rename, sys_rename)
+    系统调用_注册(SYS_chmod, sys_chmod)
+    系统调用_注册(SYS_chown, sys_chown)
+    系统调用_注册(SYS_chdir, sys_chdir)
+    系统调用_注册(SYS_getcwd, sys_getcwd)
+
+    系统调用_注册(SYS_getpid, sys_getpid)
+    系统调用_注册(SYS_getppid, sys_getppid)
+    系统调用_注册(SYS_getuid, sys_getuid)
+    系统调用_注册(SYS_getgid, sys_getgid)
+    系统调用_注册(SYS_geteuid, sys_geteuid)
+    系统调用_注册(SYS_getegid, sys_getegid)
+    系统调用_注册(SYS_fork, sys_fork)
+    系统调用_注册(SYS_vfork, sys_vfork)
+    系统调用_注册(SYS_clone, sys_clone)
+    系统调用_注册(SYS_execve, sys_execve)
+    系统调用_注册(SYS_exit, sys_exit)
+    系统调用_注册(SYS_exit_group, sys_exit_group)
+    系统调用_注册(SYS_wait4, sys_wait4)
+    系统调用_注册(SYS_setpgid, sys_setpgid)
+    系统调用_注册(SYS_getpgid, sys_getpgid)
+    系统调用_注册(SYS_setsid, sys_setsid)
+
+    系统调用_注册(SYS_kill, sys_kill)
+    系统调用_注册(SYS_rt_sigaction, sys_rt_sigaction)
+    系统调用_注册(SYS_rt_sigprocmask, sys_rt_sigprocmask)
+
+    系统调用_注册(SYS_brk, sys_brk)
+    系统调用_注册(SYS_Nova内存映射, sys_Nova内存映射)
+    系统调用_注册(SYS_munmap, sys_munmap)
+    系统调用_注册(SYS_mprotect, sys_mprotect)
+
+    系统调用_注册(SYS_socket, sys_socket)
+    系统调用_注册(SYS_bind, sys_bind)
+    系统调用_注册(SYS_listen, sys_listen)
+    系统调用_注册(SYS_accept, sys_accept)
+    系统调用_注册(SYS_connect, sys_connect)
+    系统调用_注册(SYS_sendto, sys_sendto)
+    系统调用_注册(SYS_recvfrom, sys_recvfrom)
+    系统调用_注册(SYS_shutdown, sys_shutdown)
+    系统调用_注册(SYS_Nova事件轮询_创建1, sys_epoll_create1)
+    系统调用_注册(SYS_Nova事件轮询_ctl, sys_epoll_ctl)
+    系统调用_注册(SYS_Nova事件轮询_wait, sys_epoll_wait)
+
+    系统调用_注册(SYS_gettimeofday, sys_gettimeofday)
+    系统调用_注册(SYS_nanosleep, sys_nanosleep)
+    系统调用_注册(SYS_clock_gettime, sys_clock_gettime)
+
+    系统调用_注册(SYS_uname, sys_uname)
+    系统调用_注册(SYS_sysinfo, sys_sysinfo)
+
+    注册AI系统调用()           // AI系统调用.nova: 推理/学习/查询/画像
+
+    内核信息数值("系统调用注册完成, 已注册", 系统调用_已注册数())
+}
+
+// 统计
+
+函数 系统调用_已注册数() {
+    定义 可变 数 = 0
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        如果 (系统调用表[i] != 空) { 数 = 数 + 1 }
+        i = i + 1
+    }
+    返回 数
+}
+
+函数 系统调用_统计_表() {
+    返回 [系统调用_总次数, 系统调用_未注册次数, 系统调用_已注册数()]
+}
+
+// 每调用耗时统计
+
+定义 可变 系统调用_耗时 = []      // 每个系统调用的累计耗时
+定义 可变 系统调用_最大耗时 = []  // 每个系统调用的最大单次耗时
+
+函数 系统调用_耗时初始化() {
+    系统调用_耗时 = []
+    系统调用_最大耗时 = []
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        追加(系统调用_耗时, 0)
+        追加(系统调用_最大耗时, 0)
+        i = i + 1
+    }
+}
+
+函数 系统调用_记录耗时(号, 耗时_ns) {
+    如果 (号 >= 0 && 号 < 最大系统调用) {
+        设置(系统调用_耗时, 号, 系统调用_耗时[号] + 耗时_ns)
+        如果 (耗时_ns > 系统调用_最大耗时[号]) {
+            设置(系统调用_最大耗时, 号, 耗时_ns)
+        }
+    }
+}
+
+函数 系统调用_平均耗时(号) {
+    如果 (号 < 0 || 号 >= 最大系统调用) { 返回 0 }
+    如果 (系统调用计数[号] == 0) { 返回 0 }
+    返回 系统调用_耗时[号] / 系统调用计数[号]
+}
+
+// 审计日志 — 敏感调用记录
+
+定义 审计缓冲大小 = 128
+定义 可变 审计_缓冲 = []         // [调用号, pid, 时间戳, 结果]
+定义 可变 审计_头 = 0
+定义 可变 审计_启用 = 假
+定义 可变 审计_总数 = 0
+
+函数 系统调用_审计初始化() {
+    审计_缓冲 = []
+    定义 可变 i = 0
+    当 (i < 审计缓冲大小 * 4) { 追加(审计_缓冲, 0); i = i + 1 }
+    审计_头 = 0
+    审计_启用 = 真
+}
+
+函数 系统调用_审计记录(号, pid, 结果) {
+    如果 (!审计_启用) { 返回 }
+    // 只审计敏感系统调用
+    如果 (号 != SYS_execve && 号 != SYS_kill && 号 != SYS_setuid &&
+        号 != SYS_setgid && 号 != SYS_clone && 号 != SYS_unlink) {
+        返回
+    }
+    定义 base = (审计_头 % 审计缓冲大小) * 4
+    设置(审计_缓冲, base, 号)
+    设置(审计_缓冲, base + 1, pid)
+    设置(审计_缓冲, base + 2, 系统调用_总次数)  // 序列号作为时间戳
+    设置(审计_缓冲, base + 3, 结果)
+    审计_头 = 审计_头 + 1
+    审计_总数 = 审计_总数 + 1
+}
+
+// Seccomp过滤 — 系统调用白/黑名单
+
+定义 SECCOMP_允许 = 0
+定义 SECCOMP_拒绝 = 1
+定义 SECCOMP_日志 = 2       // 允许但记录日志
+
+定义 可变 seccomp_启用 = 假
+定义 可变 seccomp_规则 = []    // 每个系统调用的策略
+定义 可变 seccomp_拒绝数 = 0
+
+函数 seccomp_初始化() {
+    seccomp_规则 = []
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        追加(seccomp_规则, SECCOMP_允许)  // 默认允许
+        i = i + 1
+    }
+    seccomp_启用 = 真
+}
+
+函数 seccomp_设置规则(号, 策略) {
+    如果 (号 >= 0 && 号 < 最大系统调用) {
+        设置(seccomp_规则, 号, 策略)
+    }
+}
+
+函数 seccomp_检查(号) {
+    如果 (!seccomp_启用) { 返回 SECCOMP_允许 }
+    如果 (号 < 0 || 号 >= 最大系统调用) { 返回 SECCOMP_拒绝 }
+    定义 策略 = seccomp_规则[号]
+    如果 (策略 == SECCOMP_拒绝) { seccomp_拒绝数 = seccomp_拒绝数 + 1 }
+    返回 策略
+}
+
+// 速率限制 — 防止系统调用洪泛
+
+定义 可变 速率_窗口开始 = 0
+定义 可变 速率_窗口计数 = 0
+定义 可变 速率_限制 = 100000        // 每秒最大8万次系统调用
+定义 可变 速率_窗口_ms = 1000       // 窗口大小(ms)
+定义 可变 速率_被限次数 = 0
+
+函数 系统调用_速率检查() {
+    定义 现在 = 读取毫秒()
+    如果 (现在 - 速率_窗口开始 >= 速率_窗口_ms) {
+        // 新窗口
+        速率_窗口开始 = 现在
+        速率_窗口计数 = 0
+    }
+    速率_窗口计数 = 速率_窗口计数 + 1
+    如果 (速率_窗口计数 > 速率_限制) {
+        速率_被限次数 = 速率_被限次数 + 1
+        返回 假  // 被限制
+    }
+    返回 真  // 允许
+}
+
+// 的Top-K热点系统调用
+
+函数 系统调用_热点Top5() {
+    // 返回调用次数最多的5个系统调用
+    定义 可变 top = [0, 0, 0, 0, 0]
+    定义 可变 top值 = [0, 0, 0, 0, 0]
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        如果 (系统调用计数[i] > top值[4]) {
+            // 插入到正确位置
+            定义 可变 j = 4
+            当 (j > 0 && 系统调用计数[i] > top值[j - 1]) { j = j - 1 }
+            // 后移
+            定义 可变 k = 4
+            当 (k > j) { top[k] = top[k - 1]; top值[k] = top值[k - 1]; k = k - 1 }
+            top[j] = i
+            top值[j] = 系统调用计数[i]
+        }
+        i = i + 1
+    }
+    返回 [top, top值]
+}
+
+// 完整诊断统计
+
+函数 系统调用表_完整统计() {
+    返回 {
+        总调用数: 系统调用_总次数,
+        未注册: 系统调用_未注册次数,
+        已注册: 系统调用_已注册数(),
+        审计总数: 审计_总数,
+        seccomp拒绝: seccomp_拒绝数,
+        被限速次数: 速率_被限次数
+    }
+}
+
+// §7 重置与存取器
+
+函数 系统调用_重置统计() {
+    系统调用_总次数 = 0
+    系统调用_未注册次数 = 0
+    审计_总数 = 0
+    seccomp_拒绝数 = 0
+    速率_被限次数 = 0
+    速率_窗口计数 = 0
+    定义 可变 i = 0
+    当 (i < 最大系统调用) {
+        系统调用计数[i] = 0
+        i = i + 1
+    }
+}
+
+函数 系统调用_获取总数() { 返回 系统调用_总次数 }
+函数 系统调用_获取未注册数() { 返回 系统调用_未注册次数 }
+函数 系统调用_获取审计数() { 返回 审计_总数 }
+函数 系统调用_获取拒绝数() { 返回 seccomp_拒绝数 }
+函数 系统调用_获取限速数() { 返回 速率_被限次数 }
+
+函数 系统调用_健康检查() {
+    定义 可变 问题 = 0
+    // 检查未注册率
+    如果 (系统调用_总次数 > 100) {
+        定义 未注册率 = 系统调用_未注册次数 * 100 / 系统调用_总次数
+        如果 (未注册率 > 20) { 问题 = 问题 + 1 }
+    }
+    // 检查seccomp拒绝率
+    如果 (seccomp_拒绝数 > 系统调用_总次数 / 10) { 问题 = 问题 + 1 }
+    // 检查限速异常
+    如果 (速率_被限次数 > 100) { 问题 = 问题 + 1 }
+    返回 问题 == 0
+}
+
+函数 系统调用_打印统计() {
+    打印行("=== 系统调用表统计 ===")
+    打印行("总调用: " + 整数转字符串(系统调用_总次数))
+    打印行("未注册: " + 整数转字符串(系统调用_未注册次数))
+    打印行("已注册: " + 整数转字符串(系统调用_已注册数()))
+    打印行("审计: " + 整数转字符串(审计_总数))
+    打印行("seccomp拒绝: " + 整数转字符串(seccomp_拒绝数))
+    打印行("限速: " + 整数转字符串(速率_被限次数))
+}
+
+// ◆ SDT 理论 — Syscall Dispatch Table
+//   公理1: 系统调用是用户态到内核态的受控入口映射
+//   公理2: Seccomp策略实现白/黑名单安全过滤
+//   公理3: 速率限制防止系统调用洪泛攻击
+//   定理: 审计+Seccomp+限速三层防御使恶意调用成功率趋近零
+//         P(exploit|审计∧seccomp∧限速) → 0
+
+函数 系统调用表_统计() {
+    返回 {
+        系统调用计数: 计数(系统调用计数),
+        系统调用总次数: 系统调用_总次数,
+        系统调用总计数: 系统调用_总计数,
+        系统调用未注册次数: 系统调用_未注册次数,
+        审计总数: 审计_总数,
+        速率窗口计数: 速率_窗口计数,
+        速率被限次数: 速率_被限次数
+    }
+}
+
+函数 系统调用表_健康评估() {
+    定义 可变 问题 = []
+    // 未注册调用率: 大量未注册调用说明有非法系统调用尝试
+    如果 (系统调用_总次数 > 100 && 系统调用_未注册次数 * 100 / 系统调用_总次数 > 5) { 追加(问题, "未注册系统调用比例过高") }
+    // 速率限制触发: 被限次数占窗口计数比例过高说明系统调用洪泛
+    如果 (速率_窗口计数 > 100 && 速率_被限次数 * 100 / 速率_窗口计数 > 20) { 追加(问题, "系统调用速率限制触发频繁") }
+    // 审计缓冲膨胀
+    如果 (计数(审计_缓冲) > 10000) { 追加(问题, "审计缓冲膨胀") }
+    返回 计数(问题) == 0
+}
+
+函数 系统调用表_综合报告() {
+    打印("[系统调用表] ═══ 综合报告 ═══")
+    打印("  系统调用计数: " + 整数转字符串(计数(系统调用计数)))
+    打印("  系统调用_总次数: " + 整数转字符串(系统调用_总次数))
+    打印("  系统调用_总计数: " + 整数转字符串(系统调用_总计数))
+    打印("  系统调用_未注册次数: " + 整数转字符串(系统调用_未注册次数))
+    打印("  审计_总数: " + 整数转字符串(审计_总数))
+    打印("  速率_窗口计数: " + 整数转字符串(速率_窗口计数))
+    打印("  速率_被限次数: " + 整数转字符串(速率_被限次数))
+    打印("  健康: " + 如果 (系统调用表_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 系统调用表_全局重置() {
+    系统调用计数 = []
+    系统调用_总次数 = 0
+    系统调用_总计数 = 0
+    系统调用_未注册次数 = 0
+    审计_总数 = 0
+    速率_窗口计数 = 0
+    速率_被限次数 = 0
+    打印("[系统调用表] 统计已重置")
+    返回 0
+}

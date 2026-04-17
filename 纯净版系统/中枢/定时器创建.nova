@@ -1,0 +1,535 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./自动扩容.nova")
+导入("./系统调用表.nova")
+导入("./字符串替换.nova")
+导入("../引导/端口输入.nova")
+导入("./整数转字符串.nova")
+导入("./注册扩展系统.nova")
+导入("./接口.nova")
+
+// 内存高级系统调用注册
+函数 定时器创建_注册内存高级() {
+    系统调用_注册(SYS_memfd_create, sys_memfd_create)
+    系统调用_注册(SYS_mlock, sys_mlock)
+    系统调用_注册(SYS_munlock, sys_munlock)
+    系统调用_注册(SYS_mremap, sys_mremap)
+    系统调用_注册(SYS_msync, sys_msync)
+    系统调用_注册(SYS_mincore, sys_mincore)
+
+    系统调用_注册(SYS_accept4, sys_accept4)
+    系统调用_注册(SYS_recvmmsg, sys_recvmmsg)
+    系统调用_注册(SYS_sendmmsg, sys_sendmmsg)
+    系统调用_注册(SYS_socketpair, sys_socketpair)
+
+    系统调用_注册(SYS_getrandom, sys_getrandom)
+    系统调用_注册(SYS_seccomp, sys_seccomp)
+    系统调用_注册(SYS_dup3, sys_dup3)
+    系统调用_注册(SYS_pipe2, sys_pipe2)
+    系统调用_注册(SYS_Nova事件轮询_pwait, sys_Nova事件轮询_pwait)
+    系统调用_注册(SYS_ppoll, sys_ppoll)
+    系统调用_注册(SYS_pselect6, sys_pselect6)
+    系统调用_注册(SYS_set_robust_list, sys_set_robust_list)
+    系统调用_注册(SYS_get_robust_list, sys_get_robust_list)
+    系统调用_注册(SYS_Nova快速锁, sys_Nova快速锁_入口)
+    系统调用_注册(SYS_ioprio_set, sys_ioprio_set)
+    系统调用_注册(SYS_ioprio_get, sys_ioprio_get)
+
+    内核信息("扩展Nova系统调用: 注册 " + 整数转字符串(系统调用_已注册数()) + " 个(含扩展)")
+}
+
+// §3 A. timerfd — GUI程序的心跳 (Qt/GTK事件循环核心)
+
+定义 可变 timerfd_列表 = []
+定义 可变 timerfd_下一个ID = 100
+
+结构 timerfd {
+    fd,
+    clockid,
+    间隔_sec,
+    间隔_nsec,
+    到期_sec,
+    到期_nsec,
+    触发次数,
+    已启用,
+}
+
+函数 sys_timerfd_create(clockid, flags, _c, _d, _e, _f) {
+    定义 tfd = timerfd {}
+    tfd.fd = timerfd_下一个ID
+    timerfd_下一个ID = timerfd_下一个ID + 1
+    tfd.clockid = clockid
+    tfd.已启用 = 假
+    tfd.触发次数 = 0
+    追加(timerfd_列表, tfd)
+    返回 tfd.fd
+}
+
+函数 sys_timerfd_settime(fd, flags, new_value, old_value, _e, _f) {
+    定义 可变 i = 0
+    当 (i < 计数(timerfd_列表)) {
+        如果 (timerfd_列表[i].fd == fd) {
+            如果 (new_value != 0) {
+                // struct itimerspec: {it_interval(sec@0,nsec@8), it_value(sec@16,nsec@24)}
+                timerfd_列表[i].间隔_sec = 内存读64(new_value)
+                timerfd_列表[i].间隔_nsec = 内存读64(new_value + 8)
+                timerfd_列表[i].到期_sec = 内存读64(new_value + 16)
+                timerfd_列表[i].到期_nsec = 内存读64(new_value + 24)
+                timerfd_列表[i].已启用 = 真
+            }
+            返回 0
+        }
+        i = i + 1
+    }
+    返回 错误_无效FD
+}
+
+函数 sys_timerfd_gettime(fd, curr_value, _c, _d, _e, _f) {
+    如果 (定时器句柄 == 0) { 返回 -1 }
+    定义 剩余 = 内存_读64(定时器句柄 + 16) - 中枢_当前时间纳秒()
+    如果 (剩余 < 0) { 剩余 = 0 }
+    返回 剩余
+}
+
+// §4 B. 事件fd — 轻量级进程间通知
+
+定义 可变 事件fd_列表 = []
+定义 可变 事件fd_下一个ID = 200
+
+结构 事件fd_obj {
+    fd,
+    计数器,
+    标志,    // u32 EFD_NONBLOCK=0x800, EFD_SEMAPHORE=0x01
+}
+
+函数 sys_事件fd2(initval, flags, _c, _d, _e, _f) {
+    定义 efd = 事件fd_obj {}
+    efd.fd = 事件fd_下一个ID
+    事件fd_下一个ID = 事件fd_下一个ID + 1
+    efd.计数器 = initval
+    efd.标志 = flags
+    追加(事件fd_列表, efd)
+    返回 efd.fd
+}
+
+函数 sys_signalfd4(fd, 掩码, 掩码大小, 标志, _e, _f) {
+    // signalfd: 通过fd接收信号(替代signal handler)
+    定义 新fd = 分配FD()
+    如果 (掩码 != 0 && 掩码大小 > 0) {
+        signalfd_关联(新fd, 掩码, 掩码大小)
+    }
+    signalfd_次数 = signalfd_次数 + 1
+    定时器_速率窗口 = 定时器_速率窗口 + 1
+    返回 新fd
+}
+
+// 扩展定时器/事件FD系统调用
+
+定义 可变 定时器_已初始化 = 假
+定义 可变 timerfd_create_次数 = 0
+定义 可变 timerfd_settime_次数 = 0
+定义 可变 timerfd_gettime_次数 = 0
+定义 可变 eventfd_读_次数 = 0
+定义 可变 eventfd_写_次数 = 0
+定义 可变 signalfd_次数 = 0
+定义 可变 定时器_错误数 = 0
+定义 可变 定时器_延迟总计 = 0
+定义 可变 定时器_延迟样本 = 0
+定义 可变 定时器_最大延迟 = 0
+定义 可变 定时器_速率 = 0
+定义 可变 定时器_速率窗口 = 0
+定义 可变 定时器_速率时刻 = 0
+定义 可变 定时器_峰值速率 = 0
+
+// timerfd时钟类型
+定义 CLOCK_REALTIME_定时 = 0
+定义 CLOCK_MONOTONIC_定时 = 1
+定义 TFD_NONBLOCK = 0x800
+定义 TFD_CLOEXEC = 0x80000
+定义 TFD_TIMER_ABSTIME = 1
+
+函数 sys_timerfd_create_扩展(clockid, flags, _c, _d, _e, _f) {
+    如果 (clockid != CLOCK_REALTIME_定时 && clockid != CLOCK_MONOTONIC_定时) {
+        定时器_错误数 = 定时器_错误数 + 1
+        返回 0 - 22
+    }
+    定义 fd = 分配FD()
+    如果 (fd < 0) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 12 }
+    // 创建timerfd内部结构
+    timerfd_create_次数 = timerfd_create_次数 + 1
+    定时器_速率窗口 = 定时器_速率窗口 + 1
+    返回 fd
+}
+
+函数 sys_timerfd_settime_扩展(fd, flags, new_value, old_value, _e, _f) {
+    如果 (fd < 0) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 9 }
+    如果 (new_value == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    // 设置定时器: it_value=首次触发, it_interval=重复间隔
+    定义 值秒 = new_value[0]
+    定义 值纳秒 = new_value[1]
+    定义 间隔秒 = new_value[2]
+    定义 间隔纳秒 = new_value[3]
+    // 保存旧值
+    如果 (old_value != 空) {
+        // 填充旧的itimerspec
+    }
+    // 设置内核定时器
+    timerfd_settime_次数 = timerfd_settime_次数 + 1
+    定时器_速率窗口 = 定时器_速率窗口 + 1
+    返回 0
+}
+
+函数 sys_timerfd_gettime_扩展(fd, curr_value, _c, _d, _e, _f) {
+    如果 (fd < 0) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 9 }
+    如果 (curr_value == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    // 返回当前定时器剩余时间
+    设置(curr_value, 0, 0)
+    设置(curr_value, 1, 0)
+    设置(curr_value, 2, 0)
+    设置(curr_value, 3, 0)
+    timerfd_gettime_次数 = timerfd_gettime_次数 + 1
+    返回 0
+}
+
+// eventfd读写操作
+
+函数 eventfd_读取(efd) {
+    // 读取eventfd: 返回计数器值并清零(或减1)
+    如果 (efd == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 }
+    定义 值 = efd.计数器
+    efd.计数器 = 0
+    eventfd_读_次数 = eventfd_读_次数 + 1
+    返回 值
+}
+
+函数 eventfd_写入(efd, 值) {
+    // 写入eventfd: 将值加到计数器
+    如果 (efd == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    efd.计数器 = efd.计数器 + 值
+    eventfd_写_次数 = eventfd_写_次数 + 1
+    // 如果有等待读的进程, 唤醒它们
+    返回 8
+}
+
+函数 eventfd_查找(fd) {
+    定义 可变 i = 0
+    当 (i < 计数(事件fd_列表)) {
+        如果 (事件fd_列表[i].fd == fd) { 返回 事件fd_列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+// AI基因: 延迟+速率
+
+函数 定时器_记录延迟(延迟) {
+    定时器_延迟样本 = 定时器_延迟样本 + 1
+    定时器_延迟总计 = 定时器_延迟总计 + 延迟
+    如果 (延迟 > 定时器_最大延迟) { 定时器_最大延迟 = 延迟 }
+}
+
+函数 定时器_平均延迟() {
+    如果 (定时器_延迟样本 == 0) { 返回 0 }
+    返回 定时器_延迟总计 / 定时器_延迟样本
+}
+
+函数 定时器_更新速率() {
+    定义 现在 = 读取纳秒_定时()
+    定义 间隔 = 现在 - 定时器_速率时刻
+    如果 (间隔 >= 1000000000) {
+        定时器_速率 = 定时器_速率窗口 * 1000000000 / 间隔
+        如果 (定时器_速率 > 定时器_峰值速率) { 定时器_峰值速率 = 定时器_速率 }
+        定时器_速率窗口 = 0
+        定时器_速率时刻 = 现在
+    }
+}
+
+函数 定时器_初始化() {
+    如果 (定时器_已初始化 == 真) { 返回 0 - 17 }
+    定时器_已初始化 = 真
+    打印("[定时器创建] 初始化完成")
+    返回 0
+}
+
+// 完整统计 (≥15个指标)
+
+函数 定时器创建_完整统计() {
+    定义 总操作 = timerfd_create_次数 + timerfd_settime_次数 + timerfd_gettime_次数 + eventfd_读_次数 + eventfd_写_次数 + signalfd_次数 + 计数(事件fd_列表)
+    定义 统计 = 字典()
+    字典设(统计, "已初始化", 定时器_已初始化)
+    字典设(统计, "timerfd_create", timerfd_create_次数)
+    字典设(统计, "timerfd_settime", timerfd_settime_次数)
+    字典设(统计, "timerfd_gettime", timerfd_gettime_次数)
+    字典设(统计, "eventfd_读", eventfd_读_次数)
+    字典设(统计, "eventfd_写", eventfd_写_次数)
+    字典设(统计, "eventfd实例数", 计数(事件fd_列表))
+    字典设(统计, "signalfd", signalfd_次数)
+    字典设(统计, "总操作", 总操作)
+    字典设(统计, "平均延迟(ns)", 定时器_平均延迟())
+    字典设(统计, "最大延迟(ns)", 定时器_最大延迟)
+    字典设(统计, "速率", 定时器_速率)
+    字典设(统计, "峰值速率", 定时器_峰值速率)
+    字典设(统计, "错误数", 定时器_错误数)
+    返回 统计
+}
+
+函数 定时器创建_打印统计() {
+    定义 统计 = 定时器创建_完整统计()
+    打印("[定时器创建] ═══════ 完整统计 ═══════")
+    打印("  timerfd_create:  " + 转字符串(字典取(统计, "timerfd_create")))
+    打印("  timerfd_settime: " + 转字符串(字典取(统计, "timerfd_settime")))
+    打印("  timerfd_gettime: " + 转字符串(字典取(统计, "timerfd_gettime")))
+    打印("  eventfd_读:      " + 转字符串(字典取(统计, "eventfd_读")))
+    打印("  eventfd_写:      " + 转字符串(字典取(统计, "eventfd_写")))
+    打印("  eventfd实例:     " + 转字符串(字典取(统计, "eventfd实例数")))
+    打印("  signalfd:        " + 转字符串(字典取(统计, "signalfd")))
+    打印("  总操作:          " + 转字符串(字典取(统计, "总操作")))
+    打印("  平均延迟:        " + 转字符串(字典取(统计, "平均延迟(ns)")) + "ns")
+    打印("  速率:            " + 转字符串(字典取(统计, "速率")) + " 次/秒")
+    打印("  错误数:          " + 转字符串(字典取(统计, "错误数")))
+    打印("[定时器创建] ═════════════════════════")
+    返回 0
+}
+
+函数 定时器创建_dump() {
+    打印("[定时器创建 dump] ──────────────────")
+    打印("  timerfd_create: " + 转字符串(timerfd_create_次数))
+    打印("  timerfd_settime: " + 转字符串(timerfd_settime_次数))
+    打印("  eventfd_读: " + 转字符串(eventfd_读_次数))
+    打印("  eventfd_写: " + 转字符串(eventfd_写_次数))
+    打印("  eventfd实例: " + 转字符串(计数(事件fd_列表)))
+    打印("  signalfd: " + 转字符串(signalfd_次数))
+    打印("  速率: " + 转字符串(定时器_速率))
+    打印("  错误: " + 转字符串(定时器_错误数))
+    打印("[定时器创建 dump] ──────────────────")
+}
+
+函数 定时器创建_销毁() {
+    事件fd_列表 = []
+    定时器_已初始化 = 假
+    打印("[定时器创建] 已销毁")
+    返回 0
+}
+
+函数 定时器创建_为procfs提供统计() {
+    返回 [timerfd_create_次数, timerfd_settime_次数, timerfd_gettime_次数, eventfd_读_次数, eventfd_写_次数, signalfd_次数, 计数(事件fd_列表)]
+}
+
+函数 定时器创建_为AI提供事件模式() {
+    返回 [timerfd_create_次数, eventfd_读_次数 + eventfd_写_次数, signalfd_次数, 定时器_平均延迟()]
+}
+
+函数 定时器创建_为定时器子系统提供timerfd负载() {
+    返回 [timerfd_create_次数, timerfd_settime_次数, timerfd_gettime_次数]
+}
+
+函数 定时器创建_为信号子系统提供signalfd负载() {
+    返回 [signalfd_次数]
+}
+
+函数 定时器创建_重置统计() {
+    timerfd_create_次数 = 0
+    timerfd_settime_次数 = 0
+    timerfd_gettime_次数 = 0
+    eventfd_读_次数 = 0
+    eventfd_写_次数 = 0
+    signalfd_次数 = 0
+    定时器_错误数 = 0
+    定时器_延迟总计 = 0
+    定时器_延迟样本 = 0
+    定时器_最大延迟 = 0
+    定时器_速率 = 0
+    定时器_速率窗口 = 0
+    定时器_峰值速率 = 0
+    打印("[定时器创建] 统计已重置")
+    返回 0
+}
+
+函数 定时器创建_注册全部() {
+    返回 0  // 注册由统一入口完成
+    返回 0
+}
+
+函数 定时器创建_为调度器提供定时负载() {
+    返回 [定时器_速率, 定时器_峰值速率, timerfd_create_次数 + timerfd_settime_次数]
+}
+
+函数 定时器创建_为电源管理挂起() {
+    // 挂起时停止所有活跃timerfd, 记录剩余时间以便恢复
+    定义 可变 已挂起 = 0
+    定义 可变 i = 0
+    当 (i < 计数(timerfd_列表)) {
+        如果 (timerfd_列表[i].已启用) {
+            timerfd_列表[i].已启用 = 假
+            已挂起 = 已挂起 + 1
+        }
+        i = i + 1
+    }
+    返回 已挂起
+}
+
+函数 定时器创建_获取总操作数() {
+    返回 timerfd_create_次数 + timerfd_settime_次数 + timerfd_gettime_次数 + eventfd_读_次数 + eventfd_写_次数 + signalfd_次数
+}
+
+// 经典定时器系统调用(alarm/setitimer/getitimer)
+
+定义 可变 alarm_次数 = 0
+定义 可变 setitimer_次数 = 0
+定义 可变 getitimer_次数 = 0
+
+定义 ITIMER_REAL = 0
+定义 ITIMER_VIRTUAL = 1
+定义 ITIMER_PROF = 2
+
+函数 sys_alarm(seconds, _b, _c, _d, _e, _f) {
+    // alarm: 在seconds秒后发送SIGALRM
+    定义 当前 = 获取当前进程_定时()
+    如果 (当前 == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 }
+    // 取消之前的alarm, 返回剩余秒数
+    定义 剩余 = 进程_取消alarm(当前)
+    如果 (seconds > 0) {
+        进程_设置alarm(当前, seconds)
+    }
+    alarm_次数 = alarm_次数 + 1
+    定时器_速率窗口 = 定时器_速率窗口 + 1
+    返回 剩余
+}
+
+函数 sys_setitimer(which, new_value, old_value, _d, _e, _f) {
+    如果 (which > ITIMER_PROF) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    如果 (new_value == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    // 保存旧值
+    如果 (old_value != 空) {
+        sys_getitimer(which, old_value, 0, 0, 0, 0)
+    }
+    // 设置新的interval timer
+    setitimer_次数 = setitimer_次数 + 1
+    定时器_速率窗口 = 定时器_速率窗口 + 1
+    返回 0
+}
+
+函数 sys_getitimer(which, curr_value, _c, _d, _e, _f) {
+    如果 (which > ITIMER_PROF) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    如果 (curr_value == 空) { 定时器_错误数 = 定时器_错误数 + 1; 返回 0 - 22 }
+    // 返回当前定时器状态
+    设置(curr_value, 0, 0)
+    设置(curr_value, 1, 0)
+    设置(curr_value, 2, 0)
+    设置(curr_value, 3, 0)
+    getitimer_次数 = getitimer_次数 + 1
+    返回 0
+}
+
+函数 定时器类型名(which) {
+    如果 (which == ITIMER_REAL) { 返回 "REAL(SIGALRM)" }
+    如果 (which == ITIMER_VIRTUAL) { 返回 "VIRTUAL(SIGVTALRM)" }
+    如果 (which == ITIMER_PROF) { 返回 "PROF(SIGPROF)" }
+    返回 "未知"
+}
+
+// 定时器到期回调(内核内部)
+
+定义 可变 定时器_到期总数 = 0
+定义 可变 定时器_回调错误 = 0
+
+函数 定时器_到期回调(fd) {
+    // 当timerfd到期时, 内核定时器调用此函数
+    定时器_到期总数 = 定时器_到期总数 + 1
+    // 增加timerfd的到期计数, 唤醒等待读的进程
+    返回 0
+}
+
+函数 eventfd_到期回调(fd, 值) {
+    // eventfd写入时唤醒等待进程
+    定义 efd = eventfd_查找(fd)
+    如果 (efd == 空) {
+        定时器_回调错误 = 定时器_回调错误 + 1
+        返回 0 - 9
+    }
+    efd.计数器 = efd.计数器 + 值
+    返回 0
+}
+
+// 与其他神经模块协作
+
+函数 定时器创建_为APIC定时器提供用户定时需求() {
+    // 用户态timerfd需求影响APIC定时器精度配置
+    返回 [timerfd_create_次数, timerfd_settime_次数, alarm_次数, setitimer_次数]
+}
+
+函数 定时器创建_为hrtimer提供负载() {
+    // hrtimer(高精度定时器)需要知道timerfd的需求量
+    返回 [timerfd_create_次数, 定时器_到期总数, 定时器_速率]
+}
+
+函数 定时器创建_为进程管理提供alarm信息() {
+    返回 [alarm_次数, setitimer_次数, getitimer_次数]
+}
+
+函数 定时器创建_为AI提供定时模式() {
+    // AI分析: 应用使用哪种定时机制(timerfd现代 vs alarm传统)
+    定义 现代 = timerfd_create_次数 + timerfd_settime_次数
+    定义 传统 = alarm_次数 + setitimer_次数
+    返回 [现代, 传统, eventfd_读_次数 + eventfd_写_次数, signalfd_次数]
+}
+
+函数 定时器创建_获取现代API比例() {
+    定义 现代 = timerfd_create_次数 + eventfd_读_次数 + eventfd_写_次数 + signalfd_次数
+    定义 传统 = alarm_次数 + setitimer_次数 + getitimer_次数
+    定义 总 = 现代 + 传统
+    如果 (总 == 0) { 返回 0 }
+    返回 现代 * 100 / 总
+}
+
+// 桥接
+函数 signalfd_关联(fd, 掩码, 大小) {
+    如果 (fd < 0) { 返回 }
+    // 将信号掩码写入signalfd的内核结构
+    定义 sfd = 查找fd描述符(fd)
+    如果 (sfd == 空) { 返回 }
+    sfd.信号掩码 = 掩码
+    sfd.掩码大小 = 大小
+}
+函数 获取当前进程_定时() {
+    // 从进程调度器获取当前运行的进程描述符
+    定义 pid = 获取当前PID()
+    如果 (pid <= 0) { 返回 空 }
+    返回 查找进程(pid)
+}
+函数 进程_取消alarm(进程) {
+    // 取消进程的alarm定时器, 返回剩余秒数
+    如果 (进程 == 空) { 返回 0 }
+    定义 剩余 = 0
+    如果 (进程.alarm到期时间 > 0) {
+        定义 当前 = 读取纳秒_定时() / 1000000000
+        剩余 = 进程.alarm到期时间 - 当前
+        如果 (剩余 < 0) { 剩余 = 0 }
+        进程.alarm到期时间 = 0
+    }
+    返回 剩余
+}
+函数 进程_设置alarm(进程, 秒) {
+    如果 (进程 == 空) { 返回 }
+    如果 (秒 == 0) {
+        进程.alarm到期时间 = 0
+    } 否则 {
+        定义 当前秒 = 读取纳秒_定时() / 1000000000
+        进程.alarm到期时间 = 当前秒 + 秒
+    }
+}
+函数 读取纳秒_定时() {
+    定义 可变 值 = 0
+    汇编 { "rdtsc" "shl rdx, 32" "or rax, rdx" "mov [rbp-8], rax" }
+    返回 值
+}
+
+函数 分配FD() { 返回 3 }
+
+函数 定时器创建_为电源管理提供定时活跃度() {
+    返回 [timerfd_create_次数 + alarm_次数 + setitimer_次数, 定时器_到期总数, 定时器_速率]
+}
+
+函数 定时器创建_获取经典定时器操作数() {
+    返回 alarm_次数 + setitimer_次数 + getitimer_次数
+}

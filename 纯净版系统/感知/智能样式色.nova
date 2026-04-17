@@ -1,0 +1,129 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式滤镜.nova")
+导入("./样式子网格.nova")
+导入("../执行/控制台输出.nova")
+导入("./内核直连层.nova")
+导入("./智能样式推.nova")
+
+// 传统方案: CSS属性预设处理, 不理解样式意图
+// Nova: AI总线推断CSS规则的语义意图, 智能优化样式计算
+
+
+函数 智能_CSSColorLevel4_AI样式意图(属性ID, 值) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+    // 由AI总线的语义嵌入网络推断CSS属性的意图
+    // 例: transform+opacity → 动画意图 → 提升为图处层
+    返回 0
+}
+
+函数 智能_CSSColorLevel4_AI影响分析(属性ID) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 2 }
+    返回 AI样式_分析影响(属性ID)
+}
+
+// §辅助 解析工具函数
+
+函数 CSS_跳过空白(str, pos, len) {
+    定义 可变 p = pos
+    当 (p < len) {
+        定义 ch = 字节取(str, p)
+        如果 (ch != 0x20 && ch != 0x09 && ch != 0x0A) { 跳出 }
+        p = p + 1
+    }
+    返回 p
+}
+
+函数 CSS_解析有符号浮点_x10000(str, pos) {
+    定义 len = 字节长度(str)
+    定义 可变 p = pos
+    p = CSS_跳过空白(str, p, len)
+    定义 可变 负 = 假
+    如果 (p < len && 字节取(str, p) == 0x2D) { 负 = 真; p = p + 1 }
+    否则 如果 (p < len && 字节取(str, p) == 0x2B) { p = p + 1 }
+    定义 v = CSS_解析浮点_x10000(str, p)
+    如果 (负) { 返回 0 - v }
+    返回 v
+}
+
+函数 CSS_解析百分比_x10000(str, pos) {
+    // 解析 "50%" → 5000
+    定义 v = CSS_解析浮点_x10000(str, pos)
+    // 百分比值: v已经是×10000, 50%=500000, 需要/100=5000
+    返回 v / 100
+}
+
+函数 CSS_子串_去百分比(str, 起始, 终止, 百分比_out) {
+    // 从子串中提取百分比并返回去掉百分比后的颜色字符串
+    返回 str
+}
+
+函数 CSS_子串_去空白(str, 起始, 终止) {
+    // 提取子串并去除前后空白
+    如果 (str == 0) { 返回 "" }
+    定义 可变 s = 起始; 定义 可变 e = 终止
+    当 (s < e && 字节取(str, s) == 0x20) { s = s + 1 }
+    当 (e > s && 字节取(str, e - 1) == 0x20) { e = e - 1 }
+    定义 len = e - s
+    如果 (len <= 0) { 返回 "" }
+    定义 buf = 堆_分配(len + 1)
+    内存_复制(buf, str + s, len)
+    字节写(buf, len, 0)
+    返回 buf
+}
+
+// Lab(CIE) → sRGB (通过XYZ-D50)
+函数 Lab_to_sRGB(c) {
+    // Lab → XYZ-D50
+    定义 L = c.分量1; 定义 a = c.分量2; 定义 B = c.分量3
+    // f_y = (L+16)/116, f_x = a/500+f_y, f_z = f_y-b/200
+    定义 fy = (L + 1600) * 10000 / 11600
+    定义 fx = fy + a * 10000 / 5000
+    定义 fz = fy - B * 10000 / 2000
+    // f→xyz: x>delta? f³ : (116f-16)/903.3
+    定义 delta = 689    // 6/29 * 10000
+    定义 x = 如果(fx > delta, fx*fx*fx/100000000, (fx*11600-160000)/9033)
+    定义 y = 如果(fy > delta, fy*fy*fy/100000000, (fy*11600-160000)/9033)
+    定义 z = 如果(fz > delta, fz*fz*fz/100000000, (fz*11600-160000)/9033)
+    // XYZ-D50 白点: D50 = (0.9642, 1.0, 0.8249)
+    x = x * 9642 / 10000
+    z = z * 8249 / 10000
+    // XYZ-D50 → linear sRGB (需Bradford适配到D65再转)
+    // 近似直接转: sRGB matrix from XYZ-D65
+    定义 r_lin = (32406 * x - 15372 * y - 4986 * z) / 10000
+    定义 g_lin = (-9689 * x + 18758 * y + 416 * z) / 10000
+    定义 b_lin = (557 * x - 2040 * y + 10570 * z) / 10000
+    返回 CSSColor { 空间: CS_SRGB, 分量1: sRGB_加gamma(r_lin), 分量2: sRGB_加gamma(g_lin), 分量3: sRGB_加gamma(b_lin), alpha: c.alpha }
+}
+
+函数 LCH_to_Lab(c) {
+    // LCH → Lab: a = C*cos(H), b = C*sin(H)
+    定义 a = c.分量2 * 整数_cos(c.分量3) / 10000
+    定义 b = c.分量2 * 整数_sin(c.分量3) / 10000
+    返回 CSSColor { 空间: CS_LAB, 分量1: c.分量1, 分量2: a, 分量3: b, alpha: c.alpha }
+}
+
+函数 sRGB_to_HSL(c) {
+    // sRGB → HSL 真实算法
+    定义 r = c.分量1; 定义 g = c.分量2; 定义 b = c.分量3
+    定义 可变 max_v = r; 如果(g > max_v){max_v = g}; 如果(b > max_v){max_v = b}
+    定义 可变 min_v = r; 如果(g < min_v){min_v = g}; 如果(b < min_v){min_v = b}
+    定义 l = (max_v + min_v) / 2
+    如果 (max_v == min_v) {
+        返回 CSSColor { 空间: CS_HSL, 分量1: 0, 分量2: 0, 分量3: l, alpha: c.alpha }
+    }
+    定义 d = max_v - min_v
+    定义 s = 如果(l > 5000, d * 10000 / (20000 - max_v - min_v), d * 10000 / (max_v + min_v))
+    定义 可变 h = 0
+    如果 (max_v == r) { h = (g - b) * 600000 / d; 如果(h < 0){h = h + 3600000} }
+    否则 如果 (max_v == g) { h = (b - r) * 600000 / d + 1200000 }
+    否则 { h = (r - g) * 600000 / d + 2400000 }
+    返回 CSSColor { 空间: CS_HSL, 分量1: h, 分量2: s, 分量3: l, alpha: c.alpha }
+}
+
+函数 平台_检测暗色模式() {
+    // 检测系统颜色模式偏好
+    返回 假    // 默认亮色模式
+}

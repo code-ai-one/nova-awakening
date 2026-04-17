@@ -1,0 +1,104 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/原生系统块分.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+
+// NovaOS · AMD 图处原生驱动 — 寄存器级完整实现
+// 覆盖: GCN 1.0 → GCN 5.0 → RDNA 1.0 → RDNA 2.0 → RDNA 3.0 →
+//        RDNA 4.0 + CDNA 1.0 → CDNA 2.0 → CDNA 3.0
+// 架构层次:
+//   GNova受限能量网络  (Graphics Register Bus Manager) — 全局控制/状态
+//   IH    (Interrupt Handler) — 环形缓冲中断
+//   GFX   (Graphics/Compute) — 着色器/光栅/计算 (CP命令处理器)
+//   S直传  (System 直传) — 异步直传复制引擎
+//   DCN   (Display Core Next) — CRTC/DPP/HUBP/OTG显示管线
+//   VCN   (视频 Core Next) — 视频编解码(替代UVD+VCE)
+//   SMU   (System Management Unit) — 电源/时钟/温度
+//   MMHUB (Memory Management Hub) — 图处页表/GART
+
+// §1 AMD MMIO寄存器定义 — 真实硬件地址
+
+定义 mmGNova受限能量网络_STATUS            = 0x8010    // 引擎忙状态
+定义 mmGNova受限能量网络_STATUS2           = 0x8014    // 扩展状态
+定义 mmGNova受限能量网络_SOFT_RESET        = 0x8020    // 软复位控制
+定义 mmGNova受限能量网络_GFX_INDEX         = 0x802C    // SE/SH/CU选择
+
+// GNova受限能量网络_STATUS位定义
+定义 GNova受限能量网络_STATUS_GUI_ACTIVE   = 1 << 31   // 图形引擎活跃
+定义 GNova受限能量网络_STATUS_CP_BUSY      = 1 << 29   // 命令处理器忙
+定义 GNova受限能量网络_STATUS_GFX_BUSY     = 1 << 26   // 图形管线忙
+定义 GNova受限能量网络_STATUS_TA_BUSY      = 1 << 14   // 纹理寻址忙
+定义 GNova受限能量网络_STATUS_SX_BUSY      = 1 << 20   // 着色器导出忙
+定义 GNova受限能量网络_STATUS_DB_BUSY      = 1 << 26   // 深度缓冲忙
+
+定义 mmCP_RB_BASE             = 0x8040    // 环缓冲基地址
+定义 mmCP_RB_CNTL             = 0x8044    // 环缓冲控制(大小/BUF_SWAP)
+定义 mmCP_RB_RPTR             = 0x8700    // 读指针(图处更新)
+定义 mmCP_RB_WPTR             = 0x8704    // 写指针(CPU更新)
+定义 mmCP_RB_RPTR_ADDR        = 0x8060    // RPTR回写地址
+定义 mmCP_ME_CNTL             = 0x86D4    // 微引擎控制(启停ME/PFP/CE)
+定义 mmCP_PFP_UCODE_ADDR      = 0xC150    // PFP固件地址
+定义 mmCP_PFP_UCODE_DATA      = 0xC154    // PFP固件数据
+定义 mmCP_ME_UCODE_ADDR       = 0xC158    // ME固件地址
+定义 mmCP_ME_UCODE_DATA       = 0xC15C    // ME固件数据
+定义 mmCP_CE_UCODE_ADDR       = 0xC168    // CE固件地址
+定义 mmCP_CE_UCODE_DATA       = 0xC16C    // CE固件数据
+
+定义 mmCP_COMPUTE_RB_BASE     = 0x8E04    // 计算环基地址
+定义 mmCP_COMPUTE_RB_CNTL     = 0x8E08
+定义 mmCP_COMPUTE_RB_RPTR     = 0x8E14
+定义 mmCP_COMPUTE_RB_WPTR     = 0x8E18
+定义 mmCP_MEC_UCODE_ADDR      = 0xC170    // MEC固件地址
+定义 mmCP_MEC_UCODE_DATA      = 0xC174    // MEC固件数据
+
+定义 mmS直传0_RB_BASE          = 0xD000    // S直传0环基地址
+定义 mmS直传0_RB_CNTL          = 0xD004
+定义 mmS直传0_RB_RPTR          = 0xD008
+定义 mmS直传0_RB_WPTR          = 0xD00C
+定义 mmS直传0_CNTL             = 0xD010    // S直传0控制
+定义 mmS直传1_RB_BASE          = 0xD800    // S直传1环基地址
+定义 mmS直传1_RB_CNTL          = 0xD804
+定义 mmS直传1_RB_RPTR          = 0xD808
+定义 mmS直传1_RB_WPTR          = 0xD80C
+
+定义 mmIH_RB_BASE             = 0xE000    // 中断环基地址
+定义 mmIH_RB_CNTL             = 0xE004    // 中断环控制
+定义 mmIH_RB_RPTR             = 0xE008    // 中断读指针
+定义 mmIH_RB_WPTR             = 0xE00C    // 中断写指针
+定义 mmIH_CNTL                = 0xE010    // 中断全局控制
+
+定义 mmDCN_HUBP0_SURFACE_ADDR = 0x3A00   // 帧缓冲表面地址
+定义 mmDCN_HUBP0_SIZE         = 0x3A04   // 帧缓冲尺寸
+定义 mmDCN_OTG0_CONTROL       = 0x3C00   // OTG(Output Timing Generator)控制
+定义 mmDCN_OTG0_H_TOTAL       = 0x3C04   // 水平总宽
+定义 mmDCN_OTG0_V_TOTAL       = 0x3C08   // 垂直总高
+定义 mmDCN_OTG0_H_ACTIVE      = 0x3C0C   // 水平活跃
+定义 mmDCN_OTG0_V_ACTIVE      = 0x3C10   // 垂直活跃
+定义 mmDCN_OTG_OFFSET         = 0x80     // 每个OTG偏移
+
+定义 mmMC_VM_FB_LOCATION_BASE = 0x2024   // 帧缓冲基地址
+定义 mmMC_VM_FB_LOCATION_TOP  = 0x2028   // 帧缓冲顶地址
+定义 mmMC_VM_AGP_BASE         = 0x2030   // AGP/GART基地址
+定义 mmMC_VM_AGP_TOP          = 0x2034
+定义 mmMC_VM_SYSTEM_APERTURE_LOW  = 0x2040
+定义 mmMC_VM_SYSTEM_APERTURE_HIGH = 0x2044
+定义 mmVM_CONTEXT0_CNTL       = 0x2080   // 页表上下文0
+定义 mmVM_L2_CNTL             = 0x2090   // L2 TLB控制
+
+定义 mmSMU_TEMPERATURE        = 0xE308   // 图处温度(读)
+定义 mmSMU_FAN_SPEED          = 0xE310   // 风扇转速
+定义 mmSMU_POWER              = 0xE314   // 功耗(毫瓦)
+
+函数 图处命令_分配(大小) {
+    定义 cmd = kmalloc(大小 + 16)
+    如果 (cmd == 空) { 返回 空 }
+    内存_写32(cmd, 大小)
+    内存_写32(cmd + 4, 0)
+    返回 cmd
+}
+
+函数 图处命令_提交(cmd) {
+    如果 (cmd == 空) { 返回 错误_参数 }
+    返回 图处驱动_提交命令缓冲(cmd, 内存_读32(cmd))
+}

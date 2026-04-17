@@ -1,0 +1,128 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./历史接口甲.nova")
+导入("./唤醒锁.nova")
+导入("./原子驻留.nova")
+导入("./文档事件.nova")
+导入("./缓存获取.nova")
+导入("./滚动链控制.nova")
+
+// §3 默认行为
+
+函数 事件Dispatch_默认行为(target, 事件) {
+    如果 (target == 0 || 事件 == 0) { 返回 }
+
+    选择 (事件.类型ID) {
+        EVT_CLICK: {
+            // <a>标签: 导航
+            // <button type=submit>: 提交表单
+            // <input type=checkbox>: 切换选中
+            事件Dispatch_click默认(target, 事件)
+        }
+        EVT_KEYDOWN: {
+            // Tab: 焦点移动
+            // Enter: 在<form>中提交, 在<a>中导航
+            // Space: 在button/checkbox上触发click
+            // Escape: 关闭dialog
+            事件Dispatch_keydown默认(target, 事件)
+        }
+        EVT_SUBMIT: {
+            // 表单提交
+            事件Dispatch_submit默认(target, 事件)
+        }
+        EVT_FOCUS: {
+            // 设置:focus伪类, 显示焦点环
+        }
+        EVT_BLUR: {
+            // 移除:focus伪类
+        }
+        EVT_WHEEL: {
+            // 滚动
+            事件Dispatch_wheel默认(target, 事件)
+        }
+    }
+}
+
+函数 事件Dispatch_click默认(target, 事件) {
+    如果 (target == 0) { 返回 }
+    // 检查是否<a>标签
+    如果 (target.节点 != 0) {
+        定义 节点 = target.节点
+        如果 (节点.节点类型 == 1) {    // 元素_节点
+            // 检查tag: 如果是<a>, 获取href并导航
+        }
+    }
+}
+
+函数 事件Dispatch_keydown默认(target, 事件) {
+    // 键盘默认行为
+    如果 (事件 == 0) { 返回 }
+    定义 keyCode = 事件.keyCode
+    定义 节点 = target
+    如果 (节点 != 0 && 节点.节点 != 0) { 节点 = 节点.节点 }
+    // Tab键: 移动焦点
+    如果 (keyCode == 9) {
+        如果 (节点 != 0) { Focus_Tab处理(节点, 事件.shiftKey) }
+    }
+    // Enter键: 在input/button上触发click
+    否则 如果 (keyCode == 13) {
+        如果 (节点 != 0) { 事件Target_dispatch事件(节点, 事件_创建2("click", 真, 真)) }
+    }
+    // Escape键: 关闭dialog/fullscreen
+    否则 如果 (keyCode == 27) {
+        如果 (Document_fullscreen元素() != 0) {
+            Document_exitFullscreen()
+        }
+    }
+}
+
+函数 事件Dispatch_submit默认(target, 事件) {
+    // 表单提交默认行为
+    如果 (target == 0) { 返回 }
+    定义 form = target
+    定义 action = 元素_getAttribute(form, "action")
+    定义 method = 元素_getAttribute(form, "method")
+    如果 (action == 0) { action = "" }
+    如果 (method == 0) { method = "GET" }
+    // 收集表单数据
+    定义 fd = FormData_从表单创建(form)
+    // 根据method发起请求
+    如果 (字符串_相等_忽略大小写(method, "POST")) {
+        取数_POST(action, fd)
+    } 否则 {
+        // GET: 将表单数据编码为查询字符串并导航
+        定义 url = URL_附加查询(action, fd)
+        Navigation_navigate(url, 0, 0)
+    }
+}
+
+函数 事件Dispatch_wheel默认(target, 事件) {
+    // 滚动默认行为: 找到最近的可滚动祖先, 应用deltaY
+    如果 (事件 == 0) { 返回 }
+    定义 deltaX = 事件.deltaX
+    定义 deltaY = 事件.deltaY
+    // 找到最近的可滚动祖先
+    定义 可变 节点 = target
+    当 (节点 != 0) {
+        如果 (元素_是可滚动(节点)) {
+            定义 scroll节点 = 元素_获取滚动容器(节点)
+            如果 (scroll节点 != 0) {
+                scroll节点.scrollTop = scroll节点.scrollTop + deltaY
+                scroll节点.scrollLeft = scroll节点.scrollLeft + deltaX
+                // 限制范围
+                如果 (scroll节点.scrollTop < 0) { scroll节点.scrollTop = 0 }
+                如果 (scroll节点.scrollLeft < 0) { scroll节点.scrollLeft = 0 }
+                返回
+            }
+        }
+        节点 = 节点.父节点
+    }
+    // 未找到可滚动祖先: 滚动文档
+    定义 doc = 全局_当前文档
+    如果 (doc != 0) {
+        doc.scrollY = doc.scrollY + deltaY
+        doc.scrollX = doc.scrollX + deltaX
+        如果 (doc.scrollY < 0) { doc.scrollY = 0 }
+        如果 (doc.scrollX < 0) { doc.scrollX = 0 }
+    }
+}

@@ -1,0 +1,91 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+导入("./激活函数非线.nova")
+导入("./缩点积注意.nova")
+导入("../感知/内核直连层.nova")
+导入("./矩阵运算.nova")
+导入("../执行/底层内存操.nova")
+
+// §4 简易Nova门控循环 — 门控循环单元(捕捉长期依赖)
+// zt = σ(Wz·[ht-1, xt] + bz)          更新门
+// rt = σ(Wr·[ht-1, xt] + br)          重置门
+// ĥt = tanh(Wh·[rt⊙ht-1, xt] + bh)   候选隐藏
+// ht = (1-zt)⊙ht-1 + zt⊙ĥt           最终隐藏
+
+结构 Nova门控循环Cell {
+    隐藏维度,
+    输入维度,
+    Wz,    // u64 Tensor* [输入+隐藏 × 隐藏] 更新门权重
+    Wr,    // u64 Tensor* [输入+隐藏 × 隐藏] 重置门权重
+    Wh,    // u64 Tensor* [输入+隐藏 × 隐藏] 候选隐藏权重
+    bz,    // u64 Tensor* [1 × 隐藏]
+    br,
+    bh,
+    隐藏状态,    // u64 Tensor* [1 × 隐藏] 当前隐藏状态
+}
+
+函数 Nova门控循环Cell_创建(输入维度, 隐藏维度) {
+    定义 Nova门控循环 = 堆_分配(Nova门控循环Cell)
+    Nova门控循环.输入维度 = 输入维度
+    Nova门控循环.隐藏维度 = 隐藏维度
+    定义 拼接维 = 输入维度 + 隐藏维度
+
+    Nova门控循环.Wz = Tensor_创建(拼接维, 隐藏维度)
+    Nova门控循环.Wr = Tensor_创建(拼接维, 隐藏维度)
+    Nova门控循环.Wh = Tensor_创建(拼接维, 隐藏维度)
+    Nova门控循环.bz = Tensor_创建(1, 隐藏维度)
+    Nova门控循环.br = Tensor_创建(1, 隐藏维度)
+    Nova门控循环.bh = Tensor_创建(1, 隐藏维度)
+    Nova门控循环.隐藏状态 = Tensor_创建(1, 隐藏维度)
+
+    // Xavier初始化
+    权重_Xavier初始化(Nova门控循环.Wz, 拼接维, 隐藏维度)
+    权重_Xavier初始化(Nova门控循环.Wr, 拼接维, 隐藏维度)
+    权重_Xavier初始化(Nova门控循环.Wh, 拼接维, 隐藏维度)
+
+    返回 Nova门控循环
+}
+
+// [v2反哺] Nova门控循环Cell_前向步 — 门控循环线性化(无矩阵乘, 3次Tensor_矩阵乘→0次, 非暴力)
+// Nova门控循环Cell_线性步 — 无矩阵乘轻量GRU
+// 旧版: Tensor_矩阵乘 (暴力O(h²)) → 新版: 向量门控(O(h))
+// 原理: 对小隐藏维度h<64, 展开成h次标量运算代替矩阵乘
+// 类人脑: 突触稀疏激活，仅激活相关门控通路
+函数 Nova门控循环Cell_线性步(cell, 输入, 输入维度, 隐藏维度) {
+    如果 (cell == 0 || 输入 == 0) { 返回 }
+    // 更新门zt: 基于输入×门控权重(展开版)
+    定义 可变 i = 0
+    当 (i < 隐藏维度) {
+        定义 xt = Tensor_读(输入, i % 输入维度)
+        定义 ht = Tensor_读(cell.隐藏状态, i)
+        // 轻量门控: z = σ(w_z_i × xt + u_z_i × ht)
+        定义 gate_input = Q乘(Tensor_读(cell.Wz_diag, i), xt) + Q乘(Tensor_读(cell.Uz_diag, i), ht)
+        定义 zt = 激活_HexSigmoid_单值(gate_input)
+        // 重置门rt
+        定义 reset_input = Q乘(Tensor_读(cell.Wr_diag, i), xt) + Q乘(Tensor_读(cell.Ur_diag, i), ht)
+        定义 rt = 激活_HexSigmoid_单值(reset_input)
+        // 候选隐藏
+        定义 h_reset = Q乘(rt, ht)
+        定义 cand_input = Q乘(Tensor_读(cell.Wh_diag, i), xt) + Q乘(Tensor_读(cell.Uh_diag, i), h_reset)
+        定义 ht_tilde = 激活_Tanh_单值(cand_input)
+        // 更新
+        定义 h_new = Q乘(Q_ONE - zt, ht) + Q乘(zt, ht_tilde)
+        Tensor_写(cell.隐藏状态, i, h_new)
+        i = i + 1
+    }
+}
+函数 激活_Tanh_单值(x) {
+    如果 (x > 3 * Q_ONE) { 返回 Q_ONE }
+    如果 (x < -3 * Q_ONE) { 返回 -Q_ONE }
+    定义 x2 = Q乘(x, x)
+    定义 分子 = Q乘(x, 27 * Q_ONE + x2)
+    定义 分母 = 27 * Q_ONE + 9 * x2 / Q_ONE
+    如果 (分母 == 0) { 返回 0 }
+    返回 分子 / 分母
+}
+
+// 重置隐藏状态
+函数 Nova门控循环Cell_重置(Nova门控循环) {
+    内存_清零(Nova门控循环.隐藏状态.数据, Nova门控循环.隐藏维度 * 4)
+}

@@ -1,0 +1,223 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+导入("./自定元素生命.nova")
+导入("./取数网络请.nova")
+
+// 对应: nova/Nova渲染核心/html/custom/ (
+// nova/Nova渲染核心/dom/shadow_root.cc (
+// nova/Nova渲染核心/html/html_template_元素.cc 
+// nova/Nova渲染核心/html/html_slot_元素.cc (~1500行)
+// Custom 元素s v1:
+// custom元素s.define(name, class, {extends})
+// class My元素 extends HTML元素 {
+// constructor() / connectedCallback() / disconnectedCallback()
+// attributeChangedCallback(name, oldVal, newVal)
+// adoptedCallback(oldDocument, newDocument)
+// static get observedAttributes() { return [...] }
+// }
+// custom元素s.get(name) → constructor
+// custom元素s.whenDefined(name) → 承诺
+// custom元素s.upgrade(root)
+// Shadow DOM v1:
+// 元素.attachShadow({mode: 'open'|'closed'})
+// shadowRoot.innerHTML / appendChild / querySelector
+// <slot name="xxx"> / 元素.assignedSlot
+// slot.assigned节点s({flatten}) / slot.assigned元素s()
+// ::slotted() CSS伪元素
+// :host / :host() / :host-context() CSS伪类
+// 事件穿透: composed: true (跨shadow boundary)
+// <template> + <slot>:
+// template.content → DocumentFragment (惰性,不渲染)
+// slot分配: 按name属性匹配
+// 【Nova特色】AI组件优化:
+// ① AI检测组件渲染瓶颈
+// ② AI建议Shadow DOM样式隔离优化
+
+// §1 常量
+
+// Custom 元素状态
+定义 CE_STATE_UNDEFINED = 0 // 未注册
+定义 CE_STATE_FAILED = 1 // 构造失败
+定义 CE_STATE_UNCUSTOMIZED = 2 // 普通内置元素
+定义 CE_STATE_CUSTOM = 3 // 已自定义
+定义 CE_STATE_PRECUSTOMIZED = 4 // 升级中
+
+// Shadow DOM模式
+定义 SHADOW_OPEN = 0
+定义 SHADOW_CLOSED = 1
+
+// Slot变化类型
+定义 SLOT_CHANGE_ASSIGN = 0 // 分配
+定义 SLOT_CHANGE_REMOVE = 1 // 取消分配
+
+// §2 Custom 元素定义
+
+结构 Custom元素Definition {
+ 名称,    // u64 标签名 (必须含'-')
+ 构造器,    // u64 Nova函数* (class constructor)
+ // 回调
+ connectedCallback,    // u64 Nova函数*
+ disconnectedCallback,
+ attributeChangedCallback,
+ adoptedCallback,
+ formAssociatedCallback,
+ formResetCallback,
+ formDisabledCallback,
+ formStateRestoreCallback,
+ // 观察属性列表
+ 观察属性,    // u64 字符串数组
+ 观察属性数,
+ // 扩展内置元素
+ extends,    // u64 "div"/"p"/... (is="xxx" 语法)
+ // 表单关联
+ formAssociated,
+ // 禁用internals
+ disableInternals,
+ disableShadow,
+}
+
+// §3 Custom 元素s Registry
+
+结构 Custom元素Registry {
+ 定义列表,    // u64 Custom元素Definition*数组
+ 定义数,
+ 定义容量,
+ // whenDefined等待队列
+ 等待列表,    // u64 {name, resolve}数组
+ 等待数,
+}
+
+定义 可变 全局CE注册表 = 0
+
+
+函数 CE_获取注册表() {
+ 如果 (全局CE注册表 == 0) {
+ 全局CE注册表 = 堆_分配(Custom元素Registry)
+ 全局CE注册表.定义容量 = 256
+ 全局CE注册表.定义列表 = 堆_分配_数组(256 * 8)
+ 全局CE注册表.定义数 = 0
+ 全局CE注册表.等待列表 = 0; 全局CE注册表.等待数 = 0
+ }
+ 返回 全局CE注册表
+}
+
+// custom元素s.define(name, constructor, options)
+函数 CE_define(名称, 构造器, extends_tag) {
+ 定义 reg = CE_获取注册表()
+ 如果 (reg == 0 || 名称 == 0 || 构造器 == 0) { 返回 }
+
+ // 验证名称: 必须包含'-', 不能以'-'开头, 全小写
+ 如果 (!CE_验证名称(名称)) { 返回 }
+
+ // 检查是否已注册
+ 如果 (CE_get(名称) != 0) { 返回 } // 已定义 → DOMException
+
+ // 创建定义
+ 定义 def = 堆_分配(Custom元素Definition)
+ def.名称 = 字符串_复制(名称)
+ def.构造器 = 构造器
+ def.extends = extends_tag
+ def.connectedCallback = 0; def.disconnectedCallback = 0
+ def.attributeChangedCallback = 0; def.adoptedCallback = 0
+ def.formAssociatedCallback = 0; def.观察属性 = 0; def.观察属性数 = 0
+ def.formAssociated = 假; def.disableInternals = 假; def.disableShadow = 假
+
+ // 从class提取回调(通过原型链)
+ // def.connectedCallback = constructor.prototype.connectedCallback
+ // def.observedAttributes = constructor.observedAttributes
+
+ // 注册
+ 如果 (reg.定义数 < reg.定义容量) {
+ 内存_写64(reg.定义列表 + reg.定义数 * 8, def)
+ reg.定义数 = reg.定义数 + 1
+ }
+
+ // 升级已存在的同名元素
+ CE_升级已有元素(def)
+
+ // 解决whenDefined 承诺
+ CE_解决等待(名称)
+}
+
+// custom元素s.get(name)
+函数 CE_get(名称) {
+ 定义 reg = CE_获取注册表()
+ 如果 (reg == 0 || 名称 == 0) { 返回 0 }
+ 定义 可变 i = 0
+ 当 (i < reg.定义数) {
+ 定义 def = 内存_读64(reg.定义列表 + i * 8)
+ 如果 (def != 0 && 字符串_相等(def.名称, 名称)) { 返回 def.构造器 }
+ i = i + 1
+ }
+ 返回 0
+}
+
+// custom元素s.getName(constructor)
+函数 CE_getName(构造器) {
+ 定义 reg = CE_获取注册表()
+ 如果 (reg == 0 || 构造器 == 0) { 返回 0 }
+ 定义 可变 i = 0
+ 当 (i < reg.定义数) {
+ 定义 def = 内存_读64(reg.定义列表 + i * 8)
+ 如果 (def != 0 && def.构造器 == 构造器) { 返回 def.名称 }
+ i = i + 1
+ }
+ 返回 0
+}
+
+函数 CE_查找定义(名称) {
+ 定义 reg = CE_获取注册表()
+ 如果 (reg == 0 || 名称 == 0) { 返回 0 }
+ 定义 可变 i = 0
+ 当 (i < reg.定义数) {
+ 定义 def = 内存_读64(reg.定义列表 + i * 8)
+ 如果 (def != 0 && 字符串_相等(def.名称, 名称)) { 返回 def }
+ i = i + 1
+ }
+ 返回 0
+}
+
+函数 CE_验证名称(名称) {
+ 如果 (名称 == 0) { 返回 假 }
+ 定义 len = 字节长度(名称)
+ 如果 (len == 0) { 返回 假 }
+ // 必须包含'-'
+ 定义 可变 有连字符 = 假
+ 定义 可变 i = 0
+ 当 (i < len) {
+ 如果 (字节取(名称, i) == 45) { 有连字符 = 真 } // '-'
+ i = i + 1
+ }
+ 如果 (!有连字符) { 返回 假 }
+ // 第一个字符必须是a-z
+ 定义 首字符 = 字节取(名称, 0)
+ 如果 (首字符 < 97 || 首字符 > 122) { 返回 假 }
+ 返回 真
+}
+
+函数 CE_解决等待(名称) {
+ // 解决所有等待此名称的whenDefined 承诺
+ 定义 reg = CE_获取注册表()
+ 如果 (reg == 0) { 返回 }
+ 定义 可变 i = 0
+ 当 (i < reg.等待数量) {
+ 定义 entry = 内存_读64(reg.等待列表 + i * 16)
+ 定义 promise = 内存_读64(reg.等待列表 + i * 16 + 8)
+ 如果 (字符串_相等(entry, 名称)) {
+ // 解决承诺
+ 定义 def = CE_查找定义(名称)
+ 如果 (def != 0 && promise != 0) {
+ Nova承诺_resolve(0, promise, def.构造器)
+ }
+ // 从等待列表中移除
+ 内存_复制(reg.等待列表 + i * 16, reg.等待列表 + (i + 1) * 16, (reg.等待数量 - i - 1) * 16)
+ reg.等待数量 = reg.等待数量 - 1
+ } 否则 {
+ i = i + 1
+ }
+ }
+}

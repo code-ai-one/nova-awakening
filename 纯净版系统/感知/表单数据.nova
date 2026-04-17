@@ -1,0 +1,136 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+
+// §9 FormData
+
+结构 FormDataEntry {
+    名称,
+    值,    // u64 字符串或Blob
+    文件名,    // u64 File时有效
+    是文件,
+    下一个,
+}
+
+结构 FormData {
+    头,    // u64 FormDataEntry*
+    数量,
+}
+
+函数 FormData_创建() {
+    定义 fd = 堆_分配(FormData)
+    fd.头 = 0; fd.数量 = 0
+    返回 fd
+}
+
+函数 FormData_append(fd, 名称, 值) {
+    如果 (fd == 0 || 名称 == 0) { 返回 }
+    定义 entry = 堆_分配(FormDataEntry)
+    entry.名称 = 字符串_复制(名称); entry.值 = 值
+    entry.文件名 = 0; entry.是文件 = 假
+    entry.下一个 = fd.头; fd.头 = entry
+    fd.数量 = fd.数量 + 1
+}
+
+函数 FormData_get(fd, 名称) {
+    如果 (fd == 0 || 名称 == 0) { 返回 0 }
+    定义 可变 entry = fd.头
+    当 (entry != 0) {
+        如果 (字符串_相等(entry.名称, 名称)) { 返回 entry.值 }
+        entry = entry.下一个
+    }
+    返回 0
+}
+
+函数 FormData_delete(fd, 名称) {
+    如果 (fd == 0 || 名称 == 0) { 返回 }
+    定义 可变 prev = 0
+    定义 可变 entry = fd.头
+    当 (entry != 0) {
+        如果 (字符串_相等(entry.名称, 名称)) {
+            如果 (prev == 0) { fd.头 = entry.下一个 }
+            否则 { prev.下一个 = entry.下一个 }
+            fd.数量 = fd.数量 - 1
+            entry = 如果(prev == 0, fd.头, prev.下一个)
+            继续
+        }
+        prev = entry; entry = entry.下一个
+    }
+}
+
+函数 FormData_has(fd, 名称) {
+    返回 FormData_get(fd, 名称) != 0
+}
+
+// §10 URL搜索参数 (URLSearchParams)
+
+结构 URLSearchParams {
+    参数,    // u64 FormDataEntry*链表(复用)
+    数量,
+}
+
+函数 URLSearchParams_创建(查询字符串) {
+    定义 usp = 堆_分配(URLSearchParams)
+    usp.参数 = 0; usp.数量 = 0
+    如果 (查询字符串 != 0) {
+        URLSearchParams_解析(usp, 查询字符串)
+    }
+    返回 usp
+}
+
+函数 URLSearchParams_解析(usp, qs) {
+    如果 (usp == 0 || qs == 0) { 返回 }
+    // 解析: key1=value1&key2=value2
+    // 跳过开头的'?'
+    定义 可变 pos = 0
+    定义 len = 字节长度(qs)
+    如果 (len > 0 && 字节取(qs, 0) == 63) { pos = 1 }    // '?'
+    当 (pos < len) {
+        // 找'='和'&'
+        定义 可变 eq = pos
+        当 (eq < len && 字节取(qs, eq) != 61 && 字节取(qs, eq) != 38) { eq = eq + 1 }
+        定义 可变 end = eq
+        如果 (end < len && 字节取(qs, end) == 61) { end = end + 1 }
+        当 (end < len && 字节取(qs, end) != 38) { end = end + 1 }
+        // 提取key和value
+        pos = end + 1
+    }
+}
+
+函数 URLSearchParams_get(usp, 名称) {
+    如果 (usp == 0 || 名称 == 0) { 返回 0 }
+    // 遍历参数列表查找匹配的key
+    定义 可变 i = 0
+    当 (i < usp.数量) {
+        定义 off = usp.数据 + i * 16
+        定义 key = 内存_读64(off)
+        如果 (字符串_相等(key, 名称)) { 返回 内存_读64(off + 8) }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 URLSearchParams_toString(usp) {
+    如果 (usp == 0 || usp.数量 == 0) { 返回 "" }
+    // 拼接 key=value&key2=value2 格式
+    定义 buf = 堆_分配(usp.数量 * 64)
+    定义 可变 pos = 0
+    定义 可变 i = 0
+    当 (i < usp.数量) {
+        定义 off = usp.数据 + i * 16
+        定义 key = 内存_读64(off)
+        定义 val = 内存_读64(off + 8)
+        如果 (i > 0) { 字节写(buf, pos, 38); pos = pos + 1 }    // '&'
+        定义 klen = 字节长度(key)
+        内存_复制(buf + pos, key, klen); pos = pos + klen
+        字节写(buf, pos, 61); pos = pos + 1    // '='
+        定义 vlen = 字节长度(val)
+        内存_复制(buf + pos, val, vlen); pos = pos + vlen
+        i = i + 1
+    }
+    字节写(buf, pos, 0)
+    返回 buf
+}

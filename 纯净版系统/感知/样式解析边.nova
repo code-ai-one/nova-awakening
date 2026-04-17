@@ -1,0 +1,211 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./智能样式推.nova")
+
+定义 Display_none = 0
+定义 Display_block = 1
+定义 Display_inline = 2
+定义 Display_inline_block = 3
+定义 Display_flex = 4
+定义 Display_inline_flex = 5
+定义 Display_grid = 6
+定义 Display_inline_grid = 7
+定义 Display_table = 8
+定义 Display_list_item = 9
+
+定义 Position_static = 0
+定义 Position_relative = 1
+定义 Position_absolute = 2
+定义 Position_fixed = 3
+定义 Position_sticky = 4
+
+定义 TextAlign_left = 0
+定义 TextAlign_right = 1
+定义 TextAlign_center = 2
+定义 TextAlign_justify = 3
+
+定义 FlexDir_row = 0
+定义 FlexDir_row_reverse = 1
+定义 FlexDir_column = 2
+定义 FlexDir_column_reverse = 3
+
+定义 FlexWrap_nowrap = 0
+定义 FlexWrap_wrap = 1
+定义 FlexWrap_wrap_reverse = 2
+
+定义 JustifyContent_start = 0
+定义 JustifyContent_end = 1
+定义 JustifyContent_center = 2
+定义 JustifyContent_space_between = 3
+定义 JustifyContent_space_around = 4
+定义 JustifyContent_space_evenly = 5
+
+定义 AlignItems_stretch = 0
+定义 AlignItems_start = 1
+定义 AlignItems_end = 2
+定义 AlignItems_center = 3
+定义 AlignItems_baseline = 4
+
+函数 CSS解析_边框样式值(关键字ID) {
+    如果 (关键字ID == 5) { 返回 0 }   // none
+    如果 (关键字ID == 55) { 返回 1 }  // solid
+    如果 (关键字ID == 56) { 返回 2 }  // dashed
+    如果 (关键字ID == 57) { 返回 3 }  // dotted
+    如果 (关键字ID == 58) { 返回 4 }  // double
+    如果 (关键字ID == 59) { 返回 5 }  // groove
+    如果 (关键字ID == 60) { 返回 6 }  // ridge
+    如果 (关键字ID == 61) { 返回 7 }  // inset
+    如果 (关键字ID == 62) { 返回 8 }  // outset
+    返回 0
+}
+
+函数 CSS解析_overflow值(关键字ID) {
+    如果 (关键字ID == 12) { 返回 Overflow_visible }
+    如果 (关键字ID == 11) { 返回 Overflow_hidden }
+    如果 (关键字ID == 33) { 返回 Overflow_scroll }
+    如果 (关键字ID == 4) { 返回 Overflow_auto }
+    返回 Overflow_visible
+}
+
+函数 CSS解析_display值(关键字ID) {
+    如果 (关键字ID == 5) { 返回 Display_none }
+    如果 (关键字ID == 10) { 返回 Display_block }
+    如果 (关键字ID == 20) { 返回 Display_inline }
+    如果 (关键字ID == 21) { 返回 Display_inline_block }
+    如果 (关键字ID == 30) { 返回 Display_flex }
+    如果 (关键字ID == 31) { 返回 Display_inline_flex }
+    如果 (关键字ID == 40) { 返回 Display_grid }
+    如果 (关键字ID == 41) { 返回 Display_inline_grid }
+    如果 (关键字ID == 50) { 返回 Display_table }
+    如果 (关键字ID == 51) { 返回 Display_list_item }
+    返回 Display_inline
+}
+
+函数 CSS解析_position值(关键字ID) {
+    如果 (关键字ID == 70) { 返回 Position_static }
+    如果 (关键字ID == 71) { 返回 Position_relative }
+    如果 (关键字ID == 72) { 返回 Position_absolute }
+    如果 (关键字ID == 73) { 返回 Position_fixed }
+    如果 (关键字ID == 74) { 返回 Position_sticky }
+    返回 Position_static
+}
+
+函数 CSS解析_text_align值(关键字ID) {
+    如果 (关键字ID == 80) { 返回 TextAlign_left }
+    如果 (关键字ID == 81) { 返回 TextAlign_right }
+    如果 (关键字ID == 82) { 返回 TextAlign_center }
+    如果 (关键字ID == 83) { 返回 TextAlign_justify }
+    返回 TextAlign_left
+}
+
+函数 CSS解析_flex_direction值(关键字ID) {
+    如果 (关键字ID == 90) { 返回 FlexDir_row }
+    如果 (关键字ID == 91) { 返回 FlexDir_row_reverse }
+    如果 (关键字ID == 92) { 返回 FlexDir_column }
+    如果 (关键字ID == 93) { 返回 FlexDir_column_reverse }
+    返回 FlexDir_row
+}
+
+函数 CSS解析_flex_wrap值(关键字ID) {
+    如果 (关键字ID == 100) { 返回 FlexWrap_nowrap }
+    如果 (关键字ID == 101) { 返回 FlexWrap_wrap }
+    如果 (关键字ID == 102) { 返回 FlexWrap_wrap_reverse }
+    返回 FlexWrap_nowrap
+}
+
+函数 CSS解析_justify_content值(关键字ID) {
+    如果 (关键字ID == 110) { 返回 JustifyContent_start }
+    如果 (关键字ID == 111) { 返回 JustifyContent_end }
+    如果 (关键字ID == 112) { 返回 JustifyContent_center }
+    如果 (关键字ID == 113) { 返回 JustifyContent_space_between }
+    如果 (关键字ID == 114) { 返回 JustifyContent_space_around }
+    如果 (关键字ID == 115) { 返回 JustifyContent_space_evenly }
+    返回 JustifyContent_start
+}
+
+函数 CSS解析_align_items值(关键字ID) {
+    如果 (关键字ID == 120) { 返回 AlignItems_stretch }
+    如果 (关键字ID == 121) { 返回 AlignItems_start }
+    如果 (关键字ID == 122) { 返回 AlignItems_end }
+    如果 (关键字ID == 123) { 返回 AlignItems_center }
+    如果 (关键字ID == 124) { 返回 AlignItems_baseline }
+    返回 AlignItems_stretch
+}
+
+函数 CSS解析_font_weight值(关键字ID) {
+    如果 (关键字ID == 130) { 返回 100 }  // thin
+    如果 (关键字ID == 131) { 返回 300 }  // light
+    如果 (关键字ID == 132) { 返回 400 }  // normal
+    如果 (关键字ID == 133) { 返回 500 }  // medium
+    如果 (关键字ID == 134) { 返回 600 }  // semi-bold
+    如果 (关键字ID == 135) { 返回 700 }  // bold
+    如果 (关键字ID == 136) { 返回 800 }  // extra-bold
+    如果 (关键字ID == 137) { 返回 900 }  // black
+    返回 400
+}
+
+函数 CSS解析_visibility值(关键字ID) {
+    如果 (关键字ID == 12) { 返回 0 }  // visible
+    如果 (关键字ID == 11) { 返回 1 }  // hidden
+    如果 (关键字ID == 140) { 返回 2 } // collapse
+    返回 0
+}
+
+函数 CSS解析_white_space值(关键字ID) {
+    如果 (关键字ID == 132) { 返回 0 }  // normal
+    如果 (关键字ID == 150) { 返回 1 }  // nowrap
+    如果 (关键字ID == 151) { 返回 2 }  // pre
+    如果 (关键字ID == 152) { 返回 3 }  // pre-wrap
+    如果 (关键字ID == 153) { 返回 4 }  // pre-line
+    返回 0
+}
+
+函数 CSS解析_cursor值(关键字ID) {
+    如果 (关键字ID == 4) { 返回 0 }    // auto
+    如果 (关键字ID == 160) { 返回 1 }  // default
+    如果 (关键字ID == 161) { 返回 2 }  // pointer
+    如果 (关键字ID == 162) { 返回 3 }  // text
+    如果 (关键字ID == 163) { 返回 4 }  // move
+    如果 (关键字ID == 164) { 返回 5 }  // wait
+    如果 (关键字ID == 165) { 返回 6 }  // crosshair
+    如果 (关键字ID == 166) { 返回 7 }  // not-allowed
+    如果 (关键字ID == 167) { 返回 8 }  // grab
+    返回 0
+}
+
+函数 CSS_属性影响级别(属性ID) {
+    如果 (属性ID <= 10) { 返回 2 }   // layout props → reflow
+    如果 (属性ID <= 20) { 返回 1 }   // paint props → repaint
+    如果 (属性ID <= 30) { 返回 0 }   // composite props → no layout
+    返回 2
+}
+
+函数 CSS_是否触发图层提升(属性ID) {
+    如果 (属性ID == 200) { 返回 真 }  // transform
+    如果 (属性ID == 201) { 返回 真 }  // opacity
+    如果 (属性ID == 202) { 返回 真 }  // will-change
+    如果 (属性ID == 203) { 返回 真 }  // filter
+    返回 假
+}
+
+函数 智能_Computed样式_AI样式意图(属性ID, 值) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+    如果 (CSS_是否触发图层提升(属性ID)) { 返回 3 }
+    如果 (CSS_属性影响级别(属性ID) == 0) { 返回 1 }
+    返回 AI样式_推断意图(属性ID, 值)
+}
+
+函数 智能_Computed样式_AI影响分析(属性ID) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 CSS_属性影响级别(属性ID) }
+    返回 AI样式_分析影响(属性ID)
+}
+
+函数 智能_Computed样式_AI布局预测(元素, 属性ID, 新值) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 假 }
+    定义 影响 = CSS_属性影响级别(属性ID)
+    如果 (影响 >= 2) { 返回 真 }
+    返回 假
+}

@@ -1,0 +1,234 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式滤镜.nova")
+导入("../执行/控制台输出.nova")
+导入("./样式子网格.nova")
+导入("./智能样式色.nova")
+导入("./样式色彩解.nova")
+导入("../中枢/字符串替换.nova")
+
+// §4 color-mix() — 颜色混合
+// color-mix(in oklch, red 40%, blue)
+
+
+函数 CSSColor_从colorMix(str) {
+    // 解析: color-mix(in <color-space>, <color1> <percentage>?, <color2> <percentage>?)
+    定义 可变 混合空间 = CS_OKLCH    // 默认oklch
+
+    如果 (字符串_包含(str, "in srgb")) { 混合空间 = CS_SRGB }
+    否则 如果 (字符串_包含(str, "in oklch")) { 混合空间 = CS_OKLCH }
+    否则 如果 (字符串_包含(str, "in oklab")) { 混合空间 = CS_OKLAB }
+    否则 如果 (字符串_包含(str, "in lab")) { 混合空间 = CS_LAB }
+    否则 如果 (字符串_包含(str, "in lch")) { 混合空间 = CS_LCH }
+    否则 如果 (字符串_包含(str, "in hsl")) { 混合空间 = CS_HSL }
+
+    // 解析两个颜色和百分比: color-mix(in oklch, red 40%, blue)
+    // 找到第一个逗号后的颜色1, 第二个逗号后的颜色2
+    定义 len = 字节长度(str)
+    定义 可变 comma1 = 0; 定义 可变 comma2 = 0; 定义 可变 commas = 0
+    定义 可变 p = 0
+    当 (p < len) {
+        如果 (字节取(str, p) == 0x2C) {    // ','
+            commas = commas + 1
+            如果 (commas == 1) { comma1 = p }
+            如果 (commas == 2) { comma2 = p }
+        }
+        p = p + 1
+    }
+    // 提取颜色1子串(comma1+1 到 comma2或末尾)
+    定义 c1_start = comma1 + 1; 定义 c1_end = 如果(comma2>0, comma2, len-1)
+    定义 c2_start = 如果(comma2>0, comma2+1, c1_end); 定义 c2_end = len - 1
+    // 在颜色子串中查找百分比
+    定义 可变 百分比1 = 5000; 定义 可变 百分比2 = 5000
+    // 解析颜色(去掉百分比后的部分)
+    定义 颜色1_str = CSS_子串_去百分比(str, c1_start, c1_end, 百分比1)
+    定义 颜色2_str = CSS_子串_去百分比(str, c2_start, c2_end, 百分比2)
+    定义 颜色1 = CSSColor_解析(颜色1_str)
+    定义 颜色2 = CSSColor_解析(颜色2_str)
+    // 百分比归一化: 如果只指定了一个, 另一个自动补齐
+    如果 (百分比1 + 百分比2 != 10000) {
+        如果 (百分比2 == 5000 && 百分比1 != 5000) { 百分比2 = 10000 - 百分比1 }
+        否则 如果 (百分比1 == 5000 && 百分比2 != 5000) { 百分比1 = 10000 - 百分比2 }
+    }
+    返回 CSSColor_混合(颜色1, 颜色2, 百分比1, 百分比2, 混合空间)
+}
+
+函数 CSSColor_混合(c1, c2, p1, p2, 目标空间) {
+    // 1. 将两个颜色转换到目标空间
+    定义 a = CSSColor_转换到(c1, 目标空间)
+    定义 b = CSSColor_转换到(c2, 目标空间)
+
+    // 2. 归一化百分比
+    定义 总 = p1 + p2
+    如果 (总 == 0) { 返回 a }
+    定义 w1 = p1 * 10000 / 总
+    定义 w2 = p2 * 10000 / 总
+
+    // 3. 分量插值
+    定义 结果 = CSSColor { 空间: 目标空间 }
+    结果.分量1 = (a.分量1 * w1 + b.分量1 * w2) / 10000
+    结果.分量2 = (a.分量2 * w1 + b.分量2 * w2) / 10000
+
+    // 色相插值(对于极坐标空间: oklch/lch/hsl/hwb)
+    如果 (目标空间 == CS_OKLCH || 目标空间 == CS_LCH || 目标空间 == CS_HSL || 目标空间 == CS_HWB) {
+        结果.分量3 = CSSColor_色相插值(a.分量3, b.分量3, w1, w2)
+    } 否则 {
+        结果.分量3 = (a.分量3 * w1 + b.分量3 * w2) / 10000
+    }
+
+    结果.alpha = (a.alpha * w1 + b.alpha * w2) / 10000
+    返回 结果
+}
+
+函数 CSSColor_色相插值(h1, h2, w1, w2) {
+    // 色相环上的最短路径插值
+    定义 可变 差 = h2 - h1
+    如果 (差 > 1800000) { 差 = 差 - 3600000 }    // ×10000, 360°
+    如果 (差 < -1800000) { 差 = 差 + 3600000 }
+
+    定义 结果 = h1 + 差 * w2 / 10000
+    如果 (结果 < 0) { 结果 = 结果 + 3600000 }
+    如果 (结果 >= 3600000) { 结果 = 结果 - 3600000 }
+    返回 结果
+}
+
+// §5 色彩空间转换
+
+函数 CSSColor_转换到(颜色, 目标空间) {
+    如果 (颜色.空间 == 目标空间) { 返回 颜色 }
+
+    // 转换路径: 任意源 → sRGB → XYZ-D65 → 目标
+    // 直接路径(常见)
+    如果 (颜色.空间 == CS_SRGB && 目标空间 == CS_OKLAB) { 返回 sRGB_to_OKLab(颜色) }
+    如果 (颜色.空间 == CS_SRGB && 目标空间 == CS_OKLCH) { 返回 OKLab_to_OKLCH(sRGB_to_OKLab(颜色)) }
+    如果 (颜色.空间 == CS_OKLAB && 目标空间 == CS_SRGB) { 返回 OKLab_to_sRGB(颜色) }
+    如果 (颜色.空间 == CS_OKLCH && 目标空间 == CS_SRGB) { 返回 OKLab_to_sRGB(OKLCH_to_OKLab(颜色)) }
+    如果 (颜色.空间 == CS_OKLAB && 目标空间 == CS_OKLCH) { 返回 OKLab_to_OKLCH(颜色) }
+    如果 (颜色.空间 == CS_OKLCH && 目标空间 == CS_OKLAB) { 返回 OKLCH_to_OKLab(颜色) }
+    如果 (颜色.空间 == CS_HSL && 目标空间 == CS_SRGB) { 返回 HSL_to_sRGB(颜色) }
+    如果 (颜色.空间 == CS_HWB && 目标空间 == CS_SRGB) { 返回 HWB_to_sRGB(颜色) }
+    // 通用路径: 源→sRGB→目标空间
+    定义 可变 中间 = 颜色
+    如果 (颜色.空间 == CS_HSL) { 中间 = HSL_to_sRGB(颜色) }
+    否则 如果 (颜色.空间 == CS_HWB) { 中间 = HWB_to_sRGB(颜色) }
+    否则 如果 (颜色.空间 == CS_OKLAB) { 中间 = OKLab_to_sRGB(颜色) }
+    否则 如果 (颜色.空间 == CS_OKLCH) { 中间 = OKLab_to_sRGB(OKLCH_to_OKLab(颜色)) }
+    否则 如果 (颜色.空间 == CS_LAB) { 中间 = Lab_to_sRGB(颜色) }
+    否则 如果 (颜色.空间 == CS_LCH) { 中间 = Lab_to_sRGB(LCH_to_Lab(颜色)) }
+    // 现在中间是sRGB, 再转到目标
+    如果 (目标空间 == CS_SRGB) { 返回 中间 }
+    如果 (目标空间 == CS_OKLAB) { 返回 sRGB_to_OKLab(中间) }
+    如果 (目标空间 == CS_OKLCH) { 返回 OKLab_to_OKLCH(sRGB_to_OKLab(中间)) }
+    如果 (目标空间 == CS_HSL) { 返回 sRGB_to_HSL(中间) }
+    返回 中间
+}
+
+// sRGB → OKLab (Björn Ottosson's method)
+函数 sRGB_to_OKLab(c) {
+    // 1. sRGB → Linear sRGB (去gamma)
+    定义 r = sRGB_去gamma(c.分量1)
+    定义 g = sRGB_去gamma(c.分量2)
+    定义 b = sRGB_去gamma(c.分量3)
+
+    // 2. Linear sRGB → LMS (矩阵乘法, ×10000)
+    定义 l = (4122 * r + 5363 * g + 514 * b) / 10000
+    定义 m = (2119 * r + 6806 * g + 1075 * b) / 10000
+    定义 s = (883 * r + 2817 * g + 6300 * b) / 10000
+
+    // 3. LMS → LMS' (立方根)
+    定义 l_ = 整数_立方根(l)
+    定义 m_ = 整数_立方根(m)
+    定义 s_ = 整数_立方根(s)
+
+    // 4. LMS' → OKLab (矩阵乘法)
+    定义 L = (2105 * l_ + 7930 * m_ - 35 * s_) / 10000
+    定义 a = (1626 * l_ - 1389 * m_ - 237 * s_) / 1000
+    定义 B = (578 * l_ + 447 * m_ - 10252 * s_) / 10000
+
+    返回 CSSColor { 空间: CS_OKLAB, 分量1: L, 分量2: a, 分量3: B, alpha: c.alpha }
+}
+
+函数 OKLab_to_OKLCH(c) {
+    // a,b → C,H
+    定义 C = 整数_sqrt(c.分量2 * c.分量2 + c.分量3 * c.分量3)
+    定义 H = 整数_atan2(c.分量3, c.分量2)    // 返回度×10000
+    返回 CSSColor { 空间: CS_OKLCH, 分量1: c.分量1, 分量2: C, 分量3: H, alpha: c.alpha }
+}
+
+函数 OKLCH_to_OKLab(c) {
+    // C,H → a,b
+    定义 a = c.分量2 * 整数_cos(c.分量3) / 10000
+    定义 b = c.分量2 * 整数_sin(c.分量3) / 10000
+    返回 CSSColor { 空间: CS_OKLAB, 分量1: c.分量1, 分量2: a, 分量3: b, alpha: c.alpha }
+}
+
+函数 OKLab_to_sRGB(c) {
+    // OKLab → LMS' (逆矩阵)
+    定义 L = c.分量1; 定义 a = c.分量2; 定义 B = c.分量3
+    // LMS' = M_inv * [L,a,b]
+    定义 l_ = L + 3963 * a / 10000 + 2106 * B / 10000
+    定义 m_ = L - 1056 * a / 10000 - 638 * B / 10000
+    定义 s_ = L - 894 * a / 10000 - 13399 * B / 10000
+    // LMS' → LMS (立方: x³)
+    定义 l = l_ * l_ * l_ / 100000000    // (x/10000)³ * 10000
+    定义 m = m_ * m_ * m_ / 100000000
+    定义 s = s_ * s_ * s_ / 100000000
+    // LMS → linear sRGB (逆矩阵)
+    定义 r_lin = (41666 * l - 31735 * m - 931 * s) / 10000
+    定义 g_lin = (-12684 * l + 22818 * m - 134 * s) / 10000
+    定义 b_lin = (-580 * l - 7034 * m + 17614 * s) / 10000
+    // linear → sRGB (加gamma)
+    定义 r = sRGB_加gamma(r_lin)
+    定义 g = sRGB_加gamma(g_lin)
+    定义 b = sRGB_加gamma(b_lin)
+    返回 CSSColor { 空间: CS_SRGB, 分量1: r, 分量2: g, 分量3: b, alpha: c.alpha }
+}
+
+函数 HSL_to_sRGB(c) {
+    // H: 度×10000  S: 百分比×100 (0-10000)  L: 百分比×100 (0-10000)
+    定义 h = c.分量1; 定义 s = c.分量2; 定义 l = c.分量3
+    // 算法: CSS Color 4 §4.7
+    // a = S * min(L, 1-L)
+    定义 l_norm = l    // 0-10000 (代表0-1)
+    定义 s_norm = s    // 0-10000
+    定义 min_l = 如果(l_norm < 5000, l_norm, 10000 - l_norm)
+    定义 a2 = s_norm * min_l / 10000
+    // f(n) = L - a * max(-1, min(k-3, min(9-k, 1)))
+    // k = (n + H/30) mod 12
+    定义 r = HSL_f(0, h, l_norm, a2)
+    定义 g = HSL_f(8, h, l_norm, a2)
+    定义 b = HSL_f(4, h, l_norm, a2)
+    返回 CSSColor { 空间: CS_SRGB, 分量1: r, 分量2: g, 分量3: b, alpha: c.alpha }
+}
+
+函数 HSL_f(n, h, l, a) {
+    // k = (n + h/30) mod 12, h是度×10000
+    定义 k = ((n * 3600000 + h) / 300000) % 12    // h/30°的等效
+    // val = min(k-3, 9-k)  clamped to [-1, 1]
+    定义 可变 v1 = k - 3; 定义 可变 v2 = 9 - k
+    定义 可变 v = 如果(v1 < v2, v1, v2)
+    如果 (v < -1) { v = -1 }
+    如果 (v > 1) { v = 1 }
+    // result = L - a * v, scaled to 0-10000
+    返回 l - a * v
+}
+
+函数 HWB_to_sRGB(c) {
+    // HWB → sRGB: 先转HSL再调整
+    // W + B > 100% → 归一化
+    定义 h = c.分量1; 定义 w = c.分量2; 定义 b = c.分量3
+    定义 可变 白 = w; 定义 可变 黑 = b
+    如果 (白 + 黑 > 10000) {
+        白 = 白 * 10000 / (白 + 黑)
+        黑 = 黑 * 10000 / (白 + 黑)
+    }
+    // RGB = HSL(H, 100%, 50%) 然后 mix with white and black
+    定义 hsl = CSSColor { 空间: CS_HSL, 分量1: h, 分量2: 10000, 分量3: 5000, alpha: c.alpha }
+    定义 rgb = HSL_to_sRGB(hsl)
+    // r' = r * (1-w-b) + w
+    定义 factor = 10000 - 白 - 黑
+    定义 r = rgb.分量1 * factor / 10000 + 白
+    定义 g = rgb.分量2 * factor / 10000 + 白
+    定义 bv = rgb.分量3 * factor / 10000 + 白
+    返回 CSSColor { 空间: CS_SRGB, 分量1: r, 分量2: g, 分量3: bv, alpha: c.alpha }
+}

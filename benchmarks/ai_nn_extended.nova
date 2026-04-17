@@ -1,0 +1,236 @@
+// NN算子扩展验证: maxpool / dropout-mask / batchnorm / GRU单元 / 训练循环
+// 整数定点实现, 避免浮点舍入误差
+
+函数 mat_new(行, 列, 初值) {
+    定义 可变 d = []
+    定义 可变 i = 0
+    当 (i < 行 * 列) { 追加(d, 初值) i = i + 1 }
+    返回 [行, 列, d]
+}
+函数 mat_get(m, r, c) { 返回 m[2][r * m[1] + c] }
+函数 mat_set(m, r, c, v) { m[2][r * m[1] + c] = v }
+
+定义 可变 fail_count = 0
+定义 可变 pass_count = 0
+
+函数 check(name, got, want) {
+    如果 (got == want) { pass_count = pass_count + 1 } 否则 {
+        fail_count = fail_count + 1
+        打印(字符串拼接(字符串拼接(字符串拼接(字符串拼接("✗ ", name), " got="), 转字符串(got)), 字符串拼接(" want=", 转字符串(want))))
+    }
+}
+
+函数 max_int(xs) {
+    定义 可变 b = xs[0]
+    定义 可变 i = 1
+    当 (i < 计数(xs)) { 如果 (xs[i] > b) { b = xs[i] } i = i + 1 }
+    返回 b
+}
+
+// ═══════════════════════════════════════════════
+// 算子6: maxpool 2D (kH×kW, stride=kH 非重叠池化)
+// ═══════════════════════════════════════════════
+函数 maxpool2d(inp, kH, kW) {
+    定义 H = inp[0]
+    定义 W = inp[1]
+    定义 oH = H / kH
+    定义 oW = W / kW
+    定义 out = mat_new(oH, oW, 0)
+    定义 可变 i = 0
+    当 (i < oH) {
+        定义 可变 j = 0
+        当 (j < oW) {
+            定义 可变 best = mat_get(inp, i * kH, j * kW)
+            定义 可变 ki = 0
+            当 (ki < kH) {
+                定义 可变 kj = 0
+                当 (kj < kW) {
+                    定义 v = mat_get(inp, i * kH + ki, j * kW + kj)
+                    如果 (v > best) { best = v }
+                    kj = kj + 1
+                }
+                ki = ki + 1
+            }
+            mat_set(out, i, j, best)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 out
+}
+
+函数 test_maxpool() {
+    // 4×4 input, 2×2 pool → 2×2
+    // [[1,3,2,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+    // out[0][0] = max(1,3,5,6) = 6
+    // out[0][1] = max(2,4,7,8) = 8
+    // out[1][0] = max(9,10,13,14) = 14
+    // out[1][1] = max(11,12,15,16) = 16
+    定义 inp = mat_new(4, 4, 0)
+    定义 vs = [1, 3, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    定义 可变 k = 0
+    当 (k < 16) { inp[2][k] = vs[k] k = k + 1 }
+    定义 out = maxpool2d(inp, 2, 2)
+    check("maxpool shape", out[0] * 100 + out[1], 202)
+    check("maxpool[0][0]", mat_get(out, 0, 0), 6)
+    check("maxpool[0][1]", mat_get(out, 0, 1), 8)
+    check("maxpool[1][0]", mat_get(out, 1, 0), 14)
+    check("maxpool[1][1]", mat_get(out, 1, 1), 16)
+}
+
+// ═══════════════════════════════════════════════
+// 算子7: dropout mask 应用 (给定mask, 验证应用正确)
+// ═══════════════════════════════════════════════
+函数 apply_dropout(xs, mask) {
+    定义 可变 r = []
+    定义 可变 i = 0
+    当 (i < 计数(xs)) {
+        追加(r, xs[i] * mask[i])
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 test_dropout() {
+    定义 xs = [10, 20, 30, 40, 50]
+    定义 mask = [1, 0, 1, 0, 1]
+    定义 r = apply_dropout(xs, mask)
+    check("dropout[0]", r[0], 10)
+    check("dropout[1]=0", r[1], 0)
+    check("dropout[2]", r[2], 30)
+    check("dropout[3]=0", r[3], 0)
+    check("dropout[4]", r[4], 50)
+    // 全保留
+    定义 mask2 = [1, 1, 1, 1, 1]
+    定义 r2 = apply_dropout(xs, mask2)
+    check("dropout保全[2]", r2[2], 30)
+    // 全丢弃
+    定义 mask3 = [0, 0, 0, 0, 0]
+    定义 r3 = apply_dropout(xs, mask3)
+    check("dropout全弃[0]", r3[0], 0)
+    check("dropout全弃[4]", r3[4], 0)
+}
+
+// ═══════════════════════════════════════════════
+// 算子8: batchnorm 线性重缩放部分 (y = γ*x_norm + β, 整数版)
+// 验证: y_i = γ * (x_i - μ) / σ + β 简化为 y_i = γ * (x_i - μ) + β (σ=1)
+// ═══════════════════════════════════════════════
+函数 batchnorm_linear(xs, mu, gamma, beta) {
+    定义 可变 r = []
+    定义 可变 i = 0
+    当 (i < 计数(xs)) {
+        追加(r, gamma * (xs[i] - mu) + beta)
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 test_batchnorm_linear() {
+    // xs=[1,2,3,4,5], mu=3, gamma=2, beta=10
+    // r_i = 2*(x_i-3)+10
+    // r[0] = 2*(-2)+10 = 6
+    // r[1] = 2*(-1)+10 = 8
+    // r[2] = 2*(0)+10 = 10
+    // r[3] = 2*(1)+10 = 12
+    // r[4] = 2*(2)+10 = 14
+    定义 r = batchnorm_linear([1, 2, 3, 4, 5], 3, 2, 10)
+    check("BN[0]", r[0], 6)
+    check("BN[1]", r[1], 8)
+    check("BN[2]中心", r[2], 10)
+    check("BN[3]", r[3], 12)
+    check("BN[4]", r[4], 14)
+    // BN对常量输入: γ*0+β=β
+    定义 r2 = batchnorm_linear([5, 5, 5, 5], 5, 3, 7)
+    check("BN常量[0]=β", r2[0], 7)
+    check("BN常量[2]=β", r2[2], 7)
+}
+
+// ═══════════════════════════════════════════════
+// 算子9: GRU单元 整数近似 (验证门控乘加逻辑结构正确性)
+// h_new = (1-z) * h_old + z * h_candidate, 用整数门z∈{0,1}验证
+// ═══════════════════════════════════════════════
+函数 gru_gated_update(h_old, h_cand, z) {
+    返回 (1 - z) * h_old + z * h_cand
+}
+
+函数 test_gru() {
+    // z=0: h_new = h_old
+    check("GRU z=0", gru_gated_update(100, 999, 0), 100)
+    // z=1: h_new = h_cand
+    check("GRU z=1", gru_gated_update(100, 999, 1), 999)
+    // z=0 candidate与old相同: 稳定态
+    check("GRU稳定", gru_gated_update(50, 50, 0), 50)
+}
+
+// ═══════════════════════════════════════════════
+// 算子10: 简化训练循环 (梯度下降一步: w = w - lr*∂L/∂w)
+// 目标: 让 y = w*x 逼近 y_true, x=2, y_true=10, 初始w=1
+// ∂L/∂w = 2(w*x - y_true)*x, 用整数整数近似 lr=1
+// ═══════════════════════════════════════════════
+函数 train_step(w, x, y_true, lr) {
+    定义 y_pred = w * x
+    定义 error = y_pred - y_true
+    定义 grad = 2 * error * x
+    返回 w - lr * grad / 10  // lr/10 抵消grad中的2
+}
+
+函数 test_train_loop() {
+    // 初始 w=1, x=2, y_true=10
+    // step1: y_pred=2, err=-8, grad=-32, w_new=1-(-32)/10 = 1+3 = 4
+    定义 w1 = train_step(1, 2, 10, 1)
+    check("train step1 w=1→4", w1, 4)
+    // step2: y_pred=8, err=-2, grad=-8, w_new=4-(-8)/10 = 4+0 = 4 (整数下收敛)
+    定义 w2 = train_step(w1, 2, 10, 1)
+    check("train step2 w=4→4", w2, 4)
+    // step3: w=4 稳定
+    定义 w3 = train_step(w2, 2, 10, 1)
+    check("train step3稳定", w3, 4)
+    // 近似目标 y = 4*2 = 8 (y_true=10, 残差2)
+    check("train final y", w3 * 2, 8)
+}
+
+// ═══════════════════════════════════════════════
+// 算子11: 张量广播加 (矩阵 + 行向量广播)
+// ═══════════════════════════════════════════════
+函数 broadcast_add(m, bias) {
+    定义 行 = m[0]
+    定义 列 = m[1]
+    定义 r = mat_new(行, 列, 0)
+    定义 可变 i = 0
+    当 (i < 行) {
+        定义 可变 j = 0
+        当 (j < 列) {
+            mat_set(r, i, j, mat_get(m, i, j) + bias[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 test_broadcast() {
+    // M(2,3) + bias(3)
+    定义 M = mat_new(2, 3, 0)
+    mat_set(M, 0, 0, 1) mat_set(M, 0, 1, 2) mat_set(M, 0, 2, 3)
+    mat_set(M, 1, 0, 10) mat_set(M, 1, 1, 20) mat_set(M, 1, 2, 30)
+    定义 bias = [100, 200, 300]
+    定义 r = broadcast_add(M, bias)
+    check("bcast[0][0]=1+100", mat_get(r, 0, 0), 101)
+    check("bcast[0][2]=3+300", mat_get(r, 0, 2), 303)
+    check("bcast[1][1]=20+200", mat_get(r, 1, 1), 220)
+    check("bcast[1][2]=30+300", mat_get(r, 1, 2), 330)
+}
+
+函数 主程序() {
+    打印("═══ NN扩展算子验证 ═══")
+    test_maxpool()
+    test_dropout()
+    test_batchnorm_linear()
+    test_gru()
+    test_train_loop()
+    test_broadcast()
+    打印(字符串拼接(字符串拼接("通过: ", 转字符串(pass_count)), 字符串拼接("/", 转字符串(pass_count + fail_count))))
+    打印(字符串拼接("失败: ", 转字符串(fail_count)))
+    如果 (fail_count > 0) { 返回 1 }
+    返回 0
+}

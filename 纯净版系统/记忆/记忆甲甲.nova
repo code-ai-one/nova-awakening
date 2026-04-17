@@ -1,0 +1,285 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("./超级块.nova")
+导入("../中枢/硬链接.nova")
+导入("./文件节点创.nova")
+导入("./路径查找.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/字符串替换.nova")
+导入("./目录项添加.nova")
+导入("./路径缓初始.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../稳态/随机数.nova")
+导入("./文件系统类.nova")
+导入("./文件节点缓.nova")
+
+//   1. devtmpfs是自动管理/dev的tmpfs — 内核自动创建设备节点
+//   2. 设备注册时(device_add)自动在/dev创建节点
+//   3. 设备注销时(device_del)自动删除节点
+//   4. 设备节点有: 主设备号+次设备号 (dev_t = MAJOR << 20 | MINOR)
+//   5. 字符设备: /dev/null, /dev/zero, /dev/tty, /dev/console
+//   6. 块设备: /dev/sda, /dev/sda1 等
+
+定义 DEVTMPFS_MAGIC = 0x1373
+
+定义 设备_字符 = 0    // 字符设备 (S_IFCHR)
+定义 设备_块   = 1    // 块设备 (S_IFBLK)
+
+函数 MKDEV(主, 次) { 返回 (主 << 20) | 次 }
+函数 MAJOR(dev) { 返回 (dev >> 20) & 0xFFF }
+函数 MINOR(dev) { 返回 dev & 0xFFFFF }
+
+定义 可变 devtmpfs_sb = 空
+定义 可变 devtmpfs_根Nova路径项 = 空
+定义 可变 devtmpfs_设备数 = 0
+
+结构 标准设备 {
+    名称,
+    类型,
+    主号,
+    次号,
+    权限,
+}
+
+// 初始化和挂载
+
+函数 devtmpfs_初始化() {
+    注册文件系统_完整("devtmpfs", devtmpfs_挂载, 0, 空)
+    内核信息("devtmpfs: 初始化")
+}
+
+函数 devtmpfs_挂载(fs类型, 标志, 设备名, 选项) {
+    devtmpfs_sb = 超级块_创建(DEVTMPFS_MAGIC, 4096, 0, "devtmpfs")
+
+    // 创建根Nova文件节点和Nova路径项
+    定义 根Nova文件节点 = Nova文件节点_创建(类型_目录, 0o755)
+    devtmpfs_根Nova路径项 = 目录项_创建("/", 根Nova文件节点, 空)
+    超级块_设置根(devtmpfs_sb, devtmpfs_根Nova路径项)
+
+    // 创建标准子目录
+    devtmpfs_创建子目录("pts")     // /dev/pts (伪终端)
+    devtmpfs_创建子目录("shm")     // /dev/shm (共享内存)
+    devtmpfs_创建子目录("input")   // /dev/input (输入设备)
+    devtmpfs_创建子目录("block")   // /dev/block (块设备符号链接)
+    devtmpfs_创建子目录("char")    // /dev/char (字符设备符号链接)
+
+    // 创建标准设备节点
+    devtmpfs_创建标准设备()
+
+    内核信息数值("devtmpfs: 设备节点数", devtmpfs_设备数)
+    返回 devtmpfs_sb
+}
+
+函数 devtmpfs_创建子目录(名称) {
+    如果 (devtmpfs_根Nova路径项 == 空) { 返回 }
+    定义 Nova文件节点 = Nova文件节点_创建(类型_目录, 0o755)
+    定义 Nova路径项 = 目录项_创建(名称, Nova文件节点, devtmpfs_根Nova路径项)
+    目录项_添加子(devtmpfs_根Nova路径项, Nova路径项)
+}
+
+// 创建标准设备节点 
+
+函数 devtmpfs_创建标准设备() {
+    // 核心字符设备
+    devtmpfs_创建设备节点("null",    设备_字符, 1, 3, 0o666)   // /dev/null
+    devtmpfs_创建设备节点("zero",    设备_字符, 1, 5, 0o666)   // /dev/zero
+    devtmpfs_创建设备节点("full",    设备_字符, 1, 7, 0o666)   // /dev/full
+    devtmpfs_创建设备节点("random",  设备_字符, 1, 8, 0o666)   // /dev/random
+    devtmpfs_创建设备节点("urandom", 设备_字符, 1, 9, 0o666)   // /dev/urandom
+
+    // 终端设备
+    devtmpfs_创建设备节点("tty",     设备_字符, 5, 0, 0o666)   // /dev/tty
+    devtmpfs_创建设备节点("console", 设备_字符, 5, 1, 0o600)   // /dev/console
+    devtmpfs_创建设备节点("tty0",    设备_字符, 4, 0, 0o620)   // /dev/tty0
+    devtmpfs_创建设备节点("tty1",    设备_字符, 4, 1, 0o620)   // /dev/tty1
+    devtmpfs_创建设备节点("ptmx",    设备_字符, 5, 2, 0o666)   // /dev/ptmx
+
+    // 内存设备
+    devtmpfs_创建设备节点("mem",     设备_字符, 1, 1, 0o640)   // /dev/mem
+    devtmpfs_创建设备节点("kmsg",    设备_字符, 1, 11, 0o644)  // /dev/kmsg
+
+    // NovaOS AI设备
+    devtmpfs_创建设备节点("nova",    设备_字符, 240, 0, 0o666) // /dev/nova (AI接口)
+    devtmpfs_创建设备节点("tnf",     设备_字符, 240, 1, 0o644) // /dev/tnf (TNF内核)
+
+    // 符号链接
+    devtmpfs_创建符号链接("stdin",  "/proc/self/fd/0")
+    devtmpfs_创建符号链接("stdout", "/proc/self/fd/1")
+    devtmpfs_创建符号链接("stderr", "/proc/self/fd/2")
+    devtmpfs_创建符号链接("fd",     "/proc/self/fd")
+}
+
+// 创建/删除设备节点
+
+函数 devtmpfs_创建设备节点(名称, 类型, 主设备号, 次设备号, 权限) {
+    如果 (devtmpfs_根Nova路径项 == 空) { 返回 错误_未初始化 }
+
+    // 检查是否包含路径(如 "input/事件0")
+    定义 可变 父Nova路径项 = devtmpfs_根Nova路径项
+    定义 可变 节点名 = 名称
+    定义 分隔位 = 字符串最后索引(名称, "/")
+    如果 (分隔位 >= 0) {
+        定义 目录部分 = 字符串子串(名称, 0, 分隔位)
+        节点名 = 字符串子串(名称, 分隔位 + 1, 字符串长度(名称))
+        // 查找或创建中间目录
+        父Nova路径项 = devtmpfs_确保目录(目录部分)
+        如果 (父Nova路径项 == 空) { 返回 错误_不存在 }
+    }
+
+    // 检查是否已存在
+    如果 (目录项_查找子(父Nova路径项, 节点名) != 空) {
+        返回 错误_已存在
+    }
+
+    // 创建设备Nova文件节点
+    定义 可变 Nova文件节点类型 = 类型_字符设备
+    如果 (类型 == 设备_块) { Nova文件节点类型 = 类型_块设备 }
+    定义 Nova文件节点 = Nova文件节点_创建(Nova文件节点类型, 权限)
+    Nova文件节点_设置设备号(Nova文件节点, MKDEV(主设备号, 次设备号))
+
+    // 设置设备特定的file_operations
+    如果 (类型 == 设备_字符) {
+        devtmpfs_设置字符设备操作(Nova文件节点, 主设备号, 次设备号)
+    }
+
+    定义 Nova路径项 = 目录项_创建(节点名, Nova文件节点, 父Nova路径项)
+    目录项_添加子(父Nova路径项, Nova路径项)
+    devtmpfs_设备数 = devtmpfs_设备数 + 1
+
+    返回 成功
+}
+
+函数 devtmpfs_删除设备节点(名称) {
+    如果 (devtmpfs_根Nova路径项 == 空) { 返回 错误_未初始化 }
+
+    定义 Nova路径项 = 路径查找(devtmpfs_根Nova路径项, 名称)
+    如果 (Nova路径项 == 空) { 返回 错误_不存在 }
+
+    定义 父 = 目录项_父(Nova路径项)
+    如果 (父 != 空) {
+        目录项_移除子(父, Nova路径项)
+    }
+    devtmpfs_设备数 = devtmpfs_设备数 - 1
+    返回 成功
+}
+
+函数 devtmpfs_创建符号链接(名称, 目标) {
+    如果 (devtmpfs_根Nova路径项 == 空) { 返回 错误_未初始化 }
+    定义 Nova文件节点 = Nova文件节点_创建(类型_符号链接, 0o777)
+    Nova文件节点_设置链接目标(Nova文件节点, 目标)
+    定义 Nova路径项 = 目录项_创建(名称, Nova文件节点, devtmpfs_根Nova路径项)
+    目录项_添加子(devtmpfs_根Nova路径项, Nova路径项)
+    返回 成功
+}
+
+// /dev/null, /dev/zero, /dev/random 特殊操作
+
+函数 devtmpfs_设置字符设备操作(Nova文件节点, 主, 次) {
+    如果 (主 == 1 && 次 == 3) {
+        // /dev/null: 读返回EOF, 写丢弃
+        Nova文件节点_设置file_ops(Nova文件节点, { 读: dev_null_读, 写: dev_null_写 })
+    }
+    如果 (主 == 1 && 次 == 5) {
+        // /dev/zero: 读返回零, 写丢弃
+        Nova文件节点_设置file_ops(Nova文件节点, { 读: dev_zero_读, 写: dev_null_写 })
+    }
+    如果 (主 == 1 && 次 == 7) {
+        // /dev/full: 读返回零, 写返回ENOSPC
+        Nova文件节点_设置file_ops(Nova文件节点, { 读: dev_zero_读, 写: dev_full_写 })
+    }
+    如果 (主 == 1 && (次 == 8 || 次 == 9)) {
+        // /dev/random, /dev/urandom: 读返回伪随机
+        Nova文件节点_设置file_ops(Nova文件节点, { 读: dev_random_读, 写: dev_null_写 })
+    }
+    如果 (主 == 1 && 次 == 11) {
+        // /dev/kmsg: 内核消息缓冲区
+        Nova文件节点_设置file_ops(Nova文件节点, { 读: dev_kmsg_读, 写: dev_kmsg_写 })
+    }
+}
+
+函数 dev_null_读(文件, 缓冲, 大小, 位置) { 返回 0 }  // EOF
+函数 dev_null_写(文件, 缓冲, 大小, 位置) { 返回 大小 }  // 丢弃
+
+函数 dev_zero_读(文件, 缓冲, 大小, 位置) {
+    内存清零(缓冲, 大小)
+    返回 大小
+}
+
+函数 dev_full_写(文件, 缓冲, 大小, 位置) {
+    返回 错误_无空间   // ENOSPC
+}
+
+函数 dev_random_读(文件, 缓冲, 大小, 位置) {
+    // 委托给内核随机数模块(支持RDRAND硬件加速)
+    get_random_bytes(缓冲, 大小)
+    返回 大小
+}
+
+函数 dev_kmsg_读(文件, 缓冲, 大小, 位置) {
+    // 读取内核日志缓冲区
+    返回 内核日志_读取(缓冲, 大小, 位置)
+}
+
+函数 dev_kmsg_写(文件, 缓冲, 大小, 位置) {
+    // 写入内核日志
+    内核信息_缓冲(缓冲, 大小)
+    返回 大小
+}
+
+// 辅助
+
+函数 devtmpfs_确保目录(路径) {
+    定义 部分 = 字符串分割(路径, "/")
+    定义 可变 当前 = devtmpfs_根Nova路径项
+    定义 可变 i = 0
+    当 (i < 计数(部分)) {
+        定义 子 = 目录项_查找子(当前, 部分[i])
+        如果 (子 == 空) {
+            // 创建中间目录
+            定义 Nova文件节点 = Nova文件节点_创建(类型_目录, 0o755)
+            子 = 目录项_创建(部分[i], Nova文件节点, 当前)
+            目录项_添加子(当前, 子)
+        }
+        当前 = 子
+        i = i + 1
+    }
+    返回 当前
+}
+
+
+函数 devtmpfs_完整统计() {
+    返回 [devtmpfs_设备数]
+}
+
+// devtmpfs健康检查与辅助
+
+函数 devtmpfs_健康检查() {
+    定义 可变 问题 = []
+    如果 (devtmpfs_设备数 == 0) { 追加(问题, "devtmpfs无设备节点") }
+    如果 (devtmpfs_设备数 > 4096) {
+        追加(问题, "devtmpfs设备节点过多: " + 整数转字符串(devtmpfs_设备数))
+    }
+    如果 (计数(问题) == 0) { 返回 "devtmpfs健康" }
+    返回 问题
+}
+
+函数 devtmpfs_查找设备(名称) {
+    定义 可变 i = 0
+    当 (i < devtmpfs_设备数) {
+        如果 (devtmpfs_节点表[i].名称 == 名称) { 返回 devtmpfs_节点表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 devtmpfs_是字符设备(节点) {
+    如果 (节点 == 空) { 返回 假 }
+    返回 节点.类型 == 1
+}
+
+函数 devtmpfs_是块设备(节点) {
+    如果 (节点 == 空) { 返回 假 }
+    返回 节点.类型 == 2
+}
+
+// 错误_未初始化 定义在 核心/公共/错误码.nova

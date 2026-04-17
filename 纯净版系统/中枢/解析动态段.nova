@@ -1,0 +1,128 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./哈希函数.nova")
+导入("./可执行加载.nova")
+导入("../记忆/文件层文件.nova")
+导入("../稳态/接收初始化.nova")
+导入("../记忆/虚文件信号.nova")
+导入("./内核打印.nova")
+导入("../引导/端口输入.nova")
+导入("../记忆/内存文件创.nova")
+
+// §5 解析PT_DYNAMIC段
+
+函数 解析动态段(obj) {
+    定义 可变 addr = obj.动态段
+    当 (真) {
+        定义 d_tag = 内存读64(addr)
+        定义 d_val = 内存读64(addr + 8)
+        如果 (d_tag == DT_NULL) { 跳出 }
+
+        如果 (d_tag == DT_NEEDED)      { 追加(obj.NEEDED列表, d_val) }  // 索引到strtab
+        如果 (d_tag == DT_STRTAB)      { obj.字符串表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_SYMTAB)      { obj.符号表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_STRSZ)       { obj.字符串表大小 = d_val }
+        如果 (d_tag == DT_SYMENT)      { obj.符号表条目大小 = d_val }
+        如果 (d_tag == DT_RELA)        { obj.RELA表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_RELASZ)      { obj.RELA大小 = d_val }
+        如果 (d_tag == DT_JMPREL)      { obj.JMPREL表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_PLTRELSZ)    { obj.JMPREL大小 = d_val }
+        如果 (d_tag == DT_PLTGOT)      { obj.GOT地址 = d_val + obj.基地址 }
+        如果 (d_tag == DT_HASH)        { obj.哈希表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_GNU_HASH)    { obj.GNU哈希表 = d_val + obj.基地址 }
+        如果 (d_tag == DT_INIT)        { obj.INIT = d_val + obj.基地址 }
+        如果 (d_tag == DT_FINI)        { obj.FINI = d_val + obj.基地址 }
+        如果 (d_tag == DT_INIT_ARRAY)  { obj.INIT_ARRAY = d_val + obj.基地址 }
+        如果 (d_tag == DT_INIT_ARRAYSZ) { obj.INIT_ARRAY大小 = d_val }
+
+        addr = addr + 16
+    }
+
+    // 将NEEDED索引转换为实际字符串
+    如果 (obj.字符串表 != 0) {
+        定义 可变 新列表 = []
+        定义 可变 n = 0
+        当 (n < 计数(obj.NEEDED列表)) {
+            定义 偏移 = obj.NEEDED列表[n]
+            定义 名称 = 读取C字符串(obj.字符串表 + 偏移)
+            追加(新列表, 名称)
+            n = n + 1
+        }
+        obj.NEEDED列表 = 新列表
+    }
+}
+
+// §6 加载共享库(.so)
+
+函数 加载共享库(路径, 名称) {
+    内核调试("ld.so: 加载 " + 名称 + " ← " + 路径)
+
+    定义 fd = vfs_open(路径, 0)
+    如果 (fd < 0) { 返回 }
+
+    定义 头 = 分配内存(4096)
+    vfs_read(fd, 头, 4096)
+
+    定义 e_type    = 内存读16(头 + 16)
+    定义 e_entry   = 内存读64(头 + 24)
+    定义 e_phoff   = 内存读64(头 + 32)
+    定义 e_phnum   = 内存读16(头 + 56)
+
+    定义 obj = 已加载对象 {}
+    obj.路径 = 路径
+    obj.名称 = 名称
+    obj.类型 = e_type
+    obj.NEEDED列表 = []
+    obj.已初始化 = 假
+
+    // 共享库总是ET_DYN, 需要分配虚拟地址
+    定义 基地址 = 分配SO地址()
+    obj.基地址 = 基地址
+
+    // 加载PT_LOAD段
+    定义 phdr_buf = 分配内存(e_phnum * 56)
+    vfs_lseek(fd, e_phoff, 0)
+    vfs_read(fd, phdr_buf, e_phnum * 56)
+
+    定义 可变 i = 0
+    当 (i < e_phnum) {
+        定义 ph = phdr_buf + i * 56
+        定义 p_type   = 内存读32(ph)
+        定义 p_flags  = 内存读32(ph + 4)
+        定义 p_offset = 内存读64(ph + 8)
+        定义 p_vaddr  = 内存读64(ph + 16)
+        定义 p_filesz = 内存读64(ph + 32)
+        定义 p_memsz  = 内存读64(ph + 40)
+
+        如果 (p_type == PT_LOAD) {
+            定义 映射地址 = 基地址 + p_vaddr
+            Nova内存映射_映射(映射地址, 页对齐(p_memsz), 转换保护标志(p_flags))
+            vfs_lseek(fd, p_offset, 0)
+            vfs_read(fd, 映射地址, p_filesz)
+            如果 (p_memsz > p_filesz) {
+                内存填零(映射地址 + p_filesz, p_memsz - p_filesz)
+            }
+        }
+        如果 (p_type == PT_DYNAMIC) { obj.动态段 = 基地址 + p_vaddr }
+        如果 (p_type == PT_安全) { obj.安全大小 = p_memsz }
+        i = i + 1
+    }
+
+    vfs_close(fd)
+    释放内存(头)
+    释放内存(phdr_buf)
+
+    obj.入口点 = 基地址 + e_entry
+
+    // 解析动态段
+    如果 (obj.动态段 != 0) { 解析动态段(obj) }
+    追加(已加载对象列表, obj)
+}
+
+定义 可变 下一个SO地址 = 0x7F000000   // 共享库加载区域起始
+
+函数 分配SO地址() {
+    定义 addr = 下一个SO地址
+    下一个SO地址 = 下一个SO地址 + 0x400000  // 每个SO预留4MB
+    返回 addr
+}

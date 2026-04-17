@@ -1,0 +1,138 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./资源取数.nova")
+导入("../中枢/辅助存根.nova")
+导入("./解包.nova")
+导入("./超传头部创.nova")
+导入("./解码器创建.nova")
+导入("./内核直连层.nova")
+导入("./安全策主机.nova")
+导入("./资源加载资源.nova")
+导入("../中枢/字符串替换.nova")
+
+// §7 Content-Type解析
+
+结构 ContentType {
+    类型,    // u64 "text"
+    子类型,    // u64 "html"
+    字符集,    // u64 "utf-8"
+}
+
+函数 ContentType_解析(头值) {
+    如果 (头值 == 0) { 返回 0 }
+    定义 ct = 堆_分配(ContentType)
+    ct.类型 = 0; ct.子类型 = 0; ct.字符集 = 字符串_复制("utf-8")
+
+    定义 长度 = 字符串_长度(头值)
+    定义 可变 pos = 0
+
+    // 类型
+    定义 类型起 = pos
+    当 (pos < 长度 && 内存_读8(头值 + pos) != 0x2F && 内存_读8(头值 + pos) != 0x3B) { pos = pos + 1 }
+    ct.类型 = 字符串_复制_N(头值 + 类型起, pos - 类型起)
+
+    // 子类型
+    如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x2F) {
+        pos = pos + 1
+        定义 子类型起 = pos
+        当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3B && 内存_读8(头值 + pos) != 0x20) { pos = pos + 1 }
+        ct.子类型 = 字符串_复制_N(头值 + 子类型起, pos - 子类型起)
+    }
+
+    // 参数(charset等)
+    当 (pos < 长度) {
+        如果 (内存_读8(头值 + pos) == 0x3B) { pos = pos + 1 }
+        当 (pos < 长度 && 内存_读8(头值 + pos) == 0x20) { pos = pos + 1 }
+
+        定义 参数起 = pos
+        当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3D && 内存_读8(头值 + pos) != 0x3B) { pos = pos + 1 }
+        定义 参数名 = 字符串_复制_N(头值 + 参数起, pos - 参数起)
+
+        如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x3D) {
+            pos = pos + 1
+            定义 值起 = pos
+            如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x22) {
+                pos = pos + 1; 值起 = pos
+                当 (pos < 长度 && 内存_读8(头值 + pos) != 0x22) { pos = pos + 1 }
+            } 否则 {
+                当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3B && 内存_读8(头值 + pos) != 0x20) { pos = pos + 1 }
+            }
+            定义 参数值 = 字符串_复制_N(头值 + 值起, pos - 值起)
+            如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x22) { pos = pos + 1 }
+
+            如果 (字符串_相等_不区分大小写(参数名, "charset")) {
+                ct.字符集 = 参数值
+            }
+        }
+    }
+
+    返回 ct
+}
+
+// §8 增强的ResourceLoader — 集成chunked/gzip/cookie/重定向
+
+函数 ResourceLoader_完整加载(loader) {
+    // 添加Cookie头
+    定义 url = loader.请求.url
+    如果 (url != 0) {
+        定义 cookie头 = Cookie_获取请求头(url.主机, url.路径, url.是安全的)
+        如果 (cookie头 != 0) {
+            HTTP头部_添加(loader.请求.请求头, "Cookie", cookie头)
+        }
+    }
+
+    // CORS预检
+    如果 (loader.请求.来源 != 0 && CORS_需要预检(loader.请求)) {
+        如果 (!CORS_发送预检(loader)) {
+            loader.状态 = 请求状态_失败
+            返回
+        }
+    }
+
+    // 发起请求
+    ResourceLoader_开始加载(loader)
+
+    // 处理重定向
+    HTTP_处理重定向(loader, 10)
+
+    如果 (loader.状态 != 请求状态_完成) { 返回 }
+
+    // 处理Set-Cookie
+    定义 可变 cookie_idx = 0
+    当 (cookie_idx < loader.响应.响应头.数量) {
+        定义 偏移 = loader.响应.响应头.条目 + cookie_idx * 32
+        定义 名 = 内存_读64(偏移)
+        如果 (字符串_相等_不区分大小写(名, "Set-Cookie")) {
+            定义 值 = 内存_读64(偏移 + 16)
+            Cookie_解析SetCookie(值, url.主机)
+        }
+        cookie_idx = cookie_idx + 1
+    }
+
+    // 检查Transfer-Encoding: chunked
+    定义 te = HTTP头部_获取(loader.响应.响应头, "Transfer-Encoding")
+    如果 (te != 0 && 字符串_相等_不区分大小写(te, "chunked")) {
+        定义 decoder = ChunkedDecoder_创建()
+        ChunkedDecoder_解码(decoder, loader.接收缓冲, loader.已接收字节)
+        // 替换缓冲
+        堆_释放(loader.接收缓冲)
+        loader.接收缓冲 = decoder.输出缓冲
+        loader.已接收字节 = decoder.输出长度
+    }
+
+    // 检查Content-Encoding: gzip
+    定义 ce = HTTP头部_获取(loader.响应.响应头, "Content-Encoding")
+    如果 (ce != 0 && (字符串_相等_不区分大小写(ce, "gzip") || 字符串_相等_不区分大小写(ce, "deflate"))) {
+        定义 inflate结果 = Gzip_解压(loader.接收缓冲, loader.已接收字节)
+        如果 (inflate结果 != 0) {
+            堆_释放(loader.接收缓冲)
+            loader.接收缓冲 = inflate结果.输出
+            loader.已接收字节 = inflate结果.输出长度
+        }
+    }
+
+    // 确保null结尾
+    如果 (loader.已接收字节 < loader.接收缓冲大小) {
+        内存_写8(loader.接收缓冲 + loader.已接收字节, 0)
+    }
+}

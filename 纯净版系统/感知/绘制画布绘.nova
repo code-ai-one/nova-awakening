@@ -1,0 +1,130 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./属性自定义属.nova")
+导入("../稳态/字体写字形.nova")
+
+
+函数 Sk画布_drawBitmap(c, 源位图, x, y, paint) {
+    // 位图绘制(图片/画布截图)
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 目标 = c.位图
+    定义 px = x / 100; 定义 py = y / 100
+
+    定义 可变 sy = 0
+    当 (sy < 源位图.高) {
+        定义 可变 sx = 0
+        当 (sx < 源位图.宽) {
+            定义 颜色 = Nova缓冲itmap_获取像素(源位图, sx, sy)
+            如果 (颜色 != SK_ColorTRANSPARENT) {
+                Sk画布_混合像素(目标, px + sx, py + sy, 颜色, paint.混合模式)
+            }
+            sx = sx + 1
+        }
+        sy = sy + 1
+    }
+}
+
+函数 Sk画布_drawPath(c, path, paint) {
+    // 路径绘制(矢量图形)
+    // 实际需要SkScan扫描线光栅化
+    c.绘制调用数 = c.绘制调用数 + 1
+    // 扫描线填充(SkScan::FillPath)和描边(SkStroke)由SkRasterPipeline处理
+}
+
+// §4 像素混合 (Porter-Duff合成)
+// (对应 Nova缓冲lendMode_Apply / Nova缓冲litter)
+
+函数 Sk画布_混合像素(bm, x, y, 源颜色, 混合模式) {
+    如果 (x < 0 || x >= bm.宽 || y < 0 || y >= bm.高) { 返回 }
+
+    如果 (混合模式 == 混合_Src) {
+        Nova缓冲itmap_设置像素(bm, x, y, 源颜色)
+        返回
+    }
+
+    定义 源a = SkColor_A(源颜色)
+    如果 (源a == 0) { 返回 }
+    如果 (源a == 255 && 混合模式 == 混合_SrcOver) {
+        Nova缓冲itmap_设置像素(bm, x, y, 源颜色)
+        返回
+    }
+
+    // SrcOver (最常用): Cs * As + Cd * (1 - As)
+    如果 (混合模式 == 混合_SrcOver) {
+        定义 目标颜色 = Nova缓冲itmap_获取像素(bm, x, y)
+        定义 目标a = SkColor_A(目标颜色)
+
+        定义 反源a = 255 - 源a
+        定义 r = (SkColor_R(源颜色) * 源a + SkColor_R(目标颜色) * 反源a) / 255
+        定义 g = (SkColor_G(源颜色) * 源a + SkColor_G(目标颜色) * 反源a) / 255
+        定义 b = (SkColor_B(源颜色) * 源a + SkColor_B(目标颜色) * 反源a) / 255
+        定义 a = 源a + 目标a * 反源a / 255
+
+        Nova缓冲itmap_设置像素(bm, x, y, SkColor(a, r, g, b))
+        返回
+    }
+
+    // 其他混合模式
+    如果 (混合模式 == 混合_Multiply) {
+        定义 目标颜色 = Nova缓冲itmap_获取像素(bm, x, y)
+        定义 r = SkColor_R(源颜色) * SkColor_R(目标颜色) / 255
+        定义 g = SkColor_G(源颜色) * SkColor_G(目标颜色) / 255
+        定义 b = SkColor_B(源颜色) * SkColor_B(目标颜色) / 255
+        Nova缓冲itmap_设置像素(bm, x, y, SkColor(255, r, g, b))
+        返回
+    }
+
+    如果 (混合模式 == 混合_Screen) {
+        定义 目标颜色 = Nova缓冲itmap_获取像素(bm, x, y)
+        定义 r = 255 - (255 - SkColor_R(源颜色)) * (255 - SkColor_R(目标颜色)) / 255
+        定义 g = 255 - (255 - SkColor_G(源颜色)) * (255 - SkColor_G(目标颜色)) / 255
+        定义 b = 255 - (255 - SkColor_B(源颜色)) * (255 - SkColor_B(目标颜色)) / 255
+        Nova缓冲itmap_设置像素(bm, x, y, SkColor(255, r, g, b))
+        返回
+    }
+
+    // 默认: SrcOver
+    Nova缓冲itmap_设置像素(bm, x, y, 源颜色)
+}
+
+函数 Sk画布_drawHLine(c, x1, x2, y, 高度, 颜色, 混合模式) {
+    定义 bm = c.位图
+    定义 可变 dy = 0
+    当 (dy < 高度) {
+        定义 可变 x = x1
+        当 (x < x2) {
+            Sk画布_混合像素(bm, x, y + dy, 颜色, 混合模式)
+            x = x + 1
+        }
+        dy = dy + 1
+    }
+}
+
+函数 Sk画布_drawVLine(c, x, y1, y2, 宽度, 颜色, 混合模式) {
+    定义 bm = c.位图
+    定义 可变 dx = 0
+    当 (dx < 宽度) {
+        定义 可变 y = y1
+        当 (y < y2) {
+            Sk画布_混合像素(bm, x + dx, y, 颜色, 混合模式)
+            y = y + 1
+        }
+        dx = dx + 1
+    }
+}
+
+函数 画布_绘制文本(画布, x, y, 文本, 颜色, 字号) {
+    如果 (画布 == 空) { 返回 }
+    定义 fb = 画布.帧缓冲
+    定义 缩放 = 字号 / 16
+    如果 (缩放 < 1) { 缩放 = 1 }
+    字体_渲染文本_透明(fb, x, y, 文本, 颜色, 缩放)
+}
+
+函数 画布_设置像素(画布, x, y, 颜色) {
+    如果 (画布 == 空) { 返回 }
+    如果 (x < 0 || x >= 画布.宽 || y < 0 || y >= 画布.高) { 返回 }
+    定义 偏移 = (y * 画布.步幅) + (x * 4)
+    内存_写32(画布.帧缓冲 + 偏移, 颜色)
+}

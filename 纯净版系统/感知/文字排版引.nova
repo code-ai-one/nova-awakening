@@ -1,0 +1,151 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./图片解码器创.nova")
+
+// 对应:  (
+//  (
+// nova/renderer/platform/fonts/ (
+// 文字渲染流水线:
+// 1. 字体加载: 解析TTF/OTF → 提取字形表(glyf/CFF)
+// 2. Shaping: 字符序列 → 字形ID序列+位置(HarfBuzz)
+// 处理连字(fi→ﬁ), 字距调整(AV), 阿拉伯连接体等
+// 3. 光栅化: 字形轮廓→位图(FreeType)
+// 贝塞尔曲线→像素覆盖率→抗锯齿灰度图
+// 4. 缓存: 字形位图缓存到图处纹理图集
+// 【Nova特色】AI总线集成:
+// ① AI预测即将需要的字形→提前光栅化
+// ② AI评估文字区域重要性→高质量/低质量光栅化
+// ③ 视口外文字用低分辨率字形, 视口内用亚像素抗锯齿
+
+// §1 TrueType/OpenType字体解析
+// TTF文件结构:
+// Offset Table → Table Directory → [head, hhea, maxp, cmap, loca, glyf, ...]
+// 关键表:
+// head: 全局字体信息(unitsPerEm, 边界框)
+// cmap: 字符→字形ID映射(Unicode→GlyphIndex)
+// hhea: 水平布局参数(ascent, descent, lineGap)
+// hmtx: 每字形水平度量(advanceWidth, leftSideBearing)
+// loca: 字形偏移索引(glyf表中的偏移)
+// glyf: 字形轮廓数据(贝塞尔控制点)
+// GPOS: 字距调整(kerning)
+// GSUB: 字形替换(连字)
+
+结构 字体 {
+ 数据,    // u64 字体文件原始数据
+ 数据大小,
+ // 全局信息(head表)
+ unitsPerEm,    // u16 通常1000或2048
+ ascent,    // i16 基线上方高度
+ descent,    // i16 基线下方深度(负值)
+ lineGap,    // i16 行间距
+
+ // 表偏移
+ cmap偏移,
+ glyf偏移,
+ loca偏移,
+ hmtx偏移,
+ kern偏移,
+ GPOS偏移,
+ GSUB偏移,
+ // cmap格式4(BMP Unicode)
+ cmap4_segCount,
+ cmap4_endCode,
+ cmap4_startCode,
+ cmap4_idDelta,
+ cmap4_idRangeOff,
+ // 字形数量
+ 字形数,
+ loca格式,    // u16 0=short, 1=long
+
+ // 字形缓存
+ 字形缓存,    // u64 Glyph缓存*
+ 缓存大小,
+}
+
+
+函数 字体_加载(数据, 大小) {
+ 如果 (数据 == 0 || 大小 < 12) { 返回 0 }
+
+ 定义 font = 堆_分配(字体)
+ font.数据 = 数据
+ font.数据大小 = 大小
+
+ // 解析Offset Table
+ 定义 sfVersion = 读32大端(数据)
+ // 0x00010000 = TrueType, 'OTTO' = CFF
+ 定义 numTables = 读16大端(数据 + 4)
+
+ // 解析Table Directory
+ 定义 可变 i = 0
+ 当 (i < numTables) {
+ 定义 entry = 数据 + 12 + i * 16
+ 定义 tag = 读32大端(entry)
+ 定义 offset = 读32大端(entry + 8)
+ 定义 length = 读32大端(entry + 12)
+
+ 如果 (tag == 0x68656164) { 字体_解析head(font, 数据 + offset) } // 'head'
+ 否则 如果 (tag == 0x68686561) { 字体_解析hhea(font, 数据 + offset) } // 'hhea'
+ 否则 如果 (tag == 0x636D6170) { 字体_解析cmap(font, 数据 + offset, length) } // 'cmap'
+ 否则 如果 (tag == 0x6C6F6361) { font.loca偏移 = offset } // 'loca'
+ 否则 如果 (tag == 0x676C7966) { font.glyf偏移 = offset } // 'glyf'
+ 否则 如果 (tag == 0x686D7478) { font.hmtx偏移 = offset } // 'hmtx'
+ 否则 如果 (tag == 0x6B65726E) { font.kern偏移 = offset } // 'kern'
+ 否则 如果 (tag == 0x47504F53) { font.GPOS偏移 = offset } // 'GPOS'
+ 否则 如果 (tag == 0x47535542) { font.GSUB偏移 = offset } // 'GSUB'
+ 否则 如果 (tag == 0x6D617870) { // 'maxp'
+ font.字形数 = 读16大端(数据 + offset + 4)
+ }
+
+ i = i + 1
+ }
+
+ // 初始化字形缓存
+ font.缓存大小 = 512
+ font.字形缓存 = 堆_分配_数组(font.缓存大小 * 16) // [glyphID, 纹理偏移, w, h]
+
+ 返回 font
+}
+
+函数 字体_解析head(font, 数据) {
+ font.unitsPerEm = 读16大端(数据 + 18)
+ font.loca格式 = 读16大端(数据 + 50) // indexToLocFormat
+}
+
+函数 字体_解析hhea(font, 数据) {
+ font.ascent = 读16大端(数据 + 4)
+ font.descent = 读16大端(数据 + 6)
+ font.lineGap = 读16大端(数据 + 8)
+}
+
+// cmap: 找Format 4表(Unicode BMP)
+函数 字体_解析cmap(font, 数据, 大小) {
+ font.cmap偏移 = 数据 - font.数据
+ 定义 numTables = 读16大端(数据 + 2)
+ 定义 可变 i = 0
+ 当 (i < numTables) {
+ 定义 entry = 数据 + 4 + i * 8
+ 定义 platformID = 读16大端(entry)
+ 定义 encodingID = 读16大端(entry + 2)
+ 定义 offset = 读32大端(entry + 4)
+
+ // Platform 3 (Windows), Encoding 1 (Unicode BMP)
+ 如果 (platformID == 3 && encodingID == 1) {
+ 定义 subtable = 数据 + offset
+ 定义 format = 读16大端(subtable)
+ 如果 (format == 4) {
+ 字体_解析cmap4(font, subtable)
+ 返回
+ }
+ }
+ i = i + 1
+ }
+}
+
+函数 字体_解析cmap4(font, 数据) {
+ font.cmap4_segCount = 读16大端(数据 + 6) / 2
+ 定义 sc = font.cmap4_segCount
+ font.cmap4_endCode = 数据 + 14
+ font.cmap4_startCode = 数据 + 14 + sc * 2 + 2 // +2 reservedPad
+ font.cmap4_idDelta = 数据 + 14 + sc * 4 + 2
+ font.cmap4_idRangeOff = 数据 + 14 + sc * 6 + 2
+}

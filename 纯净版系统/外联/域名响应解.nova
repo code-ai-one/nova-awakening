@@ -1,0 +1,118 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./域名缓存.nova")
+导入("../执行/控制台输出.nova")
+导入("./域名初始化.nova")
+
+// §6 域名响应解析
+
+函数 域名_解析响应(r, buf, len, 域名, 类型) {
+    如果 (buf == 0 || len < 12) { 返回 0 }
+    // Header
+    定义 flags = (字节取(buf, 2) << 8) | 字节取(buf, 3)
+    定义 rcode = flags & 0x0F
+    如果 (rcode == RCODE_NXDOMAIN) {
+        // 负缓存
+        域名_缓存插入(r, 域名, 类型, 0, 域名_CACHE_NEG_TTL, 真)
+        返回 0
+    }
+    如果 (rcode != RCODE_OK) { 返回 0 }
+    定义 ancount = (字节取(buf, 6) << 8) | 字节取(buf, 7)
+
+    // 跳过Question section
+    定义 可变 pos = 12
+    定义 qdcount = (字节取(buf, 4) << 8) | 字节取(buf, 5)
+    定义 可变 q = 0
+    当 (q < qdcount && pos < len) {
+        pos = 域名_跳过域名(buf, pos, len)
+        pos = pos + 4    // QTYPE + QCLASS
+        q = q + 1
+    }
+
+    // Answer section
+    定义 可变 结果 = 0
+    定义 可变 结果TTL = 0
+    定义 可变 a = 0
+    当 (a < ancount && pos + 10 < len) {
+        // Name
+        pos = 域名_跳过域名(buf, pos, len)
+        // Type(2) + Class(2) + TTL(4) + RDLENGTH(2)
+        定义 rec_type = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+        定义 rec_class = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+        定义 ttl = (字节取(buf,pos)<<24)|(字节取(buf,pos+1)<<16)|
+                  (字节取(buf,pos+2)<<8)|字节取(buf,pos+3); pos = pos + 4
+        定义 rdlen = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+
+        如果 (rec_type == 域名_A && rdlen == 4 && pos + 4 <= len) {
+            // IPv4地址
+            结果 = (字节取(buf,pos)<<24)|(字节取(buf,pos+1)<<16)|
+                  (字节取(buf,pos+2)<<8)|字节取(buf,pos+3)
+            结果TTL = ttl
+        }
+        否则 如果 (rec_type == 域名_AAAA && rdlen == 16) {
+            // IPv6(暂存第一个)
+        }
+        否则 如果 (rec_type == 域名_CNAME) {
+            // 需要再次解析CNAME目标
+        }
+        pos = pos + rdlen
+        a = a + 1
+    }
+
+    // 缓存结果
+    如果 (结果 != 0) {
+        定义 rec = 堆_分配(域名Record)
+        rec.ipv4 = 结果; rec.类型 = 域名_A; rec.TTL = 结果TTL; rec.下一个 = 0
+        域名_缓存插入(r, 域名, 类型, rec, 结果TTL, 假)
+    }
+    返回 结果
+}
+
+// 跳过压缩域名
+函数 域名_跳过域名(buf, pos, len) {
+    如果 (pos >= len) { 返回 pos }
+    定义 可变 p = pos
+    当 (p < len) {
+        定义 label_len = 字节取(buf, p)
+        如果 (label_len == 0) { 返回 p + 1 }    // 终止符
+        如果 ((label_len & 0xC0) == 0xC0) {       // 压缩指针(2字节)
+            返回 p + 2
+        }
+        p = p + 1 + label_len
+    }
+    返回 p
+}
+
+// §7 数报查询 + DoH查询
+
+函数 域名_数报查询(r, 域名, 类型) {
+    如果 (r == 0 || r.服务器数 == 0) { 返回 0 }
+    定义 buf = 堆_分配(512)
+    定义 query_len = 域名_构造查询(r, 域名, 类型, buf, 512)
+    如果 (query_len <= 0) { 返回 0 }
+
+    // 发送到第一个可用域名服务器
+    定义 server_ip = r.服务器[0]
+    平台_udp_发送(r.udp_fd, server_ip, 域名_PORT, buf, query_len)
+
+    // 接收响应(超时5秒)
+    定义 resp = 堆_分配(512)
+    定义 resp_len = 平台_udp_接收(r.udp_fd, resp, 512, 域名_TIMEOUT_MS)
+    如果 (resp_len <= 0) { 返回 0 }
+
+    返回 域名_解析响应(r, resp, resp_len, 域名, 类型)
+}
+
+函数 域名_DoH查询(r, 域名, 类型) {
+    如果 (r == 0 || r.doh_url == 0) { 返回 0 }
+    // 域名-over-HTTPS (Nova协议规范 8484):
+    // 1. 构造域名 wire format查询
+    定义 wire = 堆_分配(512)
+    定义 wire_len = 域名_构造查询(r, 域名, 类型, wire, 512)
+    // 2. Base64url编码
+    // 3. GET https://dns.google/dns-query?dns=<base64url>
+    //    Accept: application/dns-message
+    // 4. 或 POST with body=wire format, Content-Type: application/dns-message
+    // 5. 解析响应(同数报)
+    返回 0    // 需要安全+HTTP2支持
+}

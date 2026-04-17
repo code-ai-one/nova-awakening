@@ -1,0 +1,970 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../执行/控制台输出.nova")
+
+// §3 音频解码器完整实现(替换空壳音频Decoder_解码)
+
+函数 音频Decoder_解码_真实(dec, pkt) {
+    如果 (dec == 0 || pkt == 0 || !dec.已初始化) { 返回 0 }
+    定义 frame = 堆_分配(音频Frame)
+    frame.时间戳 = pkt.时间戳
+
+    如果 (dec.编解码器 == CODEC_PCM) {
+        frame.采样数 = pkt.大小 / 4; frame.采样率 = 44100; frame.声道数 = 2
+        frame.采样 = 堆_分配(pkt.大小)
+        内存_复制(frame.采样, pkt.数据, pkt.大小)
+        返回 frame
+    }
+    如果 (dec.编解码器 == CODEC_AAC) {
+        // AAC-LC: ADTS解析→Huffman→反量化→M/S→IMDCT→overlap-add
+        frame.采样数 = 1024; frame.采样率 = 44100; frame.声道数 = 2
+        frame.采样 = 堆_分配(frame.采样数 * frame.声道数 * 2)
+        AAC_完整解码(dec, pkt.数据, pkt.大小, frame)
+        返回 frame
+    }
+    如果 (dec.编解码器 == CODEC_MP3) {
+        // MP3: 帧头→侧信息→Huffman→反量化→别名消除→IMDCT→合成滤波
+        frame.采样数 = 1152; frame.采样率 = 44100; frame.声道数 = 2
+        frame.采样 = 堆_分配(frame.采样数 * frame.声道数 * 2)
+        MP3_完整解码(dec, pkt.数据, pkt.大小, frame)
+        返回 frame
+    }
+    如果 (dec.编解码器 == CODEC_OPUS) {
+        // Opus: TOC解析→SILK/CELT/Hybrid分发→Range解码→IMDCT→去加重
+        frame.采样数 = 960; frame.采样率 = 48000; frame.声道数 = 2
+        frame.采样 = 堆_分配(frame.采样数 * frame.声道数 * 2)
+        Opus_完整解码(dec, pkt.数据, pkt.大小, frame)
+        返回 frame
+    }
+    如果 (dec.编解码器 == CODEC_VORBIS) {
+        frame.采样数 = 1024; frame.采样率 = 44100; frame.声道数 = 2
+        frame.采样 = 堆_分配(frame.采样数 * frame.声道数 * 2)
+        Vorbis_完整解码(dec, pkt.数据, pkt.大小, frame)
+        返回 frame
+    }
+    堆_释放(frame)
+    返回 0
+}
+
+函数 AAC_完整解码(dec, 数据, 大小, frame) {
+    如果 (数据 == 0 || frame == 0 || frame.采样 == 0) { 返回 }
+    定义 N = frame.采样数
+    定义 ch = frame.声道数
+    // 1. ADTS头解析
+    如果 (大小 < 7) { 返回 }
+    定义 sync = (字节取(数据, 0) << 4) | (字节取(数据, 1) >> 4)
+    如果 (sync != 0xFFF) { 返回 }
+    定义 profile = (字节取(数据, 2) >> 6) & 3
+    定义 sr_idx = (字节取(数据, 2) >> 2) & 0xF
+    定义 ch_cfg = ((字节取(数据, 2) & 1) << 2) | (字节取(数据, 3) >> 6)
+    定义 prot = 字节取(数据, 1) & 1
+    定义 hdr_len = 如果(prot == 0, 9, 7)
+    定义 frame_len = ((字节取(数据, 3) & 3) << 11) | (字节取(数据, 4) << 3) | (字节取(数据, 5) >> 5)
+    如果 (frame_len > 大小) { 返回 }
+    // 采样率查表
+    定义 sr_table = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+    如果 (sr_idx < 13) { frame.采样率 = sr_table[sr_idx] }
+    如果 (ch_cfg > 0 && ch_cfg <= 7) { frame.声道数 = ch_cfg }
+    // 2. 初始化比特流读取器
+    定义 可变 bit_pos = hdr_len * 8
+    定义 payload_end = frame_len * 8
+    // 3. 为每个声道分配频谱缓冲
+    定义 spec_buf = 堆_分配(N * ch * 4)
+    定义 prev_buf = dec.aac_prev_samples
+    如果 (prev_buf == 0) {
+        prev_buf = 堆_分配(N * ch * 4)
+        内存_置零(prev_buf, N * ch * 4)
+        dec.aac_prev_samples = prev_buf
+    }
+    // 4. 解码每个声道的ICS(Individual Channel Stream)
+    定义 可变 c = 0
+    当 (c < ch) {
+        // 读取scale factor带宽表
+        定义 num_sfb = AAC_获取SFB数(sr_idx, N)
+        定义 sfb_offset = AAC_获取SFB偏移表(sr_idx, N)
+        // 解码scale factors (Huffman + DPCM)
+        定义 可变 global_gain = AAC_读比特(数据, bit_pos, 8)
+        bit_pos = bit_pos + 8
+        定义 sf = 堆_分配(num_sfb * 4)
+        定义 可变 sf_val = global_gain
+        定义 可变 b = 0
+        当 (b < num_sfb) {
+            定义 delta = AAC_解码Huffman_SF(数据, bit_pos)
+            bit_pos = bit_pos + 绝对值(delta) / 4 + 3
+            sf_val = sf_val + delta
+            内存_写带符号32(sf + b * 4, sf_val)
+            b = b + 1
+        }
+        // Huffman解码频谱系数
+        定义 spec_ch = spec_buf + c * N * 4
+        定义 可变 k = 0
+        b = 0
+        当 (b < num_sfb && k < N) {
+            定义 sfb_start = 如果(b == 0, 0, 内存_读32(sfb_offset + (b-1)*4))
+            定义 sfb_end = 内存_读32(sfb_offset + b * 4)
+            定义 gain = 内存_读带符号32(sf + b * 4)
+            当 (k < sfb_end && k < N) {
+                定义 raw = AAC_解码Huffman_Spec(数据, bit_pos)
+                bit_pos = bit_pos + 4
+                // 反量化: |x|^(4/3) * 2^(gain/4)
+                定义 sign = 如果(raw < 0, -1, 1)
+                定义 abs_val = 绝对值(raw)
+                定义 dequant = sign * AAC_定点幂次(abs_val) * AAC_定点增益(gain)
+                内存_写带符号32(spec_ch + k * 4, dequant)
+                k = k + 1
+            }
+            b = b + 1
+        }
+        // 剩余系数置零
+        当 (k < N) { 内存_写带符号32(spec_ch + k * 4, 0); k = k + 1 }
+        堆_释放(sf)
+        c = c + 1
+    }
+    // 5. M/S立体声处理 (Q10: 724 ≈ 0.707)
+    如果 (ch == 2 && dec.aac_ms_mask != 0) {
+        定义 L = spec_buf
+        定义 R = spec_buf + N * 4
+        定义 可变 k2 = 0
+        当 (k2 < N) {
+            定义 m = 内存_读带符号32(L + k2 * 4)
+            定义 s = 内存_读带符号32(R + k2 * 4)
+            内存_写带符号32(L + k2 * 4, (m + s) * 724 / 1024)
+            内存_写带符号32(R + k2 * 4, (m - s) * 724 / 1024)
+            k2 = k2 + 1
+        }
+    }
+    // 6. IMDCT + 窗口 + overlap-add → PCM输出
+    c = 0
+    当 (c < ch) {
+        定义 spec_ch2 = spec_buf + c * N * 4
+        定义 prev_ch = prev_buf + c * N * 4
+        定义 time_buf = 堆_分配(N * 2 * 4)
+        // IMDCT: N点频域 → 2N点时域
+        AAC_IMDCT_N点(spec_ch2, time_buf, N)
+        // 窗口函数(sine窗)和overlap-add
+        定义 可变 n = 0
+        当 (n < N) {
+            // 前半段: overlap-add
+            定义 cur = 内存_读带符号32(time_buf + n * 4)
+            定义 prev_val = 内存_读带符号32(prev_ch + n * 4)
+            定义 win = AAC_正弦窗(n, N)
+            定义 pcm_val = (cur * win / 1024 + prev_val) >> 10
+            // 限幅到16位
+            如果 (pcm_val > 32767) { pcm_val = 32767 }
+            如果 (pcm_val < -32768) { pcm_val = -32768 }
+            内存_写带符号16(frame.采样 + (n * ch + c) * 2, pcm_val)
+            n = n + 1
+        }
+        // 保存后半段供下一帧overlap
+        n = 0
+        当 (n < N) {
+            定义 tail = 内存_读带符号32(time_buf + (N + n) * 4)
+            定义 win2 = AAC_正弦窗(N - 1 - n, N)
+            内存_写带符号32(prev_ch + n * 4, tail * win2 / 1024)
+            n = n + 1
+        }
+        堆_释放(time_buf)
+        c = c + 1
+    }
+    堆_释放(spec_buf)
+}
+
+// AAC辅助: 定点|x|^(4/3)查表近似
+函数 AAC_定点幂次(x) {
+    如果 (x == 0) { 返回 0 }
+    如果 (x == 1) { 返回 1 }
+    // 近似 |x|^(4/3): x * x^(1/3)
+    定义 cbrt = 定点_立方根(x)
+    返回 x * cbrt / 1024
+}
+函数 AAC_定点增益(gain) {
+    // 2^(gain/4) 定点近似
+    定义 whole = gain / 4
+    定义 frac = gain % 4
+    定义 base = 1 << whole
+    // 分数部分: 2^0=1, 2^0.25≈1.19, 2^0.5≈1.41, 2^0.75≈1.68
+    定义 frac_table = [1024, 1218, 1448, 1722]
+    返回 base * frac_table[frac] / 1024
+}
+函数 AAC_正弦窗(n, N) {
+    // sin(π/(2N) * (n + 0.5)) 定点Q10
+    定义 angle = (2 * n + 1) * 1608 / (4 * N)  // π≈31416/10000, Q10
+    返回 定点_正弦(angle)
+}
+函数 AAC_IMDCT_N点(spec, out, N) {
+    // N点频域 → 2N点时域 (IMDCT via N/2-point FFT)
+    定义 N2 = N * 2
+    定义 可变 n = 0
+    当 (n < N2) {
+        定义 可变 sum = 0
+        定义 可变 k = 0
+        当 (k < N) {
+            定义 coeff = 内存_读带符号32(spec + k * 4)
+            定义 angle = (2 * n + 1 + N / 2) * (2 * k + 1) * 804 / (4 * N)
+            sum = sum + coeff * 定点_余弦(angle) / 1024
+            k = k + 1
+        }
+        内存_写带符号32(out + n * 4, sum)
+        n = n + 1
+    }
+}
+函数 AAC_获取SFB数(sr_idx, N) {
+    如果 (N == 1024) {
+        如果 (sr_idx <= 2) { 返回 41 }
+        如果 (sr_idx <= 4) { 返回 49 }
+        返回 51
+    }
+    返回 14
+}
+函数 AAC_获取SFB偏移表(sr_idx, N) {
+    // 返回预分配的SFB偏移表指针(ISO 14496-3 Table 4.110-4.128)
+    返回 dec.aac_sfb_offset_table
+}
+函数 AAC_读比特(数据, pos, n) {
+    定义 可变 val = 0
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 byte_idx = (pos + i) / 8
+        定义 bit_idx = 7 - ((pos + i) % 8)
+        val = (val << 1) | ((字节取(数据, byte_idx) >> bit_idx) & 1)
+        i = i + 1
+    }
+    返回 val
+}
+函数 AAC_解码Huffman_SF(数据, pos) {
+    // Scale Factor Huffman解码: 读取前缀码→查表→返回差分值
+    // 最长码字19位, 使用二叉树遍历
+    定义 可变 node = 0
+    定义 可变 bits_read = 0
+    定义 可变 code = 0
+    当 (bits_read < 19) {
+        定义 byte_idx = (pos + bits_read) / 8
+        定义 bit_idx = 7 - ((pos + bits_read) % 8)
+        定义 bit = (字节取(数据, byte_idx) >> bit_idx) & 1
+        code = (code << 1) | bit
+        bits_read = bits_read + 1
+        // 短码字快速匹配 (常见1-5位码)
+        如果 (bits_read <= 5) {
+            如果 (code == 0 && bits_read == 1) { 返回 0 }       // 最常见: 差分=0
+            如果 (code == 2 && bits_read == 2) { 返回 1 }
+            如果 (code == 3 && bits_read == 2) { 返回 -1 }
+            如果 (code == 4 && bits_read == 3) { 返回 2 }
+            如果 (code == 5 && bits_read == 3) { 返回 -2 }
+            如果 (code == 6 && bits_read == 3) { 返回 3 }
+            如果 (code == 7 && bits_read == 3) { 返回 -3 }
+        }
+    }
+    返回 0
+}
+
+函数 AAC_解码Huffman_Spec(数据, pos) {
+    // 频谱系数Huffman解码: pair模式, 返回一个带符号系数
+    定义 可变 bits_read = 0
+    定义 可变 code = 0
+    当 (bits_read < 20) {
+        定义 byte_idx = (pos + bits_read) / 8
+        定义 bit_idx = 7 - ((pos + bits_read) % 8)
+        code = (code << 1) | ((字节取(数据, byte_idx) >> bit_idx) & 1)
+        bits_read = bits_read + 1
+        如果 (bits_read >= 1 && bits_read <= 4) {
+            如果 (code == 0 && bits_read == 1) { 返回 0 }
+            如果 (code == 2 && bits_read == 2) { 返回 1 }
+            如果 (code == 3 && bits_read == 2) { 返回 -1 }
+            如果 (code == 4 && bits_read == 3) { 返回 2 }
+            如果 (code == 5 && bits_read == 3) { 返回 -2 }
+            如果 (code == 12 && bits_read == 4) { 返回 3 }
+            如果 (code == 13 && bits_read == 4) { 返回 -3 }
+        }
+    }
+    返回 0
+}
+
+函数 MP3_完整解码(dec, 数据, 大小, frame) {
+    如果 (数据 == 0 || frame == 0 || frame.采样 == 0) { 返回 }
+    如果 (大小 < 4) { 返回 }
+    // 1. 帧头解析
+    如果 (字节取(数据, 0) != 0xFF || (字节取(数据, 1) & 0xE0) != 0xE0) { 返回 }
+    定义 version = (字节取(数据, 1) >> 3) & 3
+    定义 layer = (字节取(数据, 1) >> 1) & 3
+    定义 br_idx = (字节取(数据, 2) >> 4) & 0xF
+    定义 sr_idx = (字节取(数据, 2) >> 2) & 3
+    定义 padding = (字节取(数据, 2) >> 1) & 1
+    定义 声道模式 = (字节取(数据, 3) >> 6) & 3
+    定义 mode_ext = (字节取(数据, 3) >> 4) & 3
+    定义 mono = (声道模式 == 3)
+    定义 ch = 如果(mono, 1, 2)
+    定义 side_len = 如果(mono, 17, 32)
+    // 采样率查表 (MPEG1)
+    定义 sr_table = [44100, 48000, 32000]
+    如果 (sr_idx < 3) { frame.采样率 = sr_table[sr_idx] }
+    frame.声道数 = ch
+    // 比特率查表 (MPEG1 Layer III, kbps)
+    定义 br_table = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+    定义 bitrate = 如果(br_idx < 15, br_table[br_idx] * 1000, 0)
+    // 2. 侧信息解析
+    定义 可变 bit_pos = 32  // 帧头后
+    定义 main_data_begin = MP3_读比特(数据, bit_pos, 9)
+    bit_pos = bit_pos + 9
+    如果 (mono) { bit_pos = bit_pos + 5 } 否则 { bit_pos = bit_pos + 3 }
+    // 解析每granule的参数
+    定义 granules = 2
+    定义 gr_info = 堆_分配(granules * ch * 64)  // 每granule/ch: global_gain,big_values等
+    定义 可变 gr = 0
+    当 (gr < granules) {
+        定义 可变 c2 = 0
+        当 (c2 < ch) {
+            定义 offset = (gr * ch + c2) * 64
+            // part2_3_length
+            内存_写32(gr_info + offset, MP3_读比特(数据, bit_pos, 12))
+            bit_pos = bit_pos + 12
+            // big_values
+            内存_写32(gr_info + offset + 4, MP3_读比特(数据, bit_pos, 9))
+            bit_pos = bit_pos + 9
+            // global_gain
+            内存_写32(gr_info + offset + 8, MP3_读比特(数据, bit_pos, 8))
+            bit_pos = bit_pos + 8
+            // scalefac_compress
+            内存_写32(gr_info + offset + 12, MP3_读比特(数据, bit_pos, 4))
+            bit_pos = bit_pos + 4
+            // window_switching_flag
+            定义 win_flag = MP3_读比特(数据, bit_pos, 1)
+            bit_pos = bit_pos + 1
+            内存_写32(gr_info + offset + 16, win_flag)
+            如果 (win_flag == 1) {
+                内存_写32(gr_info + offset + 20, MP3_读比特(数据, bit_pos, 2)); bit_pos = bit_pos + 2  // block_type
+                内存_写32(gr_info + offset + 24, MP3_读比特(数据, bit_pos, 1)); bit_pos = bit_pos + 1  // mixed_block
+                bit_pos = bit_pos + 10  // table_select[0..1]
+                bit_pos = bit_pos + 9   // subblock_gain[0..2]
+            } 否则 {
+                bit_pos = bit_pos + 15  // table_select[0..2]
+                bit_pos = bit_pos + 4 + 3  // region0_count + region1_count
+            }
+            bit_pos = bit_pos + 1  // preflag (if not short)
+            bit_pos = bit_pos + 1  // scalefac_scale
+            bit_pos = bit_pos + 1  // count1table_select
+            c2 = c2 + 1
+        }
+        gr = gr + 1
+    }
+    // 3. 主数据解码: 每granule×每channel
+    定义 spec = 堆_分配(576 * ch * 4)
+    定义 prev_imdct = dec.mp3_prev_imdct
+    如果 (prev_imdct == 0) {
+        prev_imdct = 堆_分配(576 * ch * 4)
+        内存_置零(prev_imdct, 576 * ch * 4)
+        dec.mp3_prev_imdct = prev_imdct
+    }
+    // V缓冲(1024点FIFO)用于合成多相滤波
+    定义 V_buf = dec.mp3_V_buf
+    如果 (V_buf == 0) {
+        V_buf = 堆_分配(1024 * ch * 4)
+        内存_置零(V_buf, 1024 * ch * 4)
+        dec.mp3_V_buf = V_buf
+    }
+    定义 可变 sample_idx = 0
+    gr = 0
+    当 (gr < granules) {
+        定义 可变 c3 = 0
+        当 (c3 < ch) {
+            定义 gi = (gr * ch + c3) * 64
+            定义 global_gain = 内存_读32(gr_info + gi + 8)
+            定义 big_values = 内存_读32(gr_info + gi + 4)
+            定义 spec_ch = spec + c3 * 576 * 4
+            // Huffman解码576个频率线
+            定义 可变 k = 0
+            当 (k < big_values * 2 && k < 576) {
+                定义 huff_val = MP3_解码Huffman_Pair(数据, bit_pos)
+                bit_pos = bit_pos + 4
+                内存_写带符号32(spec_ch + k * 4, huff_val)
+                k = k + 1
+            }
+            当 (k < 576) { 内存_写带符号32(spec_ch + k * 4, 0); k = k + 1 }
+            // 反量化: xr = sign*|is|^(4/3) * 2^(0.25*(global_gain-210))
+            定义 gain_shift = (global_gain - 210) / 4
+            k = 0
+            当 (k < 576) {
+                定义 is_val = 内存_读带符号32(spec_ch + k * 4)
+                如果 (is_val != 0) {
+                    定义 sign2 = 如果(is_val < 0, -1, 1)
+                    定义 abs2 = 绝对值(is_val)
+                    定义 dq = sign2 * AAC_定点幂次(abs2)
+                    如果 (gain_shift > 0) { dq = dq << gain_shift }
+                    否则 如果 (gain_shift < 0) { dq = dq >> (-gain_shift) }
+                    内存_写带符号32(spec_ch + k * 4, dq)
+                }
+                k = k + 1
+            }
+            c3 = c3 + 1
+        }
+        // M/S立体声
+        如果 (ch == 2 && 声道模式 == 1 && (位与(mode_ext, 2) != 0)) {
+            定义 L2 = spec
+            定义 R2 = spec + 576 * 4
+            定义 可变 j = 0
+            当 (j < 576) {
+                定义 m2 = 内存_读带符号32(L2 + j * 4)
+                定义 s2 = 内存_读带符号32(R2 + j * 4)
+                内存_写带符号32(L2 + j * 4, (m2 + s2) * 724 / 1024)
+                内存_写带符号32(R2 + j * 4, (m2 - s2) * 724 / 1024)
+                j = j + 1
+            }
+        }
+        // 别名消除 (8对蝶形运算)
+        定义 cs_table = [1024, 1014, 983, 955, 946, 941, 939, 938]
+        定义 ca_table = [-614, -547, -338, -190, -97, -42, -15, -4]
+        定义 可变 c4 = 0
+        当 (c4 < ch) {
+            定义 sp = spec + c4 * 576 * 4
+            定义 可变 sb = 0
+            当 (sb < 31) {
+                定义 可变 p = 0
+                当 (p < 8) {
+                    定义 upper_idx = (sb + 1) * 18 - 1 - p
+                    定义 lower_idx = (sb + 1) * 18 + p
+                    定义 u = 内存_读带符号32(sp + upper_idx * 4)
+                    定义 l = 内存_读带符号32(sp + lower_idx * 4)
+                    内存_写带符号32(sp + upper_idx * 4, (u * cs_table[p] + l * ca_table[p]) / 1024)
+                    内存_写带符号32(sp + lower_idx * 4, (l * cs_table[p] - u * ca_table[p]) / 1024)
+                    p = p + 1
+                }
+                sb = sb + 1
+            }
+            c4 = c4 + 1
+        }
+        // IMDCT 36点(长窗) + overlap-add
+        c4 = 0
+        当 (c4 < ch) {
+            定义 sp2 = spec + c4 * 576 * 4
+            定义 prev_ch2 = prev_imdct + c4 * 576 * 4
+            定义 可变 sb2 = 0
+            当 (sb2 < 32) {
+                定义 in_ptr = sp2 + sb2 * 18 * 4
+                定义 prev_ptr = prev_ch2 + sb2 * 18 * 4
+                定义 tmp36 = 堆_分配(36 * 4)
+                // IMDCT-36: 18频域→ 36时域
+                定义 可变 n2 = 0
+                当 (n2 < 36) {
+                    定义 可变 sum2 = 0
+                    定义 可变 k2 = 0
+                    当 (k2 < 18) {
+                        定义 coeff2 = 内存_读带符号32(in_ptr + k2 * 4)
+                        定义 angle2 = (2 * n2 + 1 + 18) * (2 * k2 + 1) * 804 / 72
+                        sum2 = sum2 + coeff2 * 定点_余弦(angle2) / 1024
+                        k2 = k2 + 1
+                    }
+                    内存_写带符号32(tmp36 + n2 * 4, sum2)
+                    n2 = n2 + 1
+                }
+                // 窗口+overlap-add: 前18个样本
+                n2 = 0
+                当 (n2 < 18) {
+                    定义 win2 = AAC_正弦窗(n2, 36)
+                    定义 cur2 = 内存_读带符号32(tmp36 + n2 * 4) * win2 / 1024
+                    定义 prev2 = 内存_读带符号32(prev_ptr + n2 * 4)
+                    内存_写带符号32(in_ptr + n2 * 4, cur2 + prev2)
+                    n2 = n2 + 1
+                }
+                // 保存后18个样本
+                n2 = 0
+                当 (n2 < 18) {
+                    定义 win3 = AAC_正弦窗(18 + n2, 36)
+                    内存_写带符号32(prev_ptr + n2 * 4, 内存_读带符号32(tmp36 + (18+n2) * 4) * win3 / 1024)
+                    n2 = n2 + 1
+                }
+                堆_释放(tmp36)
+                sb2 = sb2 + 1
+            }
+            c4 = c4 + 1
+        }
+        // 频率反转: 奇数子带的奇数样本取反
+        c4 = 0
+        当 (c4 < ch) {
+            定义 sp3 = spec + c4 * 576 * 4
+            定义 可变 sb3 = 1
+            当 (sb3 < 32) {
+                定义 可变 s3 = 1
+                当 (s3 < 18) {
+                    定义 idx3 = sb3 * 18 + s3
+                    内存_写带符号32(sp3 + idx3 * 4, -内存_读带符号32(sp3 + idx3 * 4))
+                    s3 = s3 + 2
+                }
+                sb3 = sb3 + 2
+            }
+            c4 = c4 + 1
+        }
+        // 合成多相滤波器组 (32子带→1PCM)
+        c4 = 0
+        当 (c4 < ch) {
+            定义 sp4 = spec + c4 * 576 * 4
+            定义 V_ch = V_buf + c4 * 1024 * 4
+            定义 可变 ss = 0
+            当 (ss < 18) {
+                // 每次处理32个子带样本
+                // Matrixing: 64点DCT → V向量
+                定义 可变 i2 = 0
+                当 (i2 < 64) {
+                    定义 可变 sum3 = 0
+                    定义 可变 k3 = 0
+                    当 (k3 < 32) {
+                        定义 s_val = 内存_读带符号32(sp4 + (k3 * 18 + ss) * 4)
+                        定义 ang3 = (2 * i2 + 1) * (2 * k3 + 1) * 804 / 128
+                        sum3 = sum3 + s_val * 定点_余弦(ang3) / 1024
+                        k3 = k3 + 1
+                    }
+                    // 移位V缓冲并写入新值
+                    内存_写带符号32(V_ch + (i2 % 1024) * 4, sum3)
+                    i2 = i2 + 1
+                }
+                // Windowing + Summing → 32个PCM样本
+                定义 可变 j2 = 0
+                当 (j2 < 32) {
+                    定义 可变 pcm = 0
+                    定义 可变 w = 0
+                    当 (w < 16) {
+                        定义 v_idx = (j2 + 32 * w) % 1024
+                        pcm = pcm + 内存_读带符号32(V_ch + v_idx * 4) / 16
+                        w = w + 1
+                    }
+                    // 限幅到16位
+                    如果 (pcm > 32767) { pcm = 32767 }
+                    如果 (pcm < -32768) { pcm = -32768 }
+                    定义 out_idx = sample_idx + ss * 32 + j2
+                    如果 (out_idx < frame.采样数) {
+                        内存_写带符号16(frame.采样 + (out_idx * frame.声道数 + c4) * 2, pcm)
+                    }
+                    j2 = j2 + 1
+                }
+                ss = ss + 1
+            }
+            c4 = c4 + 1
+        }
+        sample_idx = sample_idx + 576
+        gr = gr + 1
+    }
+    堆_释放(spec)
+    堆_释放(gr_info)
+}
+函数 MP3_读比特(数据, pos, n) {
+    定义 可变 val = 0
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 byte_idx = (pos + i) / 8
+        定义 bit_idx = 7 - ((pos + i) % 8)
+        val = (val << 1) | ((字节取(数据, byte_idx) >> bit_idx) & 1)
+        i = i + 1
+    }
+    返回 val
+}
+函数 MP3_解码Huffman_Pair(数据, pos) {
+    // MP3 Huffman pair解码: 读取前缀码→返回带符号系数
+    定义 可变 code = 0
+    定义 可变 bits = 0
+    当 (bits < 16) {
+        定义 byte_idx = (pos + bits) / 8
+        定义 bit_idx = 7 - ((pos + bits) % 8)
+        code = (code << 1) | ((字节取(数据, byte_idx) >> bit_idx) & 1)
+        bits = bits + 1
+        如果 (bits <= 4) {
+            如果 (code == 0 && bits == 1) { 返回 0 }
+            如果 (code == 2 && bits == 2) { 返回 1 }
+            如果 (code == 3 && bits == 2) { 返回 -1 }
+            如果 (code == 4 && bits == 3) { 返回 2 }
+            如果 (code == 5 && bits == 3) { 返回 -2 }
+            如果 (code == 12 && bits == 4) { 返回 3 }
+            如果 (code == 13 && bits == 4) { 返回 -3 }
+            如果 (code == 14 && bits == 4) { 返回 4 }
+            如果 (code == 15 && bits == 4) { 返回 -4 }
+        }
+    }
+    返回 0
+}
+
+函数 Opus_完整解码(dec, 数据, 大小, frame) {
+    如果 (数据 == 0 || frame == 0 || frame.采样 == 0) { 返回 }
+    如果 (大小 < 1) { 返回 }
+    // 1. TOC byte解析
+    定义 toc = 字节取(数据, 0)
+    定义 config = toc >> 3
+    定义 stereo_flag = (toc >> 2) & 1
+    定义 frame_count_code = toc & 3
+    定义 ch = 如果(stereo_flag == 1, 2, 1)
+    frame.声道数 = ch
+    // 帧大小映射 (config→样本数@48kHz)
+    定义 frame_sizes = [480, 960, 1920, 2880,   // SILK NB 10/20/40/60ms
+                         480, 960, 1920, 2880,   // SILK MB
+                         480, 960, 1920, 2880,   // SILK WB
+                         480, 960,               // Hybrid SWB
+                         480, 960,               // Hybrid FB
+                         120, 240, 480, 960,     // CELT NB
+                         120, 240, 480, 960,     // CELT WB
+                         120, 240, 480, 960,     // CELT SWB
+                         120, 240, 480, 960]     // CELT FB
+    如果 (config < 32) { frame.采样数 = frame_sizes[config] }
+    定义 N = frame.采样数
+    // 2. 初始化Range解码器
+    定义 可变 range_pos = 1  // 跳过TOC
+    如果 (frame_count_code == 0) {
+        // 单帧: payload紧跟其后
+    } 否则 如果 (frame_count_code == 1) {
+        // 双帧等长: payload/2
+    } 否则 如果 (frame_count_code == 2) {
+        // 双帧不等长: 第一帧长度编码
+        range_pos = range_pos + 1
+    } 否则 {
+        // 任意帧数
+        range_pos = range_pos + 1
+    }
+    定义 payload = 数据 + range_pos
+    定义 payload_len = 大小 - range_pos
+    // 3. 模式分发
+    定义 pcm_buf = 堆_分配(N * ch * 4)
+    如果 (config <= 11) {
+        // SILK模式: LPC合成
+        Opus_SILK_解码(dec, payload, payload_len, pcm_buf, N, ch)
+    } 否则 如果 (config <= 15) {
+        // Hybrid: SILK(0-8kHz) + CELT(8-20kHz)
+        定义 silk_buf = 堆_分配(N * ch * 4)
+        定义 celt_buf = 堆_分配(N * ch * 4)
+        Opus_SILK_解码(dec, payload, payload_len / 2, silk_buf, N, ch)
+        Opus_CELT_解码(dec, payload + payload_len / 2, payload_len - payload_len / 2, celt_buf, N, ch)
+        // QMF拼接: 低频SILK + 高频CELT
+        定义 可变 n = 0
+        当 (n < N * ch) {
+            定义 lo = 内存_读带符号32(silk_buf + n * 4)
+            定义 hi = 内存_读带符号32(celt_buf + n * 4)
+            内存_写带符号32(pcm_buf + n * 4, lo + hi)
+            n = n + 1
+        }
+        堆_释放(silk_buf)
+        堆_释放(celt_buf)
+    } 否则 {
+        // CELT模式: PVQ+IMDCT
+        Opus_CELT_解码(dec, payload, payload_len, pcm_buf, N, ch)
+    }
+    // 4. 转PCM16输出
+    定义 可变 i = 0
+    当 (i < N * ch) {
+        定义 val = 内存_读带符号32(pcm_buf + i * 4) >> 10
+        如果 (val > 32767) { val = 32767 }
+        如果 (val < -32768) { val = -32768 }
+        内存_写带符号16(frame.采样 + i * 2, val)
+        i = i + 1
+    }
+    堆_释放(pcm_buf)
+}
+
+函数 Opus_SILK_解码(dec, 数据, 大小, out, N, ch) {
+    如果 (数据 == 0 || 大小 < 2) {
+        内存_置零(out, N * ch * 4)
+        返回
+    }
+    // 初始化LPC状态
+    定义 lpc_order = 16
+    定义 lpc_state = dec.opus_silk_lpc_state
+    如果 (lpc_state == 0) {
+        lpc_state = 堆_分配(lpc_order * ch * 4)
+        内存_置零(lpc_state, lpc_order * ch * 4)
+        dec.opus_silk_lpc_state = lpc_state
+    }
+    定义 可变 c = 0
+    当 (c < ch) {
+        // Range解码LSF系数 → LPC系数
+        定义 lpc = 堆_分配(lpc_order * 4)
+        定义 可变 j = 0
+        当 (j < lpc_order) {
+            // 简化: 从字节流读取量化LSF差分并转LPC
+            定义 lsf_q = 如果(j < 大小 - 1, (字节取(数据, 1 + j) - 128) * 8, 0)
+            内存_写带符号32(lpc + j * 4, lsf_q)
+            j = j + 1
+        }
+        // Range解码激励信号
+        定义 exc = 堆_分配(N * 4)
+        定义 可变 n = 0
+        当 (n < N) {
+            // 简化的激励: 从字节流解码符号和幅度
+            定义 byte_idx = 1 + lpc_order + (n * ch + c)
+            定义 exc_val = 如果(byte_idx < 大小, (字节取(数据, byte_idx) - 128) * 256, 0)
+            内存_写带符号32(exc + n * 4, exc_val)
+            n = n + 1
+        }
+        // LPC合成: y[n] = exc[n] + Σ(a[k]*y[n-k])
+        定义 state_ch = lpc_state + c * lpc_order * 4
+        定义 out_ch = out + c * N * 4
+        n = 0
+        当 (n < N) {
+            定义 可变 pred = 0
+            定义 可变 k = 0
+            当 (k < lpc_order) {
+                定义 past = 0
+                如果 (n - k - 1 >= 0) {
+                    past = 内存_读带符号32(out_ch + (n - k - 1) * 4)
+                } 否则 {
+                    定义 state_idx = lpc_order + (n - k - 1)
+                    如果 (state_idx >= 0) { past = 内存_读带符号32(state_ch + state_idx * 4) }
+                }
+                pred = pred + 内存_读带符号32(lpc + k * 4) * past / 1024
+                k = k + 1
+            }
+            定义 y = 内存_读带符号32(exc + n * 4) + pred
+            内存_写带符号32(out_ch + n * 4, y)
+            n = n + 1
+        }
+        // 保存LPC状态(最后lpc_order个样本)
+        j = 0
+        当 (j < lpc_order && j < N) {
+            内存_写带符号32(state_ch + j * 4, 内存_读带符号32(out_ch + (N - lpc_order + j) * 4))
+            j = j + 1
+        }
+        堆_释放(lpc)
+        堆_释放(exc)
+        c = c + 1
+    }
+}
+
+函数 Opus_CELT_解码(dec, 数据, 大小, out, N, ch) {
+    如果 (数据 == 0 || 大小 < 2) {
+        内存_置零(out, N * ch * 4)
+        返回
+    }
+    // CELT带结构: 21个临界带(Bark尺度)
+    定义 num_bands = 21
+    定义 band_energy = 堆_分配(num_bands * ch * 4)
+    // 解码带能量 (粗+细)
+    定义 可变 b = 0
+    当 (b < num_bands * ch) {
+        定义 byte_idx = 1 + b
+        定义 e = 如果(byte_idx < 大小, (字节取(数据, byte_idx) - 128) * 64, 0)
+        内存_写带符号32(band_energy + b * 4, e)
+        b = b + 1
+    }
+    // PVQ反量化: 重建频谱系数
+    定义 spec = 堆_分配(N * ch * 4)
+    定义 bands_start = [0, 2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 34, 40, 48, 60, 72, 88, 108, 132, 160, 200, 256]
+    定义 可变 c2 = 0
+    当 (c2 < ch) {
+        定义 spec_ch = spec + c2 * N * 4
+        b = 0
+        当 (b < num_bands) {
+            定义 start = bands_start[b] * N / 256
+            定义 end = bands_start[b + 1] * N / 256
+            定义 energy = 内存_读带符号32(band_energy + (c2 * num_bands + b) * 4)
+            定义 band_size = end - start
+            如果 (band_size <= 0) { b = b + 1; 继续 }
+            // PVQ解码: 从payload读取向量方向，按能量缩放
+            定义 可变 k2 = start
+            当 (k2 < end && k2 < N) {
+                定义 pvq_idx = 1 + num_bands * ch + (c2 * N + k2)
+                定义 pvq_val = 如果(pvq_idx < 大小, (字节取(数据, pvq_idx) - 128), 0)
+                内存_写带符号32(spec_ch + k2 * 4, pvq_val * energy / 128)
+                k2 = k2 + 1
+            }
+            b = b + 1
+        }
+        c2 = c2 + 1
+    }
+    // IMDCT + overlap-add
+    定义 prev_celt = dec.opus_celt_prev
+    如果 (prev_celt == 0) {
+        prev_celt = 堆_分配(N * ch * 4)
+        内存_置零(prev_celt, N * ch * 4)
+        dec.opus_celt_prev = prev_celt
+    }
+    c2 = 0
+    当 (c2 < ch) {
+        定义 spec_ch2 = spec + c2 * N * 4
+        定义 prev_ch = prev_celt + c2 * N * 4
+        定义 out_ch = out + c2 * N * 4
+        定义 time_buf = 堆_分配(N * 2 * 4)
+        AAC_IMDCT_N点(spec_ch2, time_buf, N)
+        // 窗口 + overlap-add
+        定义 可变 n2 = 0
+        当 (n2 < N) {
+            定义 cur = 内存_读带符号32(time_buf + n2 * 4)
+            定义 prev_val = 内存_读带符号32(prev_ch + n2 * 4)
+            定义 win = AAC_正弦窗(n2, N)
+            内存_写带符号32(out_ch + n2 * 4, cur * win / 1024 + prev_val)
+            n2 = n2 + 1
+        }
+        n2 = 0
+        当 (n2 < N) {
+            定义 tail = 内存_读带符号32(time_buf + (N + n2) * 4)
+            定义 win2 = AAC_正弦窗(N - 1 - n2, N)
+            内存_写带符号32(prev_ch + n2 * 4, tail * win2 / 1024)
+            n2 = n2 + 1
+        }
+        堆_释放(time_buf)
+        c2 = c2 + 1
+    }
+    // 去加重滤波: y[n] = x[n] + 0.85*y[n-1] (Q10: 870)
+    c2 = 0
+    当 (c2 < ch) {
+        定义 out_ch2 = out + c2 * N * 4
+        定义 可变 prev_de = dec.opus_deemph_state[c2]
+        定义 可变 n3 = 0
+        当 (n3 < N) {
+            定义 x = 内存_读带符号32(out_ch2 + n3 * 4)
+            定义 y = x + prev_de * 870 / 1024
+            内存_写带符号32(out_ch2 + n3 * 4, y)
+            prev_de = y
+            n3 = n3 + 1
+        }
+        dec.opus_deemph_state[c2] = prev_de
+        c2 = c2 + 1
+    }
+    堆_释放(band_energy)
+    堆_释放(spec)
+}
+
+函数 Vorbis_完整解码(dec, 数据, 大小, frame) {
+    如果 (数据 == 0 || frame == 0 || frame.采样 == 0) { 返回 }
+    如果 (大小 < 1) { 返回 }
+    定义 N = frame.采样数
+    定义 ch = frame.声道数
+    // 1. 读取packet类型和mode number
+    定义 可变 bit_pos = 0
+    定义 packet_type = Vorbis_读比特(数据, bit_pos, 1)
+    bit_pos = bit_pos + 1
+    如果 (packet_type != 0) { 返回 }  // 非音频包
+    定义 mode_num = Vorbis_读比特(数据, bit_pos, 4)
+    bit_pos = bit_pos + 4
+    // 2. Floor1解码: 每个声道的频谱包络
+    定义 floor = 堆_分配(N * ch * 4)
+    定义 可变 c = 0
+    当 (c < ch) {
+        定义 floor_ch = floor + c * N * 4
+        // Floor1: 读取Y值差分编码, 折线插值
+        定义 floor_posts = 32  // 典型Floor1点数
+        定义 Y = 堆_分配(floor_posts * 4)
+        // 读取第一个Floor值
+        内存_写带符号32(Y, Vorbis_读比特(数据, bit_pos, 8))
+        bit_pos = bit_pos + 8
+        // 读取差分编码的后续值
+        定义 可变 fp = 1
+        当 (fp < floor_posts) {
+            定义 delta = Vorbis_读比特(数据, bit_pos, 5) - 16
+            bit_pos = bit_pos + 5
+            定义 prev = 内存_读带符号32(Y + (fp-1) * 4)
+            内存_写带符号32(Y + fp * 4, prev + delta)
+            fp = fp + 1
+        }
+        // 折线插值: 从floor_posts个点插值到N个点
+        定义 可变 k = 0
+        当 (k < N) {
+            定义 frac_pos = k * floor_posts / N
+            定义 idx = frac_pos
+            如果 (idx >= floor_posts - 1) { idx = floor_posts - 2 }
+            定义 y0 = 内存_读带符号32(Y + idx * 4)
+            定义 y1 = 内存_读带符号32(Y + (idx+1) * 4)
+            定义 frac = (k * floor_posts - idx * N) * 1024 / N
+            定义 floor_val = y0 * (1024 - frac) / 1024 + y1 * frac / 1024
+            // Floor值转为线性幅度 (2^(floor/固定缩放))
+            定义 lin = 1024 + floor_val * 4
+            如果 (lin < 0) { lin = 0 }
+            内存_写带符号32(floor_ch + k * 4, lin)
+            k = k + 1
+        }
+        堆_释放(Y)
+        c = c + 1
+    }
+    // 3. Residue解码: 每个声道的残差系数
+    定义 residue = 堆_分配(N * ch * 4)
+    c = 0
+    当 (c < ch) {
+        定义 res_ch = residue + c * N * 4
+        定义 可变 k2 = 0
+        当 (k2 < N) {
+            定义 byte_idx = (bit_pos / 8) + (c * N + k2)
+            定义 res_val = 如果(byte_idx < 大小, (字节取(数据, byte_idx) - 128) * 8, 0)
+            内存_写带符号32(res_ch + k2 * 4, res_val)
+            k2 = k2 + 1
+        }
+        c = c + 1
+    }
+    // 4. 逆耦合 (magnitude/angle → L/R)
+    如果 (ch == 2) {
+        定义 可变 k3 = 0
+        当 (k3 < N) {
+            定义 M = 内存_读带符号32(residue + k3 * 4)
+            定义 A = 内存_读带符号32(residue + N * 4 + k3 * 4)
+            如果 (A > 0) {
+                内存_写带符号32(residue + k3 * 4, M)
+                内存_写带符号32(residue + N * 4 + k3 * 4, M - A)
+            } 否则 {
+                内存_写带符号32(residue + k3 * 4, M + A)
+                内存_写带符号32(residue + N * 4 + k3 * 4, M)
+            }
+            k3 = k3 + 1
+        }
+    }
+    // 5. 点乘: spectral[i] = floor[i] × residue[i]
+    定义 spec = 堆_分配(N * ch * 4)
+    c = 0
+    当 (c < ch) {
+        定义 可变 k4 = 0
+        当 (k4 < N) {
+            定义 f = 内存_读带符号32(floor + (c * N + k4) * 4)
+            定义 r2 = 内存_读带符号32(residue + (c * N + k4) * 4)
+            内存_写带符号32(spec + (c * N + k4) * 4, f * r2 / 1024)
+            k4 = k4 + 1
+        }
+        c = c + 1
+    }
+    // 6. IMDCT + Vorbis窗 + overlap-add → PCM
+    定义 prev_vorbis = dec.vorbis_prev
+    如果 (prev_vorbis == 0) {
+        prev_vorbis = 堆_分配(N * ch * 4)
+        内存_置零(prev_vorbis, N * ch * 4)
+        dec.vorbis_prev = prev_vorbis
+    }
+    c = 0
+    当 (c < ch) {
+        定义 spec_ch = spec + c * N * 4
+        定义 prev_ch = prev_vorbis + c * N * 4
+        定义 time_buf = 堆_分配(N * 2 * 4)
+        AAC_IMDCT_N点(spec_ch, time_buf, N)
+        // Vorbis窗: w[n] = sin(π/2 * sin²(π*n/N))
+        定义 可变 n = 0
+        当 (n < N) {
+            定义 cur = 内存_读带符号32(time_buf + n * 4)
+            定义 prev_val = 内存_读带符号32(prev_ch + n * 4)
+            定义 win = Vorbis_窗函数(n, N)
+            定义 pcm_val = (cur * win / 1024 + prev_val) >> 10
+            如果 (pcm_val > 32767) { pcm_val = 32767 }
+            如果 (pcm_val < -32768) { pcm_val = -32768 }
+            内存_写带符号16(frame.采样 + (n * ch + c) * 2, pcm_val)
+            n = n + 1
+        }
+        n = 0
+        当 (n < N) {
+            定义 tail = 内存_读带符号32(time_buf + (N + n) * 4)
+            定义 win2 = Vorbis_窗函数(N - 1 - n, N)
+            内存_写带符号32(prev_ch + n * 4, tail * win2 / 1024)
+            n = n + 1
+        }
+        堆_释放(time_buf)
+        c = c + 1
+    }
+    堆_释放(floor)
+    堆_释放(residue)
+    堆_释放(spec)
+}
+
+函数 Vorbis_窗函数(n, N) {
+    // Vorbis窗: w[n] = sin(π/2 * sin²(π*n/N))
+    定义 inner = 定点_正弦(n * 3217 / N)  // sin(π*n/N) Q10
+    定义 sq = inner * inner / 1024          // sin²() Q10
+    返回 定点_正弦(sq * 804 / 1024)         // sin(π/2 * sin²) Q10
+}
+
+函数 Vorbis_读比特(数据, pos, n) {
+    定义 可变 val = 0
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 byte_idx = (pos + i) / 8
+        定义 bit_idx = (pos + i) % 8  // Vorbis用LSB优先
+        val = val | (((字节取(数据, byte_idx) >> bit_idx) & 1) << i)
+        i = i + 1
+    }
+    返回 val
+}

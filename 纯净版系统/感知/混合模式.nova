@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./过滤列表创.nova")
+导入("./高斯模糊.nova")
+
+// §4 混合模式 (Blend Modes)
+// Porter-Duff合成 + CSS混合模式
+
+定义 BLEND_NORMAL     = 0
+定义 BLEND_MULTIPLY   = 1
+定义 BLEND_SCREEN     = 2
+定义 BLEND_OVERLAY    = 3
+定义 BLEND_DARKEN     = 4
+定义 BLEND_LIGHTEN    = 5
+定义 BLEND_COLOR_DODGE = 6
+定义 BLEND_COLOR_BURN = 7
+定义 BLEND_HARD_LIGHT = 8
+定义 BLEND_SOFT_LIGHT = 9
+定义 BLEND_DIFFERENCE = 10
+定义 BLEND_EXCLUSION  = 11
+定义 BLEND_HUE        = 12
+定义 BLEND_SATURATION = 13
+定义 BLEND_COLOR      = 14
+定义 BLEND_LUMINOSITY = 15
+
+
+函数 Blend_像素(模式, src_r, src_g, src_b, dst_r, dst_g, dst_b) {
+    // 所有值0-255
+    如果 (模式 == BLEND_NORMAL) { 返回 [src_r, src_g, src_b] }
+
+    如果 (模式 == BLEND_MULTIPLY) {
+        返回 [src_r * dst_r / 255, src_g * dst_g / 255, src_b * dst_b / 255]
+    }
+    如果 (模式 == BLEND_SCREEN) {
+        返回 [src_r + dst_r - src_r * dst_r / 255,
+              src_g + dst_g - src_g * dst_g / 255,
+              src_b + dst_b - src_b * dst_b / 255]
+    }
+    如果 (模式 == BLEND_OVERLAY) {
+        返回 [Blend_overlay通道(dst_r, src_r),
+              Blend_overlay通道(dst_g, src_g),
+              Blend_overlay通道(dst_b, src_b)]
+    }
+    如果 (模式 == BLEND_DARKEN) {
+        返回 [最小值(src_r, dst_r), 最小值(src_g, dst_g), 最小值(src_b, dst_b)]
+    }
+    如果 (模式 == BLEND_LIGHTEN) {
+        返回 [最大值(src_r, dst_r), 最大值(src_g, dst_g), 最大值(src_b, dst_b)]
+    }
+    如果 (模式 == BLEND_COLOR_DODGE) {
+        返回 [Blend_dodge通道(dst_r, src_r),
+              Blend_dodge通道(dst_g, src_g),
+              Blend_dodge通道(dst_b, src_b)]
+    }
+    如果 (模式 == BLEND_COLOR_BURN) {
+        返回 [Blend_burn通道(dst_r, src_r),
+              Blend_burn通道(dst_g, src_g),
+              Blend_burn通道(dst_b, src_b)]
+    }
+    如果 (模式 == BLEND_HARD_LIGHT) {
+        返回 [Blend_overlay通道(src_r, dst_r),
+              Blend_overlay通道(src_g, dst_g),
+              Blend_overlay通道(src_b, dst_b)]
+    }
+    如果 (模式 == BLEND_DIFFERENCE) {
+        返回 [绝对值(src_r - dst_r), 绝对值(src_g - dst_g), 绝对值(src_b - dst_b)]
+    }
+    如果 (模式 == BLEND_EXCLUSION) {
+        返回 [src_r + dst_r - 2 * src_r * dst_r / 255,
+              src_g + dst_g - 2 * src_g * dst_g / 255,
+              src_b + dst_b - 2 * src_b * dst_b / 255]
+    }
+
+    返回 [src_r, src_g, src_b]
+}
+
+函数 Blend_overlay通道(a, b) {
+    如果 (a < 128) { 返回 2 * a * b / 255 }
+    返回 255 - 2 * (255 - a) * (255 - b) / 255
+}
+
+函数 Blend_dodge通道(dst, src) {
+    如果 (dst == 0) { 返回 0 }
+    如果 (src == 255) { 返回 255 }
+    返回 钳制(dst * 255 / (255 - src), 0, 255)
+}
+
+函数 Blend_burn通道(dst, src) {
+    如果 (dst == 255) { 返回 255 }
+    如果 (src == 0) { 返回 0 }
+    返回 255 - 钳制((255 - dst) * 255 / src, 0, 255)
+}
+
+// §5 滤镜管线 — 串联多个滤镜
+
+函数 FilterList_应用(fl, 像素, 宽, 高) {
+    如果 (fl == 0 || fl.数量 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < fl.数量) {
+        定义 op = 内存_读64(fl.操作 + i * 8)
+        如果 (op == 0) { i = i + 1; 继续 }
+
+        如果 (op.类型 == FILTER_BLUR) { Filter_blur(像素, 宽, 高, op.参数1) }
+        否则 如果 (op.类型 == FILTER_BRIGHTNESS) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_brightness矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_CONTRAST) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_contrast矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_GRAYSCALE) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_grayscale矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_SEPIA) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_sepia矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_INVERT) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_invert矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_OPACITY) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_opacity矩阵(op.参数1)) }
+        否则 如果 (op.类型 == FILTER_SATURATE) { Filter_颜色矩阵应用(像素, 宽, 高, Filter_saturate矩阵(op.参数1)) }
+
+        i = i + 1
+    }
+}
+
+函数 钳制(值, 最小, 最大) {
+    如果 (值 < 最小) { 返回 最小 }
+    如果 (值 > 最大) { 返回 最大 }
+    返回 值
+}
+
+函数 绝对值(v) { 如果 (v < 0) { 返回 0 - v } 返回 v }
+函数 最小值(a, b) { 如果 (a < b) { 返回 a } 返回 b }
+函数 最大值(a, b) { 如果 (a > b) { 返回 a } 返回 b }

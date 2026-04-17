@@ -1,0 +1,496 @@
+// NovaOS NVTS 视图过渡快照引擎 (Nova View Transition Snapshot)
+// NVTS理论: 基于双缓冲快照差异的视图过渡算法
+//   1. 快照捕获: 元素子树光栅化为离屏位图
+//   2. 状态机: IDLE→CAPTURING→UPDATING→ANIMATING→DONE
+//   3. 动画插值: 位置/尺寸/变换矩阵线性插值 + opacity交叉淡入
+//   4. 伪元素树: ::view-transition > group > image-pair > old/new
+//   5. 宽高比保持: aspect-ratio解析与约束应用
+//   AI增强: Tensor特征向量预测动画时长/插值曲线/帧率调节
+
+导入("./内核直连层.nova")
+导入("../中枢/硬链接.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/节点操作.nova")
+导入("../执行/底层内存操.nova")
+导入("../中枢/字符串替换.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内存初始化.nova")
+
+// §1 View Transition 状态
+
+定义 VT_STATE_IDLE        = 0
+定义 VT_STATE_CAPTURING   = 1    // 捕获旧状态
+定义 VT_STATE_UPDATING    = 2    // 执行DOM更新
+定义 VT_STATE_ANIMATING   = 3    // 播放过渡动画
+定义 VT_STATE_DONE        = 4
+定义 VT_STATE_SKIPPED     = 5    // 被跳过(skip)
+
+// §2 快照(Snapshot) — 元素的视觉状态捕获
+
+结构 VTSnapshot {
+    名称,    // u64 view-transition-name
+    // 位置和尺寸(相对于视口)
+    x,
+    y,
+    宽,
+    高,
+    // 变换矩阵
+    变换,    // u64 float[16] 4x4矩阵
+    // 像素数据(光栅化的图像)
+    像素,    // u64 RGBA数据
+    像素宽,
+    像素高,
+    // writing-mode / direction
+    书写模式,
+    方向,
+    // border-radius
+    圆角,    // u64 [tl, tr, br, bl]
+    // overflow: clip
+    有裁剪,
+}
+
+函数 VTSnapshot_创建(名称, 元素) {
+    定义 snap = 堆_分配(VTSnapshot)
+    snap.名称 = 名称 != 0 ? 字符串_复制(名称) : ""
+    snap.像素 = 0; snap.像素宽 = 0; snap.像素高 = 0
+    snap.变换 = 堆_分配(64)    // 16 * 4 bytes
+    snap.有裁剪 = 假
+
+    如果 (元素 != 0) {
+        定义 布局 = 元素.布局对象
+        如果 (布局 != 0) {
+            snap.x = 布局.x; snap.y = 布局.y
+            snap.宽 = 布局.宽; snap.高 = 布局.高
+        }
+        // 光栅化元素为位图
+        VTSnapshot_光栅化(snap, 元素)
+    }
+
+    返回 snap
+}
+
+函数 VTSnapshot_光栅化(snap, 元素) {
+    如果 (snap == 0 || 元素 == 0) { 返回 }
+    // 创建离屏canvas,绘制元素子树
+    snap.像素宽 = snap.宽 > 0 ? snap.宽 : 1
+    snap.像素高 = snap.高 > 0 ? snap.高 : 1
+    snap.像素 = 堆_分配(snap.像素宽 * snap.像素高 * 4)
+    // 光栅化: 绘制元素子树到离屏canvas
+    内存_清零(snap.像素, snap.像素宽 * snap.像素高 * 4)
+    定义 offscreen = Sk画布_创建_从Buffer(snap.像素, snap.像素宽, snap.像素高)
+    绘制Layer_绘制子树(offscreen, 元素, snap.宽, snap.高)
+}
+
+// §3 NVTS 全局状态与统计
+
+定义 NVTS_默认动画时长 = 250   // ms
+定义 NVTS_最大快照数 = 64
+定义 NVTS_帧率 = 60
+
+定义 可变 NVTS_当前状态 = VT_STATE_IDLE
+定义 可变 NVTS_快照列表 = []       // 旧快照数组
+定义 可变 NVTS_新快照列表 = []     // 新快照数组
+定义 可变 NVTS_动画时长 = NVTS_默认动画时长
+定义 可变 NVTS_动画开始时间 = 0
+定义 可变 NVTS_DOM更新回调 = 0
+
+// 统计计数器
+定义 可变 NVTS_快照捕获次数 = 0
+定义 可变 NVTS_动画播放次数 = 0
+定义 可变 NVTS_光栅化次数 = 0
+定义 可变 NVTS_插值次数 = 0
+定义 可变 NVTS_跳过次数 = 0
+定义 可变 NVTS_AI预测次数 = 0
+定义 可变 NVTS_伪元素创建次数 = 0
+
+// AI总线引用
+定义 可变 NVTS_AI总线 = 0
+
+// §4 视图过渡状态机
+
+函数 NVTS_开始视图过渡(文档, 回调) {
+    如果 (NVTS_当前状态 != VT_STATE_IDLE) {
+        打印("[NVTS] 警告: 已有过渡进行中, 跳过")
+        NVTS_跳过次数 = NVTS_跳过次数 + 1
+        返回 假
+    }
+    NVTS_DOM更新回调 = 回调
+    // 步骤1: 捕获旧快照
+    NVTS_当前状态 = VT_STATE_CAPTURING
+    NVTS_快照列表 = []
+    NVTS_捕获所有快照(文档, NVTS_快照列表)
+    // 步骤2: 执行DOM更新
+    NVTS_当前状态 = VT_STATE_UPDATING
+    如果 (NVTS_DOM更新回调 != 0) {
+        NVTS_DOM更新回调()
+    }
+    // 步骤3: 捕获新快照
+    NVTS_新快照列表 = []
+    NVTS_捕获所有快照(文档, NVTS_新快照列表)
+    // 步骤4: 开始动画
+    NVTS_当前状态 = VT_STATE_ANIMATING
+    NVTS_动画开始时间 = 系统调用_时间戳()
+    NVTS_动画播放次数 = NVTS_动画播放次数 + 1
+    返回 真
+}
+
+函数 NVTS_捕获所有快照(文档, 目标列表) {
+    // 遍历文档中所有有 view-transition-name 的元素
+    定义 可变 i = 0
+    定义 总数 = DOM_元素总数(文档)
+    当 (i < 总数 && 计数(目标列表) < NVTS_最大快照数) {
+        定义 元素 = DOM_获取元素按索引(文档, i)
+        定义 vtName = DOM_获取属性(文档, 元素.ID, "view-transition-name")
+        如果 (字符串长度(vtName) > 0 && vtName != "none") {
+            定义 snap = VTSnapshot_创建(vtName, 元素)
+            追加(目标列表, snap)
+            NVTS_快照捕获次数 = NVTS_快照捕获次数 + 1
+        }
+        i = i + 1
+    }
+}
+
+// §5 动画插值引擎
+
+函数 NVTS_线性插值(a, b, t) {
+    // lerp: a + (b - a) * t
+    返回 a + (b - a) * t
+}
+
+函数 NVTS_ease插值(t) {
+    // cubic-bezier(0.25, 0.1, 0.25, 1.0) 近似
+    // 使用三次多项式近似: 3t^2 - 2t^3
+    返回 t * t * (3.0 - 2.0 * t)
+}
+
+函数 NVTS_easeInOut插值(t) {
+    // 先加速后减速: 6t^5 - 15t^4 + 10t^3
+    返回 t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+函数 NVTS_计算插值快照(旧snap, 新snap, t) {
+    NVTS_插值次数 = NVTS_插值次数 + 1
+    定义 easeT = NVTS_ease插值(t)
+    定义 结果 = 堆_分配(VTSnapshot)
+    结果.名称 = 新snap.名称
+    // 位置插值
+    结果.x = NVTS_线性插值(旧snap.x, 新snap.x, easeT)
+    结果.y = NVTS_线性插值(旧snap.y, 新snap.y, easeT)
+    // 尺寸插值
+    结果.宽 = NVTS_线性插值(旧snap.宽, 新snap.宽, easeT)
+    结果.高 = NVTS_线性插值(旧snap.高, 新snap.高, easeT)
+    // 圆角插值
+    如果 (旧snap.圆角 != 0 && 新snap.圆角 != 0) {
+        结果.圆角 = 堆_分配(16)  // 4 * 4 bytes
+        定义 可变 ci = 0
+        当 (ci < 4) {
+            定义 旧r = 内存_读32(旧snap.圆角 + ci * 4)
+            定义 新r = 内存_读32(新snap.圆角 + ci * 4)
+            内存_写i32(结果.圆角 + ci * 4, NVTS_线性插值(旧r, 新r, easeT))
+            ci = ci + 1
+        }
+    }
+    返回 结果
+}
+
+// §6 交叉淡入淡出引擎
+
+函数 NVTS_交叉淡入帧(旧snap, 新snap, t, 目标缓冲, 视口宽, 视口高) {
+    // 旧快照: opacity = 1-t, 新快照: opacity = t
+    定义 easeT = NVTS_ease插值(t)
+    定义 插值 = NVTS_计算插值快照(旧snap, 新snap, easeT)
+    // 渲染旧快照 (opacity = 1 - easeT)
+    如果 (旧snap.像素 != 0) {
+        NVTS_绘制快照到缓冲(目标缓冲, 旧snap, 插值, 1.0 - easeT, 视口宽, 视口高)
+    }
+    // 渲染新快照 (opacity = easeT)
+    如果 (新snap.像素 != 0) {
+        NVTS_绘制快照到缓冲(目标缓冲, 新snap, 插值, easeT, 视口宽, 视口高)
+    }
+    堆_释放(插值)
+}
+
+函数 NVTS_绘制快照到缓冲(目标, snap, 插值快照, opacity, vw, vh) {
+    // 将快照像素写入目标缓冲, 应用opacity混合
+    定义 dx = 插值快照.x
+    定义 dy = 插值快照.y
+    定义 dw = 插值快照.宽
+    定义 dh = 插值快照.高
+    如果 (dw <= 0 || dh <= 0) { 返回 }
+    // 缩放因子
+    定义 scaleX = dw / snap.像素宽
+    定义 scaleY = dh / snap.像素高
+    定义 可变 py = 0
+    当 (py < dh && (dy + py) < vh) {
+        定义 srcY = py / scaleY
+        如果 (srcY >= snap.像素高) { 返回 }
+        定义 可变 px = 0
+        当 (px < dw && (dx + px) < vw) {
+            定义 srcX = px / scaleX
+            如果 (srcX < snap.像素宽) {
+                定义 srcOff = (srcY * snap.像素宽 + srcX) * 4
+                定义 dstOff = ((dy + py) * vw + (dx + px)) * 4
+                // RGBA混合
+                定义 sr = 内存_读u8(snap.像素 + srcOff)
+                定义 sg = 内存_读u8(snap.像素 + srcOff + 1)
+                定义 sb = 内存_读u8(snap.像素 + srcOff + 2)
+                定义 sa = 内存_读u8(snap.像素 + srcOff + 3)
+                定义 混合透明 = (sa * opacity) / 255
+                定义 dr = 内存_读u8(目标 + dstOff)
+                定义 dg = 内存_读u8(目标 + dstOff + 1)
+                定义 db = 内存_读u8(目标 + dstOff + 2)
+                // alpha混合: dst = src*alpha + dst*(1-alpha)
+                内存_写u8(目标 + dstOff, (sr * 混合透明 + dr * (255 - 混合透明)) / 255)
+                内存_写u8(目标 + dstOff + 1, (sg * 混合透明 + dg * (255 - 混合透明)) / 255)
+                内存_写u8(目标 + dstOff + 2, (sb * 混合透明 + db * (255 - 混合透明)) / 255)
+                内存_写u8(目标 + dstOff + 3, 255)
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// §7 伪元素树构建
+
+定义 VT_伪_根 = 0
+定义 VT_伪_组 = 1
+定义 VT_伪_图像对 = 2
+定义 VT_伪_旧 = 3
+定义 VT_伪_新 = 4
+
+结构 NVTS_伪元素节点 {
+    类型: 0       // VT_伪_*
+    名称: ""      // transition-name
+    子节点: []    // 子伪元素列表
+    快照: 0       // VTSnapshot指针
+}
+
+函数 NVTS_构建伪元素树(旧快照列表, 新快照列表) {
+    NVTS_伪元素创建次数 = NVTS_伪元素创建次数 + 1
+    // 创建根 ::view-transition
+    定义 root = NVTS_伪元素节点 { 类型: VT_伪_根, 名称: "", 子节点: [], 快照: 0 }
+    // 收集所有唯一名称
+    定义 名称集 = []
+    NVTS_收集名称(旧快照列表, 名称集)
+    NVTS_收集名称(新快照列表, 名称集)
+    // 为每个名称创建 group > image-pair > old + new
+    定义 可变 i = 0
+    当 (i < 计数(名称集)) {
+        定义 name = 名称集[i]
+        定义 group = NVTS_伪元素节点 { 类型: VT_伪_组, 名称: name, 子节点: [], 快照: 0 }
+        定义 pair = NVTS_伪元素节点 { 类型: VT_伪_图像对, 名称: name, 子节点: [], 快照: 0 }
+        // old伪元素
+        定义 旧snap = NVTS_查找快照(旧快照列表, name)
+        定义 oldNode = NVTS_伪元素节点 { 类型: VT_伪_旧, 名称: name, 子节点: [], 快照: 旧snap }
+        // new伪元素
+        定义 新snap = NVTS_查找快照(新快照列表, name)
+        定义 newNode = NVTS_伪元素节点 { 类型: VT_伪_新, 名称: name, 子节点: [], 快照: 新snap }
+        追加(pair.子节点, oldNode)
+        追加(pair.子节点, newNode)
+        追加(group.子节点, pair)
+        追加(root.子节点, group)
+        i = i + 1
+    }
+    返回 root
+}
+
+函数 NVTS_收集名称(快照列表, 名称集) {
+    定义 可变 i = 0
+    当 (i < 计数(快照列表)) {
+        定义 name = 快照列表[i].名称
+        // 检查是否已存在
+        定义 可变 found = 假
+        定义 可变 j = 0
+        当 (j < 计数(名称集)) {
+            如果 (名称集[j] == name) { found = 真 }
+            j = j + 1
+        }
+        如果 (!found) { 追加(名称集, name) }
+        i = i + 1
+    }
+}
+
+函数 NVTS_查找快照(快照列表, 名称) {
+    定义 可变 i = 0
+    当 (i < 计数(快照列表)) {
+        如果 (快照列表[i].名称 == 名称) { 返回 快照列表[i] }
+        i = i + 1
+    }
+    返回 0
+}
+
+// §8 宽高比计算引擎
+
+结构 NVTS_宽高比 {
+    自动: 假      // auto标志
+    宽比: 0       // 如 16
+    高比: 0       // 如 9
+}
+
+函数 NVTS_解析宽高比(值串) {
+    定义 结果 = NVTS_宽高比 { 自动: 假, 宽比: 0, 高比: 0 }
+    如果 (值串 == "auto") {
+        结果.自动 = 真
+        返回 结果
+    }
+    // 检查 "auto W / H" 格式
+    定义 autoPos = 字符串查找(值串, "auto ")
+    如果 (autoPos == 0) {
+        结果.自动 = 真
+        定义 rest = 字符串子串(值串, 5, 字符串长度(值串) - 5)
+        定义 slashPos = 字符串查找(rest, "/")
+        如果 (slashPos >= 0) {
+            结果.宽比 = 字符串转整数(字符串去空格(字符串子串(rest, 0, slashPos)))
+            结果.高比 = 字符串转整数(字符串去空格(字符串子串(rest, slashPos + 1, 字符串长度(rest) - slashPos - 1)))
+        }
+        返回 结果
+    }
+    // 纯 "W / H" 格式
+    定义 slashPos = 字符串查找(值串, "/")
+    如果 (slashPos >= 0) {
+        结果.宽比 = 字符串转整数(字符串去空格(字符串子串(值串, 0, slashPos)))
+        结果.高比 = 字符串转整数(字符串去空格(字符串子串(值串, slashPos + 1, 字符串长度(值串) - slashPos - 1)))
+    }
+    返回 结果
+}
+
+函数 NVTS_应用宽高比(宽, 高, ratio) {
+    // 根据宽高比约束调整尺寸
+    如果 (ratio.宽比 <= 0 || ratio.高比 <= 0) {
+        返回 [宽, 高]
+    }
+    定义 目标比 = ratio.宽比 / ratio.高比
+    定义 当前比 = 宽 / 高
+    如果 (当前比 > 目标比) {
+        // 太宽, 缩小宽度
+        返回 [高 * 目标比, 高]
+    } 否则 {
+        // 太高, 缩小高度
+        返回 [宽, 宽 / 目标比]
+    }
+}
+
+// §9 动画帧循环与完成
+
+函数 NVTS_动画帧更新(目标缓冲, 视口宽, 视口高) {
+    如果 (NVTS_当前状态 != VT_STATE_ANIMATING) { 返回 假 }
+    定义 now = 系统调用_时间戳()
+    定义 elapsed = now - NVTS_动画开始时间
+    定义 可变 t = elapsed / NVTS_动画时长
+    如果 (t > 1.0) { t = 1.0 }
+    // 对每对旧/新快照执行交叉淡入
+    定义 可变 i = 0
+    当 (i < 计数(NVTS_快照列表)) {
+        定义 旧snap = NVTS_快照列表[i]
+        定义 新snap = NVTS_查找快照(NVTS_新快照列表, 旧snap.名称)
+        如果 (新snap != 0) {
+            NVTS_交叉淡入帧(旧snap, 新snap, t, 目标缓冲, 视口宽, 视口高)
+        }
+        i = i + 1
+    }
+    // 检查动画是否完成
+    如果 (t >= 1.0) {
+        NVTS_完成过渡()
+        返回 假
+    }
+    返回 真  // 还有帧需要继续
+}
+
+函数 NVTS_完成过渡() {
+    NVTS_当前状态 = VT_STATE_DONE
+    // 释放旧快照
+    定义 可变 i = 0
+    当 (i < 计数(NVTS_快照列表)) {
+        NVTS_释放快照(NVTS_快照列表[i])
+        i = i + 1
+    }
+    NVTS_快照列表 = []
+    NVTS_新快照列表 = []
+    NVTS_当前状态 = VT_STATE_IDLE
+}
+
+函数 NVTS_跳过过渡() {
+    NVTS_跳过次数 = NVTS_跳过次数 + 1
+    NVTS_完成过渡()
+}
+
+函数 NVTS_释放快照(snap) {
+    如果 (snap == 0) { 返回 }
+    如果 (snap.像素 != 0) { 堆_释放(snap.像素) }
+    如果 (snap.变换 != 0) { 堆_释放(snap.变换) }
+    如果 (snap.圆角 != 0) { 堆_释放(snap.圆角) }
+    堆_释放(snap)
+}
+
+// §10 AI过渡预测引擎
+
+函数 NVTS_AI特征提取(旧snap, 新snap) {
+    定义 tensor = Tensor_创建(12)
+    // 特征[0-1]: 旧快照尺寸归一化
+    Tensor_写(tensor, 0, 旧snap.宽 / 1920.0)
+    Tensor_写(tensor, 1, 旧snap.高 / 1080.0)
+    // 特征[2-3]: 新快照尺寸归一化
+    Tensor_写(tensor, 2, 新snap.宽 / 1920.0)
+    Tensor_写(tensor, 3, 新snap.高 / 1080.0)
+    // 特征[4-5]: 位置偏移归一化
+    定义 dx = 新snap.x - 旧snap.x
+    定义 dy = 新snap.y - 旧snap.y
+    Tensor_写(tensor, 4, dx / 1920.0)
+    Tensor_写(tensor, 5, dy / 1080.0)
+    // 特征[6]: 尺寸变化比
+    定义 旧面积 = 旧snap.宽 * 旧snap.高
+    定义 新面积 = 新snap.宽 * 新snap.高
+    如果 (旧面积 > 0) {
+        Tensor_写(tensor, 6, 新面积 / 旧面积)
+    } 否则 {
+        Tensor_写(tensor, 6, 1.0)
+    }
+    // 特征[7]: 像素数据大小 (帧预算)
+    Tensor_写(tensor, 7, (新snap.像素宽 * 新snap.像素高 * 4) / (1024.0 * 1024.0))
+    返回 tensor
+}
+
+函数 NVTS_AI预测动画时长(旧snap, 新snap) {
+    NVTS_AI预测次数 = NVTS_AI预测次数 + 1
+    如果 (NVTS_AI总线 == 0) { 返回 NVTS_默认动画时长 }
+    定义 tensor = NVTS_AI特征提取(旧snap, 新snap)
+    定义 结果 = AI总线_推理(NVTS_AI总线, "vt_duration", tensor)
+    定义 推荐时长 = Tensor_读(结果, 0)
+    Tensor_释放(tensor)
+    Tensor_释放(结果)
+    // 限制在合理范围内
+    如果 (推荐时长 < 100) { 推荐时长 = 100 }
+    如果 (推荐时长 > 1000) { 推荐时长 = 1000 }
+    返回 推荐时长
+}
+
+// §11 初始化与诊断
+
+函数 NVTS_初始化() {
+    NVTS_当前状态 = VT_STATE_IDLE
+    NVTS_快照列表 = []
+    NVTS_新快照列表 = []
+    NVTS_动画时长 = NVTS_默认动画时长
+    NVTS_动画开始时间 = 0
+    NVTS_DOM更新回调 = 0
+    NVTS_快照捕获次数 = 0
+    NVTS_动画播放次数 = 0
+    NVTS_光栅化次数 = 0
+    NVTS_插值次数 = 0
+    NVTS_跳过次数 = 0
+    NVTS_AI预测次数 = 0
+    NVTS_伪元素创建次数 = 0
+    NVTS_AI总线 = 全局AI总线
+    打印("[NVTS] 视图过渡快照引擎初始化完成")
+}
+
+函数 NVTS_诊断报告() {
+    打印("[NVTS] === 视图过渡诊断 ===")
+    打印("  状态=" + 整数转字符串(NVTS_当前状态) + " 动画时长=" + 整数转字符串(NVTS_动画时长) + "ms")
+    打印("  快照捕获=" + 整数转字符串(NVTS_快照捕获次数) + " 动画播放=" + 整数转字符串(NVTS_动画播放次数) + " 跳过=" + 整数转字符串(NVTS_跳过次数))
+    打印("  插值=" + 整数转字符串(NVTS_插值次数) + " 光栅化=" + 整数转字符串(NVTS_光栅化次数) + " 伪元素=" + 整数转字符串(NVTS_伪元素创建次数))
+    打印("  AI预测=" + NVTS_AI预测次数)
+}

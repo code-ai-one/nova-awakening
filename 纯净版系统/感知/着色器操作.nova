@@ -1,0 +1,113 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+
+// §5 着色器操作
+
+
+函数 GL_createShader(gl, 类型) {
+    定义 shader = 堆_分配(GLShader)
+    shader.id = gl.下一个id; gl.下一个id = gl.下一个id + 1
+    shader.类型 = 类型; shader.已编译 = 假; shader.错误日志 = 0
+    返回 shader
+}
+
+函数 GL_shaderSource(gl, shader, 源码) {
+    如果 (shader == 0) { 返回 }
+    shader.源码 = 字符串_复制(源码)
+}
+
+函数 GL_compileShader(gl, shader) {
+    如果 (shader == 0 || shader.源码 == 0) { 返回 }
+    // GLSL ES编译: 词法→语法树→语义检查→中间IR
+    // 软件渲染时IR直接解释执行, 硬件渲染时转为图处指令
+    shader.已编译 = 真
+    shader.编译状态 = GLSL_编译(shader.源码)
+}
+
+函数 GL_createProgram(gl) {
+    定义 prog = 堆_分配(GLProgram)
+    prog.id = gl.下一个id; gl.下一个id = gl.下一个id + 1
+    prog.已链接 = 假
+    prog.uniform列表 = 堆_分配_数组(64 * 32)
+    prog.uniform数量 = 0
+    prog.attribute列表 = 堆_分配_数组(16 * 32)
+    prog.attribute数量 = 0
+    返回 prog
+}
+
+函数 GL_attachShader(gl, 程序, shader) {
+    如果 (程序 == 0 || shader == 0) { 返回 }
+    如果 (shader.类型 == GL_VERTEX_SHADER) { 程序.顶点着色器 = shader }
+    否则 如果 (shader.类型 == GL_FRAGMENT_SHADER) { 程序.片段着色器 = shader }
+}
+
+函数 GL_linkProgram(gl, 程序) {
+    如果 (程序 == 0) { 返回 }
+    如果 (程序.顶点着色器 == 0 || 程序.片段着色器 == 0) { 返回 }
+    如果 (!程序.顶点着色器.已编译 || !程序.片段着色器.已编译) { 返回 }
+    程序.已链接 = 真
+}
+
+函数 GL_useProgram(gl, 程序) {
+    gl.当前程序 = 程序
+}
+
+函数 GL_getUniformLocation(gl, 程序, 名称) {
+    如果 (程序 == 0) { 返回 -1 }
+    // 查找已有uniform名称
+    定义 可变 i = 0
+    当 (i < 程序.uniform数量) {
+        如果 (字符串_相等(内存_读64(程序.uniform列表 + i * 32), 名称)) { 返回 i }
+        i = i + 1
+    }
+    // 未找到: 分配新位置
+    如果 (程序.uniform数量 < 64) {
+        定义 idx = 程序.uniform数量
+        内存_写64(程序.uniform列表 + idx * 32, 名称)
+        程序.uniform数量 = idx + 1
+        返回 idx
+    }
+    返回 -1
+}
+
+函数 GL_getAttribLocation(gl, 程序, 名称) {
+    如果 (程序 == 0) { 返回 -1 }
+    // 查找已有attribute名称
+    定义 可变 i = 0
+    当 (i < 程序.attribute数量) {
+        如果 (字符串_相等(内存_读64(程序.attribute列表 + i * 32), 名称)) { 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+// §6 Uniform设置
+
+函数 GL_uniform1f(gl, 位置, v) { 如果 (位置 >= 0) { gl.uniforms[位置] = [v] } }
+函数 GL_uniform2f(gl, 位置, v0, v1) { 如果 (位置 >= 0) { gl.uniforms[位置] = [v0, v1] } }
+函数 GL_uniform3f(gl, 位置, v0, v1, v2) { 如果 (位置 >= 0) { gl.uniforms[位置] = [v0, v1, v2] } }
+函数 GL_uniform4f(gl, 位置, v0, v1, v2, v3) { 如果 (位置 >= 0) { gl.uniforms[位置] = [v0, v1, v2, v3] } }
+函数 GL_uniform1i(gl, 位置, v) { 如果 (位置 >= 0) { gl.uniforms[位置] = [v] } }    // 纹理采样器用
+函数 GL_uniformMatrix4fv(gl, 位置, 转置, 数据) { 如果 (位置 >= 0) { gl.uniforms[位置] = 数据 } }    // 4x4矩阵
+
+// §7 顶点属性
+
+函数 GL_enableVertexAttrib数组(gl, 索引) {
+    如果 (gl.当前VAO != 0) {
+        // 在VAO中启用属性
+    }
+}
+
+函数 GL_vertexAttribPointer(gl, 索引, 大小, 类型, 归一化, 步长, 偏移) {
+    // 绑定当前ARRAY_BUFFER到属性
+    如果 (gl.当前VAO != 0 && 索引 < gl.当前VAO.属性数量) {
+        内存_写64(gl.当前VAO.属性缓冲 + 索引 * 8, gl.绑定_ARRAY)
+        内存_写32(gl.当前VAO.属性偏移 + 索引 * 4, 偏移)
+        内存_写32(gl.当前VAO.属性步长 + 索引 * 4, 步长)
+        内存_写32(gl.当前VAO.属性类型 + 索引 * 4, 类型)
+        内存_写32(gl.当前VAO.属性大小 + 索引 * 4, 大小)
+    }
+}

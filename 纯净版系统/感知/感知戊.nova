@@ -1,0 +1,181 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+
+// §3 SDP (Session Description Protocol)
+
+结构 RTCSessionDescription {
+    类型,    // u8 SDP_xxx
+    sdp,    // u64 SDP字符串
+}
+
+结构 SDP媒体Section {
+    类型,    // u64 "audio"/"video"/"application"
+    端口,
+    协议,    // u64 "数报/安全/RTP/SAVPF"
+    // 编解码器
+    codecs,    // [16]u32 payload type
+    codec数,
+    // ICE
+    ufrag,
+    pwd,
+    // D安全
+    fingerprint,    // u64 "sha-256 xx:xx:..."
+    setup,    // u8 0=active 1=passive 2=actpass
+    // 方向
+    direction,    // u8 0=sendrecv 1=sendonly 2=recvonly 3=inactive
+    // mid
+    mid,
+}
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 SDP_解析(sdp字符串) {
+    如果 (sdp字符串 == 0) { 返回 0 }
+    定义 desc = 堆_分配(RTCSessionDescription)
+    desc.sdp = sdp字符串
+    // 解析SDP行:
+    // v=0
+    // o=- sessionId version IN IP4 addr
+    // s=-
+    // t=0 0
+    // a=group:BUNDLE audio video
+    // m=audio port 数报/安全/RTP/SAVPF payloadTypes
+    // a=rtpmap:111 opus/48000/2
+    // a=ice-ufrag:xxx
+    // a=ice-pwd:xxx
+    // a=fingerprint:sha-256 xx:xx:...
+    // a=candidate:...
+    返回 desc
+}
+
+函数 SDP_生成Offer(pc) {
+    如果 (pc == 0) { 返回 0 }
+    // 根据本地媒体能力生成SDP
+    定义 sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+    // 添加媒体行
+    定义 desc = 堆_分配(RTCSessionDescription)
+    desc.类型 = SDP_OFFER; desc.sdp = sdp
+    返回 desc
+}
+
+函数 SDP_生成Answer(pc) {
+    如果 (pc == 0) { 返回 0 }
+    定义 desc = 堆_分配(RTCSessionDescription)
+    desc.类型 = SDP_ANSWER; desc.sdp = ""
+    返回 desc
+}
+
+// §4 媒体Stream / 媒体StreamTrack
+
+结构 媒体StreamTrack {
+    id,
+    kind,    // u8 0=audio 1=video
+    label,
+    enabled,
+    muted,
+    readyState,    // u8 TRACK_xxx
+    // 约束
+    约束,    // u64 媒体TrackConstraints*
+    // 设置
+    宽度,    // u32 video only
+    高度,
+    帧率,    // u32 Q10
+    采样率,    // u32 audio only
+    声道数,
+    // 回调
+    onended,
+    onmute,
+    onunmute,
+}
+
+结构 媒体Stream {
+    id,
+    // 轨道
+    音频轨道,    // [8]u64 媒体StreamTrack*
+    音频轨道数,
+    视频轨道,    // [4]u64
+    视频轨道数,
+    // 活跃状态
+    active,
+}
+
+函数 媒体Stream_创建() {
+    定义 ms = 堆_分配(媒体Stream)
+    ms.id = 0; ms.音频轨道数 = 0; ms.视频轨道数 = 0; ms.active = 假
+    返回 ms
+}
+
+函数 媒体Stream_addTrack(ms, track) {
+    如果 (ms == 0 || track == 0) { 返回 }
+    如果 (track.kind == 0 && ms.音频轨道数 < 8) {
+        ms.音频轨道[ms.音频轨道数] = track; ms.音频轨道数 = ms.音频轨道数 + 1
+    } 否则 如果 (track.kind == 1 && ms.视频轨道数 < 4) {
+        ms.视频轨道[ms.视频轨道数] = track; ms.视频轨道数 = ms.视频轨道数 + 1
+    }
+    ms.active = 真
+}
+
+函数 媒体Stream_removeTrack(ms, track) {
+    如果 (ms == 0 || track == 0) { 返回 }
+    // 从对应列表中移除
+}
+
+函数 媒体StreamTrack_stop(track) {
+    如果 (track == 0) { 返回 }
+    track.readyState = TRACK_ENDED
+    如果 (track.onended != 0) {
+        // 触发ended事件
+    }
+}
+
+函数 媒体StreamTrack_clone(track) {
+    如果 (track == 0) { 返回 0 }
+    定义 新track = 堆_分配(媒体StreamTrack)
+    内存_复制(新track, track, 大小of(媒体StreamTrack))
+    // 生成新ID
+    返回 新track
+}
+
+// navigator.mediaDevices.getUser媒体(constraints)
+函数 GetUser媒体(音频, 视频) {
+    定义 ms = 媒体Stream_创建()
+    如果 (音频) {
+        定义 at = 堆_分配(媒体StreamTrack)
+        at.kind = 0; at.label = "默认音频"; at.enabled = 真
+        at.readyState = TRACK_LIVE; at.采样率 = 48000; at.声道数 = 1
+        媒体Stream_addTrack(ms, at)
+    }
+    如果 (视频) {
+        定义 vt = 堆_分配(媒体StreamTrack)
+        vt.kind = 1; vt.label = "默认摄像头"; vt.enabled = 真
+        vt.readyState = TRACK_LIVE; vt.宽度 = 1280; vt.高度 = 720; vt.帧率 = 30 * 1024
+        媒体Stream_addTrack(ms, vt)
+    }
+    返回 ms
+}
+
+// navigator.mediaDevices.getDisplay媒体()
+函数 GetDisplay媒体() {
+    定义 ms = 媒体Stream_创建()
+    定义 vt = 堆_分配(媒体StreamTrack)
+    vt.kind = 1; vt.label = "屏幕共享"; vt.enabled = 真
+    vt.readyState = TRACK_LIVE; vt.宽度 = 1920; vt.高度 = 1080; vt.帧率 = 30 * 1024
+    媒体Stream_addTrack(ms, vt)
+    返回 ms
+}
+
+定义 可变 AI_感知戊_热点函数 = []
+
+函数 AI_感知戊_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_感知戊_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_感知戊_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

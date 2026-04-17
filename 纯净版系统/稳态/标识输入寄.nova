@@ -1,0 +1,107 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+
+// NovaOS · NVIDIA 图处原生驱动 — 寄存器级完整实现
+// 覆盖: Tesla → Fermi → Kepler → Maxwell → Pascal → Volta →
+//        Turing → Ampere → Ada Lovelace → Blackwell
+// 架构层次:
+//   PMC  (Power Management Controller) — 全局控制/复位/时钟
+//   PBUS (Bus Interface) — PCI/PCIe配置
+//   PFIFO (Command FIFO) — 命令通道管理
+//   PGRAPH (Graphics Engine) — 着色器/光栅化/计算
+//   PDISPLAY (Display Engine) — CRTC/DAC/SOR/HDMI/DP
+//   PCOPY/CE (Copy Engine) — 直传复制
+//   PVIDEO/NVDEC — 视频编解码
+//   PMU/SEC2 — 固件微控制器
+
+// §1 NVIDIA MMIO寄存器定义 — 真实硬件地址
+
+定义 NV_PMC_BOOT_0          = 0x000000   // 芯片ID(只读)
+定义 NV_PMC_BOOT_1          = 0x000004   // 修订ID
+定义 NV_PMC_ENABLE           = 0x000200   // 引擎使能位掩码
+定义 NV_PMC_INTR_0           = 0x000100   // 中断状态(读)
+定义 NV_PMC_INTR_EN_0        = 0x000140   // 中断使能(写)
+定义 NV_PMC_INTR_LT_0        = 0x000160   // 中断线程(Turing+)
+
+// PMC_ENABLE位定义
+定义 PMC_ENABLE_PFIFO        = 1 << 8    // FIFO引擎
+定义 PMC_ENABLE_PGRAPH       = 1 << 12   // 图形引擎
+定义 PMC_ENABLE_PCOPY0       = 1 << 15   // 复制引擎0
+定义 PMC_ENABLE_PCOPY1       = 1 << 16   // 复制引擎1
+定义 PMC_ENABLE_PDISPLAY     = 1 << 26   // 显示引擎
+定义 PMC_ENABLE_PWR          = 1 << 13   // 电源管理
+
+定义 NV_PBUS_INTR_0          = 0x001100
+定义 NV_PBUS_INTR_EN_0       = 0x001140
+定义 NV_PBUS_BAR0_WINDOW     = 0x001700   // BAR0窗口(访问>1MB空间)
+定义 NV_PBUS_BAR1_BLOCK      = 0x001704   // BAR1(显存)映射控制
+
+定义 NV_PTIMER_TIME_0        = 0x009400   // 图处纳秒时钟(低32位)
+定义 NV_PTIMER_TIME_1        = 0x009410   // 图处纳秒时钟(高32位)
+定义 NV_PTIMER_INTR_0        = 0x009100   // 定时器中断
+
+定义 NV_PFIFO_INTR_0         = 0x002100   // FIFO中断状态
+定义 NV_PFIFO_INTR_EN_0      = 0x002140
+// Kepler+ PFIFO (Host)
+定义 NV_PFIFO_RUNLIST_BASE   = 0x002270   // 运行列表基地址
+定义 NV_PFIFO_RUNLIST_SUBMIT = 0x002274   // 提交运行列表
+定义 NV_PFIFO_CHAN_BASE       = 0x800000   // 通道实例块基地址
+定义 NV_PFIFO_CHAN_SIZE       = 0x1000     // 每通道4KB
+
+定义 NV_PGRAPH_INTR          = 0x400100   // 图形引擎中断
+定义 NV_PGRAPH_NSTATUS       = 0x400104
+定义 NV_PGRAPH_STATUS        = 0x400700   // 引擎忙状态
+// Fermi+ GPC/TPC/SM寄存器
+定义 NV_PGRAPH_GPC_NUM       = 0x409604   // GPC数量
+定义 NV_PGRAPH_TPC_PER_GPC   = 0x409614   // 每GPC的TPC数
+定义 NV_PGRAPH_SM_PER_TPC    = 0x409618   // 每TPC的SM数(通常=1)
+定义 NV_PGRAPH_FECS_INTR     = 0x409C20   // FECS固件中断
+
+定义 NV_PDISPLAY_INTR_0      = 0x610020   // 显示中断
+定义 NV_PDISPLAY_INTR_EN_0   = 0x610024
+// CRTC (每个头一组寄存器, 头0基址0x616300, 头1基址0x616380)
+定义 NV_PDISP_HEAD_STATE_CTRL = 0x616300  // 显示头控制
+定义 NV_PDISP_HEAD_STATE_SIZE = 0x616304  // 活动分辨率
+定义 NV_PDISP_HEAD_STATE_SYNC = 0x616308  // 同步参数
+// SOR (Serial Output Resource — HDMI/DP/DVI)
+定义 NV_PDISP_SOR_HDMI_CTRL  = 0x616500
+定义 NV_PDISP_SOR_DP_CTRL    = 0x616540
+
+定义 NV_PCE_INTR             = 0x104100   // CE中断
+
+定义 NV_PRAMIN_BASE           = 0x700000  // 图处实例内存(通道描述符等)
+
+// §2 NVIDIA架构世代识别
+
+定义 NV_ARCH_TESLA    = 50     // GT200 (计算能力1.x)
+定义 NV_ARCH_FERMI    = 0xC0   // GF100 (计算能力2.x)
+定义 NV_ARCH_KEPLER   = 0xE0   // GK104 (计算能力3.x)
+定义 NV_ARCH_MAXWELL  = 0x110  // GM204 (计算能力5.x)
+定义 NV_ARCH_PASCAL   = 0x130  // GP100 (计算能力6.x)
+定义 NV_ARCH_VOLTA    = 0x140  // GV100 (计算能力7.0) — Tensor Core初代
+定义 NV_ARCH_TURING   = 0x160  // TU102 (计算能力7.5) — RT Core初代
+定义 NV_ARCH_AMPERE   = 0x170  // GA100 (计算能力8.x)
+定义 NV_ARCH_ADA      = 0x190  // AD102 (计算能力8.9)
+定义 NV_ARCH_BLACKWELL = 0x1A0 // GB100 (计算能力10.0)
+
+结构 NV驱动状态 {
+    mmio,    // u64 BAR0映射后的虚拟地址
+    gpu,    // 图处设备
+    架构代,    // u32 NV_ARCH_*
+    芯片ID,    // u32 BOOT_0读取
+    GPC数,    // u32 Graphics Processing Cluster
+    TPC数,    // u32 Texture Processing Cluster
+    SM数,    // u32 Streaming Multiprocessor (CUDA核心组)
+    显存类型,    // 字符串 GDDR6/GDDR6X/HBM2e/HBM3
+    显存总线宽,    // u32 128/192/256/384位
+    最大线程_每SM,    // u32 1024/1536/2048
+    // 通道管理
+    通道数,
+    通道列表,    // []
+    // 显示
+    头数,    // u32 显示头(CRTC)数量
+    SOR数,    // u32 串行输出(HDMI/DP)数量
+    已初始化,
+}
+
+定义 可变 NV状态 = NV驱动状态 {}

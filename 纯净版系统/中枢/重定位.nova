@@ -1,0 +1,483 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("../引导/端口输入.nova")
+导入("./内核打印.nova")
+导入("./整数转字符串.nova")
+
+// §8 重定位
+
+函数 执行重定位(obj) {
+    // 处理DT_RELA
+    如果 (obj.RELA表 != 0 && obj.RELA大小 > 0) {
+        处理RELA(obj, obj.RELA表, obj.RELA大小)
+    }
+    // 处理DT_JMPREL (PLT重定位)
+    如果 (obj.JMPREL表 != 0 && obj.JMPREL大小 > 0) {
+        处理RELA(obj, obj.JMPREL表, obj.JMPREL大小)
+    }
+}
+
+函数 处理RELA(obj, rela_addr, rela_size) {
+    // Elf64_Rela: r_offset(8) + r_info(8) + r_addend(8) = 24字节
+    定义 条目数 = rela_size / 24
+    定义 可变 i = 0
+    当 (i < 条目数) {
+        定义 r = rela_addr + i * 24
+        定义 r_offset = 内存读64(r)
+        定义 r_info   = 内存读64(r + 8)
+        定义 r_addend = 内存读64(r + 16)
+
+        定义 类型 = r_info & 0xFFFFFFFF
+        定义 sym_idx = r_info >> 32
+
+        定义 修补地址 = obj.基地址 + r_offset
+
+        如果 (类型 == R_X86_64_RELATIVE) {
+            // B + A: 基址 + addend
+            内存写64(修补地址, obj.基地址 + r_addend)
+        }
+        否则 如果 (类型 == R_X86_64_GLOB_DAT || 类型 == R_X86_64_JUMP_SLOT) {
+            // S: 符号值
+            定义 sym_name = 获取符号名(obj, sym_idx)
+            定义 sym_addr = 查找符号(sym_name)
+            如果 (sym_addr != 0) {
+                内存写64(修补地址, sym_addr + r_addend)
+            } 否则 {
+                // 弱符号允许为0
+                定义 绑定 = 获取符号绑定(obj, sym_idx)
+                如果 (绑定 != STB_WEAK) {
+                    内核警告("ld.so: 未定义符号 " + sym_name)
+                }
+                内存写64(修补地址, 0)
+            }
+        }
+        否则 如果 (类型 == R_X86_64_64) {
+            // S + A
+            定义 sym_name = 获取符号名(obj, sym_idx)
+            定义 sym_addr = 查找符号(sym_name)
+            内存写64(修补地址, sym_addr + r_addend)
+        }
+        否则 如果 (类型 == R_X86_64_IRELATIVE) {
+            // IRELATIVE: 调用resolver函数获取真实地址
+            // resolver = base + addend, 调用它返回实际函数地址
+            定义 resolver = obj.基地址 + r_addend
+            定义 真实地址 = 调用函数_返回值(resolver)
+            内存写64(修补地址, 真实地址)
+        }
+        否则 如果 (类型 == R_X86_64_TPOFF64) {
+            // 安全偏移
+            定义 sym_name = 获取符号名(obj, sym_idx)
+            内存写64(修补地址, 链接器_安全总偏移 + r_addend)
+        }
+        否则 如果 (类型 != R_X86_64_NONE) {
+            内核调试("ld.so: 未处理的重定位类型 " + 整数转字符串(类型))
+        }
+
+        链接器_重定位总数 = 链接器_重定位总数 + 1
+        i = i + 1
+    }
+}
+
+函数 获取符号名(obj, idx) {
+    如果 (idx == 0 || obj.符号表 == 0 || obj.字符串表 == 0) { 返回 "" }
+    定义 sym = obj.符号表 + idx * 24
+    定义 st_name = 内存读32(sym)
+    返回 读取C字符串(obj.字符串表 + st_name)
+}
+
+函数 获取符号绑定(obj, idx) {
+    如果 (idx == 0 || obj.符号表 == 0) { 返回 0 }
+    定义 sym = obj.符号表 + idx * 24
+    定义 st_info = 内存读8(sym + 4)
+    返回 (st_info >> 4) & 0xF
+}
+
+// §9 初始化
+
+函数 调用初始化(obj) {
+    如果 (obj.已初始化) { 返回 }
+    obj.已初始化 = 真
+
+    // 调用DT_INIT
+    如果 (obj.INIT != 0) {
+        调用函数(obj.INIT)
+    }
+
+    // 调用DT_INIT_ARRAY
+    如果 (obj.INIT_ARRAY != 0 && obj.INIT_ARRAY大小 > 0) {
+        定义 数量 = obj.INIT_ARRAY大小 / 8
+        定义 可变 i = 0
+        当 (i < 数量) {
+            定义 func = 内存读64(obj.INIT_ARRAY + i * 8)
+            如果 (func != 0) { 调用函数(func) }
+            i = i + 1
+        }
+    }
+}
+
+// §10 终结化(DT_FINI / DT_FINI_ARRAY)
+
+函数 调用终结化(obj) {
+    // DT_FINI_ARRAY: 逆序调用
+    如果 (obj.FINI_ARRAY != 0 && obj.FINI_ARRAY大小 > 0) {
+        定义 数量 = obj.FINI_ARRAY大小 / 8
+        定义 可变 i = 数量 - 1
+        当 (i >= 0) {
+            定义 func = 内存读64(obj.FINI_ARRAY + i * 8)
+            如果 (func != 0) { 调用函数(func) }
+            i = i - 1
+        }
+    }
+    // DT_FINI
+    如果 (obj.FINI != 0) {
+        调用函数(obj.FINI)
+    }
+}
+
+// §11 全局符号查找(跨所有已加载对象)
+
+定义 可变 链接器_对象列表 = []
+定义 可变 链接器_安全总偏移 = 0
+定义 STB_WEAK = 2
+
+定义 R_X86_64_NONE = 0
+定义 R_X86_64_64 = 1
+定义 R_X86_64_GLOB_DAT = 6
+定义 R_X86_64_JUMP_SLOT = 7
+定义 R_X86_64_RELATIVE = 8
+定义 R_X86_64_TPOFF64 = 18
+定义 R_X86_64_IRELATIVE = 37
+
+函数 查找符号(名称) {
+    如果 (名称 == "" || 名称 == 0) { 返回 0 }
+    链接器_符号查找数 = 链接器_符号查找数 + 1
+    // 遍历所有已加载的共享对象
+    定义 可变 i = 0
+    当 (i < 计数(链接器_对象列表)) {
+        定义 obj = 链接器_对象列表[i]
+        定义 addr = 查找符号_在对象中(obj, 名称)
+        如果 (addr != 0) { 返回 addr }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 查找符号_在对象中(obj, 名称) {
+    如果 (obj.符号表 == 0 || obj.字符串表 == 0) { 返回 0 }
+    // 使用GNU哈希表加速(如果有)
+    如果 (obj.GNU_HASH != 0) {
+        返回 查找符号_GNU哈希(obj, 名称)
+    }
+    // 回退: 线性搜索
+    定义 可变 idx = 1
+    当 (idx < obj.符号表大小) {
+        定义 sym = obj.符号表 + idx * 24
+        定义 st_name = 内存读32(sym)
+        定义 sym_name = 读取C字符串(obj.字符串表 + st_name)
+        如果 (字符串_比较(sym_name, 名称) == 0) {
+            定义 st_value = 内存读64(sym + 8)
+            如果 (st_value != 0) {
+                返回 obj.基地址 + st_value
+            }
+        }
+        idx = idx + 1
+    }
+    返回 0
+}
+
+函数 查找符号_GNU哈希(obj, 名称) {
+    // GNU哈希表: 布隆过滤器+桶+链
+    定义 哈希 = GNU_哈希(名称)
+    // 简化: 回退到线性搜索
+    返回 查找符号_在对象中_线性(obj, 名称)
+}
+
+函数 查找符号_在对象中_线性(obj, 名称) {
+    如果 (obj.符号表 == 0 || obj.字符串表 == 0) { 返回 0 }
+    定义 可变 idx = 1
+    当 (idx < obj.符号表大小) {
+        定义 sym = obj.符号表 + idx * 24
+        定义 st_name = 内存读32(sym)
+        定义 sym_name = 读取C字符串(obj.字符串表 + st_name)
+        如果 (字符串_比较(sym_name, 名称) == 0) {
+            定义 st_value = 内存读64(sym + 8)
+            如果 (st_value != 0) {
+                返回 obj.基地址 + st_value
+            }
+        }
+        idx = idx + 1
+    }
+    返回 0
+}
+
+函数 GNU_哈希(名称) {
+    定义 可变 h = 5381
+    定义 可变 i = 0
+    当 (内存读8(名称 + i) != 0) {
+        h = ((h << 5) + h) + 内存读8(名称 + i)
+        i = i + 1
+    }
+    返回 h & 0xFFFFFFFF
+}
+
+函数 读取C字符串(地址) {
+    如果 (地址 == 0) { 返回 "" }
+    定义 可变 结果 = ""
+    定义 可变 i = 0
+    当 (i < 4096) {
+        定义 c = 内存读8(地址 + i)
+        如果 (c == 0) { 返回 结果 }
+        结果 = 结果 + 字符(c)
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 字符串_比较(a, b) {
+    如果 (a == b) { 返回 0 }
+    如果 (a == 空 || a == 0) {
+        如果 (b == 空 || b == 0) { 返回 0 }
+        返回 -1
+    }
+    如果 (b == 空 || b == 0) { 返回 1 }
+
+    定义 al = 字符串长度(a)
+    定义 bl = 字符串长度(b)
+    定义 可变 i = 0
+    当 (i < al && i < bl) {
+        定义 ac = 字符编码(a, i)
+        定义 bc = 字符编码(b, i)
+        如果 (ac != bc) { 返回 ac - bc }
+        i = i + 1
+    }
+    返回 al - bl
+}
+
+函数 调用函数(地址) {
+    如果 (地址 == 0) { 返回 }
+    汇编 {
+        "mov rax, [rbp+16]"
+        "call rax"
+    }
+}
+
+函数 调用函数_返回值(地址) {
+    如果 (地址 == 0) { 返回 0 }
+    定义 可变 结果 = 0
+    汇编 {
+        "mov rax, [rbp+16]"
+        "call rax"
+        "mov [rbp-8], rax"
+    }
+    返回 结果
+}
+
+// §12 动态链接器初始化
+
+定义 可变 链接器_已初始化 = 假
+定义 可变 链接器_加载对象数 = 0
+定义 可变 链接器_重定位总数 = 0
+定义 可变 链接器_符号查找数 = 0
+
+函数 链接器_初始化() {
+    链接器_对象列表 = []
+    链接器_已初始化 = 真
+}
+
+函数 链接器_加载共享对象(路径) {
+    // 1. 检查是否已加载
+    定义 可变 i = 0
+    当 (i < 计数(链接器_已加载列表)) {
+        如果 (链接器_已加载列表[i].路径 == 路径) {
+            链接器_已加载列表[i].引用计数 = 链接器_已加载列表[i].引用计数 + 1
+            返回 链接器_已加载列表[i].基址
+        }
+        i = i + 1
+    }
+    // 2. 打开ELF文件
+    定义 fd = 系统调用_打开(路径, 0, 0)
+    如果 (fd < 0) { 返回 0 }
+    // 读取ELF头(64字节)
+    定义 ehdr = 堆_分配(64)
+    如果 (系统调用_读(fd, ehdr, 64) < 64) { 系统调用_关闭(fd); 堆_释放(ehdr); 返回 0 }
+    // 验证ELF魔数
+    如果 (内存_读8(ehdr) != 0x7F || 内存_读8(ehdr+1) != 0x45) { 系统调用_关闭(fd); 堆_释放(ehdr); 返回 0 }
+    // 3. 解析程序头
+    定义 phoff = 内存_读64(ehdr + 32)
+    定义 phnum = 内存_读16(ehdr + 56)
+    定义 phentsize = 内存_读16(ehdr + 54)
+    // 计算总内存范围(LOAD段的最低-最高地址)
+    如果 (phnum == 0 || phentsize == 0) { 系统调用_关闭(fd); 堆_释放(ehdr); 返回 0 }
+    定义 phdr_buf = 堆_分配(phnum * phentsize)
+    如果 (phdr_buf == 0) { 返回 -1 }
+    系统调用_lseek(fd, phoff, 0)
+    如果 (系统调用_读(fd, phdr_buf, phnum * phentsize) < phnum * phentsize) {
+        系统调用_关闭(fd); 堆_释放(ehdr); 堆_释放(phdr_buf); 返回 0
+    }
+    定义 可变 load_min = 0xFFFFFFFFFFFF
+    定义 可变 load_max = 0
+    i = 0
+    当 (i < phnum) {
+        定义 ph = phdr_buf + i * phentsize
+        定义 p_type = 内存_读32(ph)
+        如果 (p_type == 1) {  // PT_LOAD
+            定义 vaddr = 内存_读64(ph + 16)
+            定义 memsz = 内存_读64(ph + 40)
+            如果 (vaddr < load_min) { load_min = vaddr }
+            如果 (vaddr + memsz > load_max) { load_max = vaddr + memsz }
+        }
+        i = i + 1
+    }
+    // 4. mmap分配地址空间
+    定义 total_size = load_max - load_min
+    定义 base = 系统调用_mmap(0, total_size, 3, 0x22, -1, 0)  // PROT_RW, MAP_ANON|PRIVATE
+    如果 (base == 0 || base == -1) { 系统调用_关闭(fd); 堆_释放(ehdr); 堆_释放(phdr_buf); 返回 0 }
+    // 5. 加载每个PT_LOAD段
+    i = 0
+    当 (i < phnum) {
+        定义 ph = phdr_buf + i * phentsize
+        如果 (内存_读32(ph) == 1) {  // PT_LOAD
+            定义 offset = 内存_读64(ph + 8)
+            定义 vaddr = 内存_读64(ph + 16)
+            定义 filesz = 内存_读64(ph + 32)
+            定义 memsz = 内存_读64(ph + 40)
+            定义 dest = base + vaddr - load_min
+            系统调用_lseek(fd, offset, 0)
+            如果 (系统调用_读(fd, dest, filesz) < 0) {
+                内核警告("链接器: PT_LOAD段读取失败")
+            }
+            // BSS: 清零filesz到memsz的部分
+            如果 (memsz > filesz) { 内存_置零(dest + filesz, memsz - filesz) }
+        }
+        i = i + 1
+    }
+    系统调用_关闭(fd)
+    // 6. 解析动态段(PT_DYNAMIC) → 执行重定位
+    定义 可变 dyn_ptr = 0
+    定义 可变 dyn_size = 0
+    i = 0
+    当 (i < phnum) {
+        定义 ph = phdr_buf + i * phentsize
+        如果 (内存_读32(ph) == 2) {  // PT_DYNAMIC
+            dyn_ptr = base + 内存_读64(ph + 16) - load_min
+            dyn_size = 内存_读64(ph + 32)
+        }
+        i = i + 1
+    }
+    定义 可变 rela_ptr = 0; 定义 可变 rela_size = 0
+    定义 可变 init_func = 0
+    如果 (dyn_ptr != 0) {
+        定义 可变 d = dyn_ptr
+        当 (d < dyn_ptr + dyn_size) {
+            定义 tag = 内存_读64(d)
+            定义 val = 内存_读64(d + 8)
+            如果 (tag == 0) { d = dyn_ptr + dyn_size }  // DT_NULL
+            否则 {
+                如果 (tag == 7) { rela_ptr = base + val - load_min }  // DT_RELA
+                如果 (tag == 8) { rela_size = val }                   // DT_RELASZ
+                如果 (tag == 12) { init_func = base + val - load_min } // DT_INIT
+            }
+            d = d + 16
+        }
+    }
+    // 7. 应用RELA重定位
+    如果 (rela_ptr != 0 && rela_size > 0) {
+        定义 可变 r = rela_ptr
+        当 (r < rela_ptr + rela_size) {
+            定义 r_offset = 内存_读64(r)
+            定义 r_info = 内存_读64(r + 8)
+            定义 r_addend = 内存_读64(r + 16)
+            定义 r_type = r_info & 0xFFFFFFFF
+            定义 target = base + r_offset - load_min
+            如果 (r_type == 8) {  // R_X86_64_RELATIVE
+                内存_写64(target, base + r_addend - load_min)
+            }
+            链接器_重定位总数 = 链接器_重定位总数 + 1
+            r = r + 24
+        }
+    }
+    // 8. W^X: 加载和重定位完成后, 将代码段改为可执行不可写
+    系统调用_mprotect(base, total_size, 5)  // PROT_RX
+    // 9. 调用DT_INIT
+    如果 (init_func != 0) { 调用(init_func) }
+    // 9. 记录已加载对象
+    追加(链接器_已加载列表, { 路径: 路径, 基址: base, 大小: total_size, 引用计数: 1 })
+    链接器_加载对象数 = 链接器_加载对象数 + 1
+    堆_释放(ehdr)
+    堆_释放(phdr_buf)
+    返回 base
+}
+
+// §13 统计与诊断
+
+函数 链接器_统计() {
+    返回 {
+        已加载对象: 链接器_加载对象数,
+        重定位总数: 链接器_重定位总数,
+        符号查找: 链接器_符号查找数,
+        已初始化: 链接器_已初始化,
+    }
+}
+
+函数 链接器_健康检查() {
+    定义 可变 问题 = []
+    如果 (!链接器_已初始化) { 追加(问题, "链接器未初始化") }
+    如果 (计数(问题) == 0) { 返回 "动态链接器健康" }
+    返回 问题
+}
+
+// 重定位辅助
+
+定义 可变 重定位_处理数 = 0
+定义 可变 重定位_失败数 = 0
+
+定义 R_X86_64_NONE = 0
+定义 R_X86_64_64 = 1
+定义 R_X86_64_PC32 = 2
+定义 R_X86_64_GOT32 = 3
+定义 R_X86_64_PLT32 = 4
+定义 R_X86_64_RELATIVE = 8
+定义 R_X86_64_GLOB_DAT = 6
+定义 R_X86_64_JUMP_SLOT = 7
+
+函数 重定位_类型名(类型) {
+    如果 (类型 == R_X86_64_NONE) { 返回 "NONE" }
+    如果 (类型 == R_X86_64_64) { 返回 "R_X86_64_64" }
+    如果 (类型 == R_X86_64_PC32) { 返回 "R_X86_64_PC32" }
+    如果 (类型 == R_X86_64_PLT32) { 返回 "R_X86_64_PLT32" }
+    如果 (类型 == R_X86_64_RELATIVE) { 返回 "RELATIVE" }
+    如果 (类型 == R_X86_64_GLOB_DAT) { 返回 "GLOB_DAT" }
+    如果 (类型 == R_X86_64_JUMP_SLOT) { 返回 "JUMP_SLOT" }
+    返回 "UNKNOWN"
+}
+
+函数 重定位_统计() {
+    返回 { 处理: 重定位_处理数, 失败: 重定位_失败数 }
+}
+
+函数 重定位_重置() {
+    重定位_处理数 = 0
+    重定位_失败数 = 0
+}
+
+函数 重定位_健康评估() {
+    定义 可变 问题 = []
+    如果 (重定位_失败数 > 100) { 追加(问题, "重定位_失败数=" + 重定位_失败数) }
+    返回 计数(问题) == 0
+}
+
+函数 重定位_综合报告() {
+    打印("[重定位] ═══ 综合报告 ═══")
+    打印("  链接器_已初始化: " + 链接器_已初始化)
+    打印("  链接器_重定位总数: " + 链接器_重定位总数)
+    打印("  重定位_失败数: " + 重定位_失败数)
+    打印("  健康: " + 如果 (重定位_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 重定位_全局重置() {
+    链接器_已初始化 = 0
+    链接器_重定位总数 = 0
+    重定位_失败数 = 0
+    打印("[重定位] 统计已重置")
+    返回 0
+}

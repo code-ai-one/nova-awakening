@@ -1,0 +1,224 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./张量创建.nova")
+导入("./值乘.nova")
+导入("../中枢/内存初始化.nova")
+导入("./多头注意力.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/随机失活前向.nova")
+
+// §4 Nova注意力架构 块级 (Nova注意力 + FFN)
+
+结构 Nova注意力架构块级 {
+    attn_weights,    // u64 Nova注意力Weights*
+    attn_config,    // u64 Nova注意力Config*
+    // FFN: 2层线性 + GELU
+    ffn_w1,    // u64 Tensor* [d_model, d_ff]
+    ffn_b1,
+    ffn_w2,    // u64 Tensor* [d_ff, d_model]
+    ffn_b2,
+    d_ff,    // u32 FFN中间维度(通常4*d_model)
+    // LayerNorm
+    ln1_gamma,
+    ln1_beta,
+    ln2_gamma,
+    ln2_beta,
+}
+
+函数 Nova注意力架构块级_前向(block, input, output) {
+    如果 (block == 0 || input == 0) { 返回 }
+    定义 config = block.attn_config
+    定义 seq = config.seq_len
+    定义 dm = config.d_model
+
+    // Pre-norm: LayerNorm → Nova注意力 → Residual Add
+    定义 normed = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    内存_复制(normed.数据, input.数据, seq * dm * 4)
+    定义 可变 s = 0
+    当 (s < seq) {
+        LayerNorm(normed, block.ln1_gamma, block.ln1_beta, s * dm, dm)
+        s = s + 1
+    }
+
+    // Multi-Head Nova注意力
+    定义 attn_out = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    MultiHeadNova注意力(normed, attn_out, config, block.attn_weights)
+    // Dropout: 训练时随机置零10%神经元(防过拟合), 推理时跳过
+    如果 (全局训练模式) { NOGL_Dropout前向(attn_out, 102, 真) }
+
+    // Residual: x = x + attn_out
+    VecAdd(input, attn_out, output)
+
+    // Pre-norm → FFN → Residual
+    定义 normed2 = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    内存_复制(normed2.数据, output.数据, seq * dm * 4)
+    s = 0
+    当 (s < seq) {
+        LayerNorm(normed2, block.ln2_gamma, block.ln2_beta, s * dm, dm)
+        s = s + 1
+    }
+
+    // FFN: h = GELU(x·W1 + b1)·W2 + b2
+    定义 ffn_hidden = Tensor_创建(seq, block.d_ff, 0, 0, 2, DTYPE_F32)
+    MatMul(normed2, block.ffn_w1, ffn_hidden, seq, dm, block.d_ff)
+    如果 (block.ffn_b1 != 0) { VecAdd(ffn_hidden, block.ffn_b1, ffn_hidden) }
+    GELU(ffn_hidden)
+    // FFN后Dropout
+    如果 (全局训练模式) { NOGL_Dropout前向(ffn_hidden, 102, 真) }
+
+    定义 ffn_out = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    MatMul(ffn_hidden, block.ffn_w2, ffn_out, seq, block.d_ff, dm)
+    如果 (block.ffn_b2 != 0) { VecAdd(ffn_out, block.ffn_b2, ffn_out) }
+
+    // Residual: output = output + ffn_out
+    VecAdd(output, ffn_out, output)
+}
+
+// §5 完整小模型推理
+
+结构 NovaAIModel {
+    // 模型参数
+    d_model,    // u32 256
+    n_heads,    // u32 4
+    n_layers,    // u32 4
+    vocab_size,    // u32 8192
+    max_seq,    // u32 128
+    d_ff,    // u32 1024
+    // 层
+    embedding,    // u64 Tensor* [vocab_size, d_model]
+    pos_encoding,    // u64 Tensor* [max_seq, d_model]
+    layers,    // [8]u64 Nova注意力架构块级*
+    final_ln_g,
+    final_ln_b,
+    output_proj,    // u64 Tensor* [d_model, vocab_size]
+    // 已加载
+    已加载,
+}
+
+// 训练/推理模式切换(Dropout等正则化仅在训练时激活)
+定义 可变 全局训练模式 = 假
+函数 智能_设置训练模式(开启) { 全局训练模式 = 开启 }
+函数 智能_是训练模式() { 返回 全局训练模式 }
+
+// 进化阶段: 映射系统自举过程 (Rust种子→Stage1→Stage2→self-hosting)
+定义 进化_种子阶段   = 0    // 随机初始化, 完全依赖云端, 等待首次蒸馏
+定义 进化_萌芽阶段   = 1    // 已完成种子蒸馏, 本地可产生低置信推理
+定义 进化_成长阶段   = 2    // 持续在线学习中, 本地推理质量上升
+定义 进化_自主阶段   = 3    // 云端变为可选, 本地模型自给自足
+
+定义 可变 全局AI模型 = 0
+定义 可变 全局进化阶段 = 进化_种子阶段
+定义 可变 全局蒸馏总步数 = 0
+定义 进化_萌芽阈值 = 100       // 蒸馏100步后进入萌芽
+定义 进化_成长阈值 = 1000      // 蒸馏1000步后进入成长
+定义 进化_自主阈值 = 10000     // 蒸馏10000步后进入自主
+定义 模型权重路径 = "/var/nova/model.weights"
+
+函数 智能_进化阶段() { 返回 全局进化阶段 }
+函数 智能_进化阶段名() {
+    如果 (全局进化阶段 == 进化_种子阶段) { 返回 "种子" }
+    如果 (全局进化阶段 == 进化_萌芽阶段) { 返回 "萌芽" }
+    如果 (全局进化阶段 == 进化_成长阶段) { 返回 "成长" }
+    返回 "自主"
+}
+
+函数 智能_推进进化(新增蒸馏步数) {
+    全局蒸馏总步数 = 全局蒸馏总步数 + 新增蒸馏步数
+    如果 (全局进化阶段 == 进化_种子阶段 && 全局蒸馏总步数 >= 进化_萌芽阈值) {
+        全局进化阶段 = 进化_萌芽阶段
+    }
+    如果 (全局进化阶段 == 进化_萌芽阶段 && 全局蒸馏总步数 >= 进化_成长阈值) {
+        全局进化阶段 = 进化_成长阶段
+    }
+    如果 (全局进化阶段 == 进化_成长阶段 && 全局蒸馏总步数 >= 进化_自主阈值) {
+        全局进化阶段 = 进化_自主阶段
+    }
+}
+
+函数 智能_模型_加载(模型路径) {
+    如果 (全局AI模型 != 0) { 返回 全局AI模型 }
+    定义 model = 堆_分配(NovaAIModel)
+    如果 (model == 0) { 返回 0 }
+    内存_置零(model, 大小of(NovaAIModel))
+    model.d_model = 256; model.n_heads = 4; model.n_layers = 4
+    model.vocab_size = 8192; model.max_seq = 128; model.d_ff = 1024
+
+    model.embedding = Tensor_创建(model.vocab_size, model.d_model, 0, 0, 2, DTYPE_F32)
+    model.pos_encoding = Tensor_创建(model.max_seq, model.d_model, 0, 0, 2, DTYPE_F32)
+    model.final_ln_g = Tensor_创建(1, model.d_model, 0, 0, 2, DTYPE_F32)
+    model.final_ln_b = Tensor_创建(1, model.d_model, 0, 0, 2, DTYPE_F32)
+    model.output_proj = Tensor_创建(model.d_model, model.vocab_size, 0, 0, 2, DTYPE_F32)
+    定义 可变 d = 0
+    当 (d < model.d_model) {
+        Tensor_写(model.final_ln_g, d, 65536)
+        Tensor_写(model.final_ln_b, d, 0)
+        d = d + 1
+    }
+    全局蒸馏总步数 = 0
+    全局进化阶段 = 进化_种子阶段
+
+    model.已加载 = 真
+    全局AI模型 = model
+    返回 model
+}
+
+函数 智能_模型_加载权重(model, 路径) {
+    返回 假
+}
+
+函数 智能_模型_保存权重(model, 路径) {
+    返回
+}
+
+// 推理: 输入令牌序列 → 输出预测分布
+函数 智能_推理(model, 输入令牌s, 输入长度) {
+    如果 (model == 0 || !model.已加载 || 输入令牌s == 0) { 返回 0 }
+    如果 (输入长度 > model.max_seq) { 输入长度 = model.max_seq }
+    定义 dm = model.d_model
+    定义 seq = 输入长度
+
+    // 1. 令牌 Embedding + Positional Encoding
+    定义 hidden = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 可变 s = 0
+    当 (s < seq) {
+        定义 令牌_id = 内存_读32(输入令牌s + s * 4)
+        如果 (令牌_id >= model.vocab_size) { 令牌_id = 0 }
+        定义 可变 d = 0
+        当 (d < dm) {
+            定义 emb = Tensor_读(model.embedding, 令牌_id * dm + d)
+            定义 pos = Tensor_读(model.pos_encoding, s * dm + d)
+            Tensor_写(hidden, s * dm + d, emb + pos)
+            d = d + 1
+        }
+        s = s + 1
+    }
+
+    // 2. Nova注意力架构层
+    定义 可变 layer = 0
+    当 (layer < model.n_layers) {
+        如果 (model.layers[layer] != 0) {
+            定义 output = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+            Nova注意力架构块级_前向(model.layers[layer], hidden, output)
+            hidden = output
+        }
+        layer = layer + 1
+    }
+
+    // 3. Final LayerNorm
+    s = 0
+    当 (s < seq) {
+        LayerNorm(hidden, model.final_ln_g, model.final_ln_b, s * dm, dm)
+        s = s + 1
+    }
+
+    // 4. 输出投影: logits = hidden[-1] · output_proj
+    定义 logits = Tensor_创建(1, model.vocab_size, 0, 0, 2, DTYPE_F32)
+    // 取最后一个令牌的hidden state
+    定义 last_hidden = Tensor_创建(1, dm, 0, 0, 2, DTYPE_F32)
+    内存_复制(last_hidden.数据, hidden.数据 + (seq-1) * dm * 4, dm * 4)
+    MatMul(last_hidden, model.output_proj, logits, 1, dm, model.vocab_size)
+
+    // 5. Nova归一化指数 → 概率分布
+    Nova归一化指数(logits, 0, model.vocab_size)
+    返回 logits
+}

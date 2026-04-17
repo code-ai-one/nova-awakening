@@ -1,0 +1,761 @@
+// §3 解析scroll-snap-type
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/公平调度度.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/主循环.nova")
+导入("../中枢/字符串替换.nova")
+
+函数 ScrollSnap_解析类型(值字符串) {
+    如果 (值字符串 == 0 || 字符串_相等(值字符串, "none")) {
+        返回 [SNAP_AXIS_NONE, SNAP_STRICT_NONE]
+    }
+
+    定义 可变 轴 = SNAP_AXIS_NONE
+    定义 可变 严格 = SNAP_STRICT_PROXIMITY    // 默认proximity
+
+    如果 (字符串_包含(值字符串, "x")) { 轴 = SNAP_AXIS_X }
+    否则 如果 (字符串_包含(值字符串, "y")) { 轴 = SNAP_AXIS_Y }
+    否则 如果 (字符串_包含(值字符串, "both")) { 轴 = SNAP_AXIS_BOTH }
+    否则 如果 (字符串_包含(值字符串, "block")) { 轴 = SNAP_AXIS_BLOCK }
+    否则 如果 (字符串_包含(值字符串, "inline")) { 轴 = SNAP_AXIS_INLINE }
+
+    如果 (字符串_包含(值字符串, "mandatory")) { 严格 = SNAP_STRICT_MANDATORY }
+    否则 如果 (字符串_包含(值字符串, "proximity")) { 严格 = SNAP_STRICT_PROXIMITY }
+
+    返回 [轴, 严格]
+}
+
+函数 ScrollSnap_解析对齐(值字符串) {
+    如果 (值字符串 == 0 || 字符串_相等(值字符串, "none")) {
+        返回 [SNAP_ALIGN_NONE, SNAP_ALIGN_NONE]
+    }
+
+    定义 可变 x对齐 = SNAP_ALIGN_NONE
+    定义 可变 y对齐 = SNAP_ALIGN_NONE
+
+    如果 (字符串_相等(值字符串, "start")) { x对齐 = SNAP_ALIGN_START; y对齐 = SNAP_ALIGN_START }
+    否则 如果 (字符串_相等(值字符串, "center")) { x对齐 = SNAP_ALIGN_CENTER; y对齐 = SNAP_ALIGN_CENTER }
+    否则 如果 (字符串_相等(值字符串, "end")) { x对齐 = SNAP_ALIGN_END; y对齐 = SNAP_ALIGN_END }
+
+    返回 [x对齐, y对齐]
+}
+
+// §4 收集snap点 — 从子元素的scroll-snap-align计算
+
+函数 ScrollSnap_收集snap点(ssc, 容器元素) {
+    如果 (ssc == 0 || 容器元素 == 0) { 返回 }
+    ssc.snap点数量 = 0
+
+    // 遍历子元素,查找有scroll-snap-align的
+    ScrollSnap_收集递归(ssc, 容器元素)
+}
+
+函数 ScrollSnap_收集递归(ssc, 元素) {
+    如果 (元素 == 0) { 返回 }
+    定义 可变 子 = 元素.第一子节点
+    当 (子 != 0) {
+        如果 (子.节点类型 == 1) {    // 元素_节点
+            定义 布局 = 子.布局对象
+            定义 样式 = 布局 != 0 ? 布局.计算样式 : 0
+            如果 (样式 != 0 && 样式.scroll_snap_align != 0) {
+                定义 对齐 = ScrollSnap_解析对齐(样式.scroll_snap_align)
+                如果 (对齐[0] != SNAP_ALIGN_NONE || 对齐[1] != SNAP_ALIGN_NONE) {
+                    // 计算snap点坐标
+                    定义 sp = 堆_分配(SnapPoint)
+                    sp.对齐x = 对齐[0]; sp.对齐y = 对齐[1]
+                    sp.元素 = 子
+
+                    // 解析scroll-snap-stop
+                    如果 (样式.scroll_snap_stop != 0 && 字符串_相等(样式.scroll_snap_stop, "always")) {
+                        sp.停止 = SNAP_STOP_ALWAYS
+                    } 否则 { sp.停止 = SNAP_STOP_NORMAL }
+
+                    // 计算snap坐标: 基于元素位置+对齐方式+scroll-margin
+                    定义 可变 margin = 0
+                    如果 (样式.scroll_margin != 0) {
+                        margin = 样式.scroll_margin_值
+                    }
+
+                    如果 (sp.对齐x == SNAP_ALIGN_START) { sp.x = 布局.x - ssc.padding_左 - margin }
+                    否则 如果 (sp.对齐x == SNAP_ALIGN_CENTER) { sp.x = 布局.x + 布局.宽 / 2 - ssc.视口宽 / 2 }
+                    否则 如果 (sp.对齐x == SNAP_ALIGN_END) { sp.x = 布局.x + 布局.宽 - ssc.视口宽 + ssc.padding_右 + margin }
+
+                    如果 (sp.对齐y == SNAP_ALIGN_START) { sp.y = 布局.y - ssc.padding_上 - margin }
+                    否则 如果 (sp.对齐y == SNAP_ALIGN_CENTER) { sp.y = 布局.y + 布局.高 / 2 - ssc.视口高 / 2 }
+                    否则 如果 (sp.对齐y == SNAP_ALIGN_END) { sp.y = 布局.y + 布局.高 - ssc.视口高 + ssc.padding_下 + margin }
+
+                    // 添加到列表
+                    如果 (ssc.snap点数量 < ssc.snap点容量) {
+                        内存_写64(ssc.snap点列表 + ssc.snap点数量 * 8, sp)
+                        ssc.snap点数量 = ssc.snap点数量 + 1
+                    }
+                }
+            }
+            // 不递归进入有自己scroll-snap-type的子容器
+            如果 (样式 == 0 || 样式.scroll_snap_type == 0 || 字符串_相等(样式.scroll_snap_type, "none")) {
+                ScrollSnap_收集递归(ssc, 子)
+            }
+        }
+        子 = 子.后一兄弟
+    }
+}
+
+// NSSP理论 — Nova滚动快照解析与预测 (Nova Scroll Snap Parsing)
+// 创新点: 语义解析 + 最近邻吸附 + 惯性预测 + AI自适应捕捉阈值
+
+定义 SNAP_AXIS_NONE = 0
+定义 SNAP_AXIS_X = 1
+定义 SNAP_AXIS_Y = 2
+定义 SNAP_AXIS_BOTH = 3
+定义 SNAP_AXIS_BLOCK = 4
+定义 SNAP_AXIS_INLINE = 5
+
+定义 SNAP_STRICT_NONE = 0
+定义 SNAP_STRICT_PROXIMITY = 1
+定义 SNAP_STRICT_MANDATORY = 2
+
+定义 SNAP_ALIGN_NONE = 0
+定义 SNAP_ALIGN_START = 1
+定义 SNAP_ALIGN_CENTER = 2
+定义 SNAP_ALIGN_END = 3
+
+定义 SNAP_STOP_NORMAL = 0
+定义 SNAP_STOP_ALWAYS = 1
+
+定义 SNAP_最大点数 = 4096
+定义 SNAP_默认阈值 = 48   // 像素
+
+结构 SnapPoint {
+    x,
+    y,
+    对齐x,
+    对齐y,
+    停止,
+    元素,
+}
+
+结构 ScrollSnapContext {
+    轴,
+    严格,
+    snap点列表,
+    snap点数量,
+    snap点容量,
+    视口宽,
+    视口高,
+    padding_上,
+    padding_右,
+    padding_下,
+    padding_左,
+    当前滚动x,
+    当前滚动y,
+    速度x,
+    速度y,
+    上次目标x,
+    上次目标y,
+    动画中,
+}
+
+定义 可变 NSSP_解析总数 = 0
+定义 可变 NSSP_收集总数 = 0
+定义 可变 NSSP_命中总数 = 0
+定义 可变 NSSP_强制捕捉总数 = 0
+定义 可变 NSSP_AI预测总数 = 0
+
+
+函数 NSSP_去首尾空白(文本) {
+    如果 (文本 == 0) { 返回 0 }
+    定义 起 = 0
+    定义 长 = 字符串_长度(文本)
+    定义 可变 终 = 长 - 1
+    当 (起 < 长 && NSSP_是空白(内存_读8(文本 + 起))) { 起 = 起 + 1 }
+    当 (终 >= 起 && NSSP_是空白(内存_读8(文本 + 终))) { 终 = 终 - 1 }
+    如果 (终 < 起) { 返回 "" }
+    返回 字符串_子串(文本, 起, 终 - 起 + 1)
+}
+
+函数 NSSP_是空白(ch) {
+    如果 (ch == 0x20) { 返回 真 }
+    如果 (ch == 0x09) { 返回 真 }
+    如果 (ch == 0x0A) { 返回 真 }
+    如果 (ch == 0x0D) { 返回 真 }
+    返回 假
+}
+
+函数 NSSP_转小写(文本) {
+    如果 (文本 == 0) { 返回 0 }
+    定义 长 = 字符串_长度(文本)
+    定义 out = 堆_分配(长 + 1)
+    定义 可变 i = 0
+    当 (i < 长) {
+        定义 ch = 内存_读8(文本 + i)
+        如果 (ch >= 0x41 && ch <= 0x5A) { ch = ch + 32 }
+        内存_写8(out + i, ch)
+        i = i + 1
+    }
+    内存_写8(out + 长, 0)
+    返回 out
+}
+
+函数 NSSP_令牌化(值字符串) {
+    // 按空格切分，最多4个令牌
+    定义 tokens = 堆_分配(4 * 8)
+    定义 可变 数量 = 0
+    定义 规范 = NSSP_去首尾空白(值字符串)
+    如果 (规范 == 0) { 返回 [tokens, 0] }
+
+    定义 长 = 字符串_长度(规范)
+    定义 可变 i = 0
+    当 (i < 长 && 数量 < 4) {
+        当 (i < 长 && NSSP_是空白(内存_读8(规范 + i))) { i = i + 1 }
+        如果 (i >= 长) { 断开 }
+        定义 开始 = i
+        当 (i < 长 && !NSSP_是空白(内存_读8(规范 + i))) { i = i + 1 }
+        定义 tok = 字符串_子串(规范, 开始, i - 开始)
+        tok = NSSP_转小写(tok)
+        内存_写64(tokens + 数量 * 8, tok)
+        数量 = 数量 + 1
+    }
+    返回 [tokens, 数量]
+}
+
+函数 NSSP_释放令牌(令牌数组, 数量) {
+    如果 (令牌数组 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 t = 内存_读64(令牌数组 + i * 8)
+        如果 (t != 0) { 堆_释放(t) }
+        i = i + 1
+    }
+    堆_释放(令牌数组)
+}
+
+函数 NSSP_解析类型_健壮(值字符串) {
+    定义 结果 = [SNAP_AXIS_NONE, SNAP_STRICT_NONE]
+    如果 (值字符串 == 0) { 返回 结果 }
+    如果 (字符串_相等(值字符串, "none")) { 返回 结果 }
+
+    定义 tk = NSSP_令牌化(值字符串)
+    定义 数组 = tk[0]
+    定义 数量 = tk[1]
+
+    定义 可变 i = 0
+    定义 可变 轴 = SNAP_AXIS_NONE
+    定义 可变 严格 = SNAP_STRICT_PROXIMITY
+    当 (i < 数量) {
+        定义 t = 内存_读64(数组 + i * 8)
+        如果 (字符串_相等(t, "x")) { 轴 = SNAP_AXIS_X }
+        否则 如果 (字符串_相等(t, "y")) { 轴 = SNAP_AXIS_Y }
+        否则 如果 (字符串_相等(t, "both")) { 轴 = SNAP_AXIS_BOTH }
+        否则 如果 (字符串_相等(t, "block")) { 轴 = SNAP_AXIS_BLOCK }
+        否则 如果 (字符串_相等(t, "inline")) { 轴 = SNAP_AXIS_INLINE }
+        否则 如果 (字符串_相等(t, "mandatory")) { 严格 = SNAP_STRICT_MANDATORY }
+        否则 如果 (字符串_相等(t, "proximity")) { 严格 = SNAP_STRICT_PROXIMITY }
+        i = i + 1
+    }
+    NSSP_释放令牌(数组, 数量)
+    NSSP_解析总数 = NSSP_解析总数 + 1
+    返回 [轴, 严格]
+}
+
+
+函数 ScrollSnap_创建上下文(视口宽, 视口高) {
+    定义 s = 堆_分配(ScrollSnapContext)
+    如果 (s == 0) { 返回 0 }
+    s.轴 = SNAP_AXIS_NONE
+    s.严格 = SNAP_STRICT_NONE
+    s.视口宽 = 视口宽
+    s.视口高 = 视口高
+    s.padding_上 = 0
+    s.padding_右 = 0
+    s.padding_下 = 0
+    s.padding_左 = 0
+    s.当前滚动x = 0
+    s.当前滚动y = 0
+    s.速度x = 0
+    s.速度y = 0
+    s.上次目标x = 0
+    s.上次目标y = 0
+    s.动画中 = 假
+    s.snap点容量 = 256
+    s.snap点数量 = 0
+    s.snap点列表 = 堆_分配(s.snap点容量 * 8)
+    返回 s
+}
+
+函数 ScrollSnap_释放上下文(ssc) {
+    如果 (ssc == 0) { 返回 }
+    ScrollSnap_清空snap点(ssc)
+    如果 (ssc.snap点列表 != 0) { 堆_释放(ssc.snap点列表) }
+    堆_释放(ssc)
+}
+
+函数 ScrollSnap_清空snap点(ssc) {
+    如果 (ssc == 0 || ssc.snap点列表 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (sp != 0) { 堆_释放(sp) }
+        i = i + 1
+    }
+    ssc.snap点数量 = 0
+}
+
+函数 NSSP_确保容量(ssc) {
+    如果 (ssc.snap点数量 < ssc.snap点容量) { 返回 }
+    定义 新容量 = ssc.snap点容量 * 2
+    如果 (新容量 > SNAP_最大点数) { 新容量 = SNAP_最大点数 }
+    如果 (新容量 <= ssc.snap点容量) { 返回 }
+    定义 新列表 = 堆_分配(新容量 * 8)
+    内存_拷贝(新列表, ssc.snap点列表, ssc.snap点容量 * 8)
+    堆_释放(ssc.snap点列表)
+    ssc.snap点列表 = 新列表
+    ssc.snap点容量 = 新容量
+}
+
+
+函数 NSSP_排序snap点(ssc) {
+    如果 (ssc == 0 || ssc.snap点数量 <= 1) { 返回 }
+    // 按主轴排序
+    定义 可变 i = 1
+    当 (i < ssc.snap点数量) {
+        定义 key = 内存_读64(ssc.snap点列表 + i * 8)
+        定义 可变 j = i - 1
+        当 (j >= 0) {
+            定义 a = 内存_读64(ssc.snap点列表 + j * 8)
+            定义 可变 av = 0
+            定义 可变 kv = 0
+            如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) {
+                av = a.x; kv = key.x
+            } 否则 {
+                av = a.y; kv = key.y
+            }
+            如果 (av <= kv) { 断开 }
+            内存_写64(ssc.snap点列表 + (j + 1) * 8, a)
+            j = j - 1
+        }
+        内存_写64(ssc.snap点列表 + (j + 1) * 8, key)
+        i = i + 1
+    }
+}
+
+函数 NSSP_去重snap点(ssc, 最小间距) {
+    如果 (ssc == 0 || ssc.snap点数量 <= 1) { 返回 }
+    定义 可变 写 = 0
+    定义 可变 i = 0
+    定义 可变 上个值 = -2147483648
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        定义 可变 值 = 0
+        如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) { 值 = sp.x }
+        否则 { 值 = sp.y }
+
+        如果 (写 == 0 || 绝对值(值 - 上个值) >= 最小间距) {
+            内存_写64(ssc.snap点列表 + 写 * 8, sp)
+            写 = 写 + 1
+            上个值 = 值
+        } 否则 {
+            堆_释放(sp)  // 去重丢弃
+        }
+        i = i + 1
+    }
+    ssc.snap点数量 = 写
+}
+
+函数 NSSP_裁剪不可达点(ssc, 最大滚动x, 最大滚动y) {
+    如果 (ssc == 0) { 返回 }
+    定义 可变 写 = 0
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        定义 可变 有效 = 真
+        如果 (sp.x < 0 || sp.x > 最大滚动x) { sp.x = 限制范围(sp.x, 0, 最大滚动x) }
+        如果 (sp.y < 0 || sp.y > 最大滚动y) { sp.y = 限制范围(sp.y, 0, 最大滚动y) }
+        如果 (有效) {
+            内存_写64(ssc.snap点列表 + 写 * 8, sp)
+            写 = 写 + 1
+        } 否则 {
+            堆_释放(sp)
+        }
+        i = i + 1
+    }
+    ssc.snap点数量 = 写
+}
+
+函数 限制范围(v, 最小, 最大) {
+    如果 (v < 最小) { 返回 最小 }
+    如果 (v > 最大) { 返回 最大 }
+    返回 v
+}
+
+
+函数 NSSP_计算距离平方(dx, dy) {
+    返回 dx * dx + dy * dy
+}
+
+函数 NSSP_寻找最近点(ssc, 目标x, 目标y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 0 }
+    定义 可变 最优 = 0
+    定义 可变 最优分数 = 2147483647
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        定义 dx = sp.x - 目标x
+        定义 dy = sp.y - 目标y
+        定义 分数 = NSSP_计算距离平方(dx, dy)
+
+        // stop:always 权重更高(分数减小)
+        如果 (sp.停止 == SNAP_STOP_ALWAYS) { 分数 = 分数 * 3 / 4 }
+
+        如果 (分数 < 最优分数) {
+            最优分数 = 分数
+            最优 = sp
+        }
+        i = i + 1
+    }
+    返回 最优
+}
+
+函数 NSSP_寻找主轴最近点(ssc, 目标值) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 0 }
+    定义 可变 最优 = 0
+    定义 可变 最小距离 = 2147483647
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        定义 可变 v = 0
+        如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) { v = sp.x }
+        否则 { v = sp.y }
+        定义 d = 绝对值(v - 目标值)
+        如果 (d < 最小距离) {
+            最小距离 = d
+            最优 = sp
+        }
+        i = i + 1
+    }
+    返回 最优
+}
+
+
+函数 NSSP_应当捕捉(ssc, 当前x, 当前y, 候选点) {
+    如果 (ssc == 0 || 候选点 == 0) { 返回 假 }
+    如果 (ssc.严格 == SNAP_STRICT_NONE) { 返回 假 }
+
+    定义 阈值 = SNAP_默认阈值
+    // mandatory模式阈值更大
+    如果 (ssc.严格 == SNAP_STRICT_MANDATORY) { 阈值 = 阈值 * 4 }
+
+    // 高速滚动阈值增加
+    定义 速度 = 绝对值(ssc.速度x) + 绝对值(ssc.速度y)
+    如果 (速度 > 100) { 阈值 = 阈值 + 24 }
+    如果 (速度 > 300) { 阈值 = 阈值 + 36 }
+
+    定义 dx = 绝对值(候选点.x - 当前x)
+    定义 dy = 绝对值(候选点.y - 当前y)
+
+    如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) {
+        返回 dx <= 阈值 || ssc.严格 == SNAP_STRICT_MANDATORY
+    }
+    如果 (ssc.轴 == SNAP_AXIS_Y || ssc.轴 == SNAP_AXIS_BLOCK) {
+        返回 dy <= 阈值 || ssc.严格 == SNAP_STRICT_MANDATORY
+    }
+    // both
+    返回 (dx <= 阈值 && dy <= 阈值) || ssc.严格 == SNAP_STRICT_MANDATORY
+}
+
+函数 ScrollSnap_应用捕捉(ssc, 当前x, 当前y, 目标x, 目标y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 [目标x, 目标y, 假] }
+
+    定义 候选 = NSSP_寻找最近点(ssc, 目标x, 目标y)
+    如果 (候选 == 0) { 返回 [目标x, 目标y, 假] }
+    如果 (!NSSP_应当捕捉(ssc, 当前x, 当前y, 候选)) {
+        返回 [目标x, 目标y, 假]
+    }
+
+    定义 可变 nx = 目标x
+    定义 可变 ny = 目标y
+
+    如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) { nx = 候选.x }
+    否则 如果 (ssc.轴 == SNAP_AXIS_Y || ssc.轴 == SNAP_AXIS_BLOCK) { ny = 候选.y }
+    否则 { nx = 候选.x; ny = 候选.y }
+
+    NSSP_命中总数 = NSSP_命中总数 + 1
+    如果 (ssc.严格 == SNAP_STRICT_MANDATORY) {
+        NSSP_强制捕捉总数 = NSSP_强制捕捉总数 + 1
+    }
+    ssc.上次目标x = nx
+    ssc.上次目标y = ny
+    返回 [nx, ny, 真]
+}
+
+
+函数 NSSP_惯性目标(位置, 速度) {
+    // 简化阻尼模型: s = v * 0.35
+    定义 偏移 = 速度 * 35 / 100
+    返回 位置 + 偏移
+}
+
+函数 ScrollSnap_按速度预测目标(ssc, 当前x, 当前y, 速度x, 速度y) {
+    如果 (ssc == 0) { 返回 [当前x, 当前y] }
+    ssc.速度x = 速度x
+    ssc.速度y = 速度y
+    定义 tx = NSSP_惯性目标(当前x, 速度x)
+    定义 ty = NSSP_惯性目标(当前y, 速度y)
+    返回 [tx, ty]
+}
+
+函数 ScrollSnap_下一点(ssc, 当前x, 当前y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 [当前x, 当前y] }
+    NSSP_排序snap点(ssc)
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) {
+            如果 (sp.x > 当前x + 1) { 返回 [sp.x, 当前y] }
+        } 否则 {
+            如果 (sp.y > 当前y + 1) { 返回 [当前x, sp.y] }
+        }
+        i = i + 1
+    }
+    返回 [当前x, 当前y]
+}
+
+函数 ScrollSnap_上一点(ssc, 当前x, 当前y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 [当前x, 当前y] }
+    NSSP_排序snap点(ssc)
+    定义 可变 i = ssc.snap点数量 - 1
+    当 (i >= 0) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) {
+            如果 (sp.x < 当前x - 1) { 返回 [sp.x, 当前y] }
+        } 否则 {
+            如果 (sp.y < 当前y - 1) { 返回 [当前x, sp.y] }
+        }
+        i = i - 1
+    }
+    返回 [当前x, 当前y]
+}
+
+
+函数 NSSP_缓动_三次(t) {
+    // easeOutCubic: 1 - (1-t)^3
+    定义 u = 1000 - t
+    定义 u2 = u * u / 1000
+    定义 u3 = u2 * u / 1000
+    返回 1000 - u3
+}
+
+函数 ScrollSnap_动画到(ssc, scroller, 目标x, 目标y, 时长毫秒) {
+    如果 (ssc == 0 || scroller == 0) { 返回 }
+    如果 (时长毫秒 <= 0) {
+        scroller.scrollLeft = 目标x
+        scroller.scrollTop = 目标y
+        返回
+    }
+    定义 起始x = scroller.scrollLeft
+    定义 起始y = scroller.scrollTop
+    定义 开始时间 = 时间_当前毫秒()
+    ssc.动画中 = 真
+    当 (真) {
+        定义 现在 = 时间_当前毫秒()
+        定义 经过 = 现在 - 开始时间
+        如果 (经过 >= 时长毫秒) { 断开 }
+        定义 t = 经过 * 1000 / 时长毫秒
+        定义 e = NSSP_缓动_三次(t)
+        scroller.scrollLeft = 起始x + (目标x - 起始x) * e / 1000
+        scroller.scrollTop = 起始y + (目标y - 起始y) * e / 1000
+        调度_让出()
+    }
+    scroller.scrollLeft = 目标x
+    scroller.scrollTop = 目标y
+    ssc.动画中 = 假
+}
+
+
+函数 ScrollSnap_处理滚动结束(ssc, scroller, 当前x, 当前y, 速度x, 速度y) {
+    如果 (ssc == 0 || scroller == 0) { 返回 [当前x, 当前y, 假] }
+    // 1) 惯性预测
+    定义 预测 = ScrollSnap_按速度预测目标(ssc, 当前x, 当前y, 速度x, 速度y)
+    // 2) snap决策
+    定义 snap = ScrollSnap_应用捕捉(ssc, 当前x, 当前y, 预测[0], 预测[1])
+    如果 (!snap[2]) { 返回 snap }
+    // 3) 平滑动画到目标
+    ScrollSnap_动画到(ssc, scroller, snap[0], snap[1], 180)
+    返回 snap
+}
+
+
+函数 NSSP_点是否在可视附近(ssc, sp, 当前x, 当前y, 范围) {
+    如果 (ssc == 0 || sp == 0) { 返回 假 }
+    定义 dx = 绝对值(sp.x - 当前x)
+    定义 dy = 绝对值(sp.y - 当前y)
+    如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_INLINE) {
+        返回 dx <= 范围
+    }
+    如果 (ssc.轴 == SNAP_AXIS_Y || ssc.轴 == SNAP_AXIS_BLOCK) {
+        返回 dy <= 范围
+    }
+    返回 dx <= 范围 && dy <= 范围
+}
+
+函数 NSSP_标记优先级(ssc, 当前x, 当前y) {
+    // 给stop:always点更高优先级（通过就地重排）
+    如果 (ssc == 0) { 返回 }
+    定义 可变 写 = 0
+    定义 临时 = 堆_分配(ssc.snap点数量 * 8)
+
+    // 先写 always
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (sp.停止 == SNAP_STOP_ALWAYS && NSSP_点是否在可视附近(ssc, sp, 当前x, 当前y, 3 * SNAP_默认阈值)) {
+            内存_写64(临时 + 写 * 8, sp); 写 = 写 + 1
+        }
+        i = i + 1
+    }
+    // 再写其他
+    i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp2 = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (!(sp2.停止 == SNAP_STOP_ALWAYS && NSSP_点是否在可视附近(ssc, sp2, 当前x, 当前y, 3 * SNAP_默认阈值))) {
+            内存_写64(临时 + 写 * 8, sp2); 写 = 写 + 1
+        }
+        i = i + 1
+    }
+    内存_拷贝(ssc.snap点列表, 临时, ssc.snap点数量 * 8)
+    堆_释放(临时)
+}
+
+
+函数 NSSP_AI提取特征(ssc, 当前x, 当前y) {
+    定义 t = Tensor_创建(12)
+    如果 (t == 0) { 返回 0 }
+    Tensor_写(t, 0, ssc.轴)
+    Tensor_写(t, 1, ssc.严格)
+    Tensor_写(t, 2, ssc.snap点数量)
+    Tensor_写(t, 3, ssc.视口宽)
+    Tensor_写(t, 4, ssc.视口高)
+    Tensor_写(t, 5, 当前x)
+    Tensor_写(t, 6, 当前y)
+    Tensor_写(t, 7, ssc.速度x)
+    Tensor_写(t, 8, ssc.速度y)
+    Tensor_写(t, 9, ssc.上次目标x)
+    Tensor_写(t, 10, ssc.上次目标y)
+    Tensor_写(t, 11, NSSP_命中总数)
+    返回 t
+}
+
+函数 NSSP_AI预测阈值(ssc, 当前x, 当前y) {
+    定义 t = NSSP_AI提取特征(ssc, 当前x, 当前y)
+    如果 (t == 0) { 返回 SNAP_默认阈值 }
+    // 简单规则融合：速度越快阈值越大，点越密阈值越小
+    定义 速度 = 绝对值(Tensor_读(t, 7)) + 绝对值(Tensor_读(t, 8))
+    定义 点数 = Tensor_读(t, 2)
+    定义 可变 阈值 = SNAP_默认阈值
+    如果 (速度 > 200) { 阈值 = 阈值 + 20 }
+    如果 (速度 > 400) { 阈值 = 阈值 + 30 }
+    如果 (点数 > 100) { 阈值 = 阈值 - 8 }
+    如果 (点数 > 300) { 阈值 = 阈值 - 12 }
+    阈值 = 限制范围(阈值, 16, 160)
+
+    // 发布诊断
+    全局AI总线.发布("nssp_threshold", "predict", 阈值)
+    Tensor_释放(t)
+    NSSP_AI预测总数 = NSSP_AI预测总数 + 1
+    返回 阈值
+}
+
+函数 NSSP_AI预测目标点(ssc, 当前x, 当前y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 [当前x, 当前y] }
+    定义 候选 = NSSP_寻找最近点(ssc, 当前x + ssc.速度x / 2, 当前y + ssc.速度y / 2)
+    如果 (候选 == 0) { 返回 [当前x, 当前y] }
+    返回 [候选.x, 候选.y]
+}
+
+
+函数 NSSP_获取统计() {
+    返回 [
+        NSSP_解析总数,
+        NSSP_收集总数,
+        NSSP_命中总数,
+        NSSP_强制捕捉总数,
+        NSSP_AI预测总数
+    ]
+}
+
+函数 NSSP_重置统计() {
+    NSSP_解析总数 = 0
+    NSSP_收集总数 = 0
+    NSSP_命中总数 = 0
+    NSSP_强制捕捉总数 = 0
+    NSSP_AI预测总数 = 0
+}
+
+
+函数 ScrollSnap_从样式初始化(ssc, 样式) {
+    如果 (ssc == 0 || 样式 == 0) { 返回 }
+    定义 t = NSSP_解析类型_健壮(样式.scroll_snap_type)
+    ssc.轴 = t[0]
+    ssc.严格 = t[1]
+    // scroll-padding
+    ssc.padding_上 = 样式.scroll_padding_top
+    ssc.padding_右 = 样式.scroll_padding_right
+    ssc.padding_下 = 样式.scroll_padding_bottom
+    ssc.padding_左 = 样式.scroll_padding_left
+}
+
+函数 ScrollSnap_重建并排序(ssc, 容器元素, 最大滚动x, 最大滚动y) {
+    如果 (ssc == 0 || 容器元素 == 0) { 返回 }
+    ScrollSnap_清空snap点(ssc)
+    ScrollSnap_收集snap点(ssc, 容器元素)
+    NSSP_收集总数 = NSSP_收集总数 + ssc.snap点数量
+    NSSP_排序snap点(ssc)
+    NSSP_去重snap点(ssc, 2)
+    NSSP_裁剪不可达点(ssc, 最大滚动x, 最大滚动y)
+}
+
+函数 ScrollSnap_页下滚(ssc, scroller) {
+    定义 当前位置x = scroller.scrollLeft
+    定义 当前位置y = scroller.scrollTop
+    定义 下个 = ScrollSnap_下一点(ssc, 当前位置x, 当前位置y)
+    ScrollSnap_动画到(ssc, scroller, 下个[0], 下个[1], 160)
+}
+
+函数 ScrollSnap_页上滚(ssc, scroller) {
+    定义 当前位置x = scroller.scrollLeft
+    定义 当前位置y = scroller.scrollTop
+    定义 上个 = ScrollSnap_上一点(ssc, 当前位置x, 当前位置y)
+    ScrollSnap_动画到(ssc, scroller, 上个[0], 上个[1], 160)
+}
+
+
+函数 NSSP_自检() {
+    定义 c = ScrollSnap_创建上下文(800, 600)
+    c.轴 = SNAP_AXIS_Y
+    c.严格 = SNAP_STRICT_PROXIMITY
+
+    // 人工插入测试点
+    定义 可变 i = 0
+    当 (i < 5) {
+        定义 sp = 堆_分配(SnapPoint)
+        sp.x = 0
+        sp.y = i * 200
+        sp.对齐x = SNAP_ALIGN_NONE
+        sp.对齐y = SNAP_ALIGN_START
+        sp.停止 = SNAP_STOP_NORMAL
+        sp.元素 = 0
+        内存_写64(c.snap点列表 + c.snap点数量 * 8, sp)
+        c.snap点数量 = c.snap点数量 + 1
+        i = i + 1
+    }
+
+    定义 r = ScrollSnap_应用捕捉(c, 0, 180, 0, 210)
+    定义 正确 = 假
+    如果 (r[2] && r[1] == 200) { 正确 = 真 }
+
+    ScrollSnap_释放上下文(c)
+    返回 正确
+}

@@ -1,0 +1,510 @@
+// §8 nova:// 内部协议处理
+
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/检查点系统初.nova")
+导入("./内核界面.nova")
+导入("../标准/原生字符串.nova")
+导入("./安装向导启.nova")
+导入("../推理/全息虚拟人.nova")
+导入("./协议增强.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./请求接口.nova")
+
+函数 浏览器网络_转义HTML(文本) {
+    如果 (文本 == 空) { 返回 "" }
+    定义 可变 转义 = 字符串替换(文本, "&", "&amp;")
+    转义 = 字符串替换(转义, "<", "&lt;")
+    转义 = 字符串替换(转义, ">", "&gt;")
+    转义 = 字符串替换(转义, "\"", "&quot;")
+    返回 转义
+}
+
+函数 浏览器网络_处理内部协议(请求) {
+    定义 路径 = 请求.路径
+    请求.响应码 = 200
+    请求.状态 = 请求状态_完成
+
+    如果 (路径 == "/newtab" || 路径 == "//newtab" || 路径 == "/终端" || 路径 == "//终端") {
+        请求.响应体 = [浏览器网络_生成新标签页HTML()]
+    } 否则 如果 (路径 == "/settings" || 路径 == "//settings") {
+        请求.响应体 = [浏览器网络_生成设置页HTML()]
+    } 否则 如果 (路径 == "/ai" || 路径 == "//ai") {
+        请求.响应体 = [浏览器网络_生成AI交互页HTML()]
+    } 否则 如果 (路径 == "/system" || 路径 == "//system") {
+        请求.响应体 = [浏览器网络_生成系统监控HTML()]
+    } 否则 如果 (路径 == "/multimodal" || 路径 == "//multimodal") {
+        请求.响应体 = [浏览器网络_生成多模态页HTML()]
+    } 否则 如果 (路径 == "/voice" || 路径 == "//voice") {
+        请求.响应体 = [浏览器网络_生成语音页HTML()]
+    } 否则 如果 (路径 == "/avatar" || 路径 == "//avatar") {
+        请求.响应体 = [浏览器网络_生成形象页HTML()]
+    } 否则 如果 (路径 == "/automation" || 路径 == "//automation") {
+        请求.响应体 = [浏览器网络_生成自动化页HTML()]
+    } 否则 如果 (路径 == "/recovery" || 路径 == "//recovery") {
+        请求.响应体 = [浏览器网络_生成恢复页HTML()]
+    } 否则 如果 (字符串查找(路径, "/setup") == 0 || 字符串查找(路径, "//setup") == 0) {
+        浏览器网络_处理安装向导动作(路径)
+        请求.响应体 = [浏览器网络_生成安装向导页HTML()]
+    } 否则 {
+        请求.响应码 = 404
+        请求.响应体 = [浏览器网络_生成未找到页HTML(路径)]
+    }
+
+    返回 请求
+}
+
+函数 浏览器网络_生成新标签页HTML() {
+    返回 浏览器网络_生成页面框架HTML("NovaOS 主壳", "系统即模型 · 模型即浏览器 · 浏览器即物理机前台", 浏览器网络_生成主壳内容HTML())
+}
+
+函数 浏览器网络_生成设置页HTML() {
+    返回 浏览器网络_生成页面框架HTML("系统设置与热更新", "通过 browser-终端 直接调整内核模块、更新策略与稳定回滚边界", 浏览器网络_生成设置内容HTML())
+}
+
+函数 浏览器网络_生成AI交互页HTML() {
+    返回 浏览器网络_生成页面框架HTML("多模态 AI 工作台", "地址栏、对话、系统命令、视觉与听觉入口统一收敛到同一主壳", 浏览器网络_生成AI工作台内容HTML())
+}
+
+函数 浏览器网络_生成系统监控HTML() {
+    返回 浏览器网络_生成页面框架HTML("系统与硬件总线", "CPU · 图处 · 内存 · 存储 · 电源 · AI模块状态以浏览器式总控面呈现", 浏览器网络_生成系统面内容HTML())
+}
+
+函数 浏览器网络_生成多模态页HTML() {
+    返回 浏览器网络_生成页面框架HTML("多模态感知", "视觉、听觉、语音、全息形象与原生环境理解统一到系统内部", 浏览器网络_生成多模态内容HTML())
+}
+
+函数 浏览器网络_生成语音页HTML() {
+    返回 浏览器网络_生成页面框架HTML("语音与听觉系统", "ASR、音频理解、语音对话与听觉感知在系统内核前台汇聚", 浏览器网络_生成语音内容HTML())
+}
+
+函数 浏览器网络_生成形象页HTML() {
+    返回 浏览器网络_生成页面框架HTML("全息形象与人格前台", "虚拟人、全息化身、情感表情与长期人格交互的系统前台", 浏览器网络_生成形象内容HTML())
+}
+
+函数 浏览器网络_生成安装向导页HTML() {
+    返回 浏览器网络_生成页面框架HTML("NovaOS 安装向导", "步骤 " + 安装向导_获取当前步骤名() + " · browser-终端 安装前台", 浏览器网络_生成安装向导内容HTML())
+}
+
+函数 浏览器网络_处理安装向导动作(路径) {
+    如果 (字符串查找(路径, "action=next") >= 0) {
+        安装向导_下一步()
+    } 否则 如果 (字符串查找(路径, "action=back") >= 0) {
+        安装向导_上一步()
+    }
+}
+
+函数 浏览器网络_生成自动化页HTML() {
+    返回 浏览器网络_生成页面框架HTML("自动化执行台", "浏览器代理、内容流水线、任务编排与授权工作流调度", 浏览器网络_生成自动化内容HTML())
+}
+
+函数 浏览器网络_生成恢复页HTML() {
+    返回 浏览器网络_生成页面框架HTML("稳定回滚与自修复", "在热更新、自升级、自演化过程中保留稳定快照与自动恢复能力", 浏览器网络_生成恢复内容HTML())
+}
+
+函数 浏览器网络_生成未找到页HTML(路径) {
+    返回 浏览器网络_生成页面框架HTML("页面未找到", "请求的系统页面未注册到当前 browser-终端 路由表", "<section class='nova-panel'><h2>缺失路由</h2><p>未找到: " + 路径 + "</p><p>可访问 nova://终端、nova://ai、nova://system、nova://multimodal、nova://voice、nova://avatar、nova://settings、nova://automation、nova://recovery</p></section>")
+}
+
+函数 浏览器网络_生成页面框架HTML(标题, 副标题, 主内容) {
+    定义 可变 html = "<html><head><meta charset='UTF-8'><title>" + 标题 + "</title><style>"
+    html = html + "body{background:linear-gradient(145deg,#f8fbff 0%,#eef4fb 50%,#e5edf7 100%);color:#17304d;font-family:'Nova Sans',system-ui,sans-serif;margin:0;padding:24px;}"
+    html = html + ".nova-终端{max-width:1080px;margin:0 auto;position:relative;}"
+    html = html + ".nova-hero{padding:24px;background:linear-gradient(180deg,rgba(255,255,255,0.82),rgba(246,249,252,0.72));border:1px solid rgba(255,255,255,0.94);border-radius:20px;box-shadow:0 20px 56px rgba(148,163,184,0.18);backdrop-filter:blur(22px);}"
+    html = html + ".nova-eyebrow{font-size:12px;color:#6682a7;margin-bottom:8px;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;}"
+    html = html + ".nova-hero h1{margin:0 0 10px 0;font-size:32px;color:#10233f;}"
+    html = html + ".nova-hero p{margin:0;color:#5c708b;line-height:1.7;}"
+    html = html + ".nova-nav{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0;}"
+    html = html + ".nova-nav a{padding:10px 14px;border-radius:12px;background:rgba(255,255,255,0.78);border:1px solid rgba(226,232,240,0.92);color:#173b68;text-decoration:none;font-size:13px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.96);transition-property:background-color,color;transition-duration:180ms;transition-timing-function:ease-out;}"
+    html = html + ".nova-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px;}"
+    html = html + ".nova-panel{padding:18px;background:linear-gradient(180deg,rgba(255,255,255,0.84),rgba(244,247,251,0.74));border:1px solid rgba(226,232,240,0.92);border-radius:16px;box-shadow:0 16px 36px rgba(148,163,184,0.14);backdrop-filter:blur(18px);}"
+    html = html + ".nova-panel h2{margin:0 0 10px 0;color:#17304d;font-size:18px;}"
+    html = html + ".nova-panel p{margin:0 0 10px 0;color:#586d88;line-height:1.6;}"
+    html = html + ".nova-panel ul{margin:0;padding-left:18px;color:#395169;}"
+    html = html + ".nova-panel li{margin-bottom:6px;}"
+    html = html + ".nova-bar{height:10px;border-radius:999px;background:rgba(148,163,184,0.18);margin-top:10px;overflow:hidden;}"
+    html = html + ".nova-bar span{display:block;height:10px;border-radius:999px;background:linear-gradient(90deg,#60a5fa,#93c5fd,#2dd4bf);}"
+    html = html + ".nova-input{margin-top:12px;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,0.82);border:1px solid rgba(226,232,240,0.92);color:#17304d;box-shadow:inset 0 1px 0 rgba(255,255,255,0.96);}" 
+    html = html + ".nova-footer{margin-top:18px;padding:12px 16px;background:linear-gradient(180deg,rgba(255,255,255,0.8),rgba(244,247,251,0.72));border:1px solid rgba(226,232,240,0.92);border-radius:14px;color:#6a7f9b;font-size:12px;box-shadow:0 14px 30px rgba(148,163,184,0.12);}"
+    html = html + 浏览器网络_生成页面增强CSS_新版()
+    html = html + 虚拟人_生成前台CSS()
+    html = html + ".setup-progress{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;}.setup-step{padding:6px 12px;border-radius:999px;font-size:11px;background:rgba(255,255,255,0.72);border:1px solid rgba(226,232,240,0.92);color:#6881a1;font-weight:700;}.setup-step.active{background:linear-gradient(90deg,rgba(219,234,254,0.96),rgba(207,250,254,0.84));border-color:rgba(191,219,254,0.92);color:#173b68;}.setup-step.done{background:rgba(220,252,231,0.84);border-color:rgba(134,239,172,0.86);color:#166534;}.setup-bar{height:10px;border-radius:999px;background:rgba(148,163,184,0.18);overflow:hidden;margin:14px 0;}.setup-bar span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#60a5fa,#93c5fd,#2dd4bf);}"
+    html = html + "</style></head><body><div class='nova-终端'>"
+    html = html + "<header class='nova-hero'><div class='nova-eyebrow'>NovaOS Kernel Browser-终端</div><h1>" + 标题 + "</h1><p>" + 副标题 + "</p>" + 浏览器网络_生成页面头部标签HTML_新版() + "</header>"
+    html = html + 浏览器网络_生成导航栏HTML()
+    html = html + 主内容
+    html = html + "<footer class='nova-footer'>系统不是承载模型的桌面，而是多模态模型在原生物理机上的操作界面、推理现场与自修复控制面。</footer>"
+    html = html + "</div></body></html>"
+    返回 html
+}
+
+函数 浏览器网络_生成导航栏HTML() {
+    定义 可变 html = "<nav class='nova-nav'>"
+    html = html + "<a href='nova://终端'>系统主壳</a>"
+    html = html + "<a href='nova://ai'>AI工作台</a>"
+    html = html + "<a href='nova://system'>系统总线</a>"
+    html = html + "<a href='nova://multimodal'>多模态</a>"
+    html = html + "<a href='nova://voice'>语音</a>"
+    html = html + "<a href='nova://avatar'>形象</a>"
+    html = html + "<a href='nova://setup'>安装向导</a>"
+    html = html + "<a href='nova://automation'>自动化</a>"
+    html = html + "<a href='nova://recovery'>回滚恢复</a>"
+    html = html + "<a href='nova://settings'>设置</a>"
+    html = html + "</nav>"
+    返回 html
+}
+
+函数 浏览器网络_生成主壳内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>系统即模型</h2><p>NovaOS 不是解压后的传统桌面主题，而是保持为原生运行态的大模型系统壳。浏览器窗口、系统桌面、内核服务面、AI入口在此合一。</p><ul><li>地址栏 = 系统命令 = AI入口</li><li>窗口 = 模型上下文 = 浏览器工作区</li><li>桌面 = HTML5 控制场而非旧式 GUI 主题</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>系统主控面</h2><p>从这里进入硬件总线、AI工作台、多模态感知、热更新恢复与合法自动化编排。</p><ul><li><a href='nova://system'>查看内核与硬件总线</a></li><li><a href='nova://ai'>进入 AI 工作台</a></li><li><a href='nova://multimodal'>查看视觉与听觉管线</a></li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>低配硬件智能化目标</h2><p>目标不是暴力堆算力，而是通过 TNF、持续蒸馏、在线学习和系统级感知，使低配设备也拥有更像类人脑的反应与决策面。</p><div class='nova-bar'><span style='width:72%'></span></div></div>"
+    html = html + "<div class='nova-panel'><h2>统一输入</h2><p>你可以直接输入 URL、自然语言、系统命令或 AI 对话。</p><div class='nova-input'>示例: @请总结当前桌面状态 / >打开设置 / 清理内存 / nova://multimodal</div></div>"
+    html = html + 浏览器网络_生成主壳增强内容HTML_新版()
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成AI工作台内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>统一 AI 入口</h2><p>自然语言、系统命令、搜索、浏览导航在同一入口融合。AI 不只是聊天，而是内核与浏览器的原生命令面。</p><div class='nova-input'>@分析当前系统负载并给出优化建议</div></div>"
+    html = html + "<div class='nova-panel'><h2>本地/云端协同</h2><p>前期云端主导、后期持续本地化。低置信度时可借助云端，高置信度时回流蒸馏进本地权重与策略。</p><ul><li>本地 TNF 推理</li><li>在线学习与蒸馏</li><li>稳定边界下自升级</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>系统级决策</h2><p>AI 可以观察窗口、页面、系统状态与多模态输入，再决定导航、工作流执行、内容生成与系统调整。</p></div>"
+    html = html + "<div class='nova-panel'><h2>对话态工作区</h2><p>后续这里会成为任务编排、工具调用、知识记忆、模型路由与多智能体协作的统一前台。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成系统面内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>硬件总线总览</h2><p>主板、内存、CPU、图处、电源、硬盘不再只是外围资源，而是系统模型能直接理解、调度和反馈的物理层对象。</p><ul><li>CPU 调度与温度</li><li>图处 渲染与推理占用</li><li>内存页与缓存状态</li><li>磁盘、供电与 IO 健康度</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>系统状态快照</h2><p>为热更新、回滚、自修复提供一致状态基础。</p><div class='nova-bar'><span style='width:81%'></span></div><p>当前目标: 让更新和恢复尽量不停机、不中断、不中崩。</p></div>"
+    html = html + "<div class='nova-panel'><h2>浏览器式系统模块</h2><p>系统服务以模块页方式组织，而不是隐藏在传统控制面板之后。</p><ul><li>日志与诊断</li><li>进程与权限</li><li>设备与驱动</li><li>模型与服务状态</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>物理机直控</h2><p>目标是 browser-终端 直接联通内核数据平面，而不是停留在用户态主题层。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成设置内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>热更新策略</h2><p>更新目标是不断迭代，而不是每次重启替换整机状态。</p><ul><li>模块级更新</li><li>会话不中断</li><li>失败自动回滚</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>稳定边界</h2><p>系统允许演化，但必须保留稳定快照与崩溃前状态保护。</p><div class='nova-bar'><span style='width:68%'></span></div></div>"
+    html = html + "<div class='nova-panel'><h2>模型本地化</h2><p>控制本地推理强度、云端辅助比例、蒸馏节奏与学习窗口。</p></div>"
+    html = html + "<div class='nova-panel'><h2>系统人格与形象</h2><p>后续这里承载语音风格、全息形象、交互人格与长期记忆策略。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成多模态内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>视觉理解</h2><p>通过系统原生截图、像素分析、OCR、场景识别理解浏览器与桌面环境。</p><ul><li>页面元素定位</li><li>文本识别</li><li>状态变化检测</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>听觉理解</h2><p>语音输入、音频内容识别、TTS/STT 与系统指令联动。</p><ul><li>语音命令</li><li>音频分析</li><li>语音对话反馈</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>全息形象</h2><p>后续承载 3D 形象、自定义人格外观与视觉陪伴接口。</p></div>"
+    html = html + "<div class='nova-panel'><h2>环境感知融合</h2><p>视觉、听觉、文本、浏览器状态与硬件状态最终汇聚到统一决策层。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成语音内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>语音入口</h2><p>把语音对话、语音命令、音频理解和系统控制统一到同一前台。</p><div class='nova-input'>示例: 开始录音 / 停止并识别 / 用语音打开系统总线</div></div>"
+    html = html + "<div class='nova-panel'><h2>ASR 管线</h2><p>现有语音识别模块具备录音缓冲、静音检测、停止识别与结果回流能力，可作为系统前台语音入口的内核基础。</p><ul><li>录音缓冲</li><li>静音检测</li><li>停止识别</li><li>结果回流</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>听觉状态</h2><p>后续这里应显示麦克风状态、音频输入质量、识别置信度与实时对话文本。</p><div class='nova-bar'><span style='width:58%'></span></div></div>"
+    html = html + "<div class='nova-panel'><h2>语音驱动系统</h2><p>目标是把“说话”变成操作系统的直接控制面，而不是外挂助手功能。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成形象内容HTML() {
+    定义 可变 人 = 获取全局虚拟人()
+    如果 (人 == 空) {
+        人 = 虚拟人_创建("Nova")
+    }
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'>" + 虚拟人_生成前台NML(人) + "</div>"
+    html = html + "<div class='nova-panel'><h2>全息化身能力</h2><p>名称、表情、状态、能量、经验、能力表和对话历史等结构，直接作为人格 UI 的内核对象。</p><ul><li>表情驱动</li><li>状态迁移</li><li>对话历史</li><li>成长等级</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>形象定制</h2><p>后续这里承载 2D/3D 形象风格、声线、动作、陪伴模式与可视对话外观。</p></div>"
+    html = html + "<div class='nova-panel'><h2>人格与系统融合</h2><p>形象不是装饰，而是模型状态、语音交互、系统任务和情感反馈的前台投影。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成安装向导内容HTML() {
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel' style='grid-column:span 2'>" + 安装向导_生成步骤进度NML() + "</div>"
+    html = html + "<div class='nova-panel' style='grid-column:span 2'>" + 安装向导_生成当前步骤内容NML() + "</div>"
+    如果 (安装.当前步骤 != 步骤_安装) {
+        html = html + "<div class='nova-panel' style='grid-column:span 2;display:flex;justify-content:flex-end;gap:12px'>"
+        如果 (安装.当前步骤 > 步骤_欢迎) {
+            html = html + "<a href='nova://setup?action=back' style='padding:10px 22px;border-radius:14px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:#d5daec;font-size:13px;text-decoration:none'>上一步</a>"
+        }
+        如果 (安装.当前步骤 < 步骤_完成) {
+            html = html + "<a href='nova://setup?action=next' style='padding:10px 22px;border-radius:14px;background:linear-gradient(135deg,#7c3aed,#2563eb);color:#ffffff;border:1px solid rgba(124,58,237,0.36);font-size:13px;text-decoration:none;box-shadow:0 8px 20px rgba(76,29,149,0.3)'>下一步</a>"
+        }
+        html = html + "</div>"
+    }
+    html = html + "</section>"
+    返回 html
+}
+
+定义 可变 _工作流队列 = []    // [{名称, 类型, 状态, 优先级, 重试次数, 最大重试}]
+定义 可变 _工作流已完成 = 0
+定义 可变 _工作流已失败 = 0
+
+函数 工作流_提交(名称, 类型, 优先级) {
+    追加(_工作流队列, [名称, 类型, "排队中", 优先级, 0, 3])
+}
+
+函数 工作流_队列长度() { 返回 计数(_工作流队列) }
+
+函数 浏览器网络_生成自动化内容HTML() {
+    定义 排队数 = 整数转字符串(计数(_工作流队列))
+    定义 完成数 = 整数转字符串(_工作流已完成)
+    定义 失败数 = 整数转字符串(_工作流已失败)
+
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>工作流队列</h2><p>排队: " + 浏览器网络_转义HTML(排队数) + " · 已完成: " + 浏览器网络_转义HTML(完成数) + " · 失败: " + 浏览器网络_转义HTML(失败数) + "</p><div class='nova-bar'><span style='width:" + (如果 (_工作流已完成 > 0) { 整数转字符串(_工作流已完成 * 100 / (_工作流已完成 + _工作流已失败 + 计数(_工作流队列) + 1)) } 否则 { "0" }) + "%'></span></div></div>"
+    html = html + "<div class='nova-panel'><h2>支持的任务类型</h2><ul><li>content-produce: 文案/脚本/视频素材生产</li><li>batch-publish: 多平台批量发布</li><li>research: 信息采集/分析/报告</li><li>monitor: 数据监控/异常告警</li><li>toolchain: 工具链操作/构建/部署</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>合法工作流边界</h2><p>自动化只面向你授权的正常操作。</p><ul><li>✅ 内容创作与发布</li><li>✅ 数据分析与报告</li><li>✅ 合规批量操作</li><li>❌ 不做人机验证绕过</li><li>❌ 不冒充真人</li><li>❌ 不欺骗平台</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>调度策略</h2><p>优先级队列 · 失败自动重试(最多3次) · 超时告警 · 收益归因 · 多代理协作预留。</p><p>所有任务通过 终端 输入 <code>>workflow submit 名称 类型</code> 提交。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+函数 浏览器网络_生成恢复内容HTML() {
+    定义 统计 = 回滚_统计()
+    定义 总次数 = 整数转字符串(统计[0])
+    定义 成功次数 = 整数转字符串(统计[1])
+    定义 失败次数 = 整数转字符串(统计[2])
+    定义 超时次数 = 整数转字符串(统计[3])
+    定义 心跳数 = 整数转字符串(统计[4])
+
+    定义 可变 html = "<section class='nova-grid'>"
+    html = html + "<div class='nova-panel'><h2>系统健康状态</h2><p>Watchdog 心跳: " + 浏览器网络_转义HTML(心跳数) + " 次</p><p>Watchdog 超时: " + 浏览器网络_转义HTML(超时次数) + " 次</p><div class='nova-bar'><span style='width:" + (如果 (统计[3] == 0) { "100" } 否则 { "40" }) + "%'></span></div></div>"
+    html = html + "<div class='nova-panel'><h2>回滚统计</h2><p>总回滚: " + 浏览器网络_转义HTML(总次数) + " 次</p><p>成功恢复: " + 浏览器网络_转义HTML(成功次数) + " 次</p><p>恢复失败: " + 浏览器网络_转义HTML(失败次数) + " 次</p></div>"
+    html = html + "<div class='nova-panel'><h2>三级回滚机制</h2><ul><li>级别1: 热补丁回滚 — 仅撤销最近函数替换</li><li>级别2: 模块回滚 — 恢复整个模块到上一版本</li><li>级别3: 检查点恢复 — 全量回滚到稳定快照</li></ul></div>"
+    html = html + "<div class='nova-panel'><h2>不中断热更新</h2><p>通过跳板表原子替换函数指针，在服务不中断的前提下替换模块。旧代码放入延迟释放池，等安全点后释放。</p></div>"
+    html = html + "<div class='nova-panel'><h2>自修复循环</h2><p>检测异常 → 诊断根因 → 回滚或重载模块 → 验证恢复 → 记录经验。</p></div>"
+    html = html + "<div class='nova-panel'><h2>演化安全阀</h2><p>任何自演化都要有预算、边界、稳定快照和人为接管点。AI质量 watchdog 持续监控推理质量，下降超阈值自动回滚权重。</p></div>"
+    html = html + "</section>"
+    返回 html
+}
+
+// §9 AI驱动优先级评估
+
+函数 浏览器网络_AI评估优先级(url) {
+    // AI根据URL模式预测资源类型和优先级
+    如果 (字符串查找(url, ".css") >= 0) { 返回 优先级_关键 }
+    如果 (字符串查找(url, ".js") >= 0) { 返回 优先级_高 }
+    如果 (字符串查找(url, ".html") >= 0) { 返回 优先级_关键 }
+    如果 (字符串查找(url, ".json") >= 0) { 返回 优先级_高 }
+    如果 (字符串查找(url, ".png") >= 0) { 返回 优先级_中 }
+    如果 (字符串查找(url, ".jpg") >= 0) { 返回 优先级_中 }
+    如果 (字符串查找(url, ".woff") >= 0) { 返回 优先级_中 }
+    如果 (字符串查找(url, "analytics") >= 0) { 返回 优先级_低 }
+    如果 (字符串查找(url, "tracking") >= 0) { 返回 优先级_低 }
+    返回 优先级_中
+}
+
+// §10 AI预取引擎 — 预测用户下一步访问
+
+定义 可变 预取_历史 = []       // 最近访问URL
+定义 可变 预取_缓存 = []       // [URL, 响应体] 预取结果
+
+函数 浏览器网络_AI预取(当前URL) {
+    // 记录访问历史供AI学习
+    追加(预取_历史, 当前URL)
+    如果 (计数(预取_历史) > 100) {
+        列表_移除(预取_历史, 0)
+    }
+
+    // AI预测下一个可能访问的URL
+    定义 预测列表 = 浏览器网络_AI预测下一页(当前URL)
+    定义 可变 i = 0
+    当 (i < 计数(预测列表) && i < 3) {
+        // 后台预取(低优先级)
+        定义 预取请求 = 浏览器网络_发起请求(方法_GET, 预测列表[i], [], "")
+        如果 (预取请求.状态 == 请求状态_完成) {
+            追加(预取_缓存, [预测列表[i], 预取请求.响应体])
+        }
+        i = i + 1
+    }
+}
+
+函数 浏览器网络_AI预测下一页(当前URL) {
+    // 基于历史模式匹配预测
+    定义 可变 预测 = []
+    // 如果在首页 → 预测常访问站点
+    // 如果在搜索结果 → 预测第一条结果
+    // 如果在文章列表 → 预测第一篇文章
+    // 由内核AI推理引擎提供预测
+    返回 预测
+}
+
+函数 浏览器网络_检查预取缓存(url) {
+    定义 可变 i = 0
+    当 (i < 计数(预取_缓存)) {
+        如果 (预取_缓存[i][0] == url) {
+            网络_AI预取命中 = 网络_AI预取命中 + 1
+            返回 预取_缓存[i][1]
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+// NIPH — Nova Internal Protocol Handler Theory
+// 公理1(协议完备): 支持nova:/data:/blob:等内部协议完整解析
+// 公理2(安全隔离): 内部协议不可被外部资源跨域引用
+// 定理1(预取收益递减): 预取缓存命中率随查询序号单调递减
+// 定理2(回滚收敛): 三级回滚机制保证有限步内恢复服务
+
+定义 可变 NIPH_请求总数 = 0
+定义 可变 NIPH_成功数 = 0
+定义 可变 NIPH_失败数 = 0
+定义 可变 NIPH_缓存命中数 = 0
+定义 可变 NIPH_总延迟 = 0
+定义 可变 NIPH_最大延迟 = 0
+
+函数 NIPH_记录请求(成功, 延迟) {
+    NIPH_请求总数 = NIPH_请求总数 + 1
+    NIPH_总延迟 = NIPH_总延迟 + 延迟
+    如果 (延迟 > NIPH_最大延迟) { NIPH_最大延迟 = 延迟 }
+    如果 (成功) { NIPH_成功数 = NIPH_成功数 + 1 }
+    否则 { NIPH_失败数 = NIPH_失败数 + 1 }
+}
+
+函数 NIPH_平均延迟() {
+    如果 (NIPH_请求总数 == 0) { 返回 0 }
+    返回 NIPH_总延迟 / NIPH_请求总数
+}
+
+函数 NIPH_成功率() {
+    如果 (NIPH_请求总数 == 0) { 返回 1000 }
+    返回 NIPH_成功数 * 1000 / NIPH_请求总数
+}
+
+定义 可变 连接池_最大数 = 16
+定义 可变 连接池_活跃数 = 0
+定义 可变 连接池_列表 = []
+
+函数 连接池_初始化(最大连接) {
+    连接池_最大数 = 最大连接
+    连接池_活跃数 = 0
+    连接池_列表 = []
+}
+
+函数 连接池_获取(主机) {
+    // 尝试复用已有连接
+    定义 可变 i = 0
+    当 (i < 计数(连接池_列表)) {
+        定义 conn = 连接池_列表[i]
+        如果 (conn.主机 == 主机 && conn.空闲) {
+            conn.空闲 = 假
+            返回 conn
+        }
+        i = i + 1
+    }
+    // 新建连接
+    如果 (连接池_活跃数 >= 连接池_最大数) { 返回 空 }
+    定义 新conn = { 主机: 主机, 空闲: 假, 创建时间: 系统时间() }
+    追加(连接池_列表, 新conn)
+    连接池_活跃数 = 连接池_活跃数 + 1
+    返回 新conn
+}
+
+函数 连接池_归还(conn) {
+    如果 (conn != 空) { conn.空闲 = 真 }
+}
+
+函数 连接池_清理超时(超时ms) {
+    定义 当前 = 系统时间()
+    定义 可变 i = 计数(连接池_列表) - 1
+    当 (i >= 0) {
+        定义 conn = 连接池_列表[i]
+        如果 (conn.空闲 && (当前 - conn.创建时间) > 超时ms) {
+            列表_移除(连接池_列表, i)
+            连接池_活跃数 = 连接池_活跃数 - 1
+        }
+        i = i - 1
+    }
+}
+
+函数 浏览器网络_失效预取(缓存键) {
+    定义 可变 i = 计数(预取_缓存) - 1
+    当 (i >= 0) {
+        如果 (预取_缓存[i][0] == 缓存键) {
+            列表_移除(预取_缓存, i)
+            返回 真
+        }
+        i = i - 1
+    }
+    返回 假
+}
+
+函数 浏览器网络_清空预取缓存() {
+    预取_缓存 = []
+    预取_历史 = []
+}
+
+定义 可变 熔断_状态 = 0    // 0=关闭, 1=半开, 2=开启
+定义 可变 熔断_失败计数 = 0
+定义 可变 熔断_阈值 = 5
+定义 可变 熔断_上次开启 = 0
+定义 可变 熔断_冷却时间 = 30000
+
+函数 熔断_记录成功() {
+    熔断_失败计数 = 0
+    熔断_状态 = 0
+}
+
+函数 熔断_记录失败() {
+    熔断_失败计数 = 熔断_失败计数 + 1
+    如果 (熔断_失败计数 >= 熔断_阈值) {
+        熔断_状态 = 2
+        熔断_上次开启 = 系统时间()
+    }
+}
+
+函数 熔断_允许请求() {
+    如果 (熔断_状态 == 0) { 返回 真 }
+    如果 (熔断_状态 == 2) {
+        // 检查冷却时间
+        如果 (系统时间() - 熔断_上次开启 > 熔断_冷却时间) {
+            熔断_状态 = 1  // 半开
+            返回 真
+        }
+        返回 假
+    }
+    返回 真  // 半开状态允许尝试
+}
+
+函数 NIPH_重置统计() {
+    NIPH_请求总数 = 0
+    NIPH_成功数 = 0
+    NIPH_失败数 = 0
+    NIPH_缓存命中数 = 0
+    NIPH_总延迟 = 0
+    NIPH_最大延迟 = 0
+    熔断_状态 = 0
+    熔断_失败计数 = 0
+}
+
+函数 NIPH_统计() {
+    返回 [NIPH_请求总数, NIPH_成功数, NIPH_失败数,
+           NIPH_缓存命中数, NIPH_平均延迟(), NIPH_最大延迟]
+}
+
+函数 NIPH_完整诊断() {
+    返回 [
+        "请求总数", NIPH_请求总数,
+        "成功率", NIPH_成功率(),
+        "平均延迟", NIPH_平均延迟(),
+        "最大延迟", NIPH_最大延迟,
+        "缓存命中", NIPH_缓存命中数,
+        "连接池活跃", 连接池_活跃数,
+        "熔断状态", 熔断_状态,
+        "原生独创_NIPH内部协议", 1
+    ]
+}

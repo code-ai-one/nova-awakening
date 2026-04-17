@@ -1,0 +1,159 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/创建甲.nova")
+导入("./感知乙乙.nova")
+
+// §4 DocumentTimeline
+
+结构 DocumentTimeline {
+    原点时间,    // u64 创建时间(performance.timeOrigin)
+    当前时间,    // u64 performance.now()相对值
+    // 关联的动画列表
+    动画,    // u64 Animation*链表
+    动画数,
+}
+
+定义 可变 全局Timeline = 0
+
+函数 Timeline_获取() {
+    如果 (全局Timeline == 0) {
+        全局Timeline = 堆_分配(DocumentTimeline)
+        全局Timeline.原点时间 = 平台_获取高精度时间()
+        全局Timeline.当前时间 = 0
+        全局Timeline.动画 = 0; 全局Timeline.动画数 = 0
+    }
+    返回 全局Timeline
+}
+
+函数 Timeline_currentTime() {
+    定义 tl = Timeline_获取()
+    tl.当前时间 = 平台_获取高精度时间() - tl.原点时间
+    返回 tl.当前时间
+}
+
+// §5 Animation对象
+
+结构 Animation {
+    id,    // u64 动画ID字符串
+    effect,    // u64 KeyframeEffect*
+    timeline,    // u64 DocumentTimeline*
+    // 时间
+    staNova往返时间ime,    // i64 timeline时间(毫秒, -1=unresolved)
+    currentTime,    // i64 本地时间(毫秒, -1=unresolved)
+    holdTime,    // i64 暂停时保存的时间
+    // 播放控制
+    playbackRate,    // i32 Q10 (1024=1.0x)
+    playState,    // u8 ANIM_xxx
+    pending,
+    // 替换状态
+    replaceState,    // u8 0=active 1=removed 2=persisted
+    // 事件
+    onfinish,
+    oncancel,
+    onremove,
+    // 链表
+    下一个,    // u64 Animation*
+}
+
+函数 Animation_创建(effect, timeline) {
+    定义 anim = 堆_分配(Animation)
+    anim.id = 0; anim.effect = effect
+    anim.timeline = 如果(timeline != 0, timeline, Timeline_获取())
+    anim.staNova往返时间ime = -1; anim.currentTime = -1; anim.holdTime = -1
+    anim.playbackRate = 1024; anim.playState = ANIM_IDLE
+    anim.pending = 假; anim.replaceState = 0
+    anim.onfinish = 0; anim.oncancel = 0; anim.onremove = 0
+    anim.下一个 = 0
+    // 添加到timeline
+    定义 tl = anim.timeline
+    如果 (tl != 0) {
+        anim.下一个 = tl.动画; tl.动画 = anim; tl.动画数 = tl.动画数 + 1
+    }
+    返回 anim
+}
+
+// animation.play()
+函数 Animation_play(anim) {
+    如果 (anim == 0) { 返回 }
+    如果 (anim.playState == ANIM_FINISHED && anim.playbackRate >= 0) {
+        anim.currentTime = 0    // 重新开始
+    }
+    anim.playState = ANIM_RUNNING; anim.pending = 假
+    anim.staNova往返时间ime = Timeline_currentTime() - anim.currentTime * 1024 / anim.playbackRate
+    anim.holdTime = -1
+}
+
+// animation.pause()
+函数 Animation_pause(anim) {
+    如果 (anim == 0 || anim.playState == ANIM_PAUSED) { 返回 }
+    anim.holdTime = anim.currentTime
+    anim.playState = ANIM_PAUSED; anim.staNova往返时间ime = -1
+}
+
+// animation.cancel()
+函数 Animation_cancel(anim) {
+    如果 (anim == 0) { 返回 }
+    anim.playState = ANIM_IDLE; anim.currentTime = -1; anim.staNova往返时间ime = -1
+    // 移除动画效果(恢复基础样式)
+    如果 (anim.oncancel != 0) { /* 触发cancel事件 */ }
+}
+
+// animation.finish()
+函数 Animation_finish(anim) {
+    如果 (anim == 0) { 返回 }
+    如果 (anim.effect != 0) {
+        定义 kfe = anim.effect
+        如果 (anim.playbackRate >= 0) {
+            anim.currentTime = kfe.delay + kfe.duration * kfe.iterations / 1024 + kfe.endDelay
+        } 否则 {
+            anim.currentTime = 0
+        }
+    }
+    anim.playState = ANIM_FINISHED
+    如果 (anim.onfinish != 0) { /* 触发finish事件 */ }
+}
+
+// animation.reverse()
+函数 Animation_reverse(anim) {
+    如果 (anim == 0) { 返回 }
+    anim.playbackRate = -anim.playbackRate
+    Animation_play(anim)
+}
+
+// animation.updatePlaybackRate(rate)
+函数 Animation_updatePlaybackRate(anim, rate) {
+    如果 (anim == 0) { 返回 }
+    定义 之前时间 = anim.currentTime
+    anim.playbackRate = rate
+    如果 (anim.playState == ANIM_RUNNING) {
+        anim.staNova往返时间ime = Timeline_currentTime() - 之前时间 * 1024 / rate
+    }
+}
+
+// 每帧更新(由rAF驱动)
+函数 Animation_tick(anim, timelineTime) {
+    如果 (anim == 0 || anim.playState != ANIM_RUNNING) { 返回 }
+
+    // 计算currentTime
+    如果 (anim.staNova往返时间ime >= 0) {
+        anim.currentTime = (timelineTime - anim.staNova往返时间ime) * anim.playbackRate / 1024
+    }
+
+    // 应用效果
+    如果 (anim.effect != 0) {
+        KeyframeEffect_计算(anim.effect, anim.currentTime)
+    }
+
+    // 检查是否完成
+    如果 (anim.effect != 0) {
+        定义 kfe = anim.effect
+        定义 endTime = kfe.delay + kfe.duration * kfe.iterations / 1024 + kfe.endDelay
+        如果 (anim.playbackRate >= 0 && anim.currentTime >= endTime) {
+            anim.playState = ANIM_FINISHED
+            如果 (anim.onfinish != 0) { /* 触发 */ }
+        } 否则 如果 (anim.playbackRate < 0 && anim.currentTime <= 0) {
+            anim.playState = ANIM_FINISHED
+            如果 (anim.onfinish != 0) { /* 触发 */ }
+        }
+    }
+}

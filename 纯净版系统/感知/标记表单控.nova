@@ -1,0 +1,105 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/字符串替换.nova")
+
+// §2 HTMLTextArea元素
+
+结构 HTMLTextArea元素 {
+    节点,
+    name,
+    值,    // u64 当前文本
+    defaultValue,    // u64 初始文本
+    placeholder,
+    // 属性
+    rows,    // u32 可见行数(默认2)
+    cols,    // u32 可见列数(默认20)
+    maxlength,    // i32 -1=无限
+    minlength,    // i32 -1=无限
+    required,
+    disabled,
+    readonly,
+    autofocus,
+    wrap,    // u8 0=soft 1=hard 2=off
+    autocomplete,    // u8 0=on 1=off
+    spellcheck,
+    // 选区
+    selectionStart,
+    selectionEnd,
+    selectionDirection,    // u8 0=forward 1=backward 2=none
+    // 脏标志
+    值已修改,
+    // 关联表单
+    form,
+    // 事件
+    oninput,
+    onchange,
+    onselect,
+}
+
+函数 TextArea_创建() {
+    定义 ta = 堆_分配(HTMLTextArea元素)
+    ta.节点 = 0; ta.name = 0; ta.值 = ""; ta.defaultValue = ""
+    ta.placeholder = 0; ta.rows = 2; ta.cols = 20
+    ta.maxlength = -1; ta.minlength = -1
+    ta.required = 假; ta.disabled = 假; ta.readonly = 假
+    ta.autofocus = 假; ta.wrap = 0; ta.autocomplete = 0; ta.spellcheck = 真
+    ta.selectionStart = 0; ta.selectionEnd = 0; ta.selectionDirection = 2
+    ta.值已修改 = 假; ta.form = 0
+    返回 ta
+}
+
+函数 TextArea_setValue(ta, 值) {
+    如果 (ta == 0) { 返回 }
+    如果 (ta.maxlength >= 0 && 字节长度(值) > ta.maxlength) {
+        ta.值 = 字符串_子串(值, 0, ta.maxlength)
+    } 否则 {
+        ta.值 = 字符串_复制(值)
+    }
+    ta.值已修改 = 真
+}
+
+函数 TextArea_setSelectionRange(ta, start, end, direction) {
+    如果 (ta == 0) { 返回 }
+    定义 len = 字节长度(ta.值)
+    如果 (start > len) { start = len }
+    如果 (end > len) { end = len }
+    如果 (start > end) { start = end }
+    ta.selectionStart = start; ta.selectionEnd = end
+    ta.selectionDirection = direction
+}
+
+函数 TextArea_select(ta) {
+    如果 (ta == 0) { 返回 }
+    TextArea_setSelectionRange(ta, 0, 字节长度(ta.值), 0)
+}
+
+// §3 HTMLDataList元素
+
+结构 HTMLDataList元素 {
+    节点,
+    id,
+    选项头,    // u64 HTMLOption元素*
+    选项数,
+}
+
+函数 DataList_创建(id) {
+    定义 dl = 堆_分配(HTMLDataList元素)
+    dl.节点 = 0; dl.id = id; dl.选项头 = 0; dl.选项数 = 0
+    返回 dl
+}
+
+函数 DataList_匹配(dl, 输入值, 结果, 最大数) {
+    如果 (dl == 0 || 输入值 == 0 || 结果 == 0) { 返回 0 }
+    定义 可变 count = 0
+    定义 可变 opt = dl.选项头
+    当 (opt != 0 && count < 最大数) {
+        如果 (opt.值 != 0 && 字符串_包含(opt.值, 输入值)) {
+            内存_写64(结果 + count * 8, opt)
+            count = count + 1
+        }
+        opt = opt.下一个
+    }
+    返回 count
+}

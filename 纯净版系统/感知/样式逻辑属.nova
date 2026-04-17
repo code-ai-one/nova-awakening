@@ -1,0 +1,135 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §4 CSS Logical Properties — 逻辑属性映射
+// 根据writing-mode和direction映射到物理属性
+
+// writing-mode
+
+定义 WM_HORIZONTAL_TB = 0    // 水平(默认)
+定义 WM_VERTICAL_RL   = 1    // 垂直(从右到左)
+定义 WM_VERTICAL_LR   = 2    // 垂直(从左到右)
+
+// direction
+定义 DIR_LTR = 0
+定义 DIR_RTL = 1
+
+// 逻辑属性ID
+定义 LP_MARGIN_INLINE_START  = 1
+定义 LP_MARGIN_INLINE_END    = 2
+定义 LP_MARGIN_BLOCK_START   = 3
+定义 LP_MARGIN_BLOCK_END     = 4
+定义 LP_PADDING_INLINE_START = 5
+定义 LP_PADDING_INLINE_END   = 6
+定义 LP_PADDING_BLOCK_START  = 7
+定义 LP_PADDING_BLOCK_END    = 8
+定义 LP_BORDER_INLINE_START  = 9
+定义 LP_BORDER_INLINE_END    = 10
+定义 LP_BORDER_BLOCK_START   = 11
+定义 LP_BORDER_BLOCK_END     = 12
+定义 LP_INLINE_SIZE           = 13   // width in horizontal-tb
+定义 LP_BLOCK_SIZE            = 14   // height in horizontal-tb
+定义 LP_MIN_INLINE_SIZE       = 15
+定义 LP_MIN_BLOCK_SIZE        = 16
+定义 LP_MAX_INLINE_SIZE       = 17
+定义 LP_MAX_BLOCK_SIZE        = 18
+定义 LP_INSET_INLINE_START    = 19   // left in ltr horizontal-tb
+定义 LP_INSET_INLINE_END      = 20   // right in ltr horizontal-tb
+定义 LP_INSET_BLOCK_START     = 21   // top in horizontal-tb
+定义 LP_INSET_BLOCK_END       = 22   // bottom in horizontal-tb
+
+// 物理属性ID
+定义 PP_TOP    = 0
+定义 PP_RIGHT  = 1
+定义 PP_BOTTOM = 2
+定义 PP_LEFT   = 3
+定义 PP_WIDTH  = 4
+定义 PP_HEIGHT = 5
+
+函数 LogicalProp_映射到物理(逻辑属性, writing_mode, direction) {
+    // 根据writing-mode和direction将逻辑属性映射到物理属性
+    定义 是水平 = (writing_mode == WM_HORIZONTAL_TB)
+    定义 是LTR = (direction == DIR_LTR)
+
+    如果 (逻辑属性 == LP_INLINE_SIZE) {
+        如果 (是水平) { 返回 PP_WIDTH }
+        返回 PP_HEIGHT
+    }
+    如果 (逻辑属性 == LP_BLOCK_SIZE) {
+        如果 (是水平) { 返回 PP_HEIGHT }
+        返回 PP_WIDTH
+    }
+
+    如果 (逻辑属性 == LP_MARGIN_INLINE_START || 逻辑属性 == LP_PADDING_INLINE_START || 逻辑属性 == LP_BORDER_INLINE_START || 逻辑属性 == LP_INSET_INLINE_START) {
+        如果 (是水平) { 返回 是LTR ? PP_LEFT : PP_RIGHT }
+        如果 (writing_mode == WM_VERTICAL_RL) { 返回 是LTR ? PP_TOP : PP_BOTTOM }
+        返回 是LTR ? PP_TOP : PP_BOTTOM
+    }
+    如果 (逻辑属性 == LP_MARGIN_INLINE_END || 逻辑属性 == LP_PADDING_INLINE_END || 逻辑属性 == LP_BORDER_INLINE_END || 逻辑属性 == LP_INSET_INLINE_END) {
+        如果 (是水平) { 返回 是LTR ? PP_RIGHT : PP_LEFT }
+        如果 (writing_mode == WM_VERTICAL_RL) { 返回 是LTR ? PP_BOTTOM : PP_TOP }
+        返回 是LTR ? PP_BOTTOM : PP_TOP
+    }
+    如果 (逻辑属性 == LP_MARGIN_BLOCK_START || 逻辑属性 == LP_PADDING_BLOCK_START || 逻辑属性 == LP_BORDER_BLOCK_START || 逻辑属性 == LP_INSET_BLOCK_START) {
+        如果 (是水平) { 返回 PP_TOP }
+        如果 (writing_mode == WM_VERTICAL_RL) { 返回 PP_RIGHT }
+        返回 PP_LEFT
+    }
+    如果 (逻辑属性 == LP_MARGIN_BLOCK_END || 逻辑属性 == LP_PADDING_BLOCK_END || 逻辑属性 == LP_BORDER_BLOCK_END || 逻辑属性 == LP_INSET_BLOCK_END) {
+        如果 (是水平) { 返回 PP_BOTTOM }
+        如果 (writing_mode == WM_VERTICAL_RL) { 返回 PP_LEFT }
+        返回 PP_RIGHT
+    }
+
+    返回 PP_LEFT    // fallback
+}
+
+函数 LogicalProp_解析名称(属性名) {
+    如果 (字符串_相等(属性名, "margin-inline-start")) { 返回 LP_MARGIN_INLINE_START }
+    如果 (字符串_相等(属性名, "margin-inline-end")) { 返回 LP_MARGIN_INLINE_END }
+    如果 (字符串_相等(属性名, "margin-block-start")) { 返回 LP_MARGIN_BLOCK_START }
+    如果 (字符串_相等(属性名, "margin-block-end")) { 返回 LP_MARGIN_BLOCK_END }
+    如果 (字符串_相等(属性名, "padding-inline-start")) { 返回 LP_PADDING_INLINE_START }
+    如果 (字符串_相等(属性名, "padding-inline-end")) { 返回 LP_PADDING_INLINE_END }
+    如果 (字符串_相等(属性名, "padding-block-start")) { 返回 LP_PADDING_BLOCK_START }
+    如果 (字符串_相等(属性名, "padding-block-end")) { 返回 LP_PADDING_BLOCK_END }
+    如果 (字符串_相等(属性名, "border-inline-start-width")) { 返回 LP_BORDER_INLINE_START }
+    如果 (字符串_相等(属性名, "border-inline-end-width")) { 返回 LP_BORDER_INLINE_END }
+    如果 (字符串_相等(属性名, "border-block-start-width")) { 返回 LP_BORDER_BLOCK_START }
+    如果 (字符串_相等(属性名, "border-block-end-width")) { 返回 LP_BORDER_BLOCK_END }
+    如果 (字符串_相等(属性名, "inline-size")) { 返回 LP_INLINE_SIZE }
+    如果 (字符串_相等(属性名, "block-size")) { 返回 LP_BLOCK_SIZE }
+    如果 (字符串_相等(属性名, "min-inline-size")) { 返回 LP_MIN_INLINE_SIZE }
+    如果 (字符串_相等(属性名, "min-block-size")) { 返回 LP_MIN_BLOCK_SIZE }
+    如果 (字符串_相等(属性名, "max-inline-size")) { 返回 LP_MAX_INLINE_SIZE }
+    如果 (字符串_相等(属性名, "max-block-size")) { 返回 LP_MAX_BLOCK_SIZE }
+    如果 (字符串_相等(属性名, "inset-inline-start")) { 返回 LP_INSET_INLINE_START }
+    如果 (字符串_相等(属性名, "inset-inline-end")) { 返回 LP_INSET_INLINE_END }
+    如果 (字符串_相等(属性名, "inset-block-start")) { 返回 LP_INSET_BLOCK_START }
+    如果 (字符串_相等(属性名, "inset-block-end")) { 返回 LP_INSET_BLOCK_END }
+    返回 0    // 非逻辑属性
+}
+
+// 速记属性展开
+函数 LogicalProp_展开_margin_inline(值_start, 值_end, wm, dir) {
+    定义 物理_start = LogicalProp_映射到物理(LP_MARGIN_INLINE_START, wm, dir)
+    定义 物理_end = LogicalProp_映射到物理(LP_MARGIN_INLINE_END, wm, dir)
+    返回 [物理_start, 值_start, 物理_end, 值_end]
+}
+
+函数 LogicalProp_展开_margin_block(值_start, 值_end, wm, dir) {
+    定义 物理_start = LogicalProp_映射到物理(LP_MARGIN_BLOCK_START, wm, dir)
+    定义 物理_end = LogicalProp_映射到物理(LP_MARGIN_BLOCK_END, wm, dir)
+    返回 [物理_start, 值_start, 物理_end, 值_end]
+}
+
+函数 LogicalProp_展开_inset(inline_start, inline_end, block_start, block_end, wm, dir) {
+    // inset: block-start inline-end block-end inline-start
+    返回 [
+        LogicalProp_映射到物理(LP_INSET_BLOCK_START, wm, dir), block_start,
+        LogicalProp_映射到物理(LP_INSET_INLINE_END, wm, dir), inline_end,
+        LogicalProp_映射到物理(LP_INSET_BLOCK_END, wm, dir), block_end,
+        LogicalProp_映射到物理(LP_INSET_INLINE_START, wm, dir), inline_start
+    ]
+}

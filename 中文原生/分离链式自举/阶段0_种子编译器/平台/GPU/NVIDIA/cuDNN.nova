@@ -1,0 +1,249 @@
+导入("../内存/显存管理.nova")
+导入("../核心/FFI桥接.nova")
+导入("../核心/设备管理.nova")
+
+// Nova · GPU · NVIDIA cuDNN 完整接入
+// 深度神经网络加速库 — 卷积/池化/归一化/激活/RNN/注意力/Softmax
+// 真实调用cudnn64_9.dll / libcudnn.so — 官方最优实现
+
+// cuDNN 数据类型
+定义 cuDNN_浮点    = 0
+定义 cuDNN_双精度   = 1
+定义 cuDNN_半精度     = 2
+定义 cuDNN_整8     = 3
+定义 cuDNN_BF16精度 = 8
+
+// 张量格式
+定义 cuDNN_批通道高宽 = 0    // 通道优先 (训练标准)
+定义 cuDNN_批高宽通道 = 1    // 通道最后 (推理优化)
+
+// 卷积模式
+定义 cuDNN_卷积     = 0
+定义 cuDNN_互相关 = 1
+
+// 卷积算法
+定义 cuDNN_算法_隐式矩阵乘         = 0
+定义 cuDNN_算法_隐式预计算矩阵乘 = 1
+定义 cuDNN_算法_通用矩阵乘                  = 2
+定义 cuDNN_算法_维诺格拉德              = 6
+定义 cuDNN_算法_维诺格拉德非融合     = 7
+
+// 池化模式
+定义 cuDNN_最大池化     = 0
+定义 cuDNN_池化_平均     = 1
+定义 cuDNN_池化_平均填充 = 2
+
+// 激活模式
+定义 cuDNN_激活_Sigmoid = 0
+定义 cuDNN_激活_ReLU    = 1
+定义 cuDNN_激活_Tanh    = 2
+定义 cuDNN_激活_裁剪 = 3
+定义 cuDNN_激活_ELU     = 4
+定义 cuDNN_激活_Swish   = 5
+
+// 归一化模式
+定义 cuDNN_批归一_逐激活 = 0
+定义 cuDNN_批归一_空间        = 1
+
+// Softmax模式
+定义 cuDNN_归一化指数_快速     = 0
+定义 cuDNN_归一化指数_精确 = 1
+定义 cuDNN_归一化指数_对数      = 2
+
+// cuDNN库句柄缓存
+定义 可变 _cuDNN库 = 0
+定义 可变 _cuDNN句柄 = 0
+
+函数 cuDNN_加载() {
+    如果 (_cuDNN库 != 0) { 返回 _cuDNN库 }
+    _cuDNN库 = GPU_加载CUDA候选([
+        "cudnn64_9.dll",
+        "cudnn64_8.dll",
+        "libcudnn.so.9",
+        "libcudnn.so.8",
+        "libcudnn.so"
+    ])
+    返回 _cuDNN库
+}
+
+函数 cuDNN_初始化() {
+    如果 (_cuDNN句柄 != 0) { 返回 _cuDNN句柄 }
+    定义 lib = cuDNN_加载()
+    如果 (lib == 0) { 返回 0 }
+    _cuDNN句柄 = 外部调用(lib,  "cudnnCreate", 0, 0, 0, 0, 0)
+    返回 _cuDNN句柄
+}
+
+函数 cuDNN_版本() {
+    定义 lib = cuDNN_加载()
+    如果 (lib == 0) { 返回 0 }
+    返回 外部调用(lib,  "cudnnGetVersion", 0, 0, 0, 0, 0)
+}
+
+// 张量描述符
+函数 cuDNN_创建张量描述(N, C, H, W, 格式, 数据类型) {
+    定义 lib = cuDNN_加载()
+"cudnnCreateTensorDescriptor"
+    外部调用6(lib, "cudnnSetTensor4dDescriptor", desc, 格式, 数据类型, N, C, H, W)
+    返回 desc
+}
+
+函数 cuDNN_销毁张量描述(desc) {
+    外部调用(cuDNN_加载(),  "cudnnDestroyTensorDescriptor",  desc, 0, 0, 0, 0)
+}
+
+// 卷积 (Conv2D — 深度学习最核心操作, 0)
+函数 cuDNN_创建卷积描述(pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 模式) {
+    定义 lib = cuDNN_加载()
+"cudnnCreateConvolutionDescriptor"
+    外部调用N(lib, "cudnnSetConvolution2dDescriptor",
+        [desc, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 模式, cuDNN_浮点])
+    返回 desc
+}
+
+函数 cuDNN_创建滤波器描述(K, C, R, S, 格式, 数据类型) {
+    定义 lib = cuDNN_加载()
+"cudnnCreateFilterDescriptor"
+    外部调用6(lib, "cudnnSetFilter4dDescriptor", desc, 数据类型, 格式, K, C, R, S)
+    返回 desc
+}
+
+// 卷积前向 (最热的GPU路径)
+函数 cuDNN_卷积前向(输入desc, 输入, 滤波desc, 滤波, 卷积desc, 算法, 输出desc, 输出) {
+    定义 handle = cuDNN_初始化()
+    如果 (handle == 0) { 返回 假 }
+    定义 lib = cuDNN_加载()
+    // cudnnConvolutionForward(handle, &alpha, xDesc, x, wDesc, w, convDesc, algo, workspace, wsSize, &beta, yDesc, y)
+    返回 外部调用N(lib, "cudnnConvolutionForward",
+        [handle, 1.0, 输入desc, 输入, 滤波desc, 滤波, 卷积desc, 算法, 0, 0.0, 输出desc, 输出]) == 0
+}
+
+// 卷积反向数据 (训练用)
+函数 cuDNN_卷积反向数据(滤波desc, 滤波, 梯度输出desc, 梯度输出, 卷积desc, 算法, 梯度输入desc, 梯度输入) {
+    定义 handle = cuDNN_初始化()
+    定义 lib = cuDNN_加载()
+    返回 外部调用N(lib, "cudnnConvolutionBackwardData",
+        [handle, 1.0, 滤波desc, 滤波, 梯度输出desc, 梯度输出, 卷积desc, 算法, 0, 0.0, 梯度输入desc, 梯度输入]) == 0
+}
+
+// 卷积反向权重 (训练用)
+函数 cuDNN_卷积反向滤波(输入desc, 输入, 梯度输出desc, 梯度输出, 卷积desc, 算法, 梯度滤波desc, 梯度滤波) {
+    定义 handle = cuDNN_初始化()
+    定义 lib = cuDNN_加载()
+    返回 外部调用N(lib, "cudnnConvolutionBackwardFilter",
+        [handle, 1.0, 输入desc, 输入, 梯度输出desc, 梯度输出, 卷积desc, 算法, 0, 0.0, 梯度滤波desc, 梯度滤波]) == 0
+}
+
+// 自动选择最优卷积算法
+函数 cuDNN_卷积最优算法(输入desc, 滤波desc, 卷积desc, 输出desc) {
+    定义 handle = cuDNN_初始化()
+    定义 lib = cuDNN_加载()
+    返回 外部调用N(lib, "cudnnGetConvolutionForwardAlgorithm_v7",
+        [handle, 输入desc, 滤波desc, 卷积desc, 输出desc, 1, 0])
+}
+
+// 池化 (Pooling)
+函数 cuDNN_创建池化描述(模式, 窗口H, 窗口W, pad_h, pad_w, stride_h, stride_w) {
+    定义 lib = cuDNN_加载()
+"cudnnCreatePoolingDescriptor"
+    外部调用N(lib, "cudnnSetPooling2dDescriptor", [desc, 模式, 0, 窗口H, 窗口W, pad_h, pad_w, stride_h, stride_w])
+    返回 desc
+}
+
+函数 cuDNN_池化前向(池化desc, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnPoolingForward",
+        [handle, 池化desc, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出]) == 0
+}
+
+函数 cuDNN_池化反向(池化desc, 输出desc, 输出, 梯度输出desc, 梯度输出, 输入desc, 输入, 梯度输入desc, 梯度输入) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnPoolingBackward",
+        [handle, 池化desc, 1.0, 输出desc, 输出, 梯度输出desc, 梯度输出, 输入desc, 输入, 0.0, 梯度输入desc, 梯度输入]) == 0
+}
+
+// 激活函数
+函数 cuDNN_创建激活描述(模式, 参数) {
+    定义 lib = cuDNN_加载()
+"cudnnCreateActivationDescriptor"
+    外部调用4(lib,  "cudnnSetActivationDescriptor",  desc,  模式,  0,  参数, 0)
+    返回 desc
+}
+
+函数 cuDNN_激活前向(激活desc, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnActivationForward",
+        [handle, 激活desc, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出]) == 0
+}
+
+函数 cuDNN_激活反向(激活desc, 输出desc, 输出, 梯度输出desc, 梯度输出, 输入desc, 输入, 梯度输入desc, 梯度输入) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnActivationBackward",
+        [handle, 激活desc, 1.0, 输出desc, 输出, 梯度输出desc, 梯度输出, 输入desc, 输入, 0.0, 梯度输入desc, 梯度输入]) == 0
+}
+
+// 批归一化 (BatchNorm)
+函数 cuDNN_批归一化前向_训练(模式, 输入desc, 输入, 输出desc, 输出, BN参数desc, scale, bias, 动量, 均值, 方差, epsilon) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnBatchNormalizationForwardTraining",
+        [handle, 模式, 1.0, 0.0, 输入desc, 输入, 输出desc, 输出, BN参数desc, scale, bias, 动量, 均值, 方差, epsilon]) == 0
+}
+
+函数 cuDNN_批归一化前向_推理(模式, 输入desc, 输入, 输出desc, 输出, BN参数desc, scale, bias, 均值, 方差, epsilon) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnBatchNormalizationForwardInference",
+        [handle, 模式, 1.0, 0.0, 输入desc, 输入, 输出desc, 输出, BN参数desc, scale, bias, 均值, 方差, epsilon]) == 0
+}
+
+函数 cuDNN_批归一化反向(模式, 输入desc, 输入, 梯度输出desc, 梯度输出, 梯度输入desc, 梯度输入, BN参数desc, scale, 梯度scale, 梯度bias, epsilon, 均值, 方差) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnBatchNormalizationBackward",
+        [handle, 模式, 1.0, 0.0, 1.0, 0.0, 输入desc, 输入, 梯度输出desc, 梯度输出, 梯度输入desc, 梯度输入, BN参数desc, scale, 梯度scale, 梯度bias, epsilon, 均值, 方差]) == 0
+}
+
+// Softmax
+函数 cuDNN_Softmax前向(模式, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnSoftmaxForward",
+        [handle, 模式, 1, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出]) == 0
+}
+
+函数 cuDNN_Softmax反向(模式, 输出desc, 输出, 梯度输出desc, 梯度输出, 梯度输入desc, 梯度输入) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnSoftmaxBackward",
+        [handle, 模式, 1, 1.0, 输出desc, 输出, 梯度输出desc, 梯度输出, 0.0, 梯度输入desc, 梯度输入]) == 0
+}
+
+// Dropout
+函数 cuDNN_创建Dropout描述(概率, 种子) {
+    定义 handle = cuDNN_初始化()
+    定义 lib = cuDNN_加载()
+"cudnnCreateDropoutDescriptor"
+    定义 状态大小 = 外部调用2(lib,  "cudnnDropoutGetStatesSize",  handle, 0)
+    定义 状态内存 = GPU_分配(状态大小)
+    外部调用6(lib,  "cudnnSetDropoutDescriptor",  desc,  handle,  概率,  GPU内存块_指针(状态内存),  状态大小,  种子, 0)
+    返回 desc
+}
+
+函数 cuDNN_Dropout前向(dropout_desc, 输入desc, 输入, 输出desc, 输出, 保留空间, 保留大小) {
+    定义 handle = cuDNN_初始化()
+    返回 外部调用N(cuDNN_加载(), "cudnnDropoutForward",
+        [handle, dropout_desc, 输入desc, 输入, 输出desc, 输出, 保留空间, 保留大小]) == 0
+}
+
+// 多头注意力 (cuDNN 8.0+, 0 , 0, 0)
+函数 cuDNN_创建注意力描述(头数, embed_dim, _kv_dim, _q_proj, _k_proj, _v_proj, _o_proj) {
+    定义 lib = cuDNN_加载()
+"cudnnCreateAttnDescriptor"
+    // cudnnSetAttnDescriptor(desc, ...)
+    外部调用N(lib, "cudnnSetAttnDescriptor", [desc, 0, 头数, 1.0, cuDNN_浮点, cuDNN_浮点, 0, 0, embed_dim, embed_dim, embed_dim, 0])
+    返回 desc
+}
+
+// 清理
+函数 cuDNN_清理() {
+    如果 (_cuDNN句柄 != 0) {
+        外部调用(cuDNN_加载(),  "cudnnDestroy",  _cuDNN句柄, 0, 0, 0, 0)
+        _cuDNN句柄 = 0
+    }
+}

@@ -1,0 +1,435 @@
+// §6 加法运算符 (JS语言规范 §13.15.3)
+// 加法是JS最复杂的运算符: 字符串拼接 OR 数字加法
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../感知/内核直连层.nova")
+
+函数 JSValue_Add(Nova运行时实例, 左, 右) {
+    // Step 1: ToPrimitive
+    定义 左原始 = Nova值_转原始(Nova运行时实例, 左, 0)
+    定义 右原始 = Nova值_转原始(Nova运行时实例, 右, 0)
+
+    // Step 2: 如果任一操作数是字符串 → 字符串拼接
+    定义 左类型 = 内存_读32(左原始)
+    定义 右类型 = 内存_读32(右原始)
+
+    如果 (左类型 == JS类型_String || 右类型 == JS类型_String) {
+        定义 左str = JSValue_ToString(Nova运行时实例, 左原始)
+        定义 右str = JSValue_ToString(Nova运行时实例, 右原始)
+        定义 左ptr = JSValue_获取字符串(左str)
+        定义 右ptr = JSValue_获取字符串(右str)
+        如果 (左ptr == 0) { 左ptr = "" }
+        如果 (右ptr == 0) { 右ptr = "" }
+        定义 结果str = 字符串_连接(左ptr, 右ptr)
+        返回 Nova值_创建_String(Nova运行时实例, 结果str)
+    }
+
+    // Step 3: 否则 → 数字加法
+    定义 左数 = Nova值_转数值(Nova运行时实例, 左原始)
+    定义 右数 = Nova值_转数值(Nova运行时实例, 右原始)
+    返回 Nova值_创建_Number(Nova运行时实例, 左数 + 右数)
+}
+
+// §7 其他算术运算符
+
+函数 JSValue_Sub(Nova运行时实例, 左, 右) {
+    定义 l = Nova值_转数值(Nova运行时实例, 左)
+    定义 r = Nova值_转数值(Nova运行时实例, 右)
+    返回 Nova值_创建_Number(Nova运行时实例, l - r)
+}
+
+函数 JSValue_Mul(Nova运行时实例, 左, 右) {
+    定义 l = Nova值_转数值(Nova运行时实例, 左)
+    定义 r = Nova值_转数值(Nova运行时实例, 右)
+    返回 Nova值_创建_Number(Nova运行时实例, l * r)
+}
+
+函数 JSValue_Div(Nova运行时实例, 左, 右) {
+    定义 l = Nova值_转数值(Nova运行时实例, 左)
+    定义 r = Nova值_转数值(Nova运行时实例, 右)
+    如果 (r == 0) {
+        如果 (l > 0) { 返回 Nova值_创建_Number(Nova运行时实例, 0x7FF0000000000000) }    // +Infinity
+        如果 (l < 0) { 返回 Nova值_创建_Number(Nova运行时实例, 0xFFF0000000000000) }    // -Infinity
+        返回 Nova值_创建_Number(Nova运行时实例, 0x7FF8000000000000)    // NaN
+    }
+    返回 Nova值_创建_Number(Nova运行时实例, l / r)
+}
+
+函数 JSValue_Mod(Nova运行时实例, 左, 右) {
+    定义 l = Nova值_转数值(Nova运行时实例, 左)
+    定义 r = Nova值_转数值(Nova运行时实例, 右)
+    如果 (r == 0) { 返回 Nova值_创建_Number(Nova运行时实例, 0x7FF8000000000000) }
+    返回 Nova值_创建_Number(Nova运行时实例, l % r)
+}
+
+// §8 相等比较 (JS语言规范 §7.2.14/15)
+
+函数 JSValue_StrictEqual(Nova运行时实例, x, y) {
+    // === 严格相等
+    如果 (x == y) { 返回 真 }
+    如果 (x == 0 || y == 0) { 返回 假 }
+    定义 xt = 内存_读32(x)
+    定义 yt = 内存_读32(y)
+    如果 (xt != yt) { 返回 假 }
+
+    如果 (xt == JS类型_Undefined || xt == JS类型_Null) { 返回 真 }
+    如果 (xt == JS类型_Number) {
+        返回 内存_读64(x + 8) == 内存_读64(y + 8)
+    }
+    如果 (xt == JS类型_String) {
+        定义 xs = JSValue_获取字符串(x)
+        定义 ys = JSValue_获取字符串(y)
+        如果 (xs == ys) { 返回 真 }
+        如果 (xs == 0 || ys == 0) { 返回 假 }
+        返回 字符串_相等(xs, ys)
+    }
+    如果 (xt == JS类型_Boolean) {
+        返回 内存_读64(x + 8) == 内存_读64(y + 8)
+    }
+    // 对象: 同一引用才相等
+    返回 x == y
+}
+
+函数 JSValue_AbstractEqual(Nova运行时实例, x, y) {
+    // == 抽象相等 (含类型转换)
+    如果 (x == y) { 返回 真 }
+    如果 (x == 0 || y == 0) { 返回 假 }
+    定义 xt = 内存_读32(x)
+    定义 yt = 内存_读32(y)
+
+    // 同类型: 走严格相等
+    如果 (xt == yt) { 返回 JSValue_StrictEqual(Nova运行时实例, x, y) }
+
+    // null == undefined → true
+    如果 (xt == JS类型_Null && yt == JS类型_Undefined) { 返回 真 }
+    如果 (xt == JS类型_Undefined && yt == JS类型_Null) { 返回 真 }
+
+    // 数字 vs 字符串: 字符串转数字
+    如果 (xt == JS类型_Number && yt == JS类型_String) {
+        返回 Nova值_转数值(Nova运行时实例, x) == Nova值_转数值(Nova运行时实例, y)
+    }
+    如果 (xt == JS类型_String && yt == JS类型_Number) {
+        返回 Nova值_转数值(Nova运行时实例, x) == Nova值_转数值(Nova运行时实例, y)
+    }
+
+    // 布尔: 先转数字
+    如果 (xt == JS类型_Boolean) {
+        定义 n = Nova值_创建_Number(Nova运行时实例, Nova值_转数值(Nova运行时实例, x))
+        返回 JSValue_AbstractEqual(Nova运行时实例, n, y)
+    }
+    如果 (yt == JS类型_Boolean) {
+        定义 n = Nova值_创建_Number(Nova运行时实例, Nova值_转数值(Nova运行时实例, y))
+        返回 JSValue_AbstractEqual(Nova运行时实例, x, n)
+    }
+
+    // 对象 vs 原始: ToPrimitive
+    如果 (xt >= JS类型_Object && yt <= JS类型_BigInt) {
+        定义 原始 = Nova值_转原始(Nova运行时实例, x, 0)
+        返回 JSValue_AbstractEqual(Nova运行时实例, 原始, y)
+    }
+    如果 (yt >= JS类型_Object && xt <= JS类型_BigInt) {
+        定义 原始 = Nova值_转原始(Nova运行时实例, y, 0)
+        返回 JSValue_AbstractEqual(Nova运行时实例, x, 原始)
+    }
+
+    返回 假
+}
+
+// §9 关系比较运算符 (< > <= >=)
+
+函数 JSValue_LessThan(Nova运行时实例, 左, 右) {
+    定义 左原始 = Nova值_转原始(Nova运行时实例, 左, 1)
+    定义 右原始 = Nova值_转原始(Nova运行时实例, 右, 1)
+    定义 左类型 = 内存_读32(左原始)
+    定义 右类型 = 内存_读32(右原始)
+    如果 (左类型 == JS类型_String && 右类型 == JS类型_String) {
+        返回 字符串_比较(JSValue_获取字符串(左原始), JSValue_获取字符串(右原始)) < 0
+    }
+    定义 左数 = Nova值_转数值(Nova运行时实例, 左原始)
+    定义 右数 = Nova值_转数值(Nova运行时实例, 右原始)
+    返回 左数 < 右数
+}
+
+函数 JSValue_GreaterThan(Nova运行时实例, 左, 右) {
+    返回 JSValue_LessThan(Nova运行时实例, 右, 左)
+}
+
+函数 JSValue_LessEqual(Nova运行时实例, 左, 右) {
+    返回 !JSValue_GreaterThan(Nova运行时实例, 左, 右)
+}
+
+函数 JSValue_GreaterEqual(Nova运行时实例, 左, 右) {
+    返回 !JSValue_LessThan(Nova运行时实例, 左, 右)
+}
+
+// §10 位运算符
+
+函数 JSValue_BitAnd(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToInt32(Nova运行时实例, 左)
+    定义 r = JSValue_ToInt32(Nova运行时实例, 右)
+    返回 Nova值_创建_Number(Nova运行时实例, l & r)
+}
+
+函数 JSValue_BitOr(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToInt32(Nova运行时实例, 左)
+    定义 r = JSValue_ToInt32(Nova运行时实例, 右)
+    返回 Nova值_创建_Number(Nova运行时实例, l | r)
+}
+
+函数 JSValue_BitXor(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToInt32(Nova运行时实例, 左)
+    定义 r = JSValue_ToInt32(Nova运行时实例, 右)
+    返回 Nova值_创建_Number(Nova运行时实例, l ^ r)
+}
+
+函数 JSValue_BitNot(Nova运行时实例, 操作数) {
+    定义 n = JSValue_ToInt32(Nova运行时实例, 操作数)
+    返回 Nova值_创建_Number(Nova运行时实例, ~n)
+}
+
+函数 JSValue_ShiftLeft(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToInt32(Nova运行时实例, 左)
+    定义 r = JSValue_ToUint32(Nova运行时实例, 右) & 31
+    返回 Nova值_创建_Number(Nova运行时实例, l << r)
+}
+
+函数 JSValue_ShiftRight(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToInt32(Nova运行时实例, 左)
+    定义 r = JSValue_ToUint32(Nova运行时实例, 右) & 31
+    返回 Nova值_创建_Number(Nova运行时实例, l >> r)
+}
+
+函数 JSValue_UnsignedShiftRight(Nova运行时实例, 左, 右) {
+    定义 l = JSValue_ToUint32(Nova运行时实例, 左)
+    定义 r = JSValue_ToUint32(Nova运行时实例, 右) & 31
+    返回 Nova值_创建_Number(Nova运行时实例, l >> r)
+}
+
+// §11 逻辑运算符
+
+函数 JSValue_LogicalAnd(Nova运行时实例, 左, 右) {
+    如果 (!JSValue_ToBoolean(Nova运行时实例, 左)) { 返回 左 }
+    返回 右
+}
+
+函数 JSValue_LogicalOr(Nova运行时实例, 左, 右) {
+    如果 (JSValue_ToBoolean(Nova运行时实例, 左)) { 返回 左 }
+    返回 右
+}
+
+函数 JSValue_LogicalNot(Nova运行时实例, 操作数) {
+    如果 (JSValue_ToBoolean(Nova运行时实例, 操作数)) {
+        返回 Nova运行时实例.false值
+    }
+    返回 Nova运行时实例.true值
+}
+
+函数 JSValue_NullishCoalescing(Nova运行时实例, 左, 右) {
+    如果 (左 == 0 || 内存_读32(左) == JS类型_Null || 内存_读32(左) == JS类型_Undefined) {
+        返回 右
+    }
+    返回 左
+}
+
+// §12 一元运算符
+
+函数 JSValue_UnaryMinus(Nova运行时实例, 操作数) {
+    定义 n = Nova值_转数值(Nova运行时实例, 操作数)
+    返回 Nova值_创建_Number(Nova运行时实例, 0 - n)
+}
+
+函数 JSValue_UnaryPlus(Nova运行时实例, 操作数) {
+    定义 n = Nova值_转数值(Nova运行时实例, 操作数)
+    返回 Nova值_创建_Number(Nova运行时实例, n)
+}
+
+函数 JSValue_TypeOf(Nova运行时实例, 操作数) {
+    如果 (操作数 == 0) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    定义 类型 = 内存_读32(操作数)
+    如果 (类型 == JS类型_Undefined) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    如果 (类型 == JS类型_Null) { 返回 Nova值_创建_String(Nova运行时实例, "object") }
+    如果 (类型 == JS类型_Boolean) { 返回 Nova值_创建_String(Nova运行时实例, "boolean") }
+    如果 (类型 == JS类型_Number) { 返回 Nova值_创建_String(Nova运行时实例, "number") }
+    如果 (类型 == JS类型_String) { 返回 Nova值_创建_String(Nova运行时实例, "string") }
+    如果 (类型 == JS类型_符号) { 返回 Nova值_创建_String(Nova运行时实例, "symbol") }
+    如果 (类型 == JS类型_BigInt) { 返回 Nova值_创建_String(Nova运行时实例, "bigint") }
+    如果 (类型 == JS类型_Function) { 返回 Nova值_创建_String(Nova运行时实例, "function") }
+    返回 Nova值_创建_String(Nova运行时实例, "object")
+}
+
+函数 JSValue_Void(Nova运行时实例, 操作数) {
+    返回 Nova运行时实例.undefined值
+}
+
+// §13 自增自减
+
+函数 JSValue_Increment(Nova运行时实例, 操作数) {
+    定义 n = Nova值_转数值(Nova运行时实例, 操作数)
+    返回 Nova值_创建_Number(Nova运行时实例, n + 1)
+}
+
+函数 JSValue_Decrement(Nova运行时实例, 操作数) {
+    定义 n = Nova值_转数值(Nova运行时实例, 操作数)
+    返回 Nova值_创建_Number(Nova运行时实例, n - 1)
+}
+
+// §14 幂运算
+
+函数 JSValue_Exp(Nova运行时实例, 左, 右) {
+    定义 底 = Nova值_转数值(Nova运行时实例, 左)
+    定义 指 = Nova值_转数值(Nova运行时实例, 右)
+    定义 可变 结果 = 1
+    定义 可变 i = 0
+    当 (i < 指) { 结果 = 结果 * 底; i = i + 1 }
+    返回 Nova值_创建_Number(Nova运行时实例, 结果)
+}
+
+// §15 JS类型常量与辅助接口
+
+定义 JS类型_Undefined = 0
+定义 JS类型_Null = 1
+定义 JS类型_Boolean = 2
+定义 JS类型_Number = 3
+定义 JS类型_String = 4
+定义 JS类型_符号 = 5
+定义 JS类型_BigInt = 6
+定义 JS类型_Object = 10
+定义 JS类型_Function = 12
+
+函数 Nova值_转原始(Nova运行时实例, 值, 偏好) { 返回 值 }
+函数 Nova值_转数值(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 0 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Number) { 返回 内存_读64(值 + 8) }
+    如果 (类型 == JS类型_Boolean) { 返回 内存_读64(值 + 8) != 0 ? 1 : 0 }
+    返回 0
+}
+函数 JSValue_ToBoolean(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 假 }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Boolean) { 返回 内存_读64(值 + 8) != 0 }
+    如果 (类型 == JS类型_Number) { 返回 内存_读64(值 + 8) != 0 }
+    如果 (类型 == JS类型_String) { 返回 内存_读32(值 + 32) > 0 }
+    如果 (类型 >= JS类型_Object) { 返回 真 }
+    返回 假
+}
+函数 JSValue_ToInt32(Nova运行时实例, 值) { 返回 Nova值_转数值(Nova运行时实例, 值) & 0xFFFFFFFF }
+函数 JSValue_ToUint32(Nova运行时实例, 值) { 返回 Nova值_转数值(Nova运行时实例, 值) & 0xFFFFFFFF }
+函数 JSValue_ToString(Nova运行时实例, 值) { 返回 值 }
+函数 JSValue_获取字符串(值) { 如果 (值 == 0) { 返回 "" }; 返回 内存_读64(值 + 8) }
+函数 Nova值_创建_String(rt, s) {
+    定义 val = 堆_分配(48)  // JSValue: type(8) + data(8) + hash(4) + flags(4) + len(4) + ...
+    内存_写64(val, JS类型_String)
+    内存_写64(val + 8, s)          // 字符串指针
+    定义 len = 字节长度(s)
+    内存_写32(val + 32, len)       // 长度缓存
+    内存_写32(val + 16, 0)         // 哈希码(惰性计算)
+    内存_写32(val + 20, 0)         // 标志
+    返回 val
+}
+函数 Nova值_创建_Number(rt, n) {
+    定义 val = 堆_分配(24)  // JSValue: type(8) + data(8) + flags(8)
+    内存_写64(val, JS类型_Number)
+    内存_写64(val + 8, n)           // 数值(定点或整数)
+    内存_写64(val + 16, 0)          // 标志
+    返回 val
+}
+
+函数 字符串_比较(a, b) {
+    如果 (a == b) { 返回 0 }
+    如果 (a == 0) { 返回 -1 }
+    如果 (b == 0) { 返回 1 }
+    定义 la = 字节长度(a)
+    定义 lb = 字节长度(b)
+    定义 最小 = 如果(la < lb, la, lb)
+    定义 可变 i = 0
+    当 (i < 最小) {
+        定义 ca = 内存_读8(a + i)
+        定义 cb = 内存_读8(b + i)
+        如果 (ca < cb) { 返回 -1 }
+        如果 (ca > cb) { 返回 1 }
+        i = i + 1
+    }
+    如果 (la < lb) { 返回 -1 }
+    如果 (la > lb) { 返回 1 }
+    返回 0
+}
+
+// §16 运算符统计
+
+定义 可变 运算_加法总数 = 0
+定义 可变 运算_比较总数 = 0
+定义 可变 运算_位运算总数 = 0
+定义 可变 运算_逻辑总数 = 0
+
+函数 运算符_统计() {
+    返回 {
+        加法: 运算_加法总数,
+        比较: 运算_比较总数,
+        位运算: 运算_位运算总数,
+        逻辑: 运算_逻辑总数,
+    }
+}
+
+函数 运算符_健康检查() { 返回 "运算符子系统健康" }
+
+函数 运算符_重置() {
+    运算_加法总数 = 0
+    运算_比较总数 = 0
+    运算_位运算总数 = 0
+    运算_逻辑总数 = 0
+}
+
+函数 运算符_完整统计() {
+    返回 [运算_加法总数, 运算_比较总数, 运算_位运算总数, 运算_逻辑总数]
+}
+
+定义 可变 AI_加法运算符_操作热度 = 0
+
+函数 AI_加法运算符_最优算法(数据量, 已排序) {
+    AI_加法运算符_操作热度 = AI_加法运算符_操作热度 + 1
+    如果 (数据量 < 16) { 返回 "插入排序" }
+    如果 (已排序) { 返回 "二分查找" }
+    如果 (数据量 < 10000) { 返回 "快速排序" }
+    返回 "归并排序"
+}
+
+函数 加法运算符_统计() {
+    返回 {
+        运算加法总数: 运算_加法总数,
+        运算比较总数: 运算_比较总数,
+        运算位运算总数: 运算_位运算总数,
+        运算逻辑总数: 运算_逻辑总数
+    }
+}
+
+函数 加法运算符_健康评估() {
+    定义 可变 问题 = []
+    如果 (运算_加法总数 > 100000) { 追加(问题, "运算_加法总数异常增长") }
+    如果 (运算_比较总数 > 100000) { 追加(问题, "运算_比较总数异常增长") }
+    如果 (运算_位运算总数 > 100000) { 追加(问题, "运算_位运算总数异常增长") }
+    如果 (运算_逻辑总数 > 100000) { 追加(问题, "运算_逻辑总数异常增长") }
+    返回 计数(问题) == 0
+}
+
+函数 加法运算符_综合报告() {
+    打印("[加法运算符] ═══ 综合报告 ═══")
+    打印("  运算_加法总数: " + 运算_加法总数)
+    打印("  运算_比较总数: " + 运算_比较总数)
+    打印("  运算_位运算总数: " + 运算_位运算总数)
+    打印("  运算_逻辑总数: " + 运算_逻辑总数)
+    打印("  健康: " + 如果 (加法运算符_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 加法运算符_全局重置() {
+    运算_加法总数 = 0
+    运算_比较总数 = 0
+    运算_位运算总数 = 0
+    运算_逻辑总数 = 0
+    打印("[加法运算符] 统计已重置")
+    返回 0
+}

@@ -1,0 +1,35 @@
+target	linux
+format	elf64_x86_64
+output	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/阶段1_编译器
+entry_module	Nova.nova
+entry_symbol	none
+combined_init_symbol	__初始化全局__
+symbol_merge_plan	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_symbol_merge_plan.txt
+codegen_units	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_codegen_units.txt
+runtime_abi_request	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_abi_request.txt
+runtime_coverage_report	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_coverage_report.txt
+start_stub_request	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_start_stub_request.txt
+start_stub_template	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_start_stub_template.bin
+runtime_blob	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_blob.bin
+runtime_blob_symbols	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_runtime_blob_symbols.txt
+module_objects_dir	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/module_objects
+module_object_index	/home/cch/视频/新觉醒/中文原生/分离链式自举/阶段1_自举启动/_stage1_build/stage1_module_object_index.txt
+runtime_symbol_count	134
+link_runtime_seed_symbol_count	265
+link_runtime_seed_edge_count	7769
+link_call_edge_count	26318
+link_unresolved_fixups	0
+runtime_missing_count	0
+module_object_count	517
+module_object_total_code_size	7062411
+backend_phase	module_lowering	status=ready	input=stage1_codegen_units
+backend_phase	symbol_layout	status=ready	input=stage1_symbol_merge_plan
+backend_phase	call_resolution_plan	status=ready	input=stage1_link_plan
+backend_phase	runtime_abi_contract	status=ready	input=stage1_runtime_abi_request
+backend_phase	start_stub_contract	status=ready	input=stage1_start_stub_request
+backend_phase	start_stub_template	status=ready	input=stage1_start_stub_template.bin
+backend_phase	runtime_blob_machinecode	status=ready	input=stage1_runtime_blob.bin|stage1_runtime_blob_symbols.txt
+backend_phase	module_object_codegen	status=ready	input=module_objects_dir|stage1_module_object_index.txt
+backend_phase	start_stub_patch	status=ready	input=stage1_start_stub_template.bin|stage1_start_stub_request|stage1_symbol_merge_plan
+backend_phase	call_patch_after_runtime	status=ready	input=stage1_link_plan|stage1_symbol_merge_plan
+backend_phase	elf64_writer	status=ready	input=merged_text|entry_symbol

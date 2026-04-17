@@ -1,0 +1,205 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./超传头部创.nova")
+导入("./资源加载资源.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./项解析.nova")
+导入("../中枢/字符串替换.nova")
+
+// §6 XMLHttpRequest (完整状态机)
+
+定义 XHR_UNSENT          = 0
+定义 XHR_OPENED          = 1
+定义 XHR_HEADERS_RECEIVED = 2
+定义 XHR_LOADING          = 3
+定义 XHR_DONE             = 4
+
+结构 XMLHttpRequest_State {
+    readyState,    // u32 0-4
+    状态码,    // u32 HTTP status
+    状态文本,    // u64 HTTP status text
+    方法,    // u64 GET/POST/...
+    URL,
+    是异步,
+    请求头,    // u64 HTTP头部列表*
+    响应头,    // u64 HTTP头部列表*
+    响应文本,    // u64 responseText
+    响应长度,
+    响应类型,    // u32 0="" 1="text" 2="json" 3="blob" 4="arraybuffer" 5="document"
+    超时,    // u32 timeout (ms)
+    携带凭证,    // 布尔 withCredentials
+    // 事件回调
+    onreadystatechange,    // u64 JS函数
+    onload,
+    onerror,
+    onprogress,
+    onabort,
+    ontimeout,
+    onloadstart,
+    onloadend,
+    // 引擎
+    Nova运行时实例,
+    // 请求体
+    发送体,
+    发送体长度,
+    // 中止标记
+    已中止,
+}
+
+函数 XHR_创建(Nova运行时实例) {
+    定义 xhr = 堆_分配(XMLHttpRequest_State)
+    xhr.readyState = XHR_UNSENT
+    xhr.状态码 = 0
+    xhr.状态文本 = 0
+    xhr.方法 = 0; xhr.URL = 0
+    xhr.是异步 = 真
+    xhr.请求头 = HTTP头部_创建()
+    xhr.响应头 = 0
+    xhr.响应文本 = 0; xhr.响应长度 = 0
+    xhr.响应类型 = 0
+    xhr.超时 = 0; xhr.携带凭证 = 假
+    xhr.onreadystatechange = 0
+    xhr.onload = 0; xhr.onerror = 0
+    xhr.onprogress = 0; xhr.onabort = 0
+    xhr.ontimeout = 0; xhr.onloadstart = 0; xhr.onloadend = 0
+    xhr.Nova运行时实例 = Nova运行时实例
+    xhr.发送体 = 0; xhr.发送体长度 = 0
+    xhr.已中止 = 假
+    返回 xhr
+}
+
+函数 XHR_open(xhr, 方法, url, 异步) {
+    xhr.方法 = 字符串_复制(方法)
+    xhr.URL = 字符串_复制(url)
+    xhr.是异步 = 异步
+    xhr.readyState = XHR_OPENED
+    xhr.状态码 = 0
+    xhr.响应文本 = 0
+    xhr.响应长度 = 0
+    xhr.已中止 = 假
+    XHR_触发readystatechange(xhr)
+}
+
+函数 XHR_setRequestHeader(xhr, 名, 值) {
+    如果 (xhr.readyState != XHR_OPENED) { 返回 }
+    HTTP头部_添加(xhr.请求头, 名, 值)
+}
+
+函数 XHR_send(xhr, 体) {
+    如果 (xhr.readyState != XHR_OPENED) { 返回 }
+    xhr.发送体 = 体
+    如果 (体 != 0) { xhr.发送体长度 = 字符串_长度(体) }
+
+    // 触发loadstart
+    如果 (xhr.onloadstart != 0) {
+        调用(xhr.onloadstart, xhr)
+    }
+
+    // 创建loader
+    定义 可变 方法 = HTTP_GET
+    如果 (字符串_相等_不区分大小写(xhr.方法, "POST")) { 方法 = HTTP_POST }
+    否则 如果 (字符串_相等_不区分大小写(xhr.方法, "PUT")) { 方法 = HTTP_PUT }
+    否则 如果 (字符串_相等_不区分大小写(xhr.方法, "DELETE")) { 方法 = HTTP_DELETE }
+
+    定义 loader = ResourceLoader_创建(xhr.URL, 资源类型_XHR)
+    loader.请求.方法 = 方法
+
+    // 复制请求头
+    定义 可变 i = 0
+    当 (i < xhr.请求头.数量) {
+        定义 偏移 = xhr.请求头.条目 + i * 32
+        HTTP头部_添加(loader.请求.请求头, 内存_读64(偏移), 内存_读64(偏移 + 16))
+        i = i + 1
+    }
+
+    // 请求体
+    如果 (xhr.发送体 != 0) {
+        loader.请求.请求体 = xhr.发送体
+        loader.请求.请求体长度 = xhr.发送体长度
+    }
+
+    // 执行加载
+    ResourceLoader_完整加载(loader)
+
+    如果 (xhr.已中止) { 返回 }
+
+    // HEADERS_RECEIVED
+    xhr.readyState = XHR_HEADERS_RECEIVED
+    xhr.状态码 = loader.响应.状态码
+    xhr.状态文本 = loader.响应.状态文本
+    xhr.响应头 = loader.响应.响应头
+    XHR_触发readystatechange(xhr)
+
+    // LOADING
+    xhr.readyState = XHR_LOADING
+    XHR_触发readystatechange(xhr)
+
+    // DONE
+    如果 (loader.状态 == 请求状态_完成) {
+        xhr.响应文本 = loader.接收缓冲
+        xhr.响应长度 = loader.已接收字节
+        xhr.readyState = XHR_DONE
+        XHR_触发readystatechange(xhr)
+
+        如果 (xhr.onload != 0) { 调用(xhr.onload, xhr) }
+    } 否则 {
+        xhr.readyState = XHR_DONE
+        XHR_触发readystatechange(xhr)
+        如果 (xhr.onerror != 0) { 调用(xhr.onerror, xhr) }
+    }
+
+    // loadend
+    如果 (xhr.onloadend != 0) { 调用(xhr.onloadend, xhr) }
+}
+
+函数 XHR_abort(xhr) {
+    xhr.已中止 = 真
+    xhr.readyState = XHR_DONE
+    如果 (xhr.onabort != 0) { 调用(xhr.onabort, xhr) }
+    如果 (xhr.onloadend != 0) { 调用(xhr.onloadend, xhr) }
+    xhr.readyState = XHR_UNSENT
+}
+
+函数 XHR_getResponseHeader(xhr, 名) {
+    如果 (xhr.响应头 == 0) { 返回 0 }
+    返回 HTTP头部_获取(xhr.响应头, 名)
+}
+
+函数 XHR_getAllResponseHeaders(xhr) {
+    如果 (xhr.响应头 == 0) { 返回 "" }
+    定义 可变 结果 = ""
+    定义 可变 i = 0
+    当 (i < xhr.响应头.数量) {
+        定义 偏移 = xhr.响应头.条目 + i * 32
+        结果 = 字符串_连接(结果, 内存_读64(偏移))
+        结果 = 字符串_连接(结果, ": ")
+        结果 = 字符串_连接(结果, 内存_读64(偏移 + 16))
+        结果 = 字符串_连接(结果, "\r\n")
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 XHR_触发readystatechange(xhr) {
+    如果 (xhr.onreadystatechange != 0) {
+        调用(xhr.onreadystatechange, xhr)
+    }
+}
+
+定义 可变 AI_标记语言请_事件频率 = 0
+定义 可变 AI_标记语言请_节流阈值 = 16
+
+函数 AI_标记语言请_节流判断(事件类型, 间隔毫秒) {
+    AI_标记语言请_事件频率 = AI_标记语言请_事件频率 + 1
+    如果 (事件类型 == "滚动" && 间隔毫秒 < AI_标记语言请_节流阈值) { 返回 真 }
+    如果 (事件类型 == "移动" && 间隔毫秒 < AI_标记语言请_节流阈值) { 返回 真 }
+    返回 假
+}
+
+函数 AI_标记语言请_优先级排序(事件类型) {
+    如果 (事件类型 == "点击") { 返回 100 }
+    如果 (事件类型 == "输入") { 返回 90 }
+    如果 (事件类型 == "滚动") { 返回 30 }
+    返回 50
+}

@@ -1,0 +1,141 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/哈希函数.nova")
+导入("../中枢/中断请求管理.nova")
+导入("../中枢/设备号创建.nova")
+
+// NovaOS virtio块设备
+// 功能: virtio-blk驱动，支持读写请求、配置空间、中断处理
+
+定义 VIRTIO_BLK_T_IN        = 0    // 读
+定义 VIRTIO_BLK_T_OUT       = 1    // 写
+定义 VIRTIO_BLK_T_FLUSH     = 4    // 刷新
+定义 VIRTIO_BLK_T_GET_ID    = 8    // 获取设备ID
+定义 VIRTIO_BLK_T_DISCARD   = 11   // TRIM/DISCARD
+定义 VIRTIO_BLK_T_WRITE_ZEROES = 13
+
+定义 VIRTIO_BLK_S_OK        = 0
+定义 VIRTIO_BLK_S_IOERR     = 1
+定义 VIRTIO_BLK_S_UNSUPP    = 2
+
+定义 VIRTIO_BLK_F_SIZE_MAX  = 1
+定义 VIRTIO_BLK_F_SEG_MAX   = 2
+定义 VIRTIO_BLK_F_GEOMETRY  = 4
+定义 VIRTIO_BLK_F_RO        = 5
+定义 VIRTIO_BLK_F_BLK_SIZE  = 6
+定义 VIRTIO_BLK_F_FLUSH     = 9
+定义 VIRTIO_BLK_F_TOPOLOGY  = 10
+定义 VIRTIO_BLK_F_MQ        = 12
+定义 VIRTIO_BLK_F_DISCARD   = 13
+
+定义 VIRTIO_BLK_CFG_容量       = 0    // u64 扇区数
+定义 VIRTIO_BLK_CFG_最大段大小  = 8    // u32
+定义 VIRTIO_BLK_CFG_最大段数    = 12   // u32
+定义 VIRTIO_BLK_CFG_几何_柱面  = 16   // u16
+定义 VIRTIO_BLK_CFG_几何_磁头  = 18   // u8
+定义 VIRTIO_BLK_CFG_几何_扇区  = 19   // u8
+定义 VIRTIO_BLK_CFG_块大小     = 20   // u32
+
+定义 VIRTIO_BLK_扇区大小 = 512
+定义 VIRTIO_BLK_队列大小 = 128
+
+// virtio-blk请求头(16字节)
+
+结构 VirtioBlk请求头 {
+    类型,
+    保留,
+    扇区,
+}
+
+// virtio-blk设备结构
+
+结构 VirtioBlk设备 {
+    virtio设备,    // 指针<VirtioDevice>
+    请求队列,    // 指针<Virtqueue>
+    容量_扇区,
+    块大小,
+    只读,
+    支持flush,
+    最大段大小,
+    最大段数,
+    设备名,
+    中断号,
+    飞行中请求,
+    锁,    // 自旋锁
+}
+
+结构 VirtioBlk请求 {
+    头,    // VirtioBlk请求头
+    数据,    // 指针<u8>
+    数据大小,
+    状态,
+    完成,    // 完成量
+    错误,
+}
+
+// 初始化
+
+定义 可变 全局virtio块设备 = 空
+
+函数 virtio块_初始化(virtio设备) {
+    内核信息("virtio-blk: 初始化设备\n")
+
+    // 分配设备结构
+    定义 可变 blk = 分配内存(大小(VirtioBlk设备))
+    如果 (blk == 空) { 返回 错误码_内存不足 }
+
+    blk.virtio设备 = virtio设备
+
+    // 协商功能
+    定义 功能 = virtio_协商功能(virtio设备,
+        (1 << VIRTIO_BLK_F_SIZE_MAX) |
+        (1 << VIRTIO_BLK_F_SEG_MAX) |
+        (1 << VIRTIO_BLK_F_BLK_SIZE) |
+        (1 << VIRTIO_BLK_F_FLUSH) |
+        (1 << VIRTIO_F_版本1))
+
+    blk.只读 = (功能 & (1 << VIRTIO_BLK_F_RO)) != 0
+    blk.支持flush = (功能 & (1 << VIRTIO_BLK_F_FLUSH)) != 0
+
+    // 读取配置空间
+    blk.容量_扇区 = virtio_读配置_u64(virtio设备, VIRTIO_BLK_CFG_容量)
+    如果 (功能 & (1 << VIRTIO_BLK_F_BLK_SIZE)) {
+        blk.块大小 = virtio_读配置_u32(virtio设备, VIRTIO_BLK_CFG_块大小)
+    } 否则 {
+        blk.块大小 = VIRTIO_BLK_扇区大小
+    }
+
+    如果 (功能 & (1 << VIRTIO_BLK_F_SEG_MAX)) {
+        blk.最大段数 = virtio_读配置_u32(virtio设备, VIRTIO_BLK_CFG_最大段数)
+    } 否则 {
+        blk.最大段数 = 1
+    }
+
+    // 设置virtqueue
+    blk.请求队列 = virtio_设置队列(virtio设备, 0, VIRTIO_BLK_队列大小)
+    如果 (blk.请求队列 == 空) {
+        释放内存(blk)
+        返回 错误码_IO
+    }
+
+    // 注册中断
+    blk.中断号 = virtio_获取中断号(virtio设备)
+    IRQ_注册_带标志(blk.中断号, "virtio-blk", virtio块_中断处理, IRQF_共享)
+
+    // 标记设备就绪
+    virtio_设备就绪(virtio设备)
+
+    blk.设备名 = "vda"
+    blk.飞行中请求 = 0
+    全局virtio块设备 = blk
+
+    定义 容量MB = (blk.容量_扇区 * VIRTIO_BLK_扇区大小) / (1024 * 1024)
+    内核信息("virtio-blk: %s 容量=%dMB 块大小=%d %s\n",
+        blk.设备名, 容量MB, blk.块大小,
+        blk.只读 ? "只读" : "读写")
+
+    // 注册到块设备层
+    块设备_注册(blk.设备名, virtio块_读, virtio块_写)
+
+    返回 0
+}

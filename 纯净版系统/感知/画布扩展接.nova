@@ -1,0 +1,118 @@
+
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// 对应: nova/renderer/modules/canvas/canvas2d/ (
+// nova/renderer/platform/graphics/ (~10000行)
+// 画布 2D核心:
+// 路径(Path): moveTo/lineTo/arc/bezierCurveTo/closePath
+// 填充/描边: fill()/stroke() — 路径→像素
+// 变换: translate/rotate/scale/setTransform
+// 样式: fill样式/stroke样式(颜色/渐变/图案)
+// 合成: globalAlpha/globalCompositeOperation
+// 图像: draw图像/get图像Data/put图像Data
+// 文字: fillText/strokeText/measureText
+// 渲染后端:
+// 软件: 直接操作像素缓冲(CPU)
+// 图处: 通过Skia→图处命令(硬件加速)
+// Nova: AI总线决定软件/图处路径
+
+// §1 画布上下文状态
+
+// 路径命令类型
+定义 路径_MoveTo = 0
+定义 路径_LineTo = 1
+定义 路径_QuadTo = 2 // 二次贝塞尔
+定义 路径_Nova三次方To = 3 // 三次贝塞尔
+定义 路径_ArcTo = 4
+定义 路径_Close = 5
+定义 路径_Arc = 6 // arc(cx,cy,r,startAngle,endAngle)
+定义 路径_Rect = 7
+定义 路径_Ellipse = 8
+
+// 线帽
+定义 LineCap_Butt = 0
+定义 LineCap_Round = 1
+定义 LineCap_Square = 2
+
+// 线连接
+定义 LineJoin_Miter = 0
+定义 LineJoin_Round = 1
+定义 LineJoin_Bevel = 2
+
+// 合成模式
+定义 Composite_SourceOver = 0
+定义 Composite_SourceIn = 1
+定义 Composite_SourceOut = 2
+定义 Composite_SourceAtop = 3
+定义 Composite_DestOver = 4
+定义 Composite_DestIn = 5
+定义 Composite_DestOut = 6
+定义 Composite_DestAtop = 7
+定义 Composite_Lighter = 8
+定义 Composite_Copy = 9
+定义 Composite_Xor = 10
+定义 Composite_Multiply = 11
+定义 Composite_Screen = 12
+
+// 填充规则
+定义 FillRule_NonZero = 0
+定义 FillRule_EvenOdd = 1
+
+// 文字对齐
+定义 TextAlign_Start = 0
+定义 TextAlign_End = 1
+定义 TextAlign_Left = 2
+定义 TextAlign_Right = 3
+定义 TextAlign_Center = 4
+
+// 文字基线
+定义 TextBaseline_Top = 0
+定义 TextBaseline_Hanging = 1
+定义 TextBaseline_Middle = 2
+定义 TextBaseline_Alphabetic = 3
+定义 TextBaseline_Ideographic = 4
+定义 TextBaseline_Bottom = 5
+
+// §2 画布状态结构
+
+结构 画布State {
+ // 变换矩阵(2D仿射, Q10定点)
+ // [a c e] [scaleX skewX translateX]
+ // [b d f] = [skewY scaleY translateY]
+ // [0 0 1]
+ a,    // i32, b: i32, c: i32, d: i32, e: i32, f: i32
+
+ // 裁剪区域
+ 裁剪x,    // i32, 裁剪y: i32, 裁剪w: u32, 裁剪h: u32
+ 有裁剪,
+ // 样式
+ 填充颜色R,    // u8, 填充颜色G: u8, 填充颜色B: u8, 填充颜色A: u8
+ 描边颜色R,    // u8, 描边颜色G: u8, 描边颜色B: u8, 描边颜色A: u8
+ 填充渐变,    // u64 画布Gradient* (0=纯色)
+ 描边渐变,
+ // 线条
+ 线宽,    // u32 Q10
+ 线帽,    // u32 LineCap_xxx
+ 线连接,    // u32 LineJoin_xxx
+ 斜切限制,    // u32 Q10
+ 虚线偏移,    // u32 Q10
+ 虚线模式,    // u64 u32数组
+ 虚线数,
+ // 合成
+ 全局透明度,    // u8 0-255
+ 合成模式,    // u32 Composite_xxx
+
+ // 文字
+ 字体,    // u64 字体*
+ 字号,    // u32 像素
+ 文字对齐,
+ 文字基线,
+ // 阴影
+ 阴影颜色R,    // u8, 阴影颜色G: u8, 阴影颜色B: u8, 阴影颜色A: u8
+ 阴影偏移x,
+ 阴影偏移y,
+ 阴影模糊,
+ // 状态栈链接
+ 上一状态,    // u64 画布State* (save/restore栈)
+}

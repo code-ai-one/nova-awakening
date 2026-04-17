@@ -1,0 +1,146 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+
+//       layout_object.cc (containment checks ~300行)
+//       css_containment.cc (~400行)
+//       paint_layer.cc (content-visibility ~500行)
+//       display_lock_context.cc (~800行)
+// CSS Containment (Level 2):
+//   contain: none | strict | content | size | layout | style | paint
+//   contain-intrinsic-size: auto 300px 200px
+//   content-visibility: visible | hidden | auto
+// contain属性值:
+//   size   — 元素大小不依赖子内容(可跳过子树布局)
+//   layout — 子树布局不影响外部(独立格式化上下文)
+//   style  — 计数器/引用等不泄漏到外部
+//   paint  — 子树不在边界外绘制(隐式overflow:clip)
+//   strict = size layout style paint
+//   content = layout style paint
+// content-visibility:
+//   visible — 正常渲染
+//   hidden  — 跳过渲染(类似display:none但保留布局空间)
+//   auto    — 不在视口时跳过渲染(IntersectionObserver驱动)
+//             进入视口时自动渲染,离开视口时自动跳过
+
+// §1 Containment标志
+
+定义 CONTAIN_NONE     = 0x00
+定义 CONTAIN_SIZE     = 0x01
+定义 CONTAIN_LAYOUT   = 0x02
+定义 CONTAIN_STYLE    = 0x04
+定义 CONTAIN_PAINT    = 0x08
+定义 CONTAIN_STRICT   = 0x0F    // size | layout | style | paint
+定义 CONTAIN_CONTENT  = 0x0E    // layout | style | paint
+定义 CONTAIN_INLINE_SIZE = 0x10 // inline-size containment (Level 3)
+
+定义 CV_VISIBLE = 0
+定义 CV_HIDDEN  = 1
+定义 CV_AUTO    = 2
+
+// §2 解析contain属性
+
+函数 Containment_解析(值字符串) {
+    如果 (值字符串 == 0) { 返回 CONTAIN_NONE }
+    如果 (字符串_相等(值字符串, "none")) { 返回 CONTAIN_NONE }
+    如果 (字符串_相等(值字符串, "strict")) { 返回 CONTAIN_STRICT }
+    如果 (字符串_相等(值字符串, "content")) { 返回 CONTAIN_CONTENT }
+
+    定义 可变 结果 = CONTAIN_NONE
+    如果 (字符串_包含(值字符串, "size")) { 结果 = 结果 | CONTAIN_SIZE }
+    如果 (字符串_包含(值字符串, "layout")) { 结果 = 结果 | CONTAIN_LAYOUT }
+    如果 (字符串_包含(值字符串, "style")) { 结果 = 结果 | CONTAIN_STYLE }
+    如果 (字符串_包含(值字符串, "paint")) { 结果 = 结果 | CONTAIN_PAINT }
+    如果 (字符串_包含(值字符串, "inline-size")) { 结果 = 结果 | CONTAIN_INLINE_SIZE }
+    返回 结果
+}
+
+函数 ContentVisibility_解析(值字符串) {
+    如果 (值字符串 == 0 || 字符串_相等(值字符串, "visible")) { 返回 CV_VISIBLE }
+    如果 (字符串_相等(值字符串, "hidden")) { 返回 CV_HIDDEN }
+    如果 (字符串_相等(值字符串, "auto")) { 返回 CV_AUTO }
+    返回 CV_VISIBLE
+}
+
+// §3 Containment对布局的影响
+
+函数 Containment_应用到布局(布局对象, contain标志) {
+    如果 (布局对象 == 0) { 返回 }
+
+    // size containment: 元素大小不依赖子内容
+    // 布局时使用contain-intrinsic-size代替子内容计算的大小
+    如果 (contain标志 & CONTAIN_SIZE) {
+        Containment_应用Size(布局对象)
+    }
+
+    // layout containment: 创建独立格式化上下文(BFC)
+    // 子树布局完全独立,不影响外部
+    如果 (contain标志 & CONTAIN_LAYOUT) {
+        Containment_应用布局(布局对象)
+    }
+
+    // paint containment: 裁剪子内容到边界
+    // 相当于隐式 overflow: clip
+    如果 (contain标志 & CONTAIN_PAINT) {
+        Containment_应用绘制(布局对象)
+    }
+
+    // style containment: 防止计数器泄漏
+    如果 (contain标志 & CONTAIN_STYLE) {
+        Containment_应用样式(布局对象)
+    }
+}
+
+函数 Containment_应用Size(布局对象) {
+    // Size containment: 
+    // 1. 布局子树时,子内容不影响元素的固有大小
+    // 2. 如果没有显式宽高,使用contain-intrinsic-size
+    // 3. 子树仍然正常布局(但不影响父大小)
+    
+    定义 样式 = 布局对象.计算样式
+    如果 (样式 == 0) { 返回 }
+
+    // 检查是否有contain-intrinsic-size
+    如果 (样式.contain_intrinsic_width > 0) {
+        布局对象.宽 = 样式.contain_intrinsic_width
+    }
+    如果 (样式.contain_intrinsic_height > 0) {
+        布局对象.高 = 样式.contain_intrinsic_height
+    }
+
+    // 标记: 子内容大小不回溯到此元素
+    布局对象.size_contained = 真
+}
+
+函数 Containment_应用布局(布局对象) {
+    // 布局 containment:
+    // 1. 创建新的BFC(块格式化上下文)
+    // 2. 子树是独立的格式化上下文
+    // 3. 不接受来自外部的浮动
+    // 4. margin不折叠穿越此边界
+    
+    布局对象.是独立BFC = 真
+    布局对象.layout_contained = 真
+}
+
+函数 Containment_应用绘制(布局对象) {
+    // 绘制 containment:
+    // 1. 子内容不在元素边界外绘制
+    // 2. 创建新的层叠上下文
+    // 3. 创建新的包含块(对fixed子元素)
+    
+    布局对象.paint_contained = 真
+    布局对象.是层叠上下文 = 真
+    // overflow行为类似clip
+    布局对象.overflow_clip = 真
+}
+
+函数 Containment_应用样式(布局对象) {
+    // 样式 containment:
+    // 1. CSS计数器的作用域限制在此元素
+    // 2. quotes属性不泄漏
+    // 3. content属性的open-quote等不泄漏
+    
+    布局对象.style_contained = 真
+}

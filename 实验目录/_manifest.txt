@@ -1,0 +1,9 @@
+Nova.nova
+backfeed/replacement_map.nova
+core/theory_core.nova
+core/crystallization_core.nova
+verify/direct_runtime_lab.nova
+exp/theory_experiments.nova
+exp/crystallization_experiments.nova
+verify/strict_validation.nova
+verify/stress_validation.nova

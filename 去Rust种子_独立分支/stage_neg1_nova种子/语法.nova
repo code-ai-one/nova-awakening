@@ -1,0 +1,337 @@
+// ════════════════════════════════════════════════════════════════
+// Nova 种子 mini 编译器 · 语法分析器 (Parser)
+// 对应 Rust: backend_seed.rs::Parser (约 450 行)
+// 目标: Nova 源码 → AST 节点列表
+// 依赖: 词法.nova (7/7 自测通过)
+// 产出: 语句列表 (Vec<Stmt>)
+//
+// 进度: 骨架 (2026-04-17) — 待逐模块填充
+// ════════════════════════════════════════════════════════════════
+
+// ─── AST 节点类型码 (对齐 常量.nova) ───
+定义 节_整数 = 100
+定义 节_字串 = 101
+定义 节_标识 = 102
+定义 节_调用 = 103
+定义 节_二元 = 104
+定义 节_列表 = 105
+定义 节_索引 = 106
+定义 节_定义 = 110
+定义 节_赋值 = 111
+定义 节_如果 = 112
+定义 节_当 = 113
+定义 节_返回 = 114
+定义 节_表达式 = 115
+定义 节_索引赋值 = 116
+定义 节_函数 = 120
+定义 节_中断 = 121
+定义 节_继续 = 122
+定义 节_导入 = 130
+定义 节_结构 = 131
+定义 节_匹配 = 132
+定义 节_尝试 = 133
+定义 节_抛出 = 134
+定义 节_浮点 = 150
+定义 节_字典 = 151
+
+// ─── Token 类型码 (对齐 词法.nova) ───
+定义 tok_fn = 1
+定义 tok_define = 2
+定义 tok_return = 3
+定义 tok_if = 4
+定义 tok_else = 5
+定义 tok_while = 6
+定义 tok_true = 7
+定义 tok_false = 8
+定义 tok_null = 9
+定义 tok_ident = 20
+定义 tok_number = 21
+定义 tok_string = 22
+定义 tok_float = 23
+定义 tok_lparen = 40
+定义 tok_rparen = 41
+定义 tok_lbrace = 42
+定义 tok_rbrace = 43
+定义 tok_comma = 44
+定义 tok_eq = 50
+定义 tok_plus = 51
+定义 tok_minus = 52
+定义 tok_star = 53
+定义 tok_slash = 54
+定义 tok_eof = 0
+
+// ─── Parser 状态 ───
+定义 可变 _tokens = []
+定义 可变 _pos = 0
+
+函数 parser_初始化(tokens) {
+    _tokens = tokens
+    _pos = 0
+    返回 空
+}
+
+函数 _peek() {
+    如果 (_pos >= 计数(_tokens)) {
+        返回 [tok_eof, "", 0]
+    }
+    返回 _tokens[_pos]
+}
+
+函数 _advance() {
+    定义 _t = _peek()
+    _pos = _pos + 1
+    返回 _t
+}
+
+函数 _expect(token_type) {
+    定义 _cur = _peek()
+    如果 (_cur[0] == token_type) {
+        _advance()
+        返回 1
+    }
+    返回 0
+}
+
+函数 _at_end() {
+    如果 (_pos >= 计数(_tokens)) { 返回 1 }
+    返回 0
+}
+
+// ─── 主入口 ───
+函数 parse_program() {
+    定义 可变 stmts = []
+    当 (_at_end() == 0) {
+        定义 _s = parse_stmt()
+        如果 (_s != 空) {
+            追加(stmts, _s)
+        }
+    }
+    返回 stmts
+}
+
+// Token 扩展
+定义 tok_break = 10
+定义 tok_continue = 11
+定义 tok_import = 12
+定义 tok_struct = 13
+定义 tok_match = 14
+定义 tok_try = 15
+定义 tok_throw = 16
+定义 tok_mutable = 17
+
+函数 parse_stmt() {
+    定义 _t = _peek()
+    定义 _tt = _t[0]
+    如果 (_tt == tok_fn) { 返回 parse_func_def() }
+    如果 (_tt == tok_define) { 返回 parse_var_def() }
+    如果 (_tt == tok_return) { 返回 parse_return() }
+    如果 (_tt == tok_if) { 返回 parse_if() }
+    如果 (_tt == tok_while) { 返回 parse_while() }
+    如果 (_tt == tok_break) { _advance() 返回 [节_中断] }
+    如果 (_tt == tok_continue) { _advance() 返回 [节_继续] }
+    如果 (_tt == tok_import) { 返回 parse_import() }
+    如果 (_tt == tok_struct) { 返回 parse_struct_def() }
+    如果 (_tt == tok_throw) {
+        _advance()
+        返回 [节_抛出, parse_expr()]
+    }
+    如果 (_tt == tok_rbrace) { _advance() 返回 空 }
+    如果 (_tt == tok_eof) { _advance() 返回 空 }
+    返回 parse_expr_or_assign()
+}
+
+函数 parse_import() {
+    _advance()  // skip 导入
+    _expect(tok_lparen)
+    定义 _path = _advance()  // 字符串字面量
+    _expect(tok_rparen)
+    返回 [节_导入, _path[1]]
+}
+
+函数 parse_struct_def() {
+    _advance()  // skip 结构
+    定义 _name = _advance()[1]
+    _expect(tok_lbrace)
+    定义 可变 字段列 = []
+    当 (_peek()[0] != tok_rbrace 且 _at_end() == 0) {
+        定义 _field = _advance()
+        追加(字段列, _field[1])
+        如果 (_peek()[0] == tok_comma) { _advance() }
+    }
+    _expect(tok_rbrace)
+    返回 [节_结构, _name, 字段列]
+}
+
+函数 parse_func_def() {
+    _advance()  // skip 函数
+    定义 _name_tok = _advance()
+    定义 名 = _name_tok[1]
+    _expect(tok_lparen)
+    定义 可变 参数 = []
+    当 (_peek()[0] != tok_rparen) {
+        定义 _p = _advance()
+        追加(参数, _p[1])
+        如果 (_peek()[0] == tok_comma) { _advance() }
+    }
+    _expect(tok_rparen)
+    _expect(tok_lbrace)
+    定义 可变 体 = []
+    当 (_peek()[0] != tok_rbrace 且 _at_end() == 0) {
+        定义 _s = parse_stmt()
+        如果 (_s != 空) { 追加(体, _s) }
+    }
+    _expect(tok_rbrace)
+    返回 ["函数", 名, 参数, 体]
+}
+
+函数 parse_var_def() {
+    _advance()  // skip 定义
+    // 可变 可选
+    定义 可变 _is_mut = 0
+    如果 (_peek()[0] == tok_mutable) {
+        _advance()
+        _is_mut = 1
+    }
+    定义 _name_tok = _advance()
+    定义 名 = _name_tok[1]
+    定义 可变 初值 = [tok_number, 0]
+    如果 (_peek()[0] == tok_eq) {
+        _advance()
+        初值 = parse_expr()
+    }
+    返回 [节_定义, 名, 初值, _is_mut]
+}
+
+函数 parse_return() {
+    _advance()  // skip 返回
+    定义 _t = _peek()[0]
+    如果 (_t == tok_rbrace 或 _t == tok_eof) {
+        返回 [节_返回, [tok_number, 0]]
+    }
+    返回 [节_返回, parse_expr()]
+}
+
+函数 parse_if() {
+    _advance()  // skip 如果
+    _expect(tok_lparen)
+    定义 _cond = parse_expr()
+    _expect(tok_rparen)
+    _expect(tok_lbrace)
+    定义 可变 then_body = []
+    当 (_peek()[0] != tok_rbrace 且 _at_end() == 0) {
+        定义 _s = parse_stmt()
+        如果 (_s != 空) { 追加(then_body, _s) }
+    }
+    _expect(tok_rbrace)
+    // else 可选 (否则 / 否则 如果)
+    定义 可变 else_body = []
+    如果 (_peek()[0] == tok_else) {
+        _advance()
+        如果 (_peek()[0] == tok_if) {
+            // else if: 递归生成嵌套 if
+            追加(else_body, parse_if())
+        } 否则 {
+            _expect(tok_lbrace)
+            当 (_peek()[0] != tok_rbrace 且 _at_end() == 0) {
+                定义 _s = parse_stmt()
+                如果 (_s != 空) { 追加(else_body, _s) }
+            }
+            _expect(tok_rbrace)
+        }
+    }
+    返回 [节_如果, _cond, then_body, else_body]
+}
+
+函数 parse_while() {
+    _advance()  // skip 当
+    _expect(tok_lparen)
+    定义 _cond = parse_expr()
+    _expect(tok_rparen)
+    _expect(tok_lbrace)
+    定义 可变 体 = []
+    当 (_peek()[0] != tok_rbrace 且 _at_end() == 0) {
+        定义 _s = parse_stmt()
+        如果 (_s != 空) { 追加(体, _s) }
+    }
+    _expect(tok_rbrace)
+    返回 [节_当, _cond, 体]
+}
+
+函数 parse_expr_or_assign() {
+    定义 _e = parse_expr()
+    // 赋值
+    如果 (_peek()[0] == tok_eq) {
+        _advance()
+        定义 _rhs = parse_expr()
+        返回 [节_赋值, _e, _rhs]
+    }
+    返回 _e
+}
+
+函数 parse_expr() {
+    // 简化: 只处理最基础的二元表达式 +/- * /
+    定义 可变 左 = parse_term()
+    当 (_peek()[0] == tok_plus 或 _peek()[0] == tok_minus) {
+        定义 _op_tok = _advance()
+        定义 _op = "+"
+        如果 (_op_tok[0] == tok_minus) { _op = "-" }
+        定义 _右 = parse_term()
+        左 = [节_二元, _op, 左, _右]
+    }
+    返回 左
+}
+
+函数 parse_term() {
+    定义 可变 左 = parse_primary()
+    当 (_peek()[0] == tok_star 或 _peek()[0] == tok_slash) {
+        定义 _op_tok = _advance()
+        定义 _op = "*"
+        如果 (_op_tok[0] == tok_slash) { _op = "/" }
+        定义 _右 = parse_primary()
+        左 = [节_二元, _op, 左, _右]
+    }
+    返回 左
+}
+
+函数 parse_primary() {
+    定义 _t = _advance()
+    定义 _tt = _t[0]
+    如果 (_tt == tok_number) { 返回 [tok_number, _t[1]] }
+    如果 (_tt == tok_float) { 返回 [节_浮点, _t[1], _t[2]] }
+    如果 (_tt == tok_string) { 返回 [节_字串, _t[1]] }
+    如果 (_tt == tok_ident) {
+        定义 名 = _t[1]
+        // 函数调用
+        如果 (_peek()[0] == tok_lparen) {
+            _advance()
+            定义 可变 args = []
+            当 (_peek()[0] != tok_rparen 且 _at_end() == 0) {
+                追加(args, parse_expr())
+                如果 (_peek()[0] == tok_comma) { _advance() }
+            }
+            _expect(tok_rparen)
+            返回 [节_调用, 名, args]
+        }
+        返回 [节_标识, 名]
+    }
+    如果 (_tt == tok_lparen) {
+        定义 _e = parse_expr()
+        _expect(tok_rparen)
+        返回 _e
+    }
+    返回 空
+}
+
+// ─── 自测 ───
+函数 parser_自测() {
+    // TODO: 填充后与 backend_seed Parser 对比 AST 结构
+    打印("Parser 骨架加载 ✓")
+    打印("下一步: 填充 parse_import / parse_struct_def / parse_match / parse_try 等")
+    打印("对齐目标: Rust backend_seed.rs::Parser (约 450 行)")
+    返回 0
+}
+
+函数 主程序() {
+    parser_自测()
+    返回 0
+}

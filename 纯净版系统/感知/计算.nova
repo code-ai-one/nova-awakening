@@ -1,0 +1,241 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./选择匹配.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/沙箱隔离进.nova")
+导入("./原子驻留.nova")
+导入("./超传头部创.nova")
+导入("./文档节点.nova")
+
+// §2 Specificity计算
+// (a, b, c) 三元组:
+//   a = ID选择器数量
+//   b = 类/属性/伪类选择器数量
+//   c = 标签/伪元素选择器数量
+// :not()/:is() 内部取最高specificity, :where() = 0
+
+结构 Specificity {
+    a,    // u32 ID权重
+    b,    // u32 类/属性/伪类权重
+    c,    // u32 标签/伪元素权重
+}
+
+函数 Specificity_计算(选择器) {
+    定义 spec = Specificity {}
+    spec.a = 0; spec.b = 0; spec.c = 0
+    如果 (选择器 == 0) { 返回 spec }
+    Specificity_累加(选择器, spec)
+    返回 spec
+}
+
+函数 Specificity_累加(选择器, spec) {
+    如果 (选择器 == 0) { 返回 }
+    如果 (选择器.类型 == SEL_ID) { spec.a = spec.a + 1 }
+    否则 如果 (选择器.类型 == SEL_CLASS) { spec.b = spec.b + 1 }
+    否则 如果 (选择器.类型 == SEL_ATTR) { spec.b = spec.b + 1 }
+    否则 如果 (选择器.类型 == SEL_TAG) { spec.c = spec.c + 1 }
+    否则 如果 (选择器.类型 == SEL_PSEUDO_ELEM) { spec.c = spec.c + 1 }
+    否则 如果 (选择器.类型 == SEL_PSEUDO_CLASS) {
+        如果 (选择器.伪类ID == PC_WHERE) {
+            // :where() specificity = 0
+        } 否则 如果 (选择器.伪类ID == PC_NOT || 选择器.伪类ID == PC_IS || 选择器.伪类ID == PC_HAS) {
+            // 取内部最高specificity
+            定义 可变 max_a = 0; 定义 可变 max_b = 0; 定义 可变 max_c = 0
+            定义 可变 i = 0
+            当 (i < 选择器.伪类子选择器数) {
+                定义 子 = 内存_读64(选择器.伪类子选择器 + i * 8)
+                定义 子spec = Specificity_计算(子)
+                如果 (子spec.a > max_a || (子spec.a == max_a && 子spec.b > max_b) || (子spec.a == max_a && 子spec.b == max_b && 子spec.c > max_c)) {
+                    max_a = 子spec.a; max_b = 子spec.b; max_c = 子spec.c
+                }
+                i = i + 1
+            }
+            spec.a = spec.a + max_a; spec.b = spec.b + max_b; spec.c = spec.c + max_c
+        } 否则 {
+            spec.b = spec.b + 1
+        }
+    }
+    否则 如果 (选择器.类型 == SEL_COMPOUND) {
+        定义 可变 i = 0
+        当 (i < 选择器.子项数量) {
+            Specificity_累加(内存_读64(选择器.子项列表 + i * 8), spec)
+            i = i + 1
+        }
+    }
+    否则 如果 (选择器.类型 == SEL_COMPLEX) {
+        Specificity_累加(选择器.左选择器, spec)
+        Specificity_累加(选择器.右选择器, spec)
+    }
+}
+
+函数 Specificity_比较(a, b) {
+    // 返回 >0 如果a优先于b, <0 如果b优先, 0 相等
+    如果 (a.a != b.a) { 返回 a.a - b.a }
+    如果 (a.b != b.b) { 返回 a.b - b.b }
+    返回 a.c - b.c
+}
+
+函数 Specificity_转数值(spec) {
+    // 用于排序: a*65536 + b*256 + c
+    返回 spec.a * 65536 + spec.b * 256 + spec.c
+}
+
+// §3 选择器匹配引擎(完整)
+
+函数 Selector_匹配(选择器, 元素) {
+    如果 (选择器 == 0 || 元素 == 0) { 返回 假 }
+
+    如果 (选择器.类型 == SEL_TAG) {
+        定义 扩展 = 元素_获取扩展(元素)
+        如果 (扩展 == 0) { 返回 假 }
+        返回 字符串_相等_不区分大小写(扩展.标签名, 选择器.名称)
+    }
+
+    如果 (选择器.类型 == SEL_CLASS) {
+        返回 元素_hasClass(元素, 选择器.名称)
+    }
+
+    如果 (选择器.类型 == SEL_ID) {
+        返回 字符串_相等(元素_getAttribute(元素, "id"), 选择器.名称)
+    }
+
+    如果 (选择器.类型 == SEL_UNIVERSAL) { 返回 真 }
+
+    如果 (选择器.类型 == SEL_ATTR) {
+        返回 Selector_匹配属性(选择器, 元素)
+    }
+
+    如果 (选择器.类型 == SEL_PSEUDO_CLASS) {
+        返回 Selector_匹配伪类(选择器, 元素)
+    }
+
+    如果 (选择器.类型 == SEL_COMPOUND) {
+        // 所有子项都必须匹配(AND)
+        定义 可变 i = 0
+        当 (i < 选择器.子项数量) {
+            如果 (!Selector_匹配(内存_读64(选择器.子项列表 + i * 8), 元素)) { 返回 假 }
+            i = i + 1
+        }
+        返回 真
+    }
+
+    如果 (选择器.类型 == SEL_COMPLEX) {
+        返回 Selector_匹配复杂(选择器, 元素)
+    }
+
+    返回 假
+}
+
+函数 Selector_匹配属性(sel, 元素) {
+    定义 属性值 = 元素_getAttribute(元素, sel.属性名)
+    如果 (sel.属性匹配 == ATTR_EXISTS) { 返回 属性值 != 0 }
+    如果 (属性值 == 0) { 返回 假 }
+    定义 期望 = sel.属性值
+    如果 (期望 == 0) { 返回 假 }
+
+    如果 (sel.属性匹配 == ATTR_EXACT) {
+        如果 (sel.属性大小写) { 返回 字符串_相等_不区分大小写(属性值, 期望) }
+        返回 字符串_相等(属性值, 期望)
+    }
+    如果 (sel.属性匹配 == ATTR_PREFIX) { 返回 字符串_开头匹配(属性值, 期望) }
+    如果 (sel.属性匹配 == ATTR_SUFFIX) { 返回 字符串_结尾匹配(属性值, 期望) }
+    如果 (sel.属性匹配 == ATTR_SUBSTRING) { 返回 字符串_包含(属性值, 期望) }
+    如果 (sel.属性匹配 == ATTR_INCLUDES) {
+        // 空格分隔的词列表中包含
+        返回 字符串_词列表包含(属性值, 期望)
+    }
+    如果 (sel.属性匹配 == ATTR_DASH) {
+        // 等于val或以val-开头
+        返回 字符串_相等(属性值, 期望) || 字符串_开头匹配(属性值, 字符串_连接(期望, "-"))
+    }
+    返回 假
+}
+
+函数 Selector_匹配伪类(sel, 元素) {
+    定义 pc = sel.伪类ID
+
+    如果 (pc == PC_HOVER) { 返回 元素_状态_hover(元素) }
+    如果 (pc == PC_FOCUS) { 返回 元素_状态_focus(元素) }
+    如果 (pc == PC_ACTIVE) { 返回 元素_状态_active(元素) }
+
+    如果 (pc == PC_FIRST_CHILD) { 返回 元素_是第一子(元素) }
+    如果 (pc == PC_LAST_CHILD) { 返回 元素_是最后子(元素) }
+    如果 (pc == PC_ONLY_CHILD) { 返回 元素_是第一子(元素) && 元素_是最后子(元素) }
+
+    如果 (pc == PC_FIRST_OF_TYPE) { 返回 元素_是同类型第一(元素) }
+    如果 (pc == PC_LAST_OF_TYPE) { 返回 元素_是同类型最后(元素) }
+    如果 (pc == PC_ONLY_OF_TYPE) { 返回 元素_是同类型第一(元素) && 元素_是同类型最后(元素) }
+
+    如果 (pc == PC_NTH_CHILD) { 返回 Selector_匹配nth(元素, sel.伪类参数_a, sel.伪类参数_b, 假, 假) }
+    如果 (pc == PC_NTH_LAST_CHILD) { 返回 Selector_匹配nth(元素, sel.伪类参数_a, sel.伪类参数_b, 真, 假) }
+    如果 (pc == PC_NTH_OF_TYPE) { 返回 Selector_匹配nth(元素, sel.伪类参数_a, sel.伪类参数_b, 假, 真) }
+    如果 (pc == PC_NTH_LAST_OF_TYPE) { 返回 Selector_匹配nth(元素, sel.伪类参数_a, sel.伪类参数_b, 真, 真) }
+
+    如果 (pc == PC_EMPTY) {
+        // 没有子节点(或只有空文本)
+        返回 元素.第一子节点 == 0
+    }
+
+    如果 (pc == PC_CHECKED) {
+        定义 c = 元素_getAttribute(元素, "checked")
+        返回 c != 0
+    }
+    如果 (pc == PC_DISABLED) { 返回 元素_getAttribute(元素, "disabled") != 0 }
+    如果 (pc == PC_ENABLED) { 返回 元素_getAttribute(元素, "disabled") == 0 }
+    如果 (pc == PC_REQUIRED) { 返回 元素_getAttribute(元素, "required") != 0 }
+    如果 (pc == PC_OPTIONAL) { 返回 元素_getAttribute(元素, "required") == 0 }
+    如果 (pc == PC_ROOT) { 返回 元素.父节点 != 0 && 元素.父节点.节点类型 == 9 }
+    如果 (pc == PC_TARGET) {
+        // 元素ID == URL的hash
+        返回 假    // 需要检查当前URL的fragment
+    }
+
+    如果 (pc == PC_NOT) {
+        // :not(selector-list): 所有都不匹配
+        定义 可变 i = 0
+        当 (i < sel.伪类子选择器数) {
+            定义 子sel = 内存_读64(sel.伪类子选择器 + i * 8)
+            如果 (Selector_匹配(子sel, 元素)) { 返回 假 }
+            i = i + 1
+        }
+        返回 真
+    }
+    如果 (pc == PC_IS || pc == PC_WHERE) {
+        // :is()/:where(selector-list): 任一匹配
+        定义 可变 i = 0
+        当 (i < sel.伪类子选择器数) {
+            定义 子sel = 内存_读64(sel.伪类子选择器 + i * 8)
+            如果 (Selector_匹配(子sel, 元素)) { 返回 真 }
+            i = i + 1
+        }
+        返回 假
+    }
+    如果 (pc == PC_HAS) {
+        // :has(selector): 检查后代/兄弟是否匹配
+        定义 可变 i = 0
+        当 (i < sel.伪类子选择器数) {
+            定义 子sel = 内存_读64(sel.伪类子选择器 + i * 8)
+            如果 (Selector_has检查后代(元素, 子sel)) { 返回 真 }
+            i = i + 1
+        }
+        返回 假
+    }
+
+    返回 假
+}
+
+定义 可变 AI_计算_调用数 = 0
+定义 可变 AI_计算_异常数 = 0
+
+函数 AI_计算_监控() {
+    AI_计算_调用数 = AI_计算_调用数 + 1
+    返回 AI_计算_异常数 == 0
+}
+
+函数 AI_计算_健康检查() {
+    如果 (AI_计算_调用数 > 0 && AI_计算_异常数 * 100 / AI_计算_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

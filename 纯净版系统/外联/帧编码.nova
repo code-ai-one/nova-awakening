@@ -1,0 +1,125 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/辅助有符号读.nova")
+
+// Nova AI原生网络栈: HTTP/2 — 智能预取引擎
+// 【创新突破】传统浏览器: 只按页面指令加载资源,不预测用户行为
+//   Nova HTTP/2 = 标准HTTP/2核心 + 以下AI原生能力:
+//   ① 意图预取 — AI预测用户下一步可能访问的资源,提前加载
+//   ② 优先级动态调整 — 根据语义角色调整流优先级
+//   ③ 带宽感知 — 根据网络状态自动调整预取策略
+//   ④ 历史学习 — 学习用户浏览模式,优化预取准确率
+//       http2_session.cc 
+//       http2_stream.cc (~1500行)
+//       hpack_encoder.cc (~800行)
+//       hpack_decoder.cc (~800行)
+//       http_network_transaction.cc (resource hints ~500行)
+// HTTP/2 核心特性:
+//   多路复用: 一个传控连接上并发多个请求/响应(stream)
+//   帧(Frame): 最小传输单位(DATA/HEADERS/PRIORITY/RST_STREAM/SETTINGS等)
+//   HPACK: 头部压缩(静态表+动态表+Huffman编码)
+//   流优先级: 依赖树+权重
+//   服务器推送: Server Push (PUSH_PROMISE)
+//   流量控制: 窗口大小(连接级+流级)
+// Resource Hints:
+//   <link rel="preload">     — 预加载关键资源
+//   <link rel="prefetch">    — 预获取未来可能需要的资源
+//   <link rel="preconnect">  — 预建立连接(域名+传控+安全)
+//   <link rel="dns-prefetch"> — 预解析域名
+//   <link rel="modulepreload"> — 预加载ES 模块
+// 帧格式:
+//   +-----------------------------------------------+
+//   |                 Length (24)                    |
+//   +---------------+---------------+---------------+
+//   |  Type (8)     |  Flags (8)    |
+//   +-+-------------+---------------+--------------+
+//   |R|               Stream ID (31)                |
+//   +=+=============+===============+================+
+//   |                Frame Payload                   |
+//   +-----------------------------------------------+
+
+// §1 HTTP/2帧类型
+
+定义 H2_FRAME_DATA          = 0x00
+定义 H2_FRAME_HEADERS       = 0x01
+定义 H2_FRAME_PRIORITY      = 0x02
+定义 H2_FRAME_RST_STREAM    = 0x03
+定义 H2_FRAME_SETTINGS      = 0x04
+定义 H2_FRAME_PUSH_PROMISE  = 0x05
+定义 H2_FRAME_PING          = 0x06
+定义 H2_FRAME_GOAWAY        = 0x07
+定义 H2_FRAME_WINDOW_UPDATE = 0x08
+定义 H2_FRAME_CONTINUATION  = 0x09
+
+// 帧标志
+定义 H2_FLAG_END_STREAM  = 0x01
+定义 H2_FLAG_END_HEADERS = 0x04
+定义 H2_FLAG_PADDED      = 0x08
+定义 H2_FLAG_PRIORITY    = 0x20
+定义 H2_FLAG_ACK         = 0x01
+
+// 流状态
+定义 H2_STREAM_IDLE       = 0
+定义 H2_STREAM_OPEN       = 1
+定义 H2_STREAM_RESERVED_L = 2    // 本地保留(push)
+定义 H2_STREAM_RESERVED_R = 3    // 远端保留
+定义 H2_STREAM_HALF_CLOSED_L = 4 // 本地半关
+定义 H2_STREAM_HALF_CLOSED_R = 5
+定义 H2_STREAM_CLOSED     = 6
+
+// 错误码
+定义 H2_NO_ERROR           = 0x00
+定义 H2_PROTOCOL_ERROR     = 0x01
+定义 H2_INTERNAL_ERROR     = 0x02
+定义 H2_FLOW_CONTROL_ERROR = 0x03
+定义 H2_SETTINGS_TIMEOUT   = 0x04
+定义 H2_STREAM_CLOSED_ERR  = 0x05
+定义 H2_FRAME_SIZE_ERROR   = 0x06
+定义 H2_REFUSED_STREAM     = 0x07
+定义 H2_CANCEL             = 0x08
+定义 H2_COMPRESSION_ERROR  = 0x09
+定义 H2_CONNECT_ERROR      = 0x0A
+定义 H2_ENHANCE_YOUR_CALM  = 0x0B
+定义 H2_INADEQUATE_SECURITY = 0x0C
+
+// §2 HTTP/2帧
+
+结构 H2Frame {
+    长度,    // u32 24位: payload长度
+    类型,    // u8 帧类型
+    标志,
+    流ID,    // u32 31位
+    有效载荷,    // u64 数据指针
+}
+
+函数 H2Frame_编码(帧, 输出缓冲) {
+    如果 (帧 == 0 || 输出缓冲 == 0) { 返回 0 }
+    // 9字节帧头
+    内存_写8(输出缓冲, (帧.长度 >> 16) & 0xFF)
+    内存_写8(输出缓冲 + 1, (帧.长度 >> 8) & 0xFF)
+    内存_写8(输出缓冲 + 2, 帧.长度 & 0xFF)
+    内存_写8(输出缓冲 + 3, 帧.类型)
+    内存_写8(输出缓冲 + 4, 帧.标志)
+    内存_写32_大端(输出缓冲 + 5, 帧.流ID & 0x7FFFFFFF)
+    // payload
+    如果 (帧.有效载荷 != 0 && 帧.长度 > 0) {
+        内存_复制(输出缓冲 + 9, 帧.有效载荷, 帧.长度)
+    }
+    返回 9 + 帧.长度
+}
+
+函数 H2Frame_解码(数据, 数据长度) {
+    如果 (数据 == 0 || 数据长度 < 9) { 返回 0 }
+    定义 帧 = 堆_分配(H2Frame)
+    帧.长度 = (内存_读8(数据) << 16) | (内存_读8(数据 + 1) << 8) | 内存_读8(数据 + 2)
+    帧.类型 = 内存_读8(数据 + 3)
+    帧.标志 = 内存_读8(数据 + 4)
+    帧.流ID = 内存_读32_大端(数据 + 5) & 0x7FFFFFFF
+    如果 (帧.长度 > 0 && 数据长度 >= 9 + 帧.长度) {
+        帧.有效载荷 = 数据 + 9
+    } 否则 {
+        帧.有效载荷 = 0
+    }
+    返回 帧
+}

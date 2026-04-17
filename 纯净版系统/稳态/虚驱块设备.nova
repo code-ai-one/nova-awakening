@@ -1,0 +1,302 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("./虚驱通用.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/链表后继.nova")
+导入("../外联/分配地址客.nova")
+导入("../中枢/信号量创建.nova")
+导入("../中枢/设备号创建.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. virtio-blk: QEMU/KVM虚拟化标准块设备
+//   2. 请求队列: 将块IO请求提交到virtqueue
+//   3. scatter-gather: 支持分散/聚集IO(多段数据)
+//   4. 请求类型: 读(IN)/写(OUT)/flush/discard
+//   5. 完成通知: 后端通过中断通知请求完成
+
+外部 块设备_注册
+
+定义 VIRTIO_BLK_T_IN      = 0    // 读
+定义 VIRTIO_BLK_T_OUT     = 1    // 写
+定义 VIRTIO_BLK_T_FLUSH   = 4    // 刷新缓存到磁盘
+定义 VIRTIO_BLK_T_DISCARD = 11   // 丢弃(TRIM)
+
+结构 virtio_blk_请求头 {
+    类型,    // u32 VIRTIO_BLK_T_*
+    保留,
+    扇区,    // u64 起始扇区号
+}
+
+结构 块IO请求 {
+    头,    // u64 virtio_blk_outhdr
+    数据,    // u64 数据缓冲区
+    数据长度,
+    状态,    // u8 0=成功, 1=IO错误, 2=不支持
+    完成,    // u64 完成量(completion)
+}
+
+定义 可变 vblk_容量_扇区 = 0
+定义 可变 vblk_扇区大小 = 512
+定义 可变 vblk_请求队列 = []
+定义 可变 vblk_已完成数 = 0
+定义 可变 vblk_已提交数 = 0
+
+// 提交请求
+
+函数 vblk_读取(扇区, 数据, 扇区数) {
+    定义 req = 块IO请求 {}
+    定义 头 = virtio_blk_请求头 {}
+    头.类型 = VIRTIO_BLK_T_IN
+    头.扇区 = 扇区
+    req.头 = 头
+    req.数据 = 数据
+    req.数据长度 = 扇区数 * vblk_扇区大小
+    req.状态 = 0xFF   // 未完成
+    req.完成 = 完成量_创建()
+
+    追加(vblk_请求队列, req)
+    vblk_已提交数 = vblk_已提交数 + 1
+
+    // 提交到virtqueue
+    // virtqueue_add_sgs + virtqueue_kick
+
+    // 等待完成
+    wait_for_completion(req.完成)
+    返回 req.状态
+}
+
+函数 vblk_写入(扇区, 数据, 扇区数) {
+    定义 req = 块IO请求 {}
+    定义 头 = virtio_blk_请求头 {}
+    头.类型 = VIRTIO_BLK_T_OUT
+    头.扇区 = 扇区
+    req.头 = 头
+    req.数据 = 数据
+    req.数据长度 = 扇区数 * vblk_扇区大小
+    req.状态 = 0xFF
+    req.完成 = 完成量_创建()
+
+    追加(vblk_请求队列, req)
+    vblk_已提交数 = vblk_已提交数 + 1
+
+    // 提交到virtqueue
+    wait_for_completion(req.完成)
+    返回 req.状态
+}
+
+函数 vblk_flush() {
+    定义 req = 块IO请求 {}
+    定义 头 = virtio_blk_请求头 {}
+    头.类型 = VIRTIO_BLK_T_FLUSH
+    头.扇区 = 0
+    req.头 = 头
+    req.数据 = 空
+    req.数据长度 = 0
+    req.状态 = 0xFF
+    req.完成 = 完成量_创建()
+    追加(vblk_请求队列, req)
+    wait_for_completion(req.完成)
+    返回 req.状态
+}
+
+// 完成中断处理
+
+函数 vblk_完成中断() {
+    // 从virtqueue取出已完成的请求
+    当 (计数(vblk_请求队列) > 0) {
+        定义 req = vblk_请求队列[0]
+        如果 (req.状态 != 0xFF) {
+            链表_删除(vblk_请求队列, 0)
+            complete(req.完成)
+            vblk_已完成数 = vblk_已完成数 + 1
+        } 否则 { 中断 }
+    }
+}
+
+// 查询
+
+函数 vblk_获取容量() { 返回 vblk_容量_扇区 * vblk_扇区大小 }
+函数 vblk_获取容量MB() { 返回 vblk_容量_扇区 * vblk_扇区大小 / 1048576 }
+函数 vblk_统计() { 返回 [vblk_已提交数, vblk_已完成数] }
+
+// 设备探测和配置 
+
+定义 可变 vblk_vq = 空        // virtqueue引用
+定义 可变 vblk_设备基址 = 0
+定义 可变 vblk_最大段数 = 128
+定义 可变 vblk_只读 = 假
+定义 可变 vblk_已初始化 = 假
+
+函数 vblk_探测(virtio_设备) {
+    如果 (virtio_设备 == 空) { 返回 错误_无效参数 }
+    vblk_设备基址 = virtio_设备
+
+    // 读取配置空间: 容量
+    vblk_容量_扇区 = virtio_读配置64(virtio_设备, 0)
+    如果 (vblk_容量_扇区 == 0) {
+        内核警告("virtio-blk: 设备容量为0")
+        返回 错误_无效参数
+    }
+
+    // 读取可选特性
+    定义 特性 = virtio_读特性(virtio_设备)
+    如果 (特性 & (1 << 5)) {  // VIRTIO_BLK_F_RO
+        vblk_只读 = 真
+        内核信息("virtio-blk: 只读设备")
+    }
+    如果 (特性 & (1 << 2)) {  // VIRTIO_BLK_F_SIZE_MAX
+        vblk_扇区大小 = virtio_读配置32(virtio_设备, 12)
+    }
+    如果 (特性 & (1 << 4)) {  // VIRTIO_BLK_F_SEG_MAX
+        vblk_最大段数 = virtio_读配置32(virtio_设备, 16)
+    }
+
+    // 初始化virtqueue
+    vblk_vq = virtqueue_创建(virtio_设备, 0, 256)
+    如果 (vblk_vq == 空) {
+        内核错误("virtio-blk: virtqueue创建失败")
+        返回 错误_资源不足
+    }
+
+    vblk_已初始化 = 真
+    内核信息("virtio-blk: 容量=" + 整数转字符串(vblk_获取容量MB()) +
+             "MB 扇区大小=" + 整数转字符串(vblk_扇区大小) +
+             " 最大段数=" + 整数转字符串(vblk_最大段数))
+    返回 成功
+}
+
+// Scatter-Gather IO 
+
+函数 vblk_提交SG(类型, 扇区, sg_列表, sg数) {
+    如果 (!vblk_已初始化) { 返回 错误_无效参数 }
+    如果 (类型 == VIRTIO_BLK_T_OUT && vblk_只读) { 返回 错误_权限不足 }
+
+    // 构建请求头
+    定义 头缓冲 = 缓冲区(16)
+    缓冲写32(头缓冲, 0, 类型)
+    缓冲写32(头缓冲, 4, 0)  // 保留
+    缓冲写64(头缓冲, 8, 扇区)
+
+    // 状态字节
+    定义 状态缓冲 = 缓冲区(1)
+    缓冲写(状态缓冲, 0, 0xFF)  // 未完成
+
+    // 构建scatter-gather列表
+    // [头(device-read)] + [数据段...] + [状态(device-write)]
+    定义 可变 描述符列表 = []
+    追加(描述符列表, [头缓冲, 16, 0])  // 0=device readable
+
+    定义 可变 i = 0
+    当 (i < sg数 && i < vblk_最大段数) {
+        定义 方向 = 0
+        如果 (类型 == VIRTIO_BLK_T_IN) { 方向 = 1 }  // 1=device writable
+        追加(描述符列表, [sg_列表[i][0], sg_列表[i][1], 方向])
+        i = i + 1
+    }
+    追加(描述符列表, [状态缓冲, 1, 1])  // 状态=device writable
+
+    // 提交到virtqueue
+    定义 结果 = virtqueue_添加(vblk_vq, 描述符列表)
+    如果 (结果 != 成功) { 返回 结果 }
+
+    // kick通知后端
+    virtqueue_通知(vblk_vq, 空)
+    vblk_已提交数 = vblk_已提交数 + 1
+
+    返回 成功
+}
+
+// Discard/TRIM 
+
+函数 vblk_discard(扇区, 扇区数) {
+    如果 (!vblk_已初始化) { 返回 错误_无效参数 }
+    定义 req = 块IO请求 {}
+    定义 头 = virtio_blk_请求头 {}
+    头.类型 = VIRTIO_BLK_T_DISCARD
+    头.扇区 = 扇区
+    req.头 = 头
+    req.数据长度 = 扇区数 * vblk_扇区大小
+    req.状态 = 0xFF
+    req.完成 = 完成量_创建()
+    追加(vblk_请求队列, req)
+    vblk_已提交数 = vblk_已提交数 + 1
+    wait_for_completion(req.完成)
+    返回 req.状态
+}
+
+// 块设备注册 
+
+定义 可变 vblk_块操作表 = 空
+
+函数 vblk_注册块设备() {
+    vblk_块操作表 = [vblk_读取, vblk_写入, vblk_flush, vblk_discard]
+    块设备_注册("vda", vblk_容量_扇区, vblk_扇区大小, vblk_块操作表)
+    内核信息("virtio-blk: /dev/vda 已注册")
+}
+
+函数 vblk_移除() {
+    vblk_已初始化 = 假
+    vblk_请求队列 = []
+    内核信息("virtio-blk: 设备已移除")
+}
+
+
+函数 vblk_完整统计() {
+    返回 [vblk_容量_扇区, vblk_扇区大小, 计数(vblk_请求队列), vblk_已初始化]
+}
+
+// virtio-blk辅助
+
+定义 可变 vblk_读总数 = 0
+定义 可变 vblk_写总数 = 0
+定义 可变 vblk_错误数 = 0
+
+函数 vblk_健康检查() {
+    定义 可变 问题 = []
+    如果 (!vblk_已初始化) { 追加(问题, "virtio-blk未初始化") }
+    如果 (vblk_错误数 > 0) {
+        追加(问题, "virtio-blk错误: " + 整数转字符串(vblk_错误数))
+    }
+    如果 (计数(问题) == 0) { 返回 "virtio-blk健康" }
+    返回 问题
+}
+
+函数 vblk_容量字节() {
+    返回 vblk_容量_扇区 * vblk_扇区大小
+}
+
+函数 vblk_容量MB() {
+    返回 vblk_容量字节() / 1024 / 1024
+}
+
+函数 vblk_队列深度() {
+    返回 计数(vblk_请求队列)
+}
+
+函数 vblk_IO统计() {
+    返回 { 读: vblk_读总数, 写: vblk_写总数, 错误: vblk_错误数 }
+}
+
+函数 vblk_重置IO统计() {
+    vblk_读总数 = 0
+    vblk_写总数 = 0
+    vblk_错误数 = 0
+}
+
+定义 可变 AI_虚驱块设备_风暴阈值 = 10000
+定义 可变 AI_虚驱块设备_预测IRQ = 0
+
+函数 AI_虚驱块设备_风暴检测(触发频率) {
+    如果 (触发频率 > AI_虚驱块设备_风暴阈值) {
+        AI_虚驱块设备_风暴阈值 = AI_虚驱块设备_风暴阈值 * 3 / 2
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_虚驱块设备_自适应合并(当前延迟) {
+    如果 (当前延迟 < 100) { 返回 16 }
+    如果 (当前延迟 < 500) { 返回 8 }
+    返回 1
+}

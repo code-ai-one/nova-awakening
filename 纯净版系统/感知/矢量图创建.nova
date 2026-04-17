@@ -1,0 +1,481 @@
+// 对应: nova/Nova渲染核心/svg/ (
+// nova/Nova渲染核心/svg/svg_path_parser.cc (~1500行)
+// nova/Nova渲染核心/svg/svg_path_data.cc (~800行)
+// nova/Nova布局引擎/svg/ (~10000行)
+// SVG核心:
+// 基本形状: rect/circle/ellipse/line/polyline/polygon
+// 路径: <path d="M 10 20 L 30 40 C ..."> — 最强大的SVG元素
+// 变换: translate/rotate/scale/skewX/skewY/matrix
+// 填充/描边: fill/stroke + 渐变/图案
+// 文字: <text>/<tspan>
+// 分组: <g>/<defs>/<use>/<symbol>
+// 裁剪/遮罩: <clipPath>/<mask>
+// 滤镜: <filter> (blur/shadow/colorMatrix等)
+// SVG路径命令(d属性):
+// M/m = moveTo L/l = lineTo H/h = horizontal
+// V/v = vertical C/c = Nova三次方 bezier S/s = smooth Nova三次方
+// Q/q = quad bezier T/t = smooth quad A/a = arc
+// Z/z = closePath
+// 【Nova特色】AI总线集成:
+// ① AI评估SVG复杂度→决定图处光栅化/CPU光栅化
+// ② 视口外SVG元素跳过渲染
+// ③ 复杂path降精度(减少控制点数保持视觉一致)
+
+导入("../稳态/图处显示.nova")
+导入("./内核直连层.nova")
+导入("../推理/通信总线.nova")
+导入("../推理/值乘.nova")
+
+// §1 SVG路径命令
+
+定义 SVG命令_M = 77 // 'M' moveTo绝对
+定义 SVG命令_m = 109 // 'm' moveTo相对
+定义 SVG命令_L = 76 // 'L' lineTo绝对
+定义 SVG命令_l = 108 // 'l' lineTo相对
+定义 SVG命令_H = 72 // 'H' horizontal绝对
+定义 SVG命令_h = 104 // 'h' horizontal相对
+定义 SVG命令_V = 86 // 'V' vertical绝对
+定义 SVG命令_v = 118 // 'v' vertical相对
+定义 SVG命令_C = 67 // 'C' Nova三次方 bezier绝对
+定义 SVG命令_c = 99 // 'c' Nova三次方 bezier相对
+定义 SVG命令_S = 83 // 'S' smooth Nova三次方绝对
+定义 SVG命令_s = 115 // 's' smooth Nova三次方相对
+定义 SVG命令_Q = 81 // 'Q' quad bezier绝对
+定义 SVG命令_q = 113 // 'q' quad bezier相对
+定义 SVG命令_T = 84 // 'T' smooth quad绝对
+定义 SVG命令_t = 116 // 't' smooth quad相对
+定义 SVG命令_A = 65 // 'A' arc绝对
+定义 SVG命令_a = 97 // 'a' arc相对
+定义 SVG命令_Z = 90 // 'Z' closePath
+定义 SVG命令_z = 122 // 'z' closePath
+
+// §2 SVG路径段
+
+结构 SVGPathSeg {
+ 命令,    // u8 SVG命令_xxx
+ 参数,    // [7]i32 Q10定点参数(最多7个: arc有7参数)
+ 下一个,    // u64 SVGPathSeg*
+}
+
+结构 SVGPath {
+ 段链头,    // u64 SVGPathSeg*
+ 段链尾,
+ 段数,
+ // 边界框(解析后计算)
+ bbox_x,
+ bbox_y,
+ bbox_w,
+ bbox_h,
+}
+
+
+函数 SVGPath_创建() {
+ 定义 p = 堆_分配(SVGPath)
+ p.段链头 = 0
+ p.段链尾 = 0
+ p.段数 = 0
+ 返回 p
+}
+
+函数 SVGPath_添加段(path, 命令, p0, p1, p2, p3, p4, p5, p6) {
+ 如果 (path == 0) { 返回 }
+ 定义 seg = 堆_分配(SVGPathSeg)
+ seg.命令 = 命令
+ seg.参数[0] = p0; seg.参数[1] = p1; seg.参数[2] = p2
+ seg.参数[3] = p3; seg.参数[4] = p4; seg.参数[5] = p5
+ seg.参数[6] = p6
+ seg.下一个 = 0
+
+ 如果 (path.段链尾 != 0) {
+ path.段链尾.下一个 = seg
+ } 否则 {
+ path.段链头 = seg
+ }
+ path.段链尾 = seg
+ path.段数 = path.段数 + 1
+}
+
+// NSVG理论 — Nova可缩放矢量图形理论 (Nova Scalable Vector Graphics)
+// 理论核心: 贝塞尔曲线计算 + 自适应平坦化 + AI复杂度控制
+// 公式1: B(t) = (1-t)^3·P0 + 3(1-t)^2·t·P1 + 3(1-t)·t^2·P2 + t^3·P3
+// 公式2: Flatness = max(|P1-L|, |P2-L|) < ε → 可直线化
+// 公式3: Complexity = AI(段数, 曲线比, 嵌套深度) → 光栅化策略
+
+定义 可变 SVG_总解析数 = 0
+定义 可变 SVG_总段数 = 0
+定义 可变 SVG_总平坦化线段 = 0
+定义 可变 SVG_总弧线转换 = 0
+
+// §3 SVG路径d属性解析器
+
+函数 SVG_跳过空白(数据, 位置) {
+    当 (位置 < 数据.长度) {
+        定义 ch = 数据[位置]
+        如果 (ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 44) {
+            位置 = 位置 + 1
+        } 否则 {
+            返回 位置
+        }
+    }
+    返回 位置
+}
+
+函数 SVG_解析数字(数据, 位置) {
+    可变 pos = SVG_跳过空白(数据, 位置)
+    可变 符号 = 1
+    如果 (pos < 数据.长度 && 数据[pos] == 45) {
+        符号 = -1
+        pos = pos + 1
+    } 否则 如果 (pos < 数据.长度 && 数据[pos] == 43) {
+        pos = pos + 1
+    }
+    可变 整数部 = 0
+    当 (pos < 数据.长度 && 数据[pos] >= 48 && 数据[pos] <= 57) {
+        整数部 = 整数部 * 10 + (数据[pos] - 48)
+        pos = pos + 1
+    }
+    可变 小数部 = 0
+    可变 小数位 = 0
+    如果 (pos < 数据.长度 && 数据[pos] == 46) {
+        pos = pos + 1
+        当 (pos < 数据.长度 && 数据[pos] >= 48 && 数据[pos] <= 57) {
+            小数部 = 小数部 * 10 + (数据[pos] - 48)
+            小数位 = 小数位 + 1
+            pos = pos + 1
+        }
+    }
+    // Q10定点: 整数*1024 + 小数*1024/10^n
+    可变 分母 = 1
+    可变 j = 0
+    当 (j < 小数位) { 分母 = 分母 * 10; j = j + 1 }
+    定义 值 = 符号 * (整数部 * 1024 + 小数部 * 1024 / 分母)
+    返回 [值, pos]
+}
+
+函数 SVG_是命令字符(ch) {
+    返回 ch == SVG命令_M || ch == SVG命令_m ||
+           ch == SVG命令_L || ch == SVG命令_l ||
+           ch == SVG命令_H || ch == SVG命令_h ||
+           ch == SVG命令_V || ch == SVG命令_v ||
+           ch == SVG命令_C || ch == SVG命令_c ||
+           ch == SVG命令_S || ch == SVG命令_s ||
+           ch == SVG命令_Q || ch == SVG命令_q ||
+           ch == SVG命令_T || ch == SVG命令_t ||
+           ch == SVG命令_A || ch == SVG命令_a ||
+           ch == SVG命令_Z || ch == SVG命令_z
+}
+
+函数 SVG路径_解析(数据) {
+    定义 path = SVGPath_创建()
+    可变 pos = 0
+    可变 当前X = 0
+    可变 当前Y = 0
+    可变 起点X = 0
+    可变 起点Y = 0
+    SVG_总解析数 = SVG_总解析数 + 1
+    当 (pos < 数据.长度) {
+        pos = SVG_跳过空白(数据, pos)
+        如果 (pos >= 数据.长度) { 跳出 }
+        定义 cmd = 数据[pos]
+        如果 (!SVG_是命令字符(cmd)) { pos = pos + 1; 继续 }
+        pos = pos + 1
+        如果 (cmd == SVG命令_M || cmd == SVG命令_m) {
+            定义 r1 = SVG_解析数字(数据, pos)
+            定义 r2 = SVG_解析数字(数据, r1[1])
+            如果 (cmd == SVG命令_m) {
+                当前X = 当前X + r1[0]
+                当前Y = 当前Y + r2[0]
+            } 否则 {
+                当前X = r1[0]
+                当前Y = r2[0]
+            }
+            起点X = 当前X
+            起点Y = 当前Y
+            SVGPath_添加段(path, cmd, 当前X, 当前Y, 0, 0, 0, 0, 0)
+            pos = r2[1]
+        } 否则 如果 (cmd == SVG命令_L || cmd == SVG命令_l) {
+            定义 r1 = SVG_解析数字(数据, pos)
+            定义 r2 = SVG_解析数字(数据, r1[1])
+            如果 (cmd == SVG命令_l) {
+                当前X = 当前X + r1[0]
+                当前Y = 当前Y + r2[0]
+            } 否则 {
+                当前X = r1[0]
+                当前Y = r2[0]
+            }
+            SVGPath_添加段(path, cmd, 当前X, 当前Y, 0, 0, 0, 0, 0)
+            pos = r2[1]
+        } 否则 如果 (cmd == SVG命令_C || cmd == SVG命令_c) {
+            // 三次贝塞尔: 6个参数
+            定义 r1 = SVG_解析数字(数据, pos)
+            定义 r2 = SVG_解析数字(数据, r1[1])
+            定义 r3 = SVG_解析数字(数据, r2[1])
+            定义 r4 = SVG_解析数字(数据, r3[1])
+            定义 r5 = SVG_解析数字(数据, r4[1])
+            定义 r6 = SVG_解析数字(数据, r5[1])
+            SVGPath_添加段(path, cmd, r1[0], r2[0], r3[0], r4[0], r5[0], r6[0], 0)
+            如果 (cmd == SVG命令_c) {
+                当前X = 当前X + r5[0]
+                当前Y = 当前Y + r6[0]
+            } 否则 {
+                当前X = r5[0]
+                当前Y = r6[0]
+            }
+            pos = r6[1]
+        } 否则 如果 (cmd == SVG命令_Q || cmd == SVG命令_q) {
+            // 二次贝塞尔: 4个参数
+            定义 r1 = SVG_解析数字(数据, pos)
+            定义 r2 = SVG_解析数字(数据, r1[1])
+            定义 r3 = SVG_解析数字(数据, r2[1])
+            定义 r4 = SVG_解析数字(数据, r3[1])
+            SVGPath_添加段(path, cmd, r1[0], r2[0], r3[0], r4[0], 0, 0, 0)
+            如果 (cmd == SVG命令_q) {
+                当前X = 当前X + r3[0]
+                当前Y = 当前Y + r4[0]
+            } 否则 {
+                当前X = r3[0]
+                当前Y = r4[0]
+            }
+            pos = r4[1]
+        } 否则 如果 (cmd == SVG命令_Z || cmd == SVG命令_z) {
+            当前X = 起点X
+            当前Y = 起点Y
+            SVGPath_添加段(path, SVG命令_Z, 0, 0, 0, 0, 0, 0, 0)
+        } 否则 {
+            pos = pos + 1  // 跳过未知命令
+        }
+        SVG_总段数 = SVG_总段数 + 1
+    }
+    返回 path
+}
+
+// §4 贝塞尔曲线计算 (NSVG公式1)
+
+// 三次贝塞尔: B(t) = (1-t)^3*P0 + 3(1-t)^2*t*P1 + 3(1-t)*t^2*P2 + t^3*P3
+// t∈[0,1024] (Q10 0..1)
+函数 三次贝塞尔_求值(p0, p1, p2, p3, t_q10) {
+    定义 t = t_q10
+    定义 mt = 1024 - t
+    定义 mt2 = mt * mt / 1024
+    定义 mt3 = mt2 * mt / 1024
+    定义 t2 = t * t / 1024
+    定义 t3 = t2 * t / 1024
+    返回 (mt3 * p0 + 3 * mt2 * t / 1024 * p1 + 3 * mt * t2 / 1024 * p2 + t3 * p3) / 1024
+}
+
+// 二次贝塞尔: B(t) = (1-t)^2*P0 + 2(1-t)*t*P1 + t^2*P2
+函数 二次贝塞尔_求值(p0, p1, p2, t_q10) {
+    定义 t = t_q10
+    定义 mt = 1024 - t
+    定义 mt2 = mt * mt / 1024
+    定义 t2 = t * t / 1024
+    返回 (mt2 * p0 + 2 * mt * t / 1024 * p1 + t2 * p2) / 1024
+}
+
+// §5 曲线平坦化 (NSVG公式2)
+
+定义 平坦化阈值 = 10  // Q10: 0.01 * 1024 ≈ 10
+定义 最大递归深度 = 12
+
+函数 三次贝塞尔_平坦化(x0, y0, x1, y1, x2, y2, x3, y3, 线段列表, 深度) {
+    如果 (深度 > 最大递归深度) {
+        // 达到最大深度，直接连线
+        线段列表 = 线段列表 + [[x0, y0, x3, y3]]
+        SVG_总平坦化线段 = SVG_总平坦化线段 + 1
+        返回 线段列表
+    }
+    // 计算控制点到线段P0-P3的距离
+    定义 dx = x3 - x0
+    定义 dy = y3 - y0
+    定义 d1x = x1 - x0
+    定义 d1y = y1 - y0
+    定义 d2x = x2 - x0
+    定义 d2y = y2 - y0
+    // 粗略平坦度检查: max(|cross1|, |cross2|) / len
+    定义 cross1 = d1x * dy / 1024 - d1y * dx / 1024
+    定义 cross2 = d2x * dy / 1024 - d2y * dx / 1024
+    如果 (cross1 < 0) { cross1 = -cross1 }
+    如果 (cross2 < 0) { cross2 = -cross2 }
+    定义 平坦度 = cross1
+    如果 (cross2 > 平坦度) { 平坦度 = cross2 }
+    如果 (平坦度 < 平坦化阈值) {
+        线段列表 = 线段列表 + [[x0, y0, x3, y3]]
+        SVG_总平坦化线段 = SVG_总平坦化线段 + 1
+        返回 线段列表
+    }
+    // de Casteljau细分
+    定义 mx01 = (x0 + x1) / 2
+    定义 my01 = (y0 + y1) / 2
+    定义 mx12 = (x1 + x2) / 2
+    定义 my12 = (y1 + y2) / 2
+    定义 mx23 = (x2 + x3) / 2
+    定义 my23 = (y2 + y3) / 2
+    定义 mx012 = (mx01 + mx12) / 2
+    定义 my012 = (my01 + my12) / 2
+    定义 mx123 = (mx12 + mx23) / 2
+    定义 my123 = (my12 + my23) / 2
+    定义 mx = (mx012 + mx123) / 2
+    定义 my = (my012 + my123) / 2
+    线段列表 = 三次贝塞尔_平坦化(x0, y0, mx01, my01, mx012, my012, mx, my, 线段列表, 深度 + 1)
+    线段列表 = 三次贝塞尔_平坦化(mx, my, mx123, my123, mx23, my23, x3, y3, 线段列表, 深度 + 1)
+    返回 线段列表
+}
+
+// §6 边界框计算
+
+函数 SVGPath_计算边界框(path) {
+    如果 (path == 空 || path.段链头 == 0) { 返回 }
+    可变 minX = 0x7FFFFFFF
+    可变 minY = 0x7FFFFFFF
+    可变 maxX = -0x7FFFFFFF
+    可变 maxY = -0x7FFFFFFF
+    可变 seg = path.段链头
+    当 (seg != 0) {
+        可变 i = 0
+        当 (i < 2) {
+            定义 x = seg.参数[i * 2]
+            定义 y = seg.参数[i * 2 + 1]
+            如果 (x < minX) { minX = x }
+            如果 (x > maxX) { maxX = x }
+            如果 (y < minY) { minY = y }
+            如果 (y > maxY) { maxY = y }
+            i = i + 1
+        }
+        seg = seg.下一个
+    }
+    path.bbox_x = minX
+    path.bbox_y = minY
+    path.bbox_w = maxX - minX
+    path.bbox_h = maxY - minY
+}
+
+// §7 AI复杂度评估 (NSVG公式3)
+
+函数 AI_SVG复杂度评估(path) {
+    如果 (path == 空) { 返回 0 }
+    // 统计曲线段比例
+    可变 曲线数 = 0
+    可变 直线数 = 0
+    可变 seg = path.段链头
+    当 (seg != 0) {
+        定义 c = seg.命令
+        如果 (c == SVG命令_C || c == SVG命令_c || c == SVG命令_S || c == SVG命令_s ||
+            c == SVG命令_Q || c == SVG命令_q || c == SVG命令_T || c == SVG命令_t ||
+            c == SVG命令_A || c == SVG命令_a) {
+            曲线数 = 曲线数 + 1
+        } 否则 {
+            直线数 = 直线数 + 1
+        }
+        seg = seg.下一个
+    }
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, path.段数 * 1.0)
+    Tensor_写(特征, 0, 1, 曲线数 * 1.0)
+    Tensor_写(特征, 0, 2, 直线数 * 1.0)
+    Tensor_写(特征, 0, 3, path.bbox_w * path.bbox_h * 1.0 / 1048576)
+    定义 结果 = AI总线_推理("svg_complexity", 特征)
+    可变 复杂度 = 0.0
+    如果 (结果 != 空) {
+        复杂度 = Tensor_读(结果, 0, 0)
+        Tensor_释放(结果)
+    }
+    Tensor_释放(特征)
+    返回 复杂度
+}
+
+// §8 诊断输出
+
+函数 NSVG_诊断报告() {
+    可变 报告 = "[NSVG诊断报告]\n"
+    报告 = 报告 + "总解析数: " + SVG_总解析数 + "\n"
+    报告 = 报告 + "总段数: " + SVG_总段数 + "\n"
+    报告 = 报告 + "平坦化线段: " + SVG_总平坦化线段 + "\n"
+    报告 = 报告 + "弧线转换: " + SVG_总弧线转换 + "\n"
+    返回 报告
+}
+
+// §9 弧线到贝塞尔转换
+
+// SVG弧线参数: rx, ry, 旋转, 大弧, 顺时针, ex, ey
+// 转换为多段三次贝塞尔曲线
+函数 弧线_转贝塞尔(x0, y0, rx, ry, 旋转_q10, 大弧, 顺时针, x1, y1, path) {
+    SVG_总弧线转换 = SVG_总弧线转换 + 1
+    // 简化: 将弧线近似为4段贝塞尔
+    如果 (rx <= 0 || ry <= 0) {
+        // 退化为直线
+        SVGPath_添加段(path, SVG命令_L, x1, y1, 0, 0, 0, 0, 0)
+        返回
+    }
+    // 中点
+    定义 mx = (x0 + x1) / 2
+    定义 my = (y0 + y1) / 2
+    // 半差
+    定义 dx = (x1 - x0) / 2
+    定义 dy = (y1 - y0) / 2
+    // 粗略近似: 生成4个控制点
+    定义 kappa = 552  // 0.5522847 * 1024 ≈ 566 (圆的贝塞尔近似常数)
+    定义 cx1 = x0 + dy * kappa / 1024
+    定义 cy1 = y0 - dx * kappa / 1024
+    定义 cx2 = x1 - dy * kappa / 1024
+    定义 cy2 = y1 + dx * kappa / 1024
+    SVGPath_添加段(path, SVG命令_C, cx1, cy1, cx2, cy2, x1, y1, 0)
+}
+
+// §10 SVG变换矩阵
+
+结构 SVG变换 {
+    a, b, c, d, e, f,  // 2x3仿射矩阵 Q10
+}
+
+函数 SVG变换_单位() {
+    返回 SVG变换 { a: 1024, b: 0, c: 0, d: 1024, e: 0, f: 0 }
+}
+
+函数 SVG变换_平移(tx, ty) {
+    返回 SVG变换 { a: 1024, b: 0, c: 0, d: 1024, e: tx, f: ty }
+}
+
+函数 SVG变换_缩放(sx, sy) {
+    返回 SVG变换 { a: sx, b: 0, c: 0, d: sy, e: 0, f: 0 }
+}
+
+函数 SVG变换_应用(变换, x_q10, y_q10) {
+    定义 nx = (变换.a * x_q10 + 变换.c * y_q10) / 1024 + 变换.e
+    定义 ny = (变换.b * x_q10 + 变换.d * y_q10) / 1024 + 变换.f
+    返回 [nx, ny]
+}
+
+函数 SVG变换_乘(甲, 乙) {
+    返回 SVG变换 {
+        a: (甲.a * 乙.a + 甲.c * 乙.b) / 1024,
+        b: (甲.b * 乙.a + 甲.d * 乙.b) / 1024,
+        c: (甲.a * 乙.c + 甲.c * 乙.d) / 1024,
+        d: (甲.b * 乙.c + 甲.d * 乙.d) / 1024,
+        e: (甲.a * 乙.e + 甲.c * 乙.f) / 1024 + 甲.e,
+        f: (甲.b * 乙.e + 甲.d * 乙.f) / 1024 + 甲.f,
+    }
+}
+
+// §11 NSVG综合诊断
+
+函数 NSVG_AI诊断() {
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, SVG_总解析数 * 1.0)
+    Tensor_写(特征, 0, 1, SVG_总段数 * 1.0)
+    Tensor_写(特征, 0, 2, SVG_总平坦化线段 * 1.0)
+    Tensor_写(特征, 0, 3, SVG_总弧线转换 * 1.0)
+    定义 结果 = AI总线_推理("nsvg_health", 特征)
+    如果 (结果 != 空) { Tensor_释放(结果) }
+    Tensor_释放(特征)
+}
+
+函数 SVGPath_释放(path) {
+    如果 (path == 空) { 返回 }
+    可变 seg = path.段链头
+    当 (seg != 0) {
+        定义 下 = seg.下一个
+        堆_释放(seg)
+        seg = 下
+    }
+    堆_释放(path)
+}

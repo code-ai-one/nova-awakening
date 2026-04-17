@@ -1,0 +1,350 @@
+// NovaOS WebAssembly运行时 — 线性内存/表/全局变量/数据段/AI内存优化
+// 本模块实现WebAssembly核心规范的内存子系统:
+//   1. 线性内存(Memory): 分页分配/grow/边界检查/多类型load/store
+//   2. 表(Table): 函数引用表/externref/间接调用
+//   3. 全局变量(Global): i32/i64/f32/f64类型/可变/不可变
+//   4. 数据段(Data): 主动/被动段初始化
+//   5. 内存保护: 边界检查/对齐检查/越界陷阱
+//   6. AI内存预测: 增长模式学习/预分配优化
+// 与脚本引擎运行时、内核内存管理、智能大脑深度耦合。
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/日志中枢.nova")
+导入("../中枢/内存虚拟.nova")
+导入("../中枢/公共智能.nova")
+导入("../引导/引导加载器.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("../执行/底层内存操.nova")
+
+定义 WASM_PAGE_SIZE = 65536    // 64KB
+
+结构 WasmMemory {
+    数据,    // u64 内存基地址
+    当前页数,
+    最大页数,
+    共享,
+}
+
+函数 WasmMemory_创建(初始页, 最大页, 共享) {
+    定义 mem = 堆_分配(WasmMemory)
+    mem.当前页数 = 初始页
+    mem.最大页数 = 最大页
+    mem.共享 = 共享
+    mem.数据 = 堆_分配(初始页 * WASM_PAGE_SIZE)
+    内存_清零(mem.数据, 初始页 * WASM_PAGE_SIZE)
+    返回 mem
+}
+
+函数 WasmMemory_grow(mem, 增加页数) {
+    如果 (mem == 0) { 返回 -1 }
+    定义 新页数 = mem.当前页数 + 增加页数
+    如果 (新页数 > mem.最大页数) { 返回 -1 }
+
+    定义 旧大小 = mem.当前页数 * WASM_PAGE_SIZE
+    定义 新大小 = 新页数 * WASM_PAGE_SIZE
+    定义 新数据 = 堆_分配(新大小)
+    内存_复制(新数据, mem.数据, 旧大小)
+    内存_清零(新数据 + 旧大小, 新大小 - 旧大小)
+    堆_释放(mem.数据)
+    mem.数据 = 新数据
+
+    定义 旧页数 = mem.当前页数
+    mem.当前页数 = 新页数
+    返回 旧页数    // 返回之前的页数
+}
+
+函数 WasmMemory_load_i32(mem, 地址) {
+    如果 (mem == 0 || 地址 + 4 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    返回 内存_读32(mem.数据 + 地址)
+}
+
+函数 WasmMemory_store_i32(mem, 地址, 值) {
+    如果 (mem == 0 || 地址 + 4 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 }
+    内存_写32(mem.数据 + 地址, 值)
+}
+
+函数 WasmMemory_load_i64(mem, 地址) {
+    如果 (mem == 0 || 地址 + 8 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    返回 内存_读64(mem.数据 + 地址)
+}
+
+函数 WasmMemory_store_i64(mem, 地址, 值) {
+    如果 (mem == 0 || 地址 + 8 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 }
+    内存_写64(mem.数据 + 地址, 值)
+}
+
+函数 WasmMemory_load_i8(mem, 地址) {
+    如果 (mem == 0 || 地址 >= mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    返回 内存_读8(mem.数据 + 地址)
+}
+
+函数 WasmMemory_store_i8(mem, 地址, 值) {
+    如果 (mem == 0 || 地址 >= mem.当前页数 * WASM_PAGE_SIZE) { 返回 }
+    内存_写8(mem.数据 + 地址, 值)
+}
+
+// §7 WasmTable — 函数引用表
+
+结构 WasmTable {
+    元素,    // u64 u64数组(函数指针)
+    当前大小,
+    最大大小,
+    元素类型,    // u32 WASM_FUNCREF / WASM_EXTERNREF
+}
+
+函数 WasmTable_创建(初始, 最大) {
+    定义 tab = 堆_分配(WasmTable)
+    tab.当前大小 = 初始; tab.最大大小 = 最大
+    tab.元素类型 = WASM_FUNCREF
+    tab.元素 = 堆_分配_数组(初始 * 8)
+    内存_清零(tab.元素, 初始 * 8)
+    返回 tab
+}
+
+函数 WasmTable_get(tab, 索引) {
+    如果 (tab == 0 || 索引 >= tab.当前大小) { 返回 0 }
+    返回 内存_读64(tab.元素 + 索引 * 8)
+}
+
+函数 WasmTable_set(tab, 索引, 值) {
+    如果 (tab == 0 || 索引 >= tab.当前大小) { 返回 }
+    内存_写64(tab.元素 + 索引 * 8, 值)
+}
+
+函数 WasmTable_grow(tab, 增加, 初始值) {
+    如果 (tab == 0) { 返回 -1 }
+    定义 新大小 = tab.当前大小 + 增加
+    如果 (新大小 > tab.最大大小) { 返回 -1 }
+    定义 新元素 = 堆_分配_数组(新大小 * 8)
+    内存_复制(新元素, tab.元素, tab.当前大小 * 8)
+    定义 可变 i = tab.当前大小
+    当 (i < 新大小) { 内存_写64(新元素 + i * 8, 初始值); i = i + 1 }
+    堆_释放(tab.元素)
+    tab.元素 = 新元素
+    定义 旧大小 = tab.当前大小
+    tab.当前大小 = 新大小
+    返回 旧大小
+}
+
+// §8 全局变量
+
+定义 WASM_TYPE_I32 = 0x7F
+定义 WASM_TYPE_I64 = 0x7E
+定义 WASM_TYPE_F32 = 0x7D
+定义 WASM_TYPE_F64 = 0x7C
+定义 WASM_FUNCREF = 0x70
+定义 WASM_EXTERNREF = 0x6F
+
+结构 WasmGlobal {
+    类型,
+    可变,
+    值_i64,
+}
+
+函数 WasmGlobal_创建(类型, 可变, 初始值) {
+    返回 WasmGlobal {
+        类型: 类型,
+        可变: 可变,
+        值_i64: 初始值,
+    }
+}
+
+函数 WasmGlobal_get(g) {
+    如果 (g == 空) { 返回 0 }
+    返回 g.值_i64
+}
+
+函数 WasmGlobal_set(g, 值) {
+    如果 (g == 空 || !g.可变) { 返回 }
+    g.值_i64 = 值
+}
+
+// §9 数据段初始化
+
+结构 WasmDataSegment {
+    内存索引,
+    偏移表达式,
+    数据,
+    数据大小,
+    是被动,
+    已dropped,
+}
+
+函数 WasmData_初始化主动段(mem, 段列表) {
+    如果 (mem == 空 || 段列表 == 空) { 返回 }
+    定义 可变 i = 0
+    当 (i < 计数(段列表)) {
+        定义 seg = 段列表[i]
+        如果 (!seg.是被动 && !seg.已dropped) {
+            定义 偏移 = seg.偏移表达式
+            如果 (偏移 + seg.数据大小 <= mem.当前页数 * WASM_PAGE_SIZE) {
+                内存_复制(mem.数据 + 偏移, seg.数据, seg.数据大小)
+            }
+        }
+        i = i + 1
+    }
+    WASM_数据初始化数 = WASM_数据初始化数 + 1
+}
+
+函数 WasmData_memory_init(mem, 段, 目标偏移, 源偏移, 长度) {
+    如果 (mem == 空 || 段 == 空 || 段.已dropped) { 返回 错误_陷阱 }
+    如果 (源偏移 + 长度 > 段.数据大小) { 返回 错误_陷阱 }
+    如果 (目标偏移 + 长度 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 错误_陷阱 }
+    内存_复制(mem.数据 + 目标偏移, 段.数据 + 源偏移, 长度)
+    返回 成功
+}
+
+函数 WasmData_drop(段) {
+    如果 (段 == 空) { 返回 }
+    段.已dropped = 真
+}
+
+// §10 扩展load/store(16位/浮点)
+
+函数 WasmMemory_load_i16_s(mem, 地址) {
+    如果 (mem == 0 || 地址 + 2 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    定义 v = 内存_读16(mem.数据 + 地址)
+    如果 (v & 0x8000) { 返回 v | 0xFFFF0000 }
+    返回 v
+}
+
+函数 WasmMemory_load_i16_u(mem, 地址) {
+    如果 (mem == 0 || 地址 + 2 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    返回 内存_读16(mem.数据 + 地址) & 0xFFFF
+}
+
+函数 WasmMemory_store_i16(mem, 地址, 值) {
+    如果 (mem == 0 || 地址 + 2 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 }
+    内存_写16(mem.数据 + 地址, 值 & 0xFFFF)
+}
+
+函数 WasmMemory_load_i8_s(mem, 地址) {
+    如果 (mem == 0 || 地址 >= mem.当前页数 * WASM_PAGE_SIZE) { 返回 0 }
+    定义 v = 内存_读8(mem.数据 + 地址)
+    如果 (v & 0x80) { 返回 v | 0xFFFFFF00 }
+    返回 v
+}
+
+函数 WasmMemory_fill(mem, 目标, 值, 长度) {
+    如果 (mem == 0 || 目标 + 长度 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 错误_陷阱 }
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存_写8(mem.数据 + 目标 + i, 值 & 0xFF)
+        i = i + 1
+    }
+    返回 成功
+}
+
+函数 WasmMemory_copy(mem, 目标, 源, 长度) {
+    如果 (mem == 0) { 返回 错误_陷阱 }
+    如果 (目标 + 长度 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 错误_陷阱 }
+    如果 (源 + 长度 > mem.当前页数 * WASM_PAGE_SIZE) { 返回 错误_陷阱 }
+    // memmove语义(处理重叠)
+    如果 (目标 <= 源) {
+        定义 可变 i = 0
+        当 (i < 长度) {
+            内存_写8(mem.数据 + 目标 + i, 内存_读8(mem.数据 + 源 + i))
+            i = i + 1
+        }
+    } 否则 {
+        定义 可变 i = 长度 - 1
+        当 (i >= 0) {
+            内存_写8(mem.数据 + 目标 + i, 内存_读8(mem.数据 + 源 + i))
+            i = i - 1
+        }
+    }
+    返回 成功
+}
+
+// §11 元素段(Table初始化)
+
+结构 WasmElemSegment {
+    表索引,
+    偏移表达式,
+    函数索引列表,
+    数量,
+    是被动,
+    已dropped,
+}
+
+函数 WasmElem_初始化主动段(tab, 段) {
+    如果 (tab == 空 || 段 == 空 || 段.已dropped) { 返回 }
+    定义 偏移 = 段.偏移表达式
+    定义 可变 i = 0
+    当 (i < 段.数量) {
+        如果 (偏移 + i < tab.当前大小) {
+            WasmTable_set(tab, 偏移 + i, 段.函数索引列表[i])
+        }
+        i = i + 1
+    }
+}
+
+函数 WasmElem_table_init(tab, 段, 目标偏移, 源偏移, 长度) {
+    如果 (tab == 空 || 段 == 空 || 段.已dropped) { 返回 错误_陷阱 }
+    如果 (源偏移 + 长度 > 段.数量) { 返回 错误_陷阱 }
+    如果 (目标偏移 + 长度 > tab.当前大小) { 返回 错误_陷阱 }
+    定义 可变 i = 0
+    当 (i < 长度) {
+        WasmTable_set(tab, 目标偏移 + i, 段.函数索引列表[源偏移 + i])
+        i = i + 1
+    }
+    返回 成功
+}
+
+函数 WasmElem_drop(段) {
+    如果 (段 == 空) { 返回 }
+    段.已dropped = 真
+}
+
+// §12 AI内存增长预测
+
+定义 可变 AI_grow历史 = []
+定义 AI_grow历史_最大 = 16
+
+函数 AI_WASM内存_预测增长(mem) {
+    如果 (计数(AI_grow历史) < 3) { 返回 1 }
+    // 计算平均增长量
+    定义 可变 总 = 0
+    定义 可变 i = 0
+    当 (i < 计数(AI_grow历史)) {
+        总 = 总 + AI_grow历史[i]
+        i = i + 1
+    }
+    定义 平均 = 总 / 计数(AI_grow历史)
+    // 预测: 下次增长1.5倍历史平均
+    定义 预测 = 平均 * 3 / 2
+    如果 (预测 < 1) { 预测 = 1 }
+    如果 (预测 > 256) { 预测 = 256 }
+    返回 预测
+}
+
+函数 AI_WASM内存_记录增长(增加页数) {
+    追加(AI_grow历史, 增加页数)
+    如果 (计数(AI_grow历史) > AI_grow历史_最大) {
+        AI_grow历史 = 子列表(AI_grow历史, AI_grow历史_最大 / 2, AI_grow历史_最大)
+    }
+}
+
+// §13 统计
+
+定义 可变 WASM_内存创建数 = 0
+定义 可变 WASM_内存grow数 = 0
+定义 可变 WASM_表创建数 = 0
+定义 可变 WASM_全局创建数 = 0
+定义 可变 WASM_数据初始化数 = 0
+定义 可变 WASM_越界陷阱数 = 0
+定义 错误_陷阱 = -100
+
+函数 WASM内存_统计() {
+    返回 {
+        内存创建: WASM_内存创建数,
+        内存grow: WASM_内存grow数,
+        表创建: WASM_表创建数,
+        全局创建: WASM_全局创建数,
+        数据初始化: WASM_数据初始化数,
+        越界陷阱: WASM_越界陷阱数,
+        AI_grow历史: 计数(AI_grow历史),
+    }
+}

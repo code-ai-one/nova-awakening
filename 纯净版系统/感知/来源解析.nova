@@ -1,0 +1,113 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./内核直连层.nova")
+
+// 对应: nova/renderer/platform/loader/cors/ (
+//  (
+// CORS规范 (取数 Standard §3):
+// 简单请求(Simple Request): 直接发送, 检查响应头
+// 预检请求(Preflight): OPTIONS请求先探测, 通过后发送实际请求
+// 凭证请求(Credentialed): 附带Cookie, 需Access-Control-Allow-Credentials
+// 关键HTTP头:
+// 请求: Origin, Access-Control-Request-Method/Headers
+// 响应: Access-Control-Allow-Origin/Methods/Headers/Credentials
+// Access-Control-Expose-Headers, Access-Control-Max-Age
+// 安全模型:
+// 同源策略(SOP): 默认禁止跨源读取
+// CORS: 服务器显式授权跨源访问
+// 不透明响应(opaque): no-cors模式, 脚本无法读取
+
+// §1 源(Origin)
+
+结构 Origin {
+ scheme,    // u64 "https"
+ host,    // u64 "example.com"
+ port,    // u32 443 (0=默认端口)
+}
+
+函数 Origin_解析(url) {
+ 如果 (url == 0) { 返回 0 }
+ 定义 o = 堆_分配(Origin)
+ o.scheme = 0; o.host = 0; o.port = 0
+ 定义 len = 字节长度(url)
+ 定义 可变 pos = 0
+ // 解析scheme
+ 定义 可变 scheme_end = 0
+ 当 (scheme_end < len && 字节取(url, scheme_end) != 0x3A) { scheme_end = scheme_end + 1 }
+ 如果 (scheme_end > 0 && scheme_end < len) {
+ o.scheme = 堆_分配(scheme_end + 1)
+ 内存_复制(o.scheme, url, scheme_end)
+ 字节写(o.scheme, scheme_end, 0)
+ }
+ // 跳过 "://"
+ pos = scheme_end + 3
+ // 解析host(:port)
+ 定义 host_start = pos
+ 当 (pos < len && 字节取(url,pos) != 0x2F && 字节取(url,pos) != 0x3A) { pos = pos + 1 }
+ 定义 host_len = pos - host_start
+ 如果 (host_len > 0) {
+ o.host = 堆_分配(host_len + 1)
+ 内存_复制(o.host, url + host_start, host_len)
+ 字节写(o.host, host_len, 0)
+ }
+ // 解析port
+ 如果 (pos < len && 字节取(url, pos) == 0x3A) {
+ pos = pos + 1
+ 定义 可变 port_val = 0
+ 当 (pos < len && 字节取(url,pos) >= 0x30 && 字节取(url,pos) <= 0x39) {
+ port_val = port_val * 10 + (字节取(url, pos) - 0x30)
+ pos = pos + 1
+ }
+ o.port = port_val
+ }
+ 返回 o
+}
+
+函数 Origin_相等(a, b) {
+ 如果 (a == 0 || b == 0) { 返回 假 }
+ 如果 (!字符串_相等(a.scheme, b.scheme)) { 返回 假 }
+ 如果 (!字符串_相等(a.host, b.host)) { 返回 假 }
+ // 端口: 比较时考虑默认端口(https=443, http=80)
+ 定义 port_a = Origin_有效端口(a)
+ 定义 port_b = Origin_有效端口(b)
+ 返回 port_a == port_b
+}
+
+函数 Origin_有效端口(o) {
+ 如果 (o == 0) { 返回 0 }
+ 如果 (o.port != 0) { 返回 o.port }
+ 如果 (字符串_相等(o.scheme, "https")) { 返回 443 }
+ 如果 (字符串_相等(o.scheme, "http")) { 返回 80 }
+ 返回 0
+}
+
+函数 Origin_序列化(o) {
+ 如果 (o == 0) { 返回 "null" }
+ // "https://example.com" 或 "https://example.com:8443"
+ 定义 buf = 堆_分配(256)
+ 定义 可变 pos = 0
+ 如果 (o.scheme != 0) {
+ 定义 slen = 字节长度(o.scheme)
+ 内存_复制(buf+pos, o.scheme, slen); pos = pos + slen
+ }
+ 内存_复制(buf+pos, "://", 3); pos = pos + 3
+ 如果 (o.host != 0) {
+ 定义 hlen = 字节长度(o.host)
+ 内存_复制(buf+pos, o.host, hlen); pos = pos + hlen
+ }
+ 定义 eff_port = Origin_有效端口(o)
+ 定义 default_port = 0
+ 如果 (字符串_相等(o.scheme,"https")) { default_port = 443 }
+ 否则 如果 (字符串_相等(o.scheme,"http")) { default_port = 80 }
+ 如果 (eff_port != default_port && eff_port > 0) {
+ 字节写(buf, pos, 0x3A); pos = pos + 1
+ // 写入端口数字
+ 定义 port_str = 整数转字符串(eff_port)
+ 定义 plen = 字节长度(port_str)
+ 内存_复制(buf+pos, port_str, plen); pos = pos + plen
+ }
+ 字节写(buf, pos, 0)
+ 返回 buf
+}

@@ -1,0 +1,213 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./同步原语.nova")
+导入("./进程描述符.nova")
+导入("./公平调度调.nova")
+导入("./每处理器.nova")
+导入("./实时调度.nova")
+导入("./内核打印.nova")
+
+//   1. 每CPU一个运行队列(rq) — 减少锁竞争
+//   2. rq包含: Nova公平调度运行队列 + RT运行队列 + deadline运行队列
+//   3. 负载均衡: 周期性检查CPU间负载差异, 迁移任务
+//   4. clock/clock_task: 运行队列时钟(含/不含中断时间)
+//   5. nr_running: 可运行进程总数(决定是否idle)
+//   6. curr/idle/stop: 当前/idle/stop进程指针
+
+定义 最大CPU数 = 64
+
+结构 运行队列 {
+    // 基本信息
+    cpu,    // u32 所属CPU编号
+    锁,    // u64 rq->lock: 保护运行队列的自旋锁
+    nr_running,    // u32 可运行进程总数 (所有调度类)
+
+    // 进程指针
+    curr,    // u64 当前正在运行的task
+    idle,    // u64 idle进程(swapper)
+    stop,    // u64 stop进程(迁移线程)
+
+    // Nova公平调度运行队列 
+    Nova公平调度_nr,    // u32 Nova公平调度类可运行进程数
+    Nova公平调度_load,    // u64 Nova公平调度总负载权重
+    Nova公平调度_min_Nova虚拟运行时间,    // u64 Nova公平调度最小Nova虚拟运行时间
+    Nova公平调度_红黑树,    // u64 Nova公平调度红黑树指针
+
+    // RT运行队列 
+    rt_nr,    // u32 RT类可运行进程数
+    rt_highest_prio,    // u32 RT最高优先级(数值最小)
+
+    // 时钟
+    clock,    // u64 运行队列时钟(纳秒, 含中断时间)
+    clock_task,    // u64 任务时钟(纳秒, 不含中断时间)
+    clock_Nova负载追踪,    // u64 Nova负载追踪负载追踪时钟
+
+    // 负载统计
+    calc_load_active,    // u32 活跃任务数(用于计算Nova负载均值)
+    calc_load_update,    // u64 下次更新Nova负载均值的时间
+
+    // 空闲统计
+    idle_stamp,    // u64 进入idle的时间戳
+    avg_idle,    // u64 平均idle时间(用于idle预测)
+    max_idle_balance_cost,    // u64 负载均衡最大开销
+
+    // 调度域
+    sd,    // u64 sched_domain指针(NUMA/MC/SMT层级)
+
+    // 中断计数
+    nr_switches,    // u64 总上下文切换次数
+    nr_migrations,    // u64 总迁移次数
+
+    // 是否在线
+    online,
+}
+
+定义 可变 所有运行队列 = []
+定义 可变 在线CPU数 = 0
+
+// 初始化
+
+函数 运行队列_初始化全部(cpu数) {
+    定义 可变 i = 0
+    当 (i < cpu数 && i < 最大CPU数) {
+        定义 rq = 运行队列_创建(i)
+        追加(所有运行队列, rq)
+        i = i + 1
+    }
+    在线CPU数 = cpu数
+    内核信息数值("per-CPU运行队列初始化, CPU数", cpu数)
+}
+
+函数 运行队列_创建(CPU号) {
+    定义 rq = 运行队列 {}
+    rq.cpu = CPU号
+    rq.锁 = 自旋锁_创建()
+    rq.nr_running = 0
+    rq.curr = 空
+    rq.idle = 空
+    rq.stop = 空
+    rq.Nova公平调度_nr = 0
+    rq.Nova公平调度_load = 0
+    rq.Nova公平调度_min_Nova虚拟运行时间 = 0
+    rq.Nova公平调度_红黑树 = 空
+    rq.rt_nr = 0
+    rq.rt_highest_prio = 99
+    rq.clock = 0
+    rq.clock_task = 0
+    rq.clock_Nova负载追踪 = 0
+    rq.calc_load_active = 0
+    rq.calc_load_update = 0
+    rq.idle_stamp = 0
+    rq.avg_idle = 0
+    rq.max_idle_balance_cost = 500000   // 500us
+    rq.sd = 空
+    rq.nr_switches = 0
+    rq.nr_migrations = 0
+    rq.online = 真
+    返回 rq
+}
+
+// 访问器
+
+函数 获取运行队列(cpu) {
+    如果 (cpu >= 0 && cpu < 计数(所有运行队列)) {
+        返回 所有运行队列[cpu]
+    }
+    返回 空
+}
+
+函数 当前CPU运行队列() {
+    返回 获取运行队列(获取当前CPU())
+}
+
+函数 运行队列_Nova公平调度数(rq)    { 返回 rq.Nova公平调度_nr }
+函数 运行队列_RT数(rq)     { 返回 rq.rt_nr }
+函数 运行队列_总数(rq)     { 返回 rq.nr_running }
+函数 运行队列_当前(rq)     { 返回 rq.curr }
+函数 运行队列_idle(rq)     { 返回 rq.idle }
+函数 运行队列_是空闲(rq)   { 返回 rq.nr_running == 0 }
+
+// 锁操作 
+
+函数 运行队列_锁定(rq) {
+    自旋锁_获取(rq.锁)
+}
+
+函数 运行队列_解锁(rq) {
+    自旋锁_释放(rq.锁)
+}
+
+函数 双运行队列_锁定(rq1, rq2) {
+    // 双锁: 按地址排序防死锁 
+    如果 (rq1 == rq2) {
+        运行队列_锁定(rq1)
+        返回
+    }
+    如果 (rq1.cpu < rq2.cpu) {
+        运行队列_锁定(rq1)
+        运行队列_锁定(rq2)
+    } 否则 {
+        运行队列_锁定(rq2)
+        运行队列_锁定(rq1)
+    }
+}
+
+函数 双运行队列_解锁(rq1, rq2) {
+    运行队列_解锁(rq1)
+    如果 (rq1 != rq2) { 运行队列_解锁(rq2) }
+}
+
+// 入队/出队 
+
+函数 运行队列_入队(rq, 任务) {
+    rq.nr_running = rq.nr_running + 1
+
+    定义 调度类 = 进程_调度类(任务)
+    如果 (调度类 == 调度类_Nova公平调度) {
+        rq.Nova公平调度_nr = rq.Nova公平调度_nr + 1
+        rq.Nova公平调度_load = rq.Nova公平调度_load + 进程_权重(任务)
+        // 插入Nova公平调度红黑树
+        Nova公平调度_入队(任务)
+    } 否则 如果 (调度类 == 调度类_RT) {
+        rq.rt_nr = rq.rt_nr + 1
+        定义 优先级 = 进程_RT优先级(任务)
+        如果 (优先级 < rq.rt_highest_prio) {
+            rq.rt_highest_prio = 优先级
+        }
+    }
+
+    rq.calc_load_active = rq.calc_load_active + 1
+}
+
+函数 运行队列_出队(rq, 任务) {
+    rq.nr_running = rq.nr_running - 1
+
+    定义 调度类 = 进程_调度类(任务)
+    如果 (调度类 == 调度类_Nova公平调度) {
+        rq.Nova公平调度_nr = rq.Nova公平调度_nr - 1
+        rq.Nova公平调度_load = rq.Nova公平调度_load - 进程_权重(任务)
+        Nova公平调度_出队(任务)
+    } 否则 如果 (调度类 == 调度类_RT) {
+        rq.rt_nr = rq.rt_nr - 1
+    }
+
+    rq.calc_load_active = rq.calc_load_active - 1
+}
+
+// 时钟更新 
+
+定义 可变 AI_运行队列初_负载窗口 = []
+
+函数 AI_运行队列初_负载预测(当前负载) {
+    追加(AI_运行队列初_负载窗口, 当前负载)
+    如果 (计数(AI_运行队列初_负载窗口) > 20) { 列表_移除(AI_运行队列初_负载窗口, 0) }
+    如果 (计数(AI_运行队列初_负载窗口) < 3) { 返回 当前负载 }
+    定义 n = 计数(AI_运行队列初_负载窗口)
+    定义 趋势 = AI_运行队列初_负载窗口[n-1] - AI_运行队列初_负载窗口[n-3]
+    返回 当前负载 + 趋势
+}
+
+函数 AI_运行队列初_迁移建议(源CPU负载, 目标CPU负载) {
+    如果 (源CPU负载 > 目标CPU负载 * 2) { 返回 真 }
+    返回 假
+}

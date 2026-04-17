@@ -1,0 +1,239 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/链表后继.nova")
+导入("./网缓读.nova")
+导入("./网缓分配.nova")
+
+//   1. netfilter: 网络包过滤框架(iptables/nftables的底层)
+//   2. hook点: PREROUTING/INPUT/FORWARD/OUTPUT/POSTROUTING
+//   3. 链式处理: 每个hook点注册多个回调, 按优先级遍历
+//   4. 判定: NF_ACCEPT(通过)/NF_DROP(丢弃)/NF_QUEUE(排队到用户空间)
+//   5. 连接追踪(conntrack): 跟踪传控/数报连接状态
+
+定义 NF_INET_PRE_ROUTING  = 0
+定义 NF_INET_LOCAL_IN     = 1
+定义 NF_INET_FORWARD      = 2
+定义 NF_INET_LOCAL_OUT    = 3
+定义 NF_INET_POST_ROUTING = 4
+定义 NF_INET_NUMHOOKS     = 5
+
+定义 NF_DROP    = 0
+定义 NF_ACCEPT  = 1
+定义 NF_STOLEN  = 2
+定义 NF_QUEUE   = 3
+定义 NF_REPEAT  = 4
+
+定义 NFPROTO_IPV4  = 2
+定义 NFPROTO_IPV6  = 10
+
+结构 nf_hook_ops {
+    回调,    // u64 fn(hooknum, Nova缓冲, in, out, okfn) → verdict
+    协议族,    // u32 NFPROTO_*
+    hook点,    // u32 NF_INET_*
+    优先级,    // u32 越小越先执行
+    数据,
+}
+
+定义 可变 nf_hooks = []    // 按hook点组织
+定义 可变 nf_规则总数 = 0
+定义 可变 nf_通过数 = 0
+定义 可变 nf_丢弃数 = 0
+
+// 初始化
+
+函数 netfilter_初始化() {
+    nf_hooks = []
+    定义 可变 i = 0
+    当 (i < NF_INET_NUMHOOKS) {
+        追加(nf_hooks, [])
+        i = i + 1
+    }
+    内核信息("netfilter: 初始化 (5个hook点: PRE/IN/FWD/OUT/POST)")
+}
+
+// 注册/注销hook 
+
+函数 nf_register_hook(ops) {
+    如果 (ops.hook点 >= NF_INET_NUMHOOKS) { 返回 错误_无效参数 }
+    定义 链 = nf_hooks[ops.hook点]
+    // 按优先级插入
+    追加(链, ops)
+    nf_规则总数 = nf_规则总数 + 1
+    返回 成功
+}
+
+函数 nf_unregister_hook(ops) {
+    如果 (ops.hook点 >= NF_INET_NUMHOOKS) { 返回 错误_无效参数 }
+    定义 链 = nf_hooks[ops.hook点]
+    定义 可变 i = 0
+    当 (i < 计数(链)) {
+        如果 (链[i] == ops) {
+            链表_删除(链, i)
+            nf_规则总数 = nf_规则总数 - 1
+            返回 成功
+        }
+        i = i + 1
+    }
+    返回 错误_不存在
+}
+
+// hook遍历 
+// 遍历hook链, 每个回调返回NF_ACCEPT则继续, NF_DROP则丢弃
+
+函数 nf_hook(hook点, Nova缓冲) {
+    如果 (hook点 >= NF_INET_NUMHOOKS) { 返回 NF_ACCEPT }
+    定义 链 = nf_hooks[hook点]
+    如果 (计数(链) == 0) { 返回 NF_ACCEPT }  // 无规则=全部通过
+
+    定义 可变 i = 0
+    当 (i < 计数(链)) {
+        定义 ops = 链[i]
+        如果 (ops.回调 != 空) {
+            定义 verdict = ops.回调(hook点, Nova缓冲, 空, 空, 空)
+            如果 (verdict == NF_DROP) {
+                nf_丢弃数 = nf_丢弃数 + 1
+                返回 NF_DROP
+            }
+            如果 (verdict == NF_STOLEN) { 返回 NF_STOLEN }
+        }
+        i = i + 1
+    }
+
+    nf_通过数 = nf_通过数 + 1
+    返回 NF_ACCEPT
+}
+
+// 简单防火墙规则 (iptables版)
+
+结构 防火墙规则 {
+    源IP,    // u32 0=任意
+    目标IP,    // u32 0=任意
+    源端口,    // u16 0=任意
+    目标端口,    // u16 0=任意
+    协议,    // u8 6=传控, 17=数报, 0=任意
+    动作,    // u32 NF_ACCEPT / NF_DROP
+}
+
+定义 可变 防火墙规则表 = []
+
+函数 防火墙_添加规则(规则) {
+    追加(防火墙规则表, 规则)
+}
+
+函数 防火墙_匹配(Nova缓冲) {
+    定义 可变 i = 0
+    当 (i < 计数(防火墙规则表)) {
+        定义 规则 = 防火墙规则表[i]
+        // 当前实现匹配逻辑
+        如果 (规则.源IP == 0 || 规则.源IP == Nova缓冲_源IP(Nova缓冲)) {
+            如果 (规则.目标IP == 0 || 规则.目标IP == Nova缓冲_目标IP(Nova缓冲)) {
+                返回 规则.动作
+            }
+        }
+        i = i + 1
+    }
+    返回 NF_ACCEPT   // 默认策略: 通过
+}
+
+函数 Nova缓冲_源IP(Nova缓冲) {
+    // 从IP头提取源IP(偏移12字节, 大端序)
+    如果 (Nova缓冲 == 空) { 返回 0 }
+    返回 Nova缓冲_读32(Nova缓冲, 12)  // IPv4头偏移12=源IP
+}
+
+函数 Nova缓冲_目标IP(Nova缓冲) {
+    // 从IP头提取目标IP(偏移16字节, 大端序)
+    如果 (Nova缓冲 == 空) { 返回 0 }
+    返回 Nova缓冲_读32(Nova缓冲, 16)  // IPv4头偏移16=目标IP
+}
+
+// 统计
+
+函数 netfilter_统计() {
+    返回 [nf_规则总数, nf_通过数, nf_丢弃数]
+}
+
+// hook点名称 (调试用)
+
+函数 nf_hook_名称(hook点) {
+    如果 (hook点 == NF_INET_PRE_ROUTING)  { 返回 "PREROUTING" }
+    如果 (hook点 == NF_INET_LOCAL_IN)     { 返回 "INPUT" }
+    如果 (hook点 == NF_INET_FORWARD)      { 返回 "FORWARD" }
+    如果 (hook点 == NF_INET_LOCAL_OUT)    { 返回 "OUTPUT" }
+    如果 (hook点 == NF_INET_POST_ROUTING) { 返回 "POSTROUTING" }
+    返回 "UNKNOWN"
+}
+
+// 防火墙规则清除/列举/默认策略
+
+定义 可变 nf_默认策略 = NF_ACCEPT   // 默认ACCEPT
+
+函数 netfilter_设置默认策略(策略) {
+    nf_默认策略 = 策略
+}
+
+函数 防火墙_清除全部() {
+    防火墙规则表 = []
+}
+
+函数 防火墙_规则数() {
+    返回 计数(防火墙规则表)
+}
+
+函数 防火墙_匹配_完整(Nova缓冲) {
+    定义 可变 i = 0
+    当 (i < 计数(防火墙规则表)) {
+        定义 规则 = 防火墙规则表[i]
+        定义 可变 匹配 = 真
+        如果 (规则.源IP != 0 && 规则.源IP != Nova缓冲_源IP(Nova缓冲)) { 匹配 = 假 }
+        如果 (规则.目标IP != 0 && 规则.目标IP != Nova缓冲_目标IP(Nova缓冲)) { 匹配 = 假 }
+        如果 (规则.协议 != 0 && 规则.协议 != Nova缓冲_协议(Nova缓冲)) { 匹配 = 假 }
+        如果 (匹配) { 返回 规则.动作 }
+        i = i + 1
+    }
+    返回 nf_默认策略
+}
+
+函数 netfilter_Nova缓冲_协议(Nova缓冲) {
+    如果 (Nova缓冲 == 空) { 返回 0 }
+    返回 Nova缓冲_读8(Nova缓冲, 9)  // IPv4头偏移9=协议字段
+}
+
+函数 netfilter_完整统计() {
+    返回 [nf_规则总数, nf_通过数, nf_丢弃数, 计数(防火墙规则表), nf_默认策略]
+}
+
+// 判定名称 + 丢弃率
+
+函数 nf_判定名称(判定) {
+    如果 (判定 == NF_DROP) { 返回 "DROP" }
+    如果 (判定 == NF_ACCEPT) { 返回 "ACCEPT" }
+    如果 (判定 == NF_STOLEN) { 返回 "STOLEN" }
+    如果 (判定 == NF_QUEUE) { 返回 "QUEUE" }
+    如果 (判定 == NF_REPEAT) { 返回 "REPEAT" }
+    返回 "UNKNOWN"
+}
+
+函数 nf_丢弃率() {
+    定义 总 = nf_通过数 + nf_丢弃数
+    如果 (总 == 0) { 返回 0 }
+    返回 nf_丢弃数 * 100 / 总
+}
+
+定义 可变 AI_网络过滤_带宽估计 = 0
+定义 可变 AI_网络过滤_丢包窗口 = []
+
+函数 AI_网络过滤_带宽预测(发送字节, 耗时毫秒) {
+    如果 (耗时毫秒 == 0) { 返回 AI_网络过滤_带宽估计 }
+    定义 当前 = 发送字节 * 1000 / 耗时毫秒
+    AI_网络过滤_带宽估计 = AI_网络过滤_带宽估计 * 700 / 1000 + 当前 * 300 / 1000
+    返回 AI_网络过滤_带宽估计
+}
+
+函数 AI_网络过滤_拥塞建议(丢包率) {
+    追加(AI_网络过滤_丢包窗口, 丢包率)
+    如果 (计数(AI_网络过滤_丢包窗口) > 10) { 列表_移除(AI_网络过滤_丢包窗口, 0) }
+    如果 (丢包率 > 50) { 返回 "减半窗口" }
+    如果 (丢包率 < 5) { 返回 "增大窗口" }
+    返回 "保持"
+}

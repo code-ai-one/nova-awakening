@@ -1,0 +1,112 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+
+// Nova网络栈: 域名解析器 — 递归解析/缓存/DoH/预取
+// 域名协议(Nova协议规范 1035):
+//   Query: Header(12) + Question(variable)
+//   Response: Header(12) + Question + Answer RRs + Authority + Additional
+//   Header: ID(2)+Flags(2)+QDCOUNT(2)+ANCOUNT(2)+NSCOUNT(2)+ARCOUNT(2)
+//   Flags: QR(1)+Opcode(4)+AA(1)+TC(1)+RD(1)+RA(1)+Z(3)+RCODE(4)
+// 记录类型: A(1)/AAAA(28)/CNAME(5)/MX(15)/TXT(16)/NS(2)/SOA(6)/SRV(33)
+// 域名-over-HTTPS (DoH): Nova协议规范 8484
+// 域名缓存: TTL驱逐 + 负缓存 + 预取(TTL<25%时触发)
+
+// §1 常量
+
+定义 域名_PORT        = 53
+定义 DOH_PORT        = 443
+
+// 记录类型
+定义 域名_A           = 1
+定义 域名_NS          = 2
+定义 域名_CNAME       = 5
+定义 域名_SOA         = 6
+定义 域名_MX          = 15
+定义 域名_TXT         = 16
+定义 域名_AAAA        = 28
+定义 域名_SRV         = 33
+定义 域名_HTTPS       = 65    // SVCB/HTTPS记录(Nova协议规范 9460)
+
+// RCODE
+定义 RCODE_OK        = 0
+定义 RCODE_FORMAT     = 1
+定义 RCODE_SERVFAIL   = 2
+定义 RCODE_NXDOMAIN   = 3
+定义 RCODE_NOTIMP     = 4
+定义 RCODE_REFUSED    = 5
+
+// 缓存配置
+定义 域名_CACHE_MAX   = 4096
+定义 域名_CACHE_NEG_TTL = 60     // 负缓存60秒
+定义 域名_TIMEOUT_MS  = 5000
+定义 域名_MAX_RETRIES = 3
+
+// §2 结构
+
+结构 域名Header {
+    id,
+    flags,
+    qdcount,
+    ancount,
+    nscount,
+    arcount,
+}
+
+结构 域名Question {
+    名称,    // u64 "www.example.com"
+    类型,    // u16 域名_A / 域名_AAAA
+    类,    // u16 IN = 1
+}
+
+结构 域名Record {
+    名称,
+    类型,
+    类,
+    TTL,
+    数据长度,
+    // 数据
+    ipv4,    // u32 A记录
+    ipv6,    // [16]u8 AAAA记录
+    cname,    // u64 CNAME字符串
+    // 链表
+    下一个,
+}
+
+// 缓存条目
+结构 域名缓存Entry {
+    域名,    // u64 哈希键
+    域名哈希,
+    记录类型,
+    // 结果
+    记录,    // u64 域名Record*链表
+    // 时间
+    过期时间,    // u64 绝对时间(ms)
+    插入时间,
+    原始TTL,
+    // 状态
+    是负缓存,    // 布尔 NXDOMAIN
+    // 哈希表链
+    下一个,
+}
+
+结构 域名Resolver {
+    // 上游域名服务器
+    服务器,    // [4]u32 IPv4地址
+    服务器数,
+    // DoH端点
+    doh_url,    // u64 "https://dns.google/dns-query"
+    启用doh,
+    // 缓存(哈希表)
+    缓存桶,    // u64 域名缓存Entry*[256]
+    缓存数,
+    // 统计
+    查询总数,
+    缓存命中,
+    缓存未命中,
+    // 下一个查询ID
+    下一个ID,
+    // socket
+    udp_fd,
+}
+
+定义 可变 全局域名 = 0

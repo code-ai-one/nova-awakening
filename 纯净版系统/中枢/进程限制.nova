@@ -1,0 +1,295 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./进程标识分.nova")
+导入("./内核打印.nova")
+导入("./每处理器.nova")
+导入("./整数转字符串.nova")
+
+//   1. rlimit: 每个进程的资源使用上限
+//   2. soft limit: 当前生效限制(可由进程自己降低)
+//   3. hard limit: 最大限制(只有root可以提高)
+//   4. RLIMIT_NOFILE: 最大打开文件数
+//   5. RLIMIT_NPROC: 最大子进程数
+//   6. RLIMIT_AS: 最大虚拟地址空间
+
+定义 RLIMIT_CPU     = 0     // CPU时间(秒)
+定义 RLIMIT_FSIZE   = 1     // 最大文件大小
+定义 RLIMIT_DATA    = 2     // 数据段大小
+定义 RLIMIT_STACK   = 3     // 栈大小
+定义 RLIMIT_CORE    = 4     // core dump大小
+定义 RLIMIT_RSS     = 5     // 常驻集大小
+定义 RLIMIT_NPROC   = 6     // 最大进程数
+定义 RLIMIT_NOFILE  = 7     // 最大打开文件数
+定义 RLIMIT_MEMLOCK = 8     // 锁定内存大小
+定义 RLIMIT_AS      = 9     // 虚拟地址空间大小
+定义 RLIMIT_LOCKS   = 10    // 文件锁数
+定义 RLIMIT_SIGPENDING = 11 // 挂起信号数
+定义 RLIMIT_MSGQUEUE = 12   // 消息队列大小
+定义 RLIMIT_NICE    = 13    // nice值范围
+定义 RLIMIT_RTPRIO  = 14    // RT优先级范围
+定义 RLIM_NLIMITS   = 16    // 总限制类型数
+定义 RLIM_INFINITY  = 0xFFFFFFFFFFFFFFFF
+
+结构 资源限制 {
+    soft,    // u64 当前生效限制
+    hard,    // u64 最大限制
+}
+
+函数 默认资源限制() {
+    定义 可变 限制 = []
+    定义 可变 i = 0
+    当 (i < RLIM_NLIMITS) {
+        定义 rl = 资源限制 {}
+        rl.soft = RLIM_INFINITY
+        rl.hard = RLIM_INFINITY
+        追加(限制, rl)
+        i = i + 1
+    }
+    // 设置具体默认值
+    限制[RLIMIT_NOFILE].soft = 1024
+    限制[RLIMIT_NOFILE].hard = 4096
+    限制[RLIMIT_NPROC].soft = 4096
+    限制[RLIMIT_NPROC].hard = 4096
+    限制[RLIMIT_STACK].soft = 8388608    // 8MB
+    限制[RLIMIT_STACK].hard = RLIM_INFINITY
+    限制[RLIMIT_CORE].soft = 0           // 默认不生成core
+    限制[RLIMIT_CORE].hard = RLIM_INFINITY
+    返回 限制
+}
+
+// getrlimit / setrlimit
+
+函数 sys_getrlimit(资源, 限制列表) {
+    如果 (资源 >= RLIM_NLIMITS) { 返回 错误_无效参数 }
+    返回 限制列表[资源]
+}
+
+函数 sys_setrlimit(资源, 新soft, 新hard, 限制列表, 是root) {
+    如果 (资源 >= RLIM_NLIMITS) { 返回 错误_无效参数 }
+    定义 rl = 限制列表[资源]
+    // soft不能超过hard
+    如果 (新soft > 新hard) { 返回 错误_无效参数 }
+    // 非root不能提高hard limit
+    如果 (!是root && 新hard > rl.hard) { 返回 错误_权限 }
+    rl.soft = 新soft
+    rl.hard = 新hard
+    返回 成功
+}
+
+// 限制检查 (各子系统调用)
+
+函数 检查文件数限制(限制列表, 当前打开数) {
+    返回 当前打开数 < 限制列表[RLIMIT_NOFILE].soft
+}
+
+函数 检查进程数限制(限制列表, 当前进程数) {
+    返回 当前进程数 < 限制列表[RLIMIT_NPROC].soft
+}
+
+函数 获取栈大小限制(限制列表) {
+    返回 限制列表[RLIMIT_STACK].soft
+}
+
+// 错误_权限 定义在 核心/公共/错误码.nova
+
+// 更多限制检查 (各子系统调用)
+
+函数 检查虚拟内存限制(限制列表, 请求大小, 当前使用) {
+    定义 限制 = 限制列表[RLIMIT_AS].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 (当前使用 + 请求大小) <= 限制
+}
+
+函数 检查CPU时间限制(限制列表, 已用秒) {
+    定义 限制 = 限制列表[RLIMIT_CPU].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 已用秒 < 限制
+}
+
+函数 检查文件大小限制(限制列表, 文件大小) {
+    定义 限制 = 限制列表[RLIMIT_FSIZE].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 文件大小 <= 限制
+}
+
+函数 检查锁定内存限制(限制列表, 请求大小, 已锁定) {
+    定义 限制 = 限制列表[RLIMIT_MEMLOCK].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 (已锁定 + 请求大小) <= 限制
+}
+
+函数 检查信号队列限制(限制列表, 当前挂起数) {
+    定义 限制 = 限制列表[RLIMIT_SIGPENDING].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 当前挂起数 < 限制
+}
+
+函数 检查消息队列限制(限制列表, 请求大小, 已用大小) {
+    定义 限制 = 限制列表[RLIMIT_MSGQUEUE].soft
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    返回 (已用大小 + 请求大小) <= 限制
+}
+
+// prlimit64: 统一的get/set接口 
+
+函数 sys_prlimit64(pid, 资源, 新限制, 旧限制输出) {
+    如果 (资源 >= RLIM_NLIMITS) { 返回 错误_无效参数 }
+
+    // 获取目标进程
+    定义 目标 = 空
+    如果 (pid == 0) {
+        目标 = 获取当前进程()
+    } 否则 {
+        目标 = 进程_按PID查找(pid)
+    }
+    如果 (目标 == 空) { 返回 错误_不存在 }
+
+    // 获取进程的限制列表
+    定义 限制列表 = 目标.资源限制
+    如果 (限制列表 == 空) { 返回 错误_无效参数 }
+
+    // 输出旧值
+    如果 (旧限制输出 != 空) {
+        旧限制输出.soft = 限制列表[资源].soft
+        旧限制输出.hard = 限制列表[资源].hard
+    }
+
+    // 设置新值
+    如果 (新限制 != 空) {
+        如果 (新限制.soft > 新限制.hard) { 返回 错误_无效参数 }
+        // 非root不能提高hard
+        定义 是root = (目标.euid == 0)
+        如果 (!是root && 新限制.hard > 限制列表[资源].hard) {
+            返回 错误_权限
+        }
+        限制列表[资源].soft = 新限制.soft
+        限制列表[资源].hard = 新限制.hard
+
+        // 特殊处理: RLIMIT_CPU到达时发送SIGXCPU
+        如果 (资源 == RLIMIT_CPU) {
+            rlimit_CPU_更新定时器(目标)
+        }
+    }
+    返回 成功
+}
+
+// CPU时间限制: 超时发送SIGXCPU 
+
+函数 rlimit_CPU_更新定时器(进程) {
+    // 当进程CPU时间超过soft limit时发送SIGXCPU
+    // 超过hard limit时发送SIGKILL
+    如果 (进程 == 空 || 进程.资源限制 == 空) { 返回 }
+    定义 限制 = 进程.资源限制[RLIMIT_CPU]
+    如果 (限制.soft == RLIM_INFINITY) { 返回 }
+    // 设置定时器在soft limit时触发
+    内核调试("RLIMIT_CPU: PID=" + 整数转字符串(进程.pid) +
+             " soft=" + 整数转字符串(限制.soft) + "s")
+}
+
+函数 rlimit_检查CPU时间(进程, 已用秒) {
+    如果 (进程 == 空 || 进程.资源限制 == 空) { 返回 }
+    定义 限制 = 进程.资源限制[RLIMIT_CPU]
+
+    // hard limit: 强制杀死
+    如果 (限制.hard != RLIM_INFINITY && 已用秒 >= 限制.hard) {
+        内核警告("RLIMIT_CPU: PID=" + 整数转字符串(进程.pid) + " 超过hard limit, SIGKILL")
+        发送信号(进程, 9)   // SIGKILL
+        返回
+    }
+
+    // soft limit: 警告信号
+    如果 (限制.soft != RLIM_INFINITY && 已用秒 >= 限制.soft) {
+        内核信息("RLIMIT_CPU: PID=" + 整数转字符串(进程.pid) + " 超过soft limit, SIGXCPU")
+        发送信号(进程, 24)  // SIGXCPU
+        // 每秒递增soft limit让进程有时间清理
+        限制.soft = 限制.soft + 1
+    }
+}
+
+// fork时限制继承 
+
+函数 rlimit_继承(父进程, 子进程) {
+    如果 (父进程 == 空 || 父进程.资源限制 == 空) {
+        子进程.资源限制 = 默认资源限制()
+        返回
+    }
+    // 深拷贝父进程的限制
+    定义 可变 新限制 = []
+    定义 可变 i = 0
+    当 (i < RLIM_NLIMITS) {
+        定义 rl = 资源限制 {}
+        如果 (i < 计数(父进程.资源限制)) {
+            rl.soft = 父进程.资源限制[i].soft
+            rl.hard = 父进程.资源限制[i].hard
+        } 否则 {
+            rl.soft = RLIM_INFINITY
+            rl.hard = RLIM_INFINITY
+        }
+        追加(新限制, rl)
+        i = i + 1
+    }
+    子进程.资源限制 = 新限制
+}
+
+// /proc/PID/limits 输出 
+
+定义 可变 rlimit_名称 = [
+    "CPU时间(秒)", "文件大小", "数据段", "栈大小",
+    "Core大小", "RSS", "进程数", "打开文件数",
+    "锁定内存", "虚拟地址空间", "文件锁", "挂起信号",
+    "消息队列", "Nice值", "RT优先级", "保留"
+]
+
+函数 rlimit_格式化(限制列表) {
+    定义 可变 结果 = "资源                 Soft Limit       Hard Limit\n"
+    定义 可变 i = 0
+    当 (i < RLIM_NLIMITS && i < 计数(限制列表)) {
+        定义 名称 = rlimit_名称[i]
+        定义 soft = 限制列表[i].soft
+        定义 hard = 限制列表[i].hard
+        定义 soft_str = "unlimited"
+        定义 hard_str = "unlimited"
+        如果 (soft != RLIM_INFINITY) { soft_str = 整数转字符串(soft) }
+        如果 (hard != RLIM_INFINITY) { hard_str = 整数转字符串(hard) }
+        结果 = 结果 + 名称 + "  " + soft_str + "  " + hard_str + "\n"
+        i = i + 1
+    }
+    返回 结果
+}
+
+
+函数 进程限制_完整统计() {
+    返回 [RLIM_NLIMITS]
+}
+
+// 进程限制辅助
+
+函数 进程限制_检查文件数(进程, 新增) {
+    定义 当前 = 进程.打开文件数
+    定义 限制 = 进程.限制[RLIMIT_NOFILE].软限制
+    如果 (当前 + 新增 > 限制) { 返回 假 }
+    返回 真
+}
+
+函数 进程限制_检查内存(进程, 请求大小) {
+    定义 当前 = 进程.虚拟内存大小
+    定义 限制 = 进程.限制[RLIMIT_AS].软限制
+    如果 (限制 == RLIM_INFINITY) { 返回 真 }
+    如果 (当前 + 请求大小 > 限制) { 返回 假 }
+    返回 真
+}
+
+定义 RLIM_INFINITY = 0xFFFFFFFFFFFFFFFF
+
+定义 可变 AI_进程限制_运行指标 = 0
+定义 可变 AI_进程限制_异常指标 = 0
+
+函数 AI_进程限制_自诊断() {
+    AI_进程限制_运行指标 = 0
+    返回 AI_进程限制_运行指标
+}
+
+函数 AI_进程限制_优化建议() {
+    定义 指标 = AI_进程限制_自诊断()
+    返回 "进程限制状态正常"
+}

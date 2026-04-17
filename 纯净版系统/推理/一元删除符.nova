@@ -1,0 +1,581 @@
+// NovaOS 字节码解释器 — 一元运算/删除/比较/测试/跳转/上下文 操作码
+// 技术: V8 Ignition Interpreter — 缺失操作码补全
+// 核心: delete操作, typeof/instanceof/in测试, 条件跳转, 上下文管理
+// NovaOS创新: AI操作码频率分析 + 热操作码快速路径 + 类型特化分发
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../标准/类型判断.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../执行/底层内存操.nova")
+导入("../标准/加法运算符.nova")
+导入("../标准/字串.nova")
+导入("./小整数快速判.nova")
+导入("../感知/内核直连层.nova")
+
+
+定义 OP_DeletePropertyStrict    = 0xA0
+定义 OP_DeletePropertySloppy    = 0xA1
+定义 OP_TestUndetectable        = 0xA2
+定义 OP_TestTypeOf              = 0xA3
+定义 OP_TestInstanceOf          = 0xA4
+定义 OP_TestIn                  = 0xA5
+定义 OP_JumpIfNotNull           = 0xA6
+定义 OP_JumpIfNotUndefined      = 0xA7
+定义 OP_SwitchOnSmiTable        = 0xA8
+定义 OP_PushContext              = 0xA9
+定义 OP_PopContext               = 0xAA
+定义 OP_LdaCurrentContextSlot   = 0xAB
+定义 OP_StaCurrentContextSlot   = 0xAC
+定义 OP_Lda模块Variable          = 0xAD
+定义 OP_Sta模块Variable          = 0xAE
+定义 OP_BitwiseNot              = 0xAF
+定义 OP_Negate                  = 0xB0
+定义 OP_ToNumber                = 0xB1
+定义 OP_ToNumeric               = 0xB2
+定义 OP_Inc                     = 0xB3
+定义 OP_Dec                     = 0xB4
+定义 OP_LogicalNot              = 0xB5
+定义 OP_TypeOf                  = 0xB6
+定义 OP_Void                    = 0xB7
+定义 OP_ForInEnumerate          = 0xB8
+定义 OP_ForInNext               = 0xB9
+定义 OP_ForInStep               = 0xBA
+定义 OP_GetIterator             = 0xBB
+定义 OP_IteratorNext            = 0xBC
+定义 OP_IteratorClose           = 0xBD
+定义 OP_CreateClosure           = 0xBE
+定义 OP_CreateBlockContext       = 0xBF
+定义 OP_CreateCatchContext       = 0xC0
+定义 OP_CreateWithContext        = 0xC1
+定义 OP_JumpIfTrue              = 0xC2
+定义 OP_JumpIfFalse             = 0xC3
+定义 OP_JumpIfToBooleanTrue     = 0xC4
+定义 OP_JumpIfToBooleanFalse    = 0xC5
+
+// typeof返回值ID
+定义 TYPEOF_undefined = 0
+定义 TYPEOF_boolean   = 1
+定义 TYPEOF_number    = 2
+定义 TYPEOF_string    = 3
+定义 TYPEOF_symbol    = 4
+定义 TYPEOF_bigint    = 5
+定义 TYPEOF_object    = 6
+定义 TYPEOF_function  = 7
+
+// 上下文槽偏移
+定义 上下文_父指针偏移   = 8
+定义 上下文_槽起始偏移   = 16
+定义 上下文_最大槽数     = 128
+定义 上下文_结构大小     = 16 + 128 * 8
+
+// AI操作码统计
+定义 AI_操作码统计_大小 = 256
+
+
+结构 操作码统计 {
+    执行次数,          // u64 每个操作码的执行次数数组(256个u64)
+    基址,              // u64 统计数组基址
+    总执行数,
+    最热操作码,
+    最热次数,
+    AI分析间隔,        // u32 每N次触发AI分析
+    AI分析计数器,
+}
+
+函数 操作码统计_创建() {
+    定义 可变 统计 = 堆_分配(操作码统计)
+    如果 (统计 == 0) { 返回 空 }
+    统计.基址 = 平台_申请内存(AI_操作码统计_大小 * 8)
+    如果 (统计.基址 != 0) {
+        内存_清零(统计.基址, AI_操作码统计_大小 * 8)
+    }
+    统计.总执行数 = 0
+    统计.最热操作码 = 0
+    统计.最热次数 = 0
+    统计.AI分析间隔 = 10000
+    统计.AI分析计数器 = 0
+    返回 统计
+}
+
+函数 操作码统计_销毁(统计) {
+    如果 (统计 == 空) { 返回 }
+    如果 (统计.基址 != 0) {
+        平台_释放内存(统计.基址, AI_操作码统计_大小 * 8)
+    }
+    堆_释放(统计)
+}
+
+函数 操作码统计_记录(统计, 操作码) {
+    如果 (统计 == 空 || 统计.基址 == 0) { 返回 }
+    如果 (操作码 < AI_操作码统计_大小) {
+        定义 偏移 = 统计.基址 + 操作码 * 8
+        定义 当前 = 内存_读64(偏移)
+        内存_写64(偏移, 当前 + 1)
+        如果 (当前 + 1 > 统计.最热次数) {
+            统计.最热次数 = 当前 + 1
+            统计.最热操作码 = 操作码
+        }
+    }
+    统计.总执行数 = 统计.总执行数 + 1
+    统计.AI分析计数器 = 统计.AI分析计数器 + 1
+    如果 (统计.AI分析计数器 >= 统计.AI分析间隔) {
+        统计.AI分析计数器 = 0
+        操作码统计_AI分析(统计)
+    }
+}
+
+函数 操作码统计_AI分析(统计) {
+    如果 (统计 == 空 || 统计.基址 == 0) { 返回 }
+    // AI分析: 找出top-5热操作码用于JIT编译优先级
+    // 简化版: 仅记录最热操作码
+}
+
+
+函数 字节码_执行一元运算(Nova运行时实例, frame, op, acc, 寄存器, 代码, 常量池) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 acc }
+
+    如果 (op == OP_BitwiseNot) {
+        定义 值 = JSValue_ToInt32(Nova运行时实例, acc)
+        返回 Nova值_创建_Int(Nova运行时实例, ~值)
+    }
+
+    如果 (op == OP_Negate) {
+        如果 (JSValue_IsSmi(acc)) {
+            定义 值 = JSValue_GetSmi(acc)
+            返回 Nova值_创建_Int(Nova运行时实例, 0 - 值)
+        }
+        定义 数值 = JSValue_ToNumber(Nova运行时实例, acc)
+        返回 Nova值_创建_Number(Nova运行时实例, 0 - 数值)
+    }
+
+    如果 (op == OP_ToNumber) {
+        如果 (JSValue_IsNumber(acc)) { 返回 acc }
+        定义 值 = JSValue_ToNumber(Nova运行时实例, acc)
+        返回 Nova值_创建_Number(Nova运行时实例, 值)
+    }
+
+    如果 (op == OP_ToNumeric) {
+        如果 (JSValue_IsNumber(acc) || JSValue_IsBigInt(acc)) { 返回 acc }
+        定义 值 = JSValue_ToNumber(Nova运行时实例, acc)
+        返回 Nova值_创建_Number(Nova运行时实例, 值)
+    }
+
+    如果 (op == OP_Inc) {
+        如果 (JSValue_IsSmi(acc)) {
+            定义 值 = JSValue_GetSmi(acc)
+            返回 Nova值_创建_Int(Nova运行时实例, 值 + 1)
+        }
+        定义 数值 = JSValue_ToNumber(Nova运行时实例, acc)
+        返回 Nova值_创建_Number(Nova运行时实例, 数值 + 1)
+    }
+
+    如果 (op == OP_Dec) {
+        如果 (JSValue_IsSmi(acc)) {
+            定义 值 = JSValue_GetSmi(acc)
+            返回 Nova值_创建_Int(Nova运行时实例, 值 - 1)
+        }
+        定义 数值 = JSValue_ToNumber(Nova运行时实例, acc)
+        返回 Nova值_创建_Number(Nova运行时实例, 数值 - 1)
+    }
+
+    如果 (op == OP_LogicalNot) {
+        定义 布尔值 = JSValue_ToBoolean(Nova运行时实例, acc)
+        如果 (布尔值 == 真) { 返回 Nova运行时实例.false值 }
+        返回 Nova运行时实例.true值
+    }
+
+    如果 (op == OP_TypeOf) {
+        定义 类型ID = JSValue_TypeOfId(Nova运行时实例, acc)
+        如果 (类型ID == TYPEOF_undefined) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+        如果 (类型ID == TYPEOF_boolean) { 返回 Nova值_创建_String(Nova运行时实例, "boolean") }
+        如果 (类型ID == TYPEOF_number) { 返回 Nova值_创建_String(Nova运行时实例, "number") }
+        如果 (类型ID == TYPEOF_string) { 返回 Nova值_创建_String(Nova运行时实例, "string") }
+        如果 (类型ID == TYPEOF_symbol) { 返回 Nova值_创建_String(Nova运行时实例, "symbol") }
+        如果 (类型ID == TYPEOF_bigint) { 返回 Nova值_创建_String(Nova运行时实例, "bigint") }
+        如果 (类型ID == TYPEOF_function) { 返回 Nova值_创建_String(Nova运行时实例, "function") }
+        返回 Nova值_创建_String(Nova运行时实例, "object")
+    }
+
+    如果 (op == OP_Void) {
+        返回 Nova运行时实例.undefined值
+    }
+
+    返回 acc
+}
+
+
+函数 字节码_执行删除(Nova运行时实例, frame, op, acc, 寄存器, 代码) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 acc }
+
+
+        否则 如果 (op == OP_DeletePropertyStrict) {
+            定义 obj_r = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            定义 obj = 内存_读64(寄存器 + obj_r * 8)
+            定义 key = JSValue_ToString(Nova运行时实例, acc)
+            acc = Nova对象_Delete(Nova运行时实例, obj, key) ? Nova运行时实例.true值 : Nova运行时实例.false值
+        }
+        否则 如果 (op == OP_DeletePropertySloppy) {
+            定义 obj_r = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            定义 obj = 内存_读64(寄存器 + obj_r * 8)
+            定义 key = JSValue_ToString(Nova运行时实例, acc)
+            Nova对象_Delete(Nova运行时实例, obj, key)
+            acc = Nova运行时实例.true值
+        }
+
+
+        否则 如果 (op == OP_TestUndetectable) {
+            acc = (JSValue_IsNull(acc) || JSValue_IsUndefined(acc)) ? Nova运行时实例.true值 : Nova运行时实例.false值
+        }
+        否则 如果 (op == OP_TestTypeOf) {
+            定义 期望类型 = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            定义 实际 = JSValue_TypeOfId(Nova运行时实例, acc)
+            acc = (实际 == 期望类型) ? Nova运行时实例.true值 : Nova运行时实例.false值
+        }
+        否则 如果 (op == OP_TestInstanceOf) {
+            定义 obj_r = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            定义 obj = 内存_读64(寄存器 + obj_r * 8)
+            acc = JSValue_InstanceOf(Nova运行时实例, obj, acc) ? Nova运行时实例.true值 : Nova运行时实例.false值
+        }
+        否则 如果 (op == OP_TestIn) {
+            定义 obj_r = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            定义 obj = 内存_读64(寄存器 + obj_r * 8)
+            定义 key = JSValue_ToString(Nova运行时实例, acc)
+            acc = Nova对象_HasProperty(Nova运行时实例, obj, key) ? Nova运行时实例.true值 : Nova运行时实例.false值
+        }
+
+
+        否则 如果 (op == OP_JumpIfNotNull) {
+            定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+            如果 (!JSValue_IsNull(acc)) { frame.PC = 目标 }
+        }
+        否则 如果 (op == OP_JumpIfNotUndefined) {
+            定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+            如果 (!JSValue_IsUndefined(acc)) { frame.PC = 目标 }
+        }
+        否则 如果 (op == OP_SwitchOnSmiTable) {
+            定义 table_idx = 内存_读8(代码 + frame.PC)
+            定义 size = 内存_读8(代码 + frame.PC + 1)
+            frame.PC = frame.PC + 2
+            定义 val = JSValue_ToInt32(Nova运行时实例, acc)
+            如果 (val >= 0 && val < size) {
+                定义 table = 常量池 + table_idx * 8
+                frame.PC = 内存_读16(table + val * 2)
+            }
+        }
+
+
+        否则 如果 (op == OP_PushContext) {
+            定义 reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            // 保存当前上下文到寄存器
+            内存_写64(寄存器 + reg * 8, frame.上下文)
+            // 创建新上下文
+            定义 新ctx = 堆_分配(256)
+            内存_写64(新ctx + 8, frame.上下文)  // 父上下文
+            frame.上下文 = 新ctx
+        }
+        否则 如果 (op == OP_PopContext) {
+            定义 reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            // 恢复之前保存的上下文
+            frame.上下文 = 内存_读64(寄存器 + reg * 8)
+        }
+        否则 如果 (op == OP_LdaCurrentContextSlot) {
+            定义 slot = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            如果 (frame.上下文 != 0) { acc = 内存_读64(frame.上下文 + 16 + slot * 8) }
+        }
+        否则 如果 (op == OP_StaCurrentContextSlot) {
+            定义 slot = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+            如果 (frame.上下文 != 0) { 内存_写64(frame.上下文 + 16 + slot * 8, acc) }
+        }
+        否则 如果 (op == OP_Lda模块Variable) {
+            定义 cell_idx = 内存_读8(代码 + frame.PC)
+            定义 depth = 内存_读8(代码 + frame.PC + 1)
+            frame.PC = frame.PC + 2
+            定义 可变 ctx = frame.上下文
+            定义 可变 d = 0
+            当 (d < depth && ctx != 0) { ctx = 内存_读64(ctx + 8); d = d + 1 }
+            如果 (ctx != 0) { acc = 内存_读64(ctx + 16 + cell_idx * 8) }
+        }
+        否则 如果 (op == OP_Sta模块Variable) {
+            定义 cell_idx = 内存_读8(代码 + frame.PC)
+            定义 depth = 内存_读8(代码 + frame.PC + 1)
+            frame.PC = frame.PC + 2
+            定义 可变 ctx = frame.上下文
+            定义 可变 d = 0
+            当 (d < depth && ctx != 0) { ctx = 内存_读64(ctx + 8); d = d + 1 }
+            如果 (ctx != 0) { 内存_写64(ctx + 16 + cell_idx * 8, acc) }
+        }
+
+
+函数 字节码_执行迭代器(Nova运行时实例, frame, op, acc, 寄存器, 代码) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 acc }
+
+    如果 (op == OP_ForInEnumerate) {
+        // 获取对象的可枚举属性键列表
+        如果 (JSValue_IsNull(acc) || JSValue_IsUndefined(acc)) {
+            返回 Nova运行时实例.undefined值
+        }
+        定义 对象 = JSValue_ToObject(Nova运行时实例, acc)
+        如果 (对象 == 0) { 返回 Nova运行时实例.undefined值 }
+        // 收集所有可枚举键到列表
+        定义 可变 键列表 = []
+        定义 可变 当前 = 对象
+        当 (当前 != 0) {
+            定义 属性数 = Nova对象_属性数量(Nova运行时实例, 当前)
+            定义 可变 i = 0
+            当 (i < 属性数) {
+                定义 键 = Nova对象_获取键_按索引(Nova运行时实例, 当前, i)
+                如果 (键 != 0) {
+                    定义 描述符 = Nova对象_获取属性描述(Nova运行时实例, 当前, 键)
+                    如果 (描述符 != 0 && (描述符 & 2) != 0) {
+                        // 可枚举
+                        追加(键列表, 键)
+                    }
+                }
+                i = i + 1
+            }
+            当前 = Nova对象_获取原型(Nova运行时实例, 当前)
+        }
+        // 创建枚举缓存对象: [键数组, 当前索引, 总数]
+        定义 缓存 = 堆_分配(枚举缓存)
+        如果 (缓存 != 0) {
+            缓存.键列表 = 键列表
+            缓存.当前索引 = 0
+            缓存.总数 = 计数(键列表)
+        }
+        返回 缓存
+    }
+
+    如果 (op == OP_ForInNext) {
+        定义 枚举_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 索引_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 枚举 = 内存_读64(寄存器 + 枚举_reg * 8)
+        定义 索引 = 内存_读64(寄存器 + 索引_reg * 8)
+        如果 (枚举 == 0) { 返回 Nova运行时实例.undefined值 }
+        如果 (索引 >= 枚举.总数) { 返回 Nova运行时实例.undefined值 }
+        返回 枚举.键列表[索引]
+    }
+
+    如果 (op == OP_ForInStep) {
+        定义 索引_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 当前索引 = 内存_读64(寄存器 + 索引_reg * 8)
+        内存_写64(寄存器 + 索引_reg * 8, 当前索引 + 1)
+        返回 acc
+    }
+
+    如果 (op == OP_GetIterator) {
+        如果 (acc == 0 || JSValue_IsNull(acc) || JSValue_IsUndefined(acc)) {
+            打印("[字节码] 错误: 不可迭代的值")
+            返回 Nova运行时实例.undefined值
+        }
+        // 获取 @@iterator 方法
+        定义 迭代器方法 = Nova对象_获取属性(Nova运行时实例, acc, "Symbol.iterator")
+        如果 (迭代器方法 == 0 || JSValue_IsUndefined(迭代器方法)) {
+            打印("[字节码] TypeError: 对象不可迭代")
+            返回 Nova运行时实例.undefined值
+        }
+        // 调用 iterator()
+        定义 迭代器 = JSValue_Call(Nova运行时实例, 迭代器方法, acc, 0, 0)
+        返回 迭代器
+    }
+
+    如果 (op == OP_IteratorNext) {
+        定义 迭代器_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 迭代器 = 内存_读64(寄存器 + 迭代器_reg * 8)
+        如果 (迭代器 == 0) { 返回 Nova运行时实例.undefined值 }
+        定义 next方法 = Nova对象_获取属性(Nova运行时实例, 迭代器, "next")
+        如果 (next方法 == 0) { 返回 Nova运行时实例.undefined值 }
+        定义 结果 = JSValue_Call(Nova运行时实例, next方法, 迭代器, 0, 0)
+        返回 结果
+    }
+
+    如果 (op == OP_IteratorClose) {
+        定义 迭代器_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 迭代器 = 内存_读64(寄存器 + 迭代器_reg * 8)
+        如果 (迭代器 != 0) {
+            定义 return方法 = Nova对象_获取属性(Nova运行时实例, 迭代器, "return")
+            如果 (return方法 != 0 && !JSValue_IsUndefined(return方法)) {
+                JSValue_Call(Nova运行时实例, return方法, 迭代器, 0, 0)
+            }
+        }
+        返回 acc
+    }
+
+    返回 acc
+}
+
+结构 枚举缓存 {
+    键列表,            // u64 键数组
+    当前索引,
+    总数,
+}
+
+
+函数 字节码_执行闭包上下文(Nova运行时实例, frame, op, acc, 寄存器, 代码, 常量池) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 acc }
+
+    如果 (op == OP_CreateClosure) {
+        定义 函数索引 = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 标志 = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        // 从常量池获取SharedFunctionInfo
+        定义 共享信息 = 内存_读64(常量池 + 函数索引 * 8)
+        如果 (共享信息 == 0) { 返回 Nova运行时实例.undefined值 }
+        // 创建JSFunction对象
+        定义 闭包 = 堆_分配(256)
+        如果 (闭包 == 0) { 返回 Nova运行时实例.undefined值 }
+        // 设置闭包字段
+        内存_写64(闭包, 共享信息)         // 共享函数信息
+        内存_写64(闭包 + 8, frame.上下文) // 捕获的上下文(闭包核心)
+        内存_写32(闭包 + 16, 标志)        // 标志位
+        内存_写64(闭包 + 24, 0)           // 原型(稍后设置)
+        返回 闭包
+    }
+
+    如果 (op == OP_CreateBlockContext) {
+        定义 槽数 = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 新ctx = 平台_申请内存(上下文_槽起始偏移 + 槽数 * 8)
+        如果 (新ctx == 0) { 返回 acc }
+        内存_清零(新ctx, 上下文_槽起始偏移 + 槽数 * 8)
+        内存_写64(新ctx + 上下文_父指针偏移, frame.上下文)
+        frame.上下文 = 新ctx
+        返回 acc
+    }
+
+    如果 (op == OP_CreateCatchContext) {
+        定义 异常_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 异常值 = 内存_读64(寄存器 + 异常_reg * 8)
+        // catch上下文: 1个槽存储异常对象
+        定义 新ctx = 平台_申请内存(上下文_槽起始偏移 + 8)
+        如果 (新ctx == 0) { 返回 acc }
+        内存_写64(新ctx + 上下文_父指针偏移, frame.上下文)
+        内存_写64(新ctx + 上下文_槽起始偏移, 异常值)
+        frame.上下文 = 新ctx
+        返回 acc
+    }
+
+    如果 (op == OP_CreateWithContext) {
+        定义 对象_reg = 内存_读8(代码 + frame.PC); frame.PC = frame.PC + 1
+        定义 对象 = 内存_读64(寄存器 + 对象_reg * 8)
+        // with上下文: 1个槽存储with对象
+        定义 新ctx = 平台_申请内存(上下文_槽起始偏移 + 8)
+        如果 (新ctx == 0) { 返回 acc }
+        内存_写64(新ctx + 上下文_父指针偏移, frame.上下文)
+        内存_写64(新ctx + 上下文_槽起始偏移, 对象)
+        frame.上下文 = 新ctx
+        返回 acc
+    }
+
+    返回 acc
+}
+
+
+函数 字节码_执行条件跳转(Nova运行时实例, frame, op, acc, 代码) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 }
+
+    如果 (op == OP_JumpIfTrue) {
+        定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+        如果 (acc == Nova运行时实例.true值) { frame.PC = 目标 }
+    }
+
+    如果 (op == OP_JumpIfFalse) {
+        定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+        如果 (acc == Nova运行时实例.false值) { frame.PC = 目标 }
+    }
+
+    如果 (op == OP_JumpIfToBooleanTrue) {
+        定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+        定义 布尔值 = JSValue_ToBoolean(Nova运行时实例, acc)
+        如果 (布尔值 == 真) { frame.PC = 目标 }
+    }
+
+    如果 (op == OP_JumpIfToBooleanFalse) {
+        定义 目标 = 内存_读16(代码 + frame.PC); frame.PC = frame.PC + 2
+        定义 布尔值 = JSValue_ToBoolean(Nova运行时实例, acc)
+        如果 (布尔值 == 假) { frame.PC = 目标 }
+    }
+}
+
+
+函数 字节码_分发扩展操作码(Nova运行时实例, frame, op, acc, 寄存器, 代码, 常量池, 统计) {
+    如果 (Nova运行时实例 == 0 || frame == 0) { 返回 acc }
+
+    // AI操作码频率记录
+    如果 (统计 != 空) {
+        操作码统计_记录(统计, op)
+    }
+
+    // 一元运算
+    如果 (op >= OP_BitwiseNot && op <= OP_Void) {
+        返回 字节码_执行一元运算(Nova运行时实例, frame, op, acc, 寄存器, 代码, 常量池)
+    }
+
+    // 删除/测试操作
+    如果 (op >= OP_DeletePropertyStrict && op <= OP_TestIn) {
+        返回 字节码_执行删除(Nova运行时实例, frame, op, acc, 寄存器, 代码)
+    }
+
+    // 跳转操作
+    如果 (op >= OP_JumpIfNotNull && op <= OP_JumpIfToBooleanFalse) {
+        字节码_执行条件跳转(Nova运行时实例, frame, op, acc, 代码)
+        返回 acc
+    }
+
+    // 迭代器操作
+    如果 (op >= OP_ForInEnumerate && op <= OP_IteratorClose) {
+        返回 字节码_执行迭代器(Nova运行时实例, frame, op, acc, 寄存器, 代码)
+    }
+
+    // 闭包/上下文操作
+    如果 (op >= OP_CreateClosure && op <= OP_CreateWithContext) {
+        返回 字节码_执行闭包上下文(Nova运行时实例, frame, op, acc, 寄存器, 代码, 常量池)
+    }
+
+    打印("[字节码] 警告: 未知操作码")
+    返回 acc
+}
+
+
+函数 操作码统计_打印(统计) {
+    如果 (统计 == 空) { 返回 }
+    打印("[字节码] ═══════════ 操作码统计 ═══════════")
+    打印(字符串拼接("  总执行数:   ", 转字符串(统计.总执行数)))
+    打印(字符串拼接("  最热操作码: 0x", 转字符串(统计.最热操作码)))
+    打印(字符串拼接("  最热次数:   ", 转字符串(统计.最热次数)))
+    // 输出top-10
+    如果 (统计.基址 != 0 && 统计.总执行数 > 0) {
+        定义 可变 i = 0
+        当 (i < AI_操作码统计_大小) {
+            定义 次数 = 内存_读64(统计.基址 + i * 8)
+            如果 (次数 > 统计.总执行数 / 100) {
+                打印(字符串拼接("  操作码0x", 字符串拼接(转字符串(i), 字符串拼接(": ", 转字符串(次数)))))
+            }
+            i = i + 1
+        }
+    }
+    打印("[字节码] ═══════════════════════════════════════")
+}
+
+函数 操作码_名称(op) {
+    如果 (op == OP_DeletePropertyStrict) { 返回 "DeletePropertyStrict" }
+    如果 (op == OP_DeletePropertySloppy) { 返回 "DeletePropertySloppy" }
+    如果 (op == OP_TestUndetectable) { 返回 "TestUndetectable" }
+    如果 (op == OP_TestTypeOf) { 返回 "TestTypeOf" }
+    如果 (op == OP_TestInstanceOf) { 返回 "TestInstanceOf" }
+    如果 (op == OP_TestIn) { 返回 "TestIn" }
+    如果 (op == OP_BitwiseNot) { 返回 "BitwiseNot" }
+    如果 (op == OP_Negate) { 返回 "Negate" }
+    如果 (op == OP_Inc) { 返回 "Inc" }
+    如果 (op == OP_Dec) { 返回 "Dec" }
+    如果 (op == OP_LogicalNot) { 返回 "LogicalNot" }
+    如果 (op == OP_TypeOf) { 返回 "TypeOf" }
+    如果 (op == OP_Void) { 返回 "Void" }
+    如果 (op == OP_ForInEnumerate) { 返回 "ForInEnumerate" }
+    如果 (op == OP_GetIterator) { 返回 "GetIterator" }
+    如果 (op == OP_CreateClosure) { 返回 "CreateClosure" }
+    如果 (op == OP_PushContext) { 返回 "PushContext" }
+    如果 (op == OP_PopContext) { 返回 "PopContext" }
+    返回 "未知操作码"
+}
+}

@@ -1,0 +1,257 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./应用样式声明.nova")
+导入("./样式解析边.nova")
+
+// §7 扩展属性应用 — 补全所有新增属性的Computed样式应用
+
+函数 Computed样式_应用扩展声明(style, 属性, 值) {
+    如果 (值 == 0) { 返回 }
+
+    // 文字属性
+    如果 (属性 == CSS属性_text_transform) {
+        如果 (值.关键字ID == 5) { style.text_transform = 0 }   // none
+        否则 如果 (值.关键字ID == 44) { style.text_transform = 1 } // uppercase
+        否则 如果 (值.关键字ID == 45) { style.text_transform = 2 } // lowercase
+        否则 如果 (值.关键字ID == 46) { style.text_transform = 3 } // capitalize
+    }
+    否则 如果 (属性 == CSS属性_text_indent) {
+        如果 (值.类型 == CSS值_长度 || 值.类型 == CSS值_百分比) { style.text_indent = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_text_overflow) {
+        如果 (值.关键字ID == 85) { style.text_overflow = 0 }  // clip
+        否则 如果 (值.关键字ID == 84) { style.text_overflow = 1 }  // ellipsis
+    }
+    否则 如果 (属性 == CSS属性_letter_spacing) {
+        如果 (值.类型 == CSS值_长度) { style.letter_spacing = 值.数值 }
+        否则 如果 (值.关键字ID == 22) { style.letter_spacing = 0 }  // normal
+    }
+    否则 如果 (属性 == CSS属性_word_spacing) {
+        如果 (值.类型 == CSS值_长度) { style.word_spacing = 值.数值 }
+        否则 如果 (值.关键字ID == 22) { style.word_spacing = 0 }
+    }
+    否则 如果 (属性 == CSS属性_overflow_wrap || 属性 == CSS属性_word_wrap) {
+        如果 (值.关键字ID == 22) { style.overflow_wrap = 0 }  // normal
+        否则 如果 (值.关键字ID == 52) { style.overflow_wrap = 1 }  // break-word
+    }
+    否则 如果 (属性 == CSS属性_white_space) {
+        如果 (值.关键字ID == 22) { style.white_space = 0 }    // normal
+        否则 如果 (值.关键字ID == 26) { style.white_space = 1 }  // nowrap
+        否则 如果 (值.关键字ID == 49) { style.white_space = 2 }  // pre
+        否则 如果 (值.关键字ID == 50) { style.white_space = 3 }  // pre-wrap
+        否则 如果 (值.关键字ID == 51) { style.white_space = 4 }  // pre-line
+    }
+    否则 如果 (属性 == CSS属性_font_style) {
+        如果 (值.关键字ID == 22) { style.font_style = 0 }    // normal
+        否则 如果 (值.关键字ID == 47) { style.font_style = 1 }  // italic
+        否则 如果 (值.关键字ID == 48) { style.font_style = 2 }  // oblique
+    }
+    否则 如果 (属性 == CSS属性_text_decoration) {
+        style.text_decoration = 0
+        如果 (值.关键字ID == 41) { style.text_decoration = 1 }  // underline
+        否则 如果 (值.关键字ID == 42) { style.text_decoration = 2 }  // overline
+        否则 如果 (值.关键字ID == 43) { style.text_decoration = 4 }  // line-through
+        否则 如果 (值.关键字ID == 5) { style.text_decoration = 0 }  // none
+    }
+    否则 如果 (属性 == CSS属性_word_break) {
+        如果 (值.关键字ID == 22) { style.word_break = 0 }     // normal
+        否则 如果 (值.关键字ID == 53) { style.word_break = 1 }  // break-all
+        否则 如果 (值.关键字ID == 54) { style.word_break = 2 }  // keep-all
+    }
+    否则 如果 (属性 == CSS属性_vertical_align) {
+        如果 (值.关键字ID == 40) { style.vertical_align = 0 }  // baseline
+        否则 如果 (值.关键字ID == 37) { style.vertical_align = 1 }  // top
+        否则 如果 (值.关键字ID == 39) { style.vertical_align = 2 }  // middle
+        否则 如果 (值.关键字ID == 38) { style.vertical_align = 3 }  // bottom
+    }
+
+    // 边框样式
+    否则 如果 (属性 == CSS属性_border_style) {
+        定义 bs = CSS解析_边框样式值(值.关键字ID)
+        style.border_top_style = bs; style.border_right_style = bs
+        style.border_bottom_style = bs; style.border_left_style = bs
+    }
+    否则 如果 (属性 == CSS属性_border_top_style) { style.border_top_style = CSS解析_边框样式值(值.关键字ID) }
+    否则 如果 (属性 == CSS属性_border_right_style) { style.border_right_style = CSS解析_边框样式值(值.关键字ID) }
+    否则 如果 (属性 == CSS属性_border_bottom_style) { style.border_bottom_style = CSS解析_边框样式值(值.关键字ID) }
+    否则 如果 (属性 == CSS属性_border_left_style) { style.border_left_style = CSS解析_边框样式值(值.关键字ID) }
+    否则 如果 (属性 == CSS属性_border_collapse) {
+        如果 (值.关键字ID == 35) { style.border_collapse = 0 }  // separate
+        否则 如果 (值.关键字ID == 34) { style.border_collapse = 1 }  // collapse
+    }
+    否则 如果 (属性 == CSS属性_border_spacing) {
+        如果 (值.类型 == CSS值_长度) { style.border_spacing = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_border_top_left_radius) {
+        如果 (值.类型 == CSS值_长度) { style.border_radius_tl = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_border_top_right_radius) {
+        如果 (值.类型 == CSS值_长度) { style.border_radius_tr = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_border_bottom_left_radius) {
+        如果 (值.类型 == CSS值_长度) { style.border_radius_bl = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_border_bottom_right_radius) {
+        如果 (值.类型 == CSS值_长度) { style.border_radius_br = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_border_color) {
+        如果 (值.类型 == CSS值_颜色) {
+            style.border_top_color = 值.颜色
+            style.border_right_color = 值.颜色
+            style.border_bottom_color = 值.颜色
+            style.border_left_color = 值.颜色
+        }
+    }
+    否则 如果 (属性 == CSS属性_border_width) {
+        如果 (值.类型 == CSS值_长度) {
+            style.border_top_width = 值.数值
+            style.border_right_width = 值.数值
+            style.border_bottom_width = 值.数值
+            style.border_left_width = 值.数值
+        }
+        否则 如果 (值.关键字ID == 63) { // thin = 1px
+            style.border_top_width = 100; style.border_right_width = 100
+            style.border_bottom_width = 100; style.border_left_width = 100
+        }
+        否则 如果 (值.关键字ID == 64) { // thick = 5px
+            style.border_top_width = 500; style.border_right_width = 500
+            style.border_bottom_width = 500; style.border_left_width = 500
+        }
+    }
+
+    // 背景属性
+    否则 如果 (属性 == CSS属性_background_repeat) {
+        如果 (值.关键字ID == 83) { style.background_repeat = 0 }   // repeat
+        否则 如果 (值.关键字ID == 80) { style.background_repeat = 1 }  // no-repeat
+        否则 如果 (值.关键字ID == 81) { style.background_repeat = 2 }  // repeat-x
+        否则 如果 (值.关键字ID == 82) { style.background_repeat = 3 }  // repeat-y
+    }
+    否则 如果 (属性 == CSS属性_background_size) {
+        如果 (值.关键字ID == 4) { style.background_size = 0 }    // auto
+        否则 如果 (值.关键字ID == 75) { style.background_size = 1 }  // cover
+        否则 如果 (值.关键字ID == 76) { style.background_size = 2 }  // contain
+    }
+    否则 如果 (属性 == CSS属性_background_attachment) {
+        如果 (值.关键字ID == 33) { style.background_attachment = 0 }  // scroll
+        否则 如果 (值.关键字ID == 15) { style.background_attachment = 1 }  // fixed
+    }
+    否则 如果 (属性 == CSS属性_background_clip || 属性 == CSS属性_background_origin) {
+        定义 变量 = 0
+        如果 (值.关键字ID == 31) { 变量 = 0 }  // border-box
+        否则 如果 (值.关键字ID == 86) { 变量 = 1 }  // padding-box
+        否则 如果 (值.关键字ID == 32) { 变量 = 2 }  // content-box
+        如果 (属性 == CSS属性_background_clip) { style.background_clip = 变量 }
+        否则 { style.background_origin = 变量 }
+    }
+
+    // 弹性增强
+    否则 如果 (属性 == CSS属性_flex_grow) {
+        如果 (值.类型 == CSS值_数字) { style.flex_grow = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_flex_shrink) {
+        如果 (值.类型 == CSS值_数字) { style.flex_shrink = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_flex_basis) {
+        style.flex_basis = Computed样式_解析长度值(值)
+    }
+    否则 如果 (属性 == CSS属性_flex_wrap) {
+        如果 (值.关键字ID == 26) { style.flex_wrap = 0 }   // nowrap
+        否则 如果 (值.关键字ID == 25) { style.flex_wrap = 1 }  // wrap
+        否则 如果 (值.关键字ID == 67) { style.flex_wrap = 2 }  // wrap-reverse
+    }
+    否则 如果 (属性 == CSS属性_align_self) {
+        如果 (值.关键字ID == 4) { style.align_self = 0 }     // auto
+        否则 如果 (值.关键字ID == 69) { style.align_self = 1 }  // flex-start
+        否则 如果 (值.关键字ID == 70) { style.align_self = 2 }  // flex-end
+        否则 如果 (值.关键字ID == 18) { style.align_self = 3 }  // center
+        否则 如果 (值.关键字ID == 29) { style.align_self = 5 }  // stretch
+    }
+    否则 如果 (属性 == CSS属性_align_content) {
+        如果 (值.关键字ID == 69) { style.align_content = JC_flex_start }
+        否则 如果 (值.关键字ID == 70) { style.align_content = JC_flex_end }
+        否则 如果 (值.关键字ID == 18) { style.align_content = JC_center }
+        否则 如果 (值.关键字ID == 27) { style.align_content = JC_space_between }
+        否则 如果 (值.关键字ID == 28) { style.align_content = JC_space_around }
+        否则 如果 (值.关键字ID == 29) { style.align_content = JC_stretch }
+    }
+    否则 如果 (属性 == CSS属性_order) {
+        如果 (值.类型 == CSS值_数字) { style.order = 值.数值 / 100 }
+    }
+    否则 如果 (属性 == CSS属性_column_gap) {
+        如果 (值.类型 == CSS值_长度) { style.column_gap = 值.数值 }
+    }
+    否则 如果 (属性 == CSS属性_row_gap) {
+        如果 (值.类型 == CSS值_长度) { style.row_gap = 值.数值 }
+    }
+
+    // 对象适配
+    否则 如果 (属性 == CSS属性_object_fit) {
+        如果 (值.关键字ID == 77) { style.object_fit = 0 }    // fill
+        否则 如果 (值.关键字ID == 76) { style.object_fit = 1 }  // contain
+        否则 如果 (值.关键字ID == 75) { style.object_fit = 2 }  // cover
+        否则 如果 (值.关键字ID == 5) { style.object_fit = 3 }   // none
+        否则 如果 (值.关键字ID == 78) { style.object_fit = 4 }  // scale-down
+    }
+
+    // 其他属性
+    否则 如果 (属性 == CSS属性_float) {
+        如果 (值.关键字ID == 5) { style.float_val = 浮动_none }
+        否则 如果 (值.关键字ID == 19) { style.float_val = 浮动_left }
+        否则 如果 (值.关键字ID == 20) { style.float_val = 浮动_right }
+    }
+    否则 如果 (属性 == CSS属性_clear) {
+        如果 (值.关键字ID == 5) { style.clear = 0 }       // none
+        否则 如果 (值.关键字ID == 19) { style.clear = 1 }  // left
+        否则 如果 (值.关键字ID == 20) { style.clear = 2 }  // right
+        否则 如果 (值.关键字ID == 36) { style.clear = 3 }  // both
+    }
+    否则 如果 (属性 == CSS属性_overflow_x) {
+        style.overflow_x = CSS解析_overflow值(值.关键字ID)
+    }
+    否则 如果 (属性 == CSS属性_overflow_y) {
+        style.overflow_y = CSS解析_overflow值(值.关键字ID)
+    }
+    否则 如果 (属性 == CSS属性_resize) {
+        如果 (值.关键字ID == 5) { style.resize = 0 }       // none
+        否则 如果 (值.关键字ID == 36) { style.resize = 1 }  // both
+    }
+    否则 如果 (属性 == CSS属性_table_layout) {
+        如果 (值.关键字ID == 4) { style.table_layout = 0 }    // auto
+        否则 如果 (值.关键字ID == 15) { style.table_layout = 1 }  // fixed
+    }
+    否则 如果 (属性 == CSS属性_direction) {
+        如果 (值.关键字ID == 19) { style.direction = 0 }  // ltr
+    }
+    否则 如果 (属性 == CSS属性_scroll_behavior) {
+        如果 (值.关键字ID == 4) { style.scroll_behavior = 0 }    // auto
+        否则 如果 (值.关键字ID == 79) { style.scroll_behavior = 1 }  // smooth
+    }
+    否则 如果 (属性 == CSS属性_pointer_事件s) {
+        如果 (值.关键字ID == 4) { style.pointer_事件s = 0 }   // auto
+        否则 如果 (值.关键字ID == 5) { style.pointer_事件s = 1 }  // none
+    }
+    否则 如果 (属性 == CSS属性_user_select) {
+        如果 (值.关键字ID == 4) { style.user_select = 0 }    // auto
+        否则 如果 (值.关键字ID == 5) { style.user_select = 1 }  // none
+    }
+    否则 如果 (属性 == CSS属性_appearance) {
+        如果 (值.关键字ID == 5) { style.appearance = 0 }    // none
+        否则 如果 (值.关键字ID == 4) { style.appearance = 1 }  // auto
+    }
+    否则 如果 (属性 == CSS属性_accent_color) {
+        如果 (值.类型 == CSS值_颜色) { style.accent_color = 值.颜色 }
+    }
+}
+
+定义 可变 AI_扩展属性应_样式缓存命中 = 0
+
+函数 AI_扩展属性应_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_扩展属性应_布局缓存(元素哈希) {
+    AI_扩展属性应_样式缓存命中 = AI_扩展属性应_样式缓存命中 + 1
+    返回 元素哈希
+}

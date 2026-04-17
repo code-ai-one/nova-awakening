@@ -1,0 +1,603 @@
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+
+定义 TOK_EOF = 0
+定义 TOK_标识符 = 1
+定义 TOK_数字 = 2
+定义 TOK_字符串 = 3
+定义 TOK_模板头 = 4
+定义 TOK_模板中 = 5
+定义 TOK_模板尾 = 6
+定义 TOK_正则 = 7
+定义 TOK_左括号 = 10
+定义 TOK_右括号 = 11
+定义 TOK_左方括号 = 12
+定义 TOK_右方括号 = 13
+定义 TOK_左花括号 = 14
+定义 TOK_右花括号 = 15
+定义 TOK_分号 = 16
+定义 TOK_逗号 = 17
+定义 TOK_点 = 18
+定义 TOK_展开 = 19
+定义 TOK_可选链 = 20
+定义 TOK_加 = 30
+定义 TOK_减 = 31
+定义 TOK_乘 = 32
+定义 TOK_除 = 33
+定义 TOK_取模 = 34
+定义 TOK_幂 = 35
+定义 TOK_赋值 = 40
+定义 TOK_加等 = 41
+定义 TOK_减等 = 42
+定义 TOK_乘等 = 43
+定义 TOK_除等 = 44
+定义 TOK_模等 = 45
+定义 TOK_幂等 = 46
+定义 TOK_等于 = 50
+定义 TOK_不等 = 51
+定义 TOK_严格等 = 52
+定义 TOK_严格不等 = 53
+定义 TOK_小于 = 54
+定义 TOK_大于 = 55
+定义 TOK_小于等 = 56
+定义 TOK_大于等 = 57
+定义 TOK_与 = 60
+定义 TOK_或 = 61
+定义 TOK_非 = 62
+定义 TOK_空合 = 63
+定义 TOK_位与 = 64
+定义 TOK_位或 = 65
+定义 TOK_位异或 = 66
+定义 TOK_位非 = 67
+定义 TOK_左移 = 68
+定义 TOK_右移 = 69
+定义 TOK_无符号右移 = 70
+定义 TOK_自增 = 71
+定义 TOK_自减 = 72
+定义 TOK_箭头 = 73
+定义 TOK_问号 = 74
+定义 TOK_冒号 = 75
+定义 TOK_错误 = 99
+
+定义 KW_var = 100
+定义 KW_let = 101
+定义 KW_const = 102
+定义 KW_function = 103
+定义 KW_return = 104
+定义 KW_if = 105
+定义 KW_else = 106
+定义 KW_while = 107
+定义 KW_for = 108
+定义 KW_do = 109
+定义 KW_break = 110
+定义 KW_continue = 111
+定义 KW_switch = 112
+定义 KW_case = 113
+定义 KW_default = 114
+定义 KW_new = 115
+定义 KW_delete = 116
+定义 KW_typeof = 117
+定义 KW_instanceof = 118
+定义 KW_in = 119
+定义 KW_this = 120
+定义 KW_class = 121
+定义 KW_extends = 122
+定义 KW_super = 123
+定义 KW_import = 124
+定义 KW_export = 125
+定义 KW_try = 126
+定义 KW_catch = 127
+定义 KW_finally = 128
+定义 KW_throw = 129
+定义 KW_void = 130
+定义 KW_yield = 131
+定义 KW_await = 132
+定义 KW_async = 133
+定义 KW_of = 134
+定义 KW_true = 135
+定义 KW_false = 136
+定义 KW_null = 137
+定义 KW_undefined = 138
+
+结构 令牌 {
+    类型,
+    值,
+    值长度,
+    行,
+    列,
+}
+
+结构 Scanner {
+    源码,
+    源码长度,
+    位置,
+    行,
+    列,
+    当前令牌,
+    前瞻令牌,
+    模板深度,
+    上一个令牌类型,
+    扫描令牌数,
+    错误数,
+}
+
+函数 Scanner_创建(源码) {
+    定义 s = 堆_分配(Scanner)
+    s.源码 = 源码
+    s.源码长度 = 字符串_长度(源码)
+    s.位置 = 0
+    s.行 = 1
+    s.列 = 0
+    s.模板深度 = 0
+    s.上一个令牌类型 = 0
+    s.扫描令牌数 = 0
+    s.错误数 = 0
+    Scanner_扫描(s)
+    返回 s
+}
+
+函数 Scanner_字符(s) {
+    如果 (s.位置 >= s.源码长度) { 返回 0 }
+    返回 内存_读8(s.源码 + s.位置)
+}
+
+函数 Scanner_前看(s) {
+    如果 (s.位置 + 1 >= s.源码长度) { 返回 0 }
+    返回 内存_读8(s.源码 + s.位置 + 1)
+}
+
+函数 Scanner_前看2(s) {
+    如果 (s.位置 + 2 >= s.源码长度) { 返回 0 }
+    返回 内存_读8(s.源码 + s.位置 + 2)
+}
+
+函数 Scanner_前进(s) {
+    如果 (s.位置 < s.源码长度) {
+        如果 (Scanner_字符(s) == 0x0A) { s.行 = s.行 + 1; s.列 = 0 }
+        否则 { s.列 = s.列 + 1 }
+        s.位置 = s.位置 + 1
+    }
+}
+
+函数 Scanner_跳过空白和注释(s) {
+    当 (s.位置 < s.源码长度) {
+        定义 c = Scanner_字符(s)
+        如果 (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0x0C || c == 0xFEFF) {
+            Scanner_前进(s)
+            继续
+        }
+        如果 (c == 0x2F && Scanner_前看(s) == 0x2F) {
+            当 (s.位置 < s.源码长度 && Scanner_字符(s) != 0x0A) {
+                Scanner_前进(s)
+            }
+            继续
+        }
+        如果 (c == 0x2F && Scanner_前看(s) == 0x2A) {
+            Scanner_前进(s); Scanner_前进(s)
+            当 (s.位置 < s.源码长度 - 1) {
+                如果 (Scanner_字符(s) == 0x2A && Scanner_前看(s) == 0x2F) {
+                    Scanner_前进(s); Scanner_前进(s)
+                    跳出
+                }
+                Scanner_前进(s)
+            }
+            继续
+        }
+        跳出
+    }
+}
+
+函数 Scanner_是标识符开始(c) {
+    如果 (c >= 0x41 && c <= 0x5A) { 返回 真 }
+    如果 (c >= 0x61 && c <= 0x7A) { 返回 真 }
+    如果 (c == 0x5F || c == 0x24) { 返回 真 }
+    如果 (c > 127) { 返回 真 }
+    返回 假
+}
+
+函数 Scanner_是标识符续(c) {
+    如果 (Scanner_是标识符开始(c)) { 返回 真 }
+    如果 (c >= 0x30 && c <= 0x39) { 返回 真 }
+    返回 假
+}
+
+函数 Scanner_关键字查找(文本, 长度) {
+    如果 (长度 == 2) {
+        如果 (字符串_相等(文本, "if", 长度)) { 返回 KW_if }
+        如果 (字符串_相等(文本, "in", 长度)) { 返回 KW_in }
+        如果 (字符串_相等(文本, "do", 长度)) { 返回 KW_do }
+        如果 (字符串_相等(文本, "of", 长度)) { 返回 KW_of }
+    }
+    如果 (长度 == 3) {
+        如果 (字符串_相等(文本, "var", 长度)) { 返回 KW_var }
+        如果 (字符串_相等(文本, "let", 长度)) { 返回 KW_let }
+        如果 (字符串_相等(文本, "for", 长度)) { 返回 KW_for }
+        如果 (字符串_相等(文本, "new", 长度)) { 返回 KW_new }
+        如果 (字符串_相等(文本, "try", 长度)) { 返回 KW_try }
+    }
+    如果 (长度 == 4) {
+        如果 (字符串_相等(文本, "this", 长度)) { 返回 KW_this }
+        如果 (字符串_相等(文本, "else", 长度)) { 返回 KW_else }
+        如果 (字符串_相等(文本, "case", 长度)) { 返回 KW_case }
+        如果 (字符串_相等(文本, "void", 长度)) { 返回 KW_void }
+        如果 (字符串_相等(文本, "true", 长度)) { 返回 KW_true }
+        如果 (字符串_相等(文本, "null", 长度)) { 返回 KW_null }
+    }
+    如果 (长度 == 5) {
+        如果 (字符串_相等(文本, "const", 长度)) { 返回 KW_const }
+        如果 (字符串_相等(文本, "while", 长度)) { 返回 KW_while }
+        如果 (字符串_相等(文本, "break", 长度)) { 返回 KW_break }
+        如果 (字符串_相等(文本, "class", 长度)) { 返回 KW_class }
+        如果 (字符串_相等(文本, "super", 长度)) { 返回 KW_super }
+        如果 (字符串_相等(文本, "throw", 长度)) { 返回 KW_throw }
+        如果 (字符串_相等(文本, "yield", 长度)) { 返回 KW_yield }
+        如果 (字符串_相等(文本, "await", 长度)) { 返回 KW_await }
+        如果 (字符串_相等(文本, "async", 长度)) { 返回 KW_async }
+        如果 (字符串_相等(文本, "false", 长度)) { 返回 KW_false }
+        如果 (字符串_相等(文本, "catch", 长度)) { 返回 KW_catch }
+    }
+    如果 (长度 == 6) {
+        如果 (字符串_相等(文本, "return", 长度)) { 返回 KW_return }
+        如果 (字符串_相等(文本, "switch", 长度)) { 返回 KW_switch }
+        如果 (字符串_相等(文本, "delete", 长度)) { 返回 KW_delete }
+        如果 (字符串_相等(文本, "typeof", 长度)) { 返回 KW_typeof }
+        如果 (字符串_相等(文本, "import", 长度)) { 返回 KW_import }
+        如果 (字符串_相等(文本, "export", 长度)) { 返回 KW_export }
+    }
+    如果 (长度 == 7) {
+        如果 (字符串_相等(文本, "default", 长度)) { 返回 KW_default }
+        如果 (字符串_相等(文本, "extends", 长度)) { 返回 KW_extends }
+        如果 (字符串_相等(文本, "finally", 长度)) { 返回 KW_finally }
+    }
+    如果 (长度 == 8) {
+        如果 (字符串_相等(文本, "function", 长度)) { 返回 KW_function }
+        如果 (字符串_相等(文本, "continue", 长度)) { 返回 KW_continue }
+    }
+    如果 (长度 == 9) {
+        如果 (字符串_相等(文本, "undefined", 长度)) { 返回 KW_undefined }
+    }
+    如果 (长度 == 10) {
+        如果 (字符串_相等(文本, "instanceof", 长度)) { 返回 KW_instanceof }
+    }
+    返回 0
+}
+
+函数 Scanner_扫描标识符(s, tok) {
+    定义 开始 = s.位置
+    当 (s.位置 < s.源码长度 && Scanner_是标识符续(Scanner_字符(s))) {
+        Scanner_前进(s)
+    }
+    定义 长度 = s.位置 - 开始
+    定义 关键字 = Scanner_关键字查找(s.源码 + 开始, 长度)
+    如果 (关键字 > 0) {
+        tok.类型 = 关键字
+    } 否则 {
+        tok.类型 = TOK_标识符
+    }
+    tok.值 = s.源码 + 开始
+    tok.值长度 = 长度
+}
+
+函数 Scanner_扫描数字(s, tok) {
+    定义 开始 = s.位置
+    定义 c = Scanner_字符(s)
+
+    如果 (c == 0x30) {
+        定义 下一个 = Scanner_前看(s)
+        如果 (下一个 == 0x78 || 下一个 == 0x58) {
+            Scanner_前进(s); Scanner_前进(s)
+            当 (s.位置 < s.源码长度) {
+                定义 h = Scanner_字符(s)
+                如果 ((h >= 0x30 && h <= 0x39) || (h >= 0x41 && h <= 0x46) || (h >= 0x61 && h <= 0x66)) {
+                    Scanner_前进(s)
+                } 否则 { 跳出 }
+            }
+            tok.类型 = TOK_数字
+            tok.值 = s.源码 + 开始
+            tok.值长度 = s.位置 - 开始
+            返回
+        }
+        如果 (下一个 == 0x6F || 下一个 == 0x4F) {
+            Scanner_前进(s); Scanner_前进(s)
+            当 (s.位置 < s.源码长度 && Scanner_字符(s) >= 0x30 && Scanner_字符(s) <= 0x37) {
+                Scanner_前进(s)
+            }
+            tok.类型 = TOK_数字
+            tok.值 = s.源码 + 开始
+            tok.值长度 = s.位置 - 开始
+            返回
+        }
+        如果 (下一个 == 0x62 || 下一个 == 0x42) {
+            Scanner_前进(s); Scanner_前进(s)
+            当 (s.位置 < s.源码长度 && (Scanner_字符(s) == 0x30 || Scanner_字符(s) == 0x31)) {
+                Scanner_前进(s)
+            }
+            tok.类型 = TOK_数字
+            tok.值 = s.源码 + 开始
+            tok.值长度 = s.位置 - 开始
+            返回
+        }
+    }
+
+    当 (s.位置 < s.源码长度 && Scanner_字符(s) >= 0x30 && Scanner_字符(s) <= 0x39) {
+        Scanner_前进(s)
+    }
+    如果 (s.位置 < s.源码长度 && Scanner_字符(s) == 0x2E) {
+        Scanner_前进(s)
+        当 (s.位置 < s.源码长度 && Scanner_字符(s) >= 0x30 && Scanner_字符(s) <= 0x39) {
+            Scanner_前进(s)
+        }
+    }
+    如果 (s.位置 < s.源码长度 && (Scanner_字符(s) == 0x65 || Scanner_字符(s) == 0x45)) {
+        Scanner_前进(s)
+        如果 (s.位置 < s.源码长度 && (Scanner_字符(s) == 0x2B || Scanner_字符(s) == 0x2D)) {
+            Scanner_前进(s)
+        }
+        当 (s.位置 < s.源码长度 && Scanner_字符(s) >= 0x30 && Scanner_字符(s) <= 0x39) {
+            Scanner_前进(s)
+        }
+    }
+    如果 (s.位置 < s.源码长度 && Scanner_字符(s) == 0x6E) {
+        Scanner_前进(s)
+    }
+    tok.类型 = TOK_数字
+    tok.值 = s.源码 + 开始
+    tok.值长度 = s.位置 - 开始
+}
+
+函数 Scanner_扫描字符串(s, tok, 引号) {
+    Scanner_前进(s)
+    定义 开始 = s.位置
+    当 (s.位置 < s.源码长度) {
+        定义 c = Scanner_字符(s)
+        如果 (c == 引号) { 跳出 }
+        如果 (c == 0x5C) { Scanner_前进(s) }
+        如果 (c == 0x0A) { s.错误数 = s.错误数 + 1; 跳出 }
+        Scanner_前进(s)
+    }
+    tok.类型 = TOK_字符串
+    tok.值 = s.源码 + 开始
+    tok.值长度 = s.位置 - 开始
+    如果 (s.位置 < s.源码长度) { Scanner_前进(s) }
+}
+
+函数 Scanner_扫描模板(s, tok) {
+    Scanner_前进(s)
+    定义 开始 = s.位置
+    当 (s.位置 < s.源码长度) {
+        定义 c = Scanner_字符(s)
+        如果 (c == 0x60) {
+            tok.类型 = TOK_模板尾
+            tok.值 = s.源码 + 开始
+            tok.值长度 = s.位置 - 开始
+            Scanner_前进(s)
+            返回
+        }
+        如果 (c == 0x24 && Scanner_前看(s) == 0x7B) {
+            tok.类型 = TOK_模板头
+            tok.值 = s.源码 + 开始
+            tok.值长度 = s.位置 - 开始
+            Scanner_前进(s); Scanner_前进(s)
+            s.模板深度 = s.模板深度 + 1
+            返回
+        }
+        如果 (c == 0x5C) { Scanner_前进(s) }
+        Scanner_前进(s)
+    }
+    tok.类型 = TOK_错误
+    s.错误数 = s.错误数 + 1
+}
+
+函数 Scanner_可能是正则(上一个类型) {
+    如果 (上一个类型 == TOK_标识符) { 返回 假 }
+    如果 (上一个类型 == TOK_数字) { 返回 假 }
+    如果 (上一个类型 == TOK_字符串) { 返回 假 }
+    如果 (上一个类型 == TOK_右括号) { 返回 假 }
+    如果 (上一个类型 == TOK_右方括号) { 返回 假 }
+    如果 (上一个类型 == KW_this) { 返回 假 }
+    如果 (上一个类型 == KW_true) { 返回 假 }
+    如果 (上一个类型 == KW_false) { 返回 假 }
+    如果 (上一个类型 == KW_null) { 返回 假 }
+    返回 真
+}
+
+函数 Scanner_扫描正则(s, tok) {
+    Scanner_前进(s)
+    定义 开始 = s.位置
+    定义 可变 在字符类中 = 假
+    当 (s.位置 < s.源码长度) {
+        定义 c = Scanner_字符(s)
+        如果 (c == 0x0A) { s.错误数 = s.错误数 + 1; 跳出 }
+        如果 (c == 0x5C) { Scanner_前进(s); Scanner_前进(s); 继续 }
+        如果 (c == 0x5B) { 在字符类中 = 真 }
+        如果 (c == 0x5D) { 在字符类中 = 假 }
+        如果 (c == 0x2F && !在字符类中) { 跳出 }
+        Scanner_前进(s)
+    }
+    定义 模式结束 = s.位置
+    如果 (s.位置 < s.源码长度) { Scanner_前进(s) }
+    当 (s.位置 < s.源码长度 && Scanner_是标识符续(Scanner_字符(s))) {
+        Scanner_前进(s)
+    }
+    tok.类型 = TOK_正则
+    tok.值 = s.源码 + 开始
+    tok.值长度 = s.位置 - 开始
+}
+
+函数 Scanner_扫描(s) {
+    Scanner_跳过空白和注释(s)
+    定义 tok = 令牌 {}
+    tok.行 = s.行
+    tok.列 = s.列
+
+    如果 (s.位置 >= s.源码长度) {
+        tok.类型 = TOK_EOF
+        s.当前令牌 = tok
+        返回
+    }
+
+    s.扫描令牌数 = s.扫描令牌数 + 1
+    定义 c = Scanner_字符(s)
+    定义 c2 = Scanner_前看(s)
+
+    如果 (Scanner_是标识符开始(c)) {
+        Scanner_扫描标识符(s, tok)
+        s.上一个令牌类型 = tok.类型
+        s.当前令牌 = tok
+        返回
+    }
+
+    如果 (c >= 0x30 && c <= 0x39) {
+        Scanner_扫描数字(s, tok)
+        s.上一个令牌类型 = tok.类型
+        s.当前令牌 = tok
+        返回
+    }
+
+    如果 (c == 0x22 || c == 0x27) {
+        Scanner_扫描字符串(s, tok, c)
+        s.上一个令牌类型 = tok.类型
+        s.当前令牌 = tok
+        返回
+    }
+
+    如果 (c == 0x60) {
+        Scanner_扫描模板(s, tok)
+        s.上一个令牌类型 = tok.类型
+        s.当前令牌 = tok
+        返回
+    }
+
+    选择 (c) {
+        0x28: { tok.类型 = TOK_左括号; Scanner_前进(s) }
+        0x29: { tok.类型 = TOK_右括号; Scanner_前进(s) }
+        0x5B: { tok.类型 = TOK_左方括号; Scanner_前进(s) }
+        0x5D: { tok.类型 = TOK_右方括号; Scanner_前进(s) }
+        0x7B: { tok.类型 = TOK_左花括号; Scanner_前进(s) }
+        0x7D: {
+            如果 (s.模板深度 > 0) {
+                s.模板深度 = s.模板深度 - 1
+                Scanner_前进(s)
+                定义 开始 = s.位置
+                当 (s.位置 < s.源码长度) {
+                    定义 tc = Scanner_字符(s)
+                    如果 (tc == 0x60) { tok.类型 = TOK_模板尾; tok.值 = s.源码 + 开始; tok.值长度 = s.位置 - 开始; Scanner_前进(s); 跳出 }
+                    如果 (tc == 0x24 && Scanner_前看(s) == 0x7B) { tok.类型 = TOK_模板中; tok.值 = s.源码 + 开始; tok.值长度 = s.位置 - 开始; Scanner_前进(s); Scanner_前进(s); s.模板深度 = s.模板深度 + 1; 跳出 }
+                    如果 (tc == 0x5C) { Scanner_前进(s) }
+                    Scanner_前进(s)
+                }
+            } 否则 {
+                tok.类型 = TOK_右花括号; Scanner_前进(s)
+            }
+        }
+        0x3B: { tok.类型 = TOK_分号; Scanner_前进(s) }
+        0x2C: { tok.类型 = TOK_逗号; Scanner_前进(s) }
+        0x7E: { tok.类型 = TOK_位非; Scanner_前进(s) }
+        0x3F: {
+            如果 (c2 == 0x2E) { tok.类型 = TOK_可选链; Scanner_前进(s); Scanner_前进(s) }
+            否则 如果 (c2 == 0x3F) { tok.类型 = TOK_空合; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_问号; Scanner_前进(s) }
+        }
+        0x3A: { tok.类型 = TOK_冒号; Scanner_前进(s) }
+        0x2E: {
+            如果 (c2 == 0x2E && Scanner_前看2(s) == 0x2E) {
+                tok.类型 = TOK_展开; Scanner_前进(s); Scanner_前进(s); Scanner_前进(s)
+            } 否则 { tok.类型 = TOK_点; Scanner_前进(s) }
+        }
+        0x2B: {
+            如果 (c2 == 0x2B) { tok.类型 = TOK_自增; Scanner_前进(s); Scanner_前进(s) }
+            否则 如果 (c2 == 0x3D) { tok.类型 = TOK_加等; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_加; Scanner_前进(s) }
+        }
+        0x2D: {
+            如果 (c2 == 0x2D) { tok.类型 = TOK_自减; Scanner_前进(s); Scanner_前进(s) }
+            否则 如果 (c2 == 0x3D) { tok.类型 = TOK_减等; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_减; Scanner_前进(s) }
+        }
+        0x2A: {
+            如果 (c2 == 0x2A) {
+                如果 (Scanner_前看2(s) == 0x3D) { tok.类型 = TOK_幂等; Scanner_前进(s); Scanner_前进(s); Scanner_前进(s) }
+                否则 { tok.类型 = TOK_幂; Scanner_前进(s); Scanner_前进(s) }
+            } 否则 如果 (c2 == 0x3D) { tok.类型 = TOK_乘等; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_乘; Scanner_前进(s) }
+        }
+        0x2F: {
+            如果 (Scanner_可能是正则(s.上一个令牌类型)) {
+                Scanner_扫描正则(s, tok)
+            } 否则 如果 (c2 == 0x3D) { tok.类型 = TOK_除等; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_除; Scanner_前进(s) }
+        }
+        0x25: {
+            如果 (c2 == 0x3D) { tok.类型 = TOK_模等; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_取模; Scanner_前进(s) }
+        }
+        0x3D: {
+            如果 (c2 == 0x3D) {
+                如果 (Scanner_前看2(s) == 0x3D) { tok.类型 = TOK_严格等; Scanner_前进(s); Scanner_前进(s); Scanner_前进(s) }
+                否则 { tok.类型 = TOK_等于; Scanner_前进(s); Scanner_前进(s) }
+            } 否则 如果 (c2 == 0x3E) { tok.类型 = TOK_箭头; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_赋值; Scanner_前进(s) }
+        }
+        0x21: {
+            如果 (c2 == 0x3D) {
+                如果 (Scanner_前看2(s) == 0x3D) { tok.类型 = TOK_严格不等; Scanner_前进(s); Scanner_前进(s); Scanner_前进(s) }
+                否则 { tok.类型 = TOK_不等; Scanner_前进(s); Scanner_前进(s) }
+            } 否则 { tok.类型 = TOK_非; Scanner_前进(s) }
+        }
+        0x3C: {
+            如果 (c2 == 0x3D) { tok.类型 = TOK_小于等; Scanner_前进(s); Scanner_前进(s) }
+            否则 如果 (c2 == 0x3C) { tok.类型 = TOK_左移; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_小于; Scanner_前进(s) }
+        }
+        0x3E: {
+            如果 (c2 == 0x3D) { tok.类型 = TOK_大于等; Scanner_前进(s); Scanner_前进(s) }
+            否则 如果 (c2 == 0x3E) {
+                如果 (Scanner_前看2(s) == 0x3E) { tok.类型 = TOK_无符号右移; Scanner_前进(s); Scanner_前进(s); Scanner_前进(s) }
+                否则 { tok.类型 = TOK_右移; Scanner_前进(s); Scanner_前进(s) }
+            } 否则 { tok.类型 = TOK_大于; Scanner_前进(s) }
+        }
+        0x26: {
+            如果 (c2 == 0x26) { tok.类型 = TOK_与; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_位与; Scanner_前进(s) }
+        }
+        0x7C: {
+            如果 (c2 == 0x7C) { tok.类型 = TOK_或; Scanner_前进(s); Scanner_前进(s) }
+            否则 { tok.类型 = TOK_位或; Scanner_前进(s) }
+        }
+        0x5E: { tok.类型 = TOK_位异或; Scanner_前进(s) }
+        默认: {
+            tok.类型 = TOK_错误
+            s.错误数 = s.错误数 + 1
+            Scanner_前进(s)
+        }
+    }
+    s.上一个令牌类型 = tok.类型
+    s.当前令牌 = tok
+}
+
+函数 Scanner_下一个(s) {
+    Scanner_扫描(s)
+    返回 s.当前令牌
+}
+
+函数 Scanner_期望(s, 期望类型) {
+    如果 (s.当前令牌.类型 != 期望类型) {
+        s.错误数 = s.错误数 + 1
+        返回 假
+    }
+    Scanner_扫描(s)
+    返回 真
+}
+
+函数 Scanner_统计(s) {
+    返回 {
+        令牌数: s.扫描令牌数,
+        错误数: s.错误数,
+        行: s.行,
+        位置: s.位置,
+        模板深度: s.模板深度
+    }
+}

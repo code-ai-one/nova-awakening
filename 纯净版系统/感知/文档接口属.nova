@@ -1,0 +1,119 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档节点.nova")
+导入("../中枢/辅助存根.nova")
+导入("./文档创建.nova")
+导入("./原子驻留.nova")
+
+// §2 Document接口属性
+
+函数 Document_document元素(文档) {
+    // DOM spec: document.document元素 — 返回<html>元素
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0 && 扩展.文档元素 != 0) {
+        返回 扩展.文档元素
+    }
+    // 遍历查找第一个元素子节点
+    定义 可变 子 = 文档.第一子节点
+    当 (子 != 0) {
+        如果 (子.节点标志 & 节点标志_是元素) {
+            返回 子
+        }
+        子 = 子.后一兄弟
+    }
+    返回 0
+}
+
+函数 Document_head(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0) { 返回 扩展.head元素 }
+    返回 0
+}
+
+函数 Document_body(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0) { 返回 扩展.body元素 }
+    返回 0
+}
+
+函数 Document_title_get(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0) { 返回 扩展.标题 }
+    返回 0
+}
+
+函数 Document_title_set(文档, 新标题) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0) {
+        扩展.标题 = 字符串_复制(新标题)
+    }
+}
+
+函数 Document_URL_get(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0) { 返回 扩展.URL }
+    返回 0
+}
+
+函数 Document_readyState(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 == 0) { 返回 0 }
+    如果 (扩展.就绪状态 == 文档状态_加载中) { 返回 "loading" }
+    如果 (扩展.就绪状态 == 文档状态_交互中) { 返回 "interactive" }
+    返回 "complete"
+}
+
+函数 Document_compatMode(文档) {
+    定义 扩展 = Document_获取扩展(文档)
+    如果 (扩展 != 0 && 扩展.兼容模式 == 兼容模式_怪异) {
+        返回 "BackCompat"
+    }
+    返回 "CSS1Compat"
+}
+
+// §3 元素创建工厂 
+
+函数 Document_create元素(文档, 标签名) {
+ // DOM spec: document.create元素(tagName)
+ 定义 元素 = 元素_创建(标签名, 文档)
+
+ // 更新统计
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 != 0) {
+ 扩展.节点总数 = 扩展.节点总数 + 1
+ 扩展.元素总数 = 扩展.元素总数 + 1
+ }
+
+ 返回 元素
+}
+
+函数 Document_createText节点(文档, 文本内容) {
+ // DOM spec: document.createText节点(data)
+ 定义 文本 = Text_创建(文本内容)
+ 文本.树作用域 = 文档
+
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 != 0) {
+ 扩展.节点总数 = 扩展.节点总数 + 1
+ }
+
+ 返回 文本
+}
+
+函数 Document_createComment(文档, 数据) {
+ 定义 注释 = Comment_创建(数据)
+ 注释.树作用域 = 文档
+
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 != 0) {
+ 扩展.节点总数 = 扩展.节点总数 + 1
+ }
+
+ 返回 注释
+}
+
+函数 Document_createDocumentFragment(文档) {
+ 定义 节点 = 节点_创建(DOCUMENT_FRAGMENT_节点, 节点标志_是文档片段 | 节点标志_是容器节点)
+ 节点.树作用域 = 文档
+ 返回 节点
+}

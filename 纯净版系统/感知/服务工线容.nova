@@ -1,0 +1,215 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("./软件拦截缓.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../推理/小整数快速判.nova")
+导入("./文档事件.nova")
+导入("../中枢/辅助存根.nova")
+
+//       service_worker_version.cc (~2000行)
+//       service_worker_registration.cc (~1000行)
+//       service_worker_context_core.cc (~1500行)
+//       cache_storage.cc (~800行)
+//       cache_storage_cache.cc (~1200行)
+// Service 工线: 离线优先的代理层
+//   navigator.service工线.register('/sw.js')
+//   生命周期: installing → waiting → active
+//   事件: install / activate / fetch / push / sync
+// 缓存 接口: 请求/响应的持久化缓存
+//   caches.open('v1')
+//   cache.put(request, response)
+//   cache.match(request)
+//   cache.addAll([urls])
+
+// §1 Service 工线 状态与注册
+
+定义 SW_STATE_PARSED      = 0
+定义 SW_STATE_INSTALLING   = 1
+定义 SW_STATE_INSTALLED    = 2     // = waiting
+定义 SW_STATE_ACTIVATING   = 3
+定义 SW_STATE_ACTIVATED    = 4
+定义 SW_STATE_REDUNDANT    = 5
+
+结构 Service工线Registration {
+    作用域,    // u64 scope URL
+    脚本URL,    // u64 sw.js URL
+    // 三个worker槽位
+    installing,    // u64 Service工线*
+    waiting,
+    active,
+    // 状态
+    更新检查中,
+    注册ID,
+}
+
+结构 Service工线 {
+    脚本URL,
+    状态,    // u32 SW_STATE_xxx
+    注册,    // u64 Service工线Registration*
+    // JS执行环境(独立于页面)
+    Nova运行时实例,    // u64 V8 Nova运行时实例*
+    全局作用域,    // u64 Service工线GlobalScope*
+    // 事件监听
+    install回调,
+    activate回调,
+    fetch回调,
+    push回调,
+    sync回调,
+    message回调,
+    // 缓存
+    缓存存储,    // u64 缓存存储*
+    // 客户端列表
+    客户端列表,
+    客户端数量,
+    // 标记
+    需要跳过等待,    // 布尔 skipWaiting()
+}
+
+结构 Service工线Container {
+    注册列表,    // u64 Service工线Registration*数组
+    注册数量,
+    注册容量,
+    控制器,    // u64 当前页面的controller Service工线*
+}
+
+定义 可变 全局SW容器 = 0
+
+函数 Service工线Container_获取() {
+    如果 (全局SW容器 == 0) {
+        全局SW容器 = 堆_分配(Service工线Container)
+        全局SW容器.注册容量 = 64
+        全局SW容器.注册列表 = 堆_分配_数组(64 * 8)
+        全局SW容器.注册数量 = 0
+        全局SW容器.控制器 = 0
+    }
+    返回 全局SW容器
+}
+
+函数 Service工线_register(脚本URL, 选项) {
+    定义 容器 = Service工线Container_获取()
+
+    // 解析作用域(默认=脚本URL所在目录)
+    定义 可变 作用域 = 0
+    如果 (选项 != 0) {
+        作用域 = Nova对象_获取属性(0, 选项, "scope")
+        如果 (作用域 != 0) { 作用域 = JSValue_获取字符串(作用域) }
+    }
+    如果 (作用域 == 0) {
+        // 从脚本URL提取目录
+        作用域 = URL_提取目录(脚本URL)
+    }
+
+    // 检查是否已有相同作用域的注册
+    定义 可变 已有注册 = 0
+    定义 可变 i = 0
+    当 (i < 容器.注册数量) {
+        定义 reg = 内存_读64(容器.注册列表 + i * 8)
+        如果 (reg != 0 && 字符串_相等(reg.作用域, 作用域)) {
+            已有注册 = reg; 跳出
+        }
+        i = i + 1
+    }
+
+    如果 (已有注册 == 0) {
+        // 新注册
+        已有注册 = 堆_分配(Service工线Registration)
+        已有注册.作用域 = 字符串_复制(作用域)
+        已有注册.脚本URL = 字符串_复制(脚本URL)
+        已有注册.installing = 0
+        已有注册.waiting = 0
+        已有注册.active = 0
+        已有注册.更新检查中 = 假
+        已有注册.注册ID = 容器.注册数量
+        如果 (容器.注册数量 < 容器.注册容量) {
+            内存_写64(容器.注册列表 + 容器.注册数量 * 8, 已有注册)
+            容器.注册数量 = 容器.注册数量 + 1
+        }
+    }
+
+    // 开始安装流程
+    Service工线_开始安装(已有注册, 脚本URL)
+
+    // 返回承诺<Service工线Registration>
+    返回 已有注册
+}
+
+函数 Service工线_开始安装(注册, 脚本URL) {
+    // 1. 下载脚本
+    定义 脚本内容 = 网络_同步获取(脚本URL)
+    如果 (脚本内容 == 0) { 返回 }
+
+    // 2. 创建Service工线实例
+    定义 sw = 堆_分配(Service工线)
+    sw.脚本URL = 字符串_复制(脚本URL)
+    sw.状态 = SW_STATE_INSTALLING
+    sw.注册 = 注册
+    sw.需要跳过等待 = 假
+
+    // 3. 创建独立执行环境
+    sw.Nova运行时实例 = Nova运行时_创建()
+    sw.缓存存储 = 缓存存储_创建()
+
+    // 4. 注入Service工线GlobalScope 接口
+    Service工线_注入全局接口(sw)
+
+    // 5. 执行脚本(注册事件监听)
+    // 注册fetch事件回调
+    sw.install回调 = 0
+    sw.activate回调 = 0
+    sw.fetch回调 = 0
+
+    // 6. 设为installing
+    注册.installing = sw
+
+    // 7. 触发install事件
+    Service工线_触发install(sw)
+}
+
+函数 Service工线_触发install(sw) {
+    如果 (sw == 0) { 返回 }
+    sw.状态 = SW_STATE_INSTALLING
+
+    // 创建Install事件
+    // 事件.waitUntil(promise) — 延长安装直到promise完成
+    如果 (sw.install回调 != 0) {
+        定义 事件 = 事件_创建("install", 假, 假)
+        // 调用install回调
+    }
+
+    // 安装成功: 进入waiting状态
+    sw.状态 = SW_STATE_INSTALLED
+    定义 注册 = sw.注册
+    如果 (注册 != 0) {
+        注册.installing = 0
+        注册.waiting = sw
+    }
+
+    // 如果skipWaiting或没有active worker: 直接激活
+    如果 (sw.需要跳过等待 || (注册 != 0 && 注册.active == 0)) {
+        Service工线_触发activate(sw)
+    }
+}
+
+函数 Service工线_触发activate(sw) {
+    如果 (sw == 0) { 返回 }
+    sw.状态 = SW_STATE_ACTIVATING
+
+    定义 注册 = sw.注册
+    如果 (注册 != 0) {
+        // 旧active → redundant
+        如果 (注册.active != 0) {
+            注册.active.状态 = SW_STATE_REDUNDANT
+        }
+        注册.waiting = 0
+        注册.active = sw
+    }
+
+    // 触发activate事件
+    如果 (sw.activate回调 != 0) {
+        定义 事件 = 事件_创建("activate", 假, 假)
+        // 事件.waitUntil(promise)
+    }
+
+    sw.状态 = SW_STATE_ACTIVATED
+}

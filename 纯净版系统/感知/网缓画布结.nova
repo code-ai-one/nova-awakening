@@ -1,0 +1,304 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./属性自定义属.nova")
+导入("./光栅化.nova")
+导入("./绘制画布绘.nova")
+导入("../执行/控制台输出.nova")
+导入("./状态栈.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./图位图像素缓.nova")
+导入("./字体扩展渲.nova")
+导入("../中枢/内存初始化.nova")
+导入("./内核直连层.nova")
+导入("./绘制矩形创建.nova")
+
+// §2 Sk画布结构 (Sk画布)
+
+结构 Sk画布状态 {
+    矩阵,    // SkMatrix
+    裁剪矩形,    // SkRect
+    透明度,    // u32 0-255
+}
+
+结构 Sk画布 {
+    位图,    // u64 Nova缓冲itmap*
+
+    状态栈,    // u64 Sk画布状态*数组
+    状态栈深度,
+    状态栈容量,
+    当前矩阵,    // SkMatrix
+    当前裁剪,    // SkRect
+    当前透明度,
+    绘制调用数,
+}
+
+
+函数 Sk画布_创建(位图) {
+    定义 c = 堆_分配(Sk画布)
+    c.位图 = 位图
+    c.状态栈容量 = 32
+    c.状态栈 = 堆_分配_数组(c.状态栈容量 * 64)
+    c.状态栈深度 = 0
+    c.当前矩阵 = SkMatrix_单位矩阵()
+    c.当前裁剪 = SkRect_创建(0, 0, 位图.宽 * 100, 位图.高 * 100)
+    c.当前透明度 = 255
+    c.绘制调用数 = 0
+    返回 c
+}
+
+函数 Sk画布_save(c) {
+    如果 (c.状态栈深度 >= c.状态栈容量) { 返回 }
+    定义 偏移 = c.状态栈 + c.状态栈深度 * 64
+    内存_复制(偏移, &c.当前矩阵, 36)
+    内存_复制(偏移 + 36, &c.当前裁剪, 16)
+    内存_写32(偏移 + 52, c.当前透明度)
+    c.状态栈深度 = c.状态栈深度 + 1
+}
+
+函数 Sk画布_restore(c) {
+    如果 (c.状态栈深度 == 0) { 返回 }
+    c.状态栈深度 = c.状态栈深度 - 1
+    定义 偏移 = c.状态栈 + c.状态栈深度 * 64
+    内存_复制(&c.当前矩阵, 偏移, 36)
+    内存_复制(&c.当前裁剪, 偏移 + 36, 16)
+    c.当前透明度 = 内存_读32(偏移 + 52)
+}
+
+函数 Sk画布_saveLayerAlpha(c, 矩形, 透明度) {
+    Sk画布_save(c)
+    c.当前透明度 = c.当前透明度 * 透明度 / 255
+}
+
+函数 Sk画布_translate(c, dx, dy) {
+    定义 t = SkMatrix_平移(dx, dy)
+    c.当前矩阵 = SkMatrix_乘(c.当前矩阵, t)
+}
+
+函数 Sk画布_scale(c, sx, sy) {
+    定义 s = SkMatrix_缩放(sx, sy)
+    c.当前矩阵 = SkMatrix_乘(c.当前矩阵, s)
+}
+
+函数 Sk画布_clipRect(c, rect) {
+    // 裁剪区域取交集
+    如果 (rect.左 > c.当前裁剪.左) { c.当前裁剪.左 = rect.左 }
+    如果 (rect.上 > c.当前裁剪.上) { c.当前裁剪.上 = rect.上 }
+    如果 (rect.右 < c.当前裁剪.右) { c.当前裁剪.右 = rect.右 }
+    如果 (rect.下 < c.当前裁剪.下) { c.当前裁剪.下 = rect.下 }
+}
+
+// §3 核心绘制操作 — 光栅化
+// (对应 SkDraw / SkScan / Nova缓冲litter)
+
+函数 Sk画布_clear(c, 颜色) {
+    Nova缓冲itmap_清除(c.位图, 颜色)
+    c.绘制调用数 = c.绘制调用数 + 1
+}
+
+函数 Sk画布_drawRect(c, rect, paint) {
+    // 填充矩形
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 bm = c.位图
+    定义 颜色 = paint.颜色
+
+    // 应用画布透明度
+    如果 (c.当前透明度 < 255) {
+        定义 a = SkColor_A(颜色) * c.当前透明度 / 255
+        颜色 = SkColor(a, SkColor_R(颜色), SkColor_G(颜色), SkColor_B(颜色))
+    }
+
+    // 变换矩形坐标(×100 → 像素)
+    定义 x1 = rect.左 / 100
+    定义 y1 = rect.上 / 100
+    定义 x2 = rect.右 / 100
+    定义 y2 = rect.下 / 100
+
+    // 裁剪
+    定义 cx1 = c.当前裁剪.左 / 100
+    定义 cy1 = c.当前裁剪.上 / 100
+    定义 cx2 = c.当前裁剪.右 / 100
+    定义 cy2 = c.当前裁剪.下 / 100
+    如果 (x1 < cx1) { x1 = cx1 }
+    如果 (y1 < cy1) { y1 = cy1 }
+    如果 (x2 > cx2) { x2 = cx2 }
+    如果 (y2 > cy2) { y2 = cy2 }
+    如果 (x1 >= x2 || y1 >= y2) { 返回 }
+
+    // 边界检查
+    如果 (x1 < 0) { x1 = 0 }
+    如果 (y1 < 0) { y1 = 0 }
+    如果 (x2 > bm.宽) { x2 = bm.宽 }
+    如果 (y2 > bm.高) { y2 = bm.高 }
+
+    如果 (paint.风格 == Sk绘制风格_填充 || paint.风格 == Sk绘制风格_填充描边) {
+        // 填充
+        定义 可变 y = y1
+        当 (y < y2) {
+            定义 可变 x = x1
+            当 (x < x2) {
+                Sk画布_混合像素(bm, x, y, 颜色, paint.混合模式)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+
+    如果 (paint.风格 == Sk绘制风格_描边 || paint.风格 == Sk绘制风格_填充描边) {
+        // 描边(四条边)
+        定义 sw = paint.描边宽度 / 100
+        如果 (sw < 1) { sw = 1 }
+        Sk画布_drawHLine(c, x1, x2, y1, sw, 颜色, paint.混合模式)
+        Sk画布_drawHLine(c, x1, x2, y2 - sw, sw, 颜色, paint.混合模式)
+        Sk画布_drawVLine(c, x1, y1, y2, sw, 颜色, paint.混合模式)
+        Sk画布_drawVLine(c, x2 - sw, y1, y2, sw, 颜色, paint.混合模式)
+    }
+}
+
+函数 Sk画布_drawRRect(c, rrect, paint) {
+    // 圆角矩形: 矩形中心 + 四角弧线
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 rect = rrect.矩形
+    定义 rx = rrect.圆角X; 定义 ry = rrect.圆角Y
+    如果 (rx <= 0 || ry <= 0) { Sk画布_drawRect(c, rect, paint); 返回 }
+    // 限制圆角不超过半边
+    定义 半宽 = (rect.右 - rect.左) / 2
+    定义 半高 = (rect.下 - rect.上) / 2
+    如果 (rx > 半宽) { rx = 半宽 }
+    如果 (ry > 半高) { ry = 半高 }
+    // 绘制: 上中矩形 + 下中矩形 + 左中矩形 + 右中矩形
+    定义 bm = c.位图; 定义 颜色 = paint.颜色
+    // 中心大矩形(不含圆角区域)
+    定义 内rect = SkRect_创建(rect.左 + rx, rect.上, rect.右 - rx, rect.下)
+    Sk画布_fillRect_直接(bm, 内rect, 颜色, paint.混合模式)
+    // 左右条
+    Sk画布_fillRect_直接(bm, SkRect_创建(rect.左, rect.上 + ry, rect.左 + rx, rect.下 - ry), 颜色, paint.混合模式)
+    Sk画布_fillRect_直接(bm, SkRect_创建(rect.右 - rx, rect.上 + ry, rect.右, rect.下 - ry), 颜色, paint.混合模式)
+    // 四角: 用椭圆弧近似填充
+    Sk画布_fillArc(bm, rect.左 + rx, rect.上 + ry, rx, ry, 颜色, paint.混合模式)
+    Sk画布_fillArc(bm, rect.右 - rx, rect.上 + ry, rx, ry, 颜色, paint.混合模式)
+    Sk画布_fillArc(bm, rect.左 + rx, rect.下 - ry, rx, ry, 颜色, paint.混合模式)
+    Sk画布_fillArc(bm, rect.右 - rx, rect.下 - ry, rx, ry, 颜色, paint.混合模式)
+}
+
+函数 Sk画布_drawLine(c, x1, y1, x2, y2, paint) {
+    // Bresenham直线算法
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 bm = c.位图
+    定义 颜色 = paint.颜色
+
+    定义 px1 = x1 / 100; 定义 py1 = y1 / 100
+    定义 px2 = x2 / 100; 定义 py2 = y2 / 100
+
+    定义 可变 dx = px2 - px1
+    定义 可变 dy = py2 - py1
+    如果 (dx < 0) { dx = 0 - dx }
+    如果 (dy < 0) { dy = 0 - dy }
+
+    定义 可变 sx = 1; 如果 (px1 > px2) { sx = -1 }
+    定义 可变 sy = 1; 如果 (py1 > py2) { sy = -1 }
+
+    定义 可变 err = dx - dy
+    定义 可变 cx = px1; 定义 可变 cy = py1
+
+    当 (1) {
+        Sk画布_混合像素(bm, cx, cy, 颜色, paint.混合模式)
+        如果 (cx == px2 && cy == py2) { 跳出 }
+        定义 e2 = err * 2
+        如果 (e2 > 0 - dy) { err = err - dy; cx = cx + sx }
+        如果 (e2 < dx) { err = err + dx; cy = cy + sy }
+    }
+}
+
+函数 Sk画布_drawText(c, 文本, 文本长度, x, y, font, paint) {
+    // 文本绘制: 通过字体光栅化器获取字形位图并混合
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 bm = c.位图
+    定义 颜色 = paint.颜色
+
+    // 1. 排版: 获取字形序列和位置
+    定义 run = Text布局_排版(font.字体, 文本, 文本长度, font.大小)
+    如果 (run == 0 || run.字形数 == 0) { 返回 }
+
+    // 2. 逐字形光栅化并绘制
+    定义 可变 gi = 0
+    当 (gi < run.字形数) {
+        定义 glyphID = 内存_读16(run.字形ID + gi * 2)
+        定义 gx = x + 内存_读32(run.位置X + gi * 4)
+        定义 gy = y
+
+        // 从缓存获取或光栅化字形
+        定义 cached = Glyph缓存_查找(0, glyphID, font.大小)
+        如果 (cached == 0) {
+            cached = 字体_光栅化字形(font.字体, glyphID, font.大小)
+        }
+        如果 (cached != 0 && cached.位图 != 0) {
+            // 将字形灰度位图混合到目标
+            定义 px = (gx + cached.bearingX) / 100
+            定义 py = (gy - cached.bearingY) / 100
+            定义 可变 row = 0
+            当 (row < cached.高) {
+                定义 可变 col = 0
+                当 (col < cached.宽) {
+                    定义 alpha = 字节取(cached.位图, row * cached.宽 + col)
+                    如果 (alpha > 0) {
+                        // 用alpha调制文本颜色
+                        定义 mod_color = SkColor_调制Alpha(颜色, alpha)
+                        Sk画布_混合像素(bm, px + col, py + row, mod_color, paint.混合模式)
+                    }
+                    col = col + 1
+                }
+                row = row + 1
+            }
+        }
+        gi = gi + 1
+    }
+}
+
+// 网缓画布辅助
+
+定义 可变 画布_渲染帧数 = 0
+定义 可变 画布_脏区数 = 0
+定义 可变 画布_合成次数 = 0
+
+函数 画布_健康检查() {
+    定义 可变 问题 = []
+    如果 (画布_脏区数 > 1000) {
+        追加(问题, "脏区过多: " + 整数转字符串(画布_脏区数))
+    }
+    如果 (计数(问题) == 0) { 返回 "画布健康" }
+    返回 问题
+}
+
+函数 画布_统计() {
+    返回 {
+        渲染帧数: 画布_渲染帧数,
+        脏区数: 画布_脏区数,
+        合成次数: 画布_合成次数,
+    }
+}
+
+函数 画布_重置统计() {
+    画布_渲染帧数 = 0
+    画布_脏区数 = 0
+    画布_合成次数 = 0
+}
+
+函数 画布_平均脏区() {
+    如果 (画布_渲染帧数 == 0) { 返回 0 }
+    返回 画布_脏区数 / 画布_渲染帧数
+}
+
+定义 可变 AI_网缓画布结_调用数 = 0
+定义 可变 AI_网缓画布结_异常数 = 0
+
+函数 AI_网缓画布结_监控() {
+    AI_网缓画布结_调用数 = AI_网缓画布结_调用数 + 1
+    返回 AI_网缓画布结_异常数 == 0
+}
+
+函数 AI_网缓画布结_健康检查() {
+    如果 (AI_网缓画布结_调用数 > 0 && AI_网缓画布结_异常数 * 100 / AI_网缓画布结_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

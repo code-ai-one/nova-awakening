@@ -1,0 +1,223 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("../引导/特权指令.nova")
+导入("./整数转字符串.nova")
+
+//   1. preempt_count: 抢占计数器(>0时禁止抢占)
+//   2. preempt_disable/enable: 关键区间保护
+//   3. 四层嵌套: 抢占禁用 + 软中断 + 硬中断 + NMI
+//   4. TIF_NEED_RESCHED: 标记需要重新调度
+//   5. 抢占点: preempt_enable时检查是否需要调度
+
+// [0:7]   抢占计数 (preempt_disable嵌套深度)
+// [8:15]  软中断计数
+// [16:19] 硬中断计数
+// [20]    NMI标志
+定义 PREEMPT_MASK     = 0x000000FF
+定义 SOFTIRQ_MASK     = 0x0000FF00
+定义 HARDIRQ_MASK     = 0x000F0000
+定义 NMI_MASK         = 0x00100000
+定义 SOFTIRQ_OFFSET   = 8
+定义 HARDIRQ_OFFSET   = 16
+
+定义 可变 preempt_count = 0
+定义 可变 need_resched = 假
+
+// 抢占禁用/启用 
+
+函数 preempt_disable() {
+    preempt_count = preempt_count + 1
+}
+
+函数 preempt_enable() {
+    preempt_count = preempt_count - 1
+    如果 (preempt_count == 0 && need_resched) {
+        // 抢占点: 计数归零且需要调度
+        preempt_schedule()
+    }
+}
+
+函数 preempt_enable_no_resched() {
+    // 启用抢占但不检查是否需要调度
+    preempt_count = preempt_count - 1
+}
+
+// 状态查询
+
+函数 preemptible() {
+    返回 preempt_count == 0
+}
+
+函数 in_interrupt() {
+    返回 (preempt_count & (HARDIRQ_MASK | SOFTIRQ_MASK | NMI_MASK)) != 0
+}
+
+函数 in_softirq() {
+    返回 (preempt_count & SOFTIRQ_MASK) != 0
+}
+
+函数 in_hardirq() {
+    返回 (preempt_count & HARDIRQ_MASK) != 0
+}
+
+函数 in_nmi() {
+    返回 (preempt_count & NMI_MASK) != 0
+}
+
+函数 in_atomic() {
+    返回 preempt_count != 0
+}
+
+// 中断计数管理
+
+函数 hardirq_enter() {
+    preempt_count = preempt_count + (1 << HARDIRQ_OFFSET)
+}
+
+函数 hardirq_exit() {
+    preempt_count = preempt_count - (1 << HARDIRQ_OFFSET)
+}
+
+函数 softirq_enter() {
+    preempt_count = preempt_count + (1 << SOFTIRQ_OFFSET)
+}
+
+函数 softirq_exit() {
+    preempt_count = preempt_count - (1 << SOFTIRQ_OFFSET)
+}
+
+// 调度标记
+
+函数 set_need_resched() {
+    need_resched = 真
+}
+
+函数 clear_need_resched() {
+    need_resched = 假
+}
+
+函数 需要重新调度_抢占() {
+    返回 need_resched
+}
+
+函数 preempt_schedule() {
+    // 抢占调度: 保存当前任务状态, 调用schedule()
+    如果 (!preemptible()) { 返回 }
+    调度()
+    clear_need_resched()
+}
+
+函数 获取preempt_count() { 返回 preempt_count }
+
+// 中断返回时的抢占检查 
+
+函数 preempt_schedule_irq() {
+    // 从中断返回时检查: 如果抢占计数为0且需要调度
+    如果 (preempt_count != 0) { 返回 }
+    如果 (!need_resched) { 返回 }
+
+    // 禁用中断期间执行调度
+    关中断()
+    如果 (need_resched && preempt_count == 0) {
+        preempt_count = preempt_count + 1  // 防止递归抢占
+        调度()
+        preempt_count = preempt_count - 1
+        clear_need_resched()
+    }
+    开中断()
+}
+
+// 条件抢占 
+// 长时间内核路径中周期性调用, 给其他进程运行机会
+
+函数 cond_resched() {
+    如果 (need_resched && preemptible()) {
+        preempt_schedule()
+        返回 真
+    }
+    返回 假
+}
+
+函数 cond_resched_lock(锁) {
+    // 持有自旋锁时的条件让步
+    如果 (need_resched) {
+        自旋锁_解锁(锁)
+        preempt_schedule()
+        自旋锁_加锁(锁)
+        返回 真
+    }
+    返回 假
+}
+
+// might_sleep: 调试检查 (不应在原子上下文中睡眠)
+
+函数 might_sleep() {
+    如果 (in_atomic()) {
+        内核警告("BUG: 在原子上下文中调用了可能睡眠的函数!")
+        内核警告("  preempt_count=" + 整数转字符串(preempt_count))
+        如果 (in_hardirq()) { 内核警告("  上下文: 硬中断") }
+        否则 如果 (in_softirq()) { 内核警告("  上下文: 软中断") }
+        否则 { 内核警告("  上下文: 抢占禁用") }
+    }
+}
+
+// 抢占嵌套深度查询
+
+函数 preempt_count_值() {
+    返回 preempt_count & PREEMPT_MASK
+}
+
+函数 softirq_count_值() {
+    返回 (preempt_count & SOFTIRQ_MASK) >> SOFTIRQ_OFFSET
+}
+
+函数 hardirq_count_值() {
+    返回 (preempt_count & HARDIRQ_MASK) >> HARDIRQ_OFFSET
+}
+
+// NMI进入/退出
+
+函数 nmi_enter() {
+    preempt_count = preempt_count | NMI_MASK
+}
+
+函数 nmi_exit() {
+    preempt_count = preempt_count & ~NMI_MASK
+}
+
+// 上下文名称 + 统计
+
+函数 当前上下文名() {
+    如果 (in_nmi()) { 返回 "NMI" }
+    如果 (in_hardirq()) { 返回 "硬中断" }
+    如果 (in_softirq()) { 返回 "软中断" }
+    如果 (!preemptible()) { 返回 "抢占禁用" }
+    返回 "进程上下文"
+}
+
+定义 可变 抢占调度_总次数 = 0
+
+函数 抢占_统计() {
+    返回 [preempt_count, 抢占调度_总次数, need_resched]
+}
+
+
+函数 抢占_完整统计() {
+    返回 [preempt_count, 抢占调度_总次数, need_resched]
+}
+
+定义 可变 AI_抢占控制_负载窗口 = []
+
+函数 AI_抢占控制_负载预测(当前负载) {
+    追加(AI_抢占控制_负载窗口, 当前负载)
+    如果 (计数(AI_抢占控制_负载窗口) > 20) { 列表_移除(AI_抢占控制_负载窗口, 0) }
+    如果 (计数(AI_抢占控制_负载窗口) < 3) { 返回 当前负载 }
+    定义 n = 计数(AI_抢占控制_负载窗口)
+    定义 趋势 = AI_抢占控制_负载窗口[n-1] - AI_抢占控制_负载窗口[n-3]
+    返回 当前负载 + 趋势
+}
+
+函数 AI_抢占控制_迁移建议(源CPU负载, 目标CPU负载) {
+    如果 (源CPU负载 > 目标CPU负载 * 2) { 返回 真 }
+    返回 假
+}

@@ -1,0 +1,493 @@
+// 布局Bo未知_计算盒模型 — NovaOS 企业级CSS盒模型计算子系统 (BFCM)
+// 理论基础: BFCM (Block Formatting Context Model)
+//   CSS盒模型完整解析 + BFC块级格式化上下文 + AI布局预测
+//   content-box / border-box 双模式 + margin auto居中
+//   padding/border/margin 完整解析 + 百分比/计算值/auto
+//   min/max约束 + 高度计算 + 浮动清除 + margin折叠
+// 创新公式:
+//   ContentWidth = Specified - (border-box ? padding+border : 0)
+//   AutoMargin = (CB_width - total_used) / auto_count
+//   CollapsedMargin = max(margin_bottom_prev, margin_top_next)
+// 架构: 12部分 — 常量/结构/padding/border/margin/width/height/
+//            box-sizing/min-max/auto居中/margin折叠/AI布局预测
+
+导入("./样式解析.nova")
+导入("./内核直连层.nova")
+导入("../推理/通信总线.nova")
+导入("../中枢/内核打印.nova")
+导入("./样式值解析.nova")
+导入("../推理/值乘.nova")
+导入("./弹性布局深度.nova")
+
+// 第1部分: 常量与显示类型
+
+定义 CSS_AUTO = -1
+定义 CSS_NONE = -2
+定义 显示_块 = 1
+定义 显示_行内 = 2
+定义 显示_行内块 = 3
+定义 显示_flex = 4
+定义 显示_grid = 5
+定义 显示_无 = 0
+定义 定位_静态 = 0
+定义 定位_相对 = 1
+定义 定位_绝对 = 2
+定义 定位_固定 = 3
+定义 定位_粘性 = 4
+
+// 第2部分: BFCM统计
+
+结构 BFCM统计 {
+    盒模型计算数,
+    宽度计算数,
+    高度计算数,
+    margin居中数,
+    margin折叠数,
+    浮动清除数,
+    AI布局预测数,
+}
+
+定义 可变 全局BFCM统计 = BFCM统计 {}
+
+// 第3部分: Padding解析
+
+
+函数 盒模型_解析Padding(layout, style, 包含块宽) {
+    // padding百分比始终相对于包含块宽度(包括padding-top/bottom)
+    layout.padding_top = CSS值_解析为像素(style.padding_top, 包含块宽)
+    layout.padding_right = CSS值_解析为像素(style.padding_right, 包含块宽)
+    layout.padding_bottom = CSS值_解析为像素(style.padding_bottom, 包含块宽)
+    layout.padding_left = CSS值_解析为像素(style.padding_left, 包含块宽)
+    // padding不允许负值
+    如果 (layout.padding_top < 0) { layout.padding_top = 0 }
+    如果 (layout.padding_right < 0) { layout.padding_right = 0 }
+    如果 (layout.padding_bottom < 0) { layout.padding_bottom = 0 }
+    如果 (layout.padding_left < 0) { layout.padding_left = 0 }
+}
+
+// 第4部分: Border解析
+
+函数 盒模型_解析Border(layout, style) {
+    layout.border_top = CSS值_解析边框宽(style.border_top_width)
+    layout.border_right = CSS值_解析边框宽(style.border_right_width)
+    layout.border_bottom = CSS值_解析边框宽(style.border_bottom_width)
+    layout.border_left = CSS值_解析边框宽(style.border_left_width)
+    // border-style为none时宽度归零
+    如果 (style.border_top_style == 0) { layout.border_top = 0 }
+    如果 (style.border_right_style == 0) { layout.border_right = 0 }
+    如果 (style.border_bottom_style == 0) { layout.border_bottom = 0 }
+    如果 (style.border_left_style == 0) { layout.border_left = 0 }
+}
+
+// 第5部分: Margin解析
+
+函数 盒模型_解析Margin(layout, style, 包含块宽) {
+    // margin可以是auto、百分比、像素、计算值
+    layout.margin_top = CSS值_解析margin(style.margin_top, 包含块宽)
+    layout.margin_right = CSS值_解析margin(style.margin_right, 包含块宽)
+    layout.margin_bottom = CSS值_解析margin(style.margin_bottom, 包含块宽)
+    layout.margin_left = CSS值_解析margin(style.margin_left, 包含块宽)
+}
+
+// 第6部分: Width计算
+
+函数 盒模型_计算宽度(layout, style, 包含块宽) {
+    全局BFCM统计.宽度计算数 = 全局BFCM统计.宽度计算数 + 1
+    定义 可变 内容宽 = 0
+    定义 宽度指定 = style.width
+
+    如果 (宽度指定 == CSS_AUTO) {
+        // auto: 块元素填满包含块
+        如果 (style.display == 显示_块 || style.display == 显示_flex) {
+            内容宽 = 包含块宽 - layout.margin_left - layout.margin_right
+                     - layout.border_left - layout.border_right
+                     - layout.padding_left - layout.padding_right
+            如果 (内容宽 < 0) { 内容宽 = 0 }
+        } 否则 如果 (style.display == 显示_行内块 || style.display == 显示_行内) {
+            // inline/inline-block: shrink-to-fit
+            内容宽 = 盒模型_计算收缩宽度(layout, style, 包含块宽)
+        }
+    } 否则 如果 (宽度指定 >= 0) {
+        内容宽 = CSS值_解析为像素(宽度指定, 包含块宽)
+    }
+
+    // box-sizing: border-box
+    如果 (style.box_sizing == 1 && 宽度指定 >= 0 && 宽度指定 != CSS_AUTO) {
+        内容宽 = 内容宽 - layout.padding_left - layout.padding_right
+                 - layout.border_left - layout.border_right
+        如果 (内容宽 < 0) { 内容宽 = 0 }
+    }
+
+    // min-width / max-width 约束
+    内容宽 = 盒模型_应用MinMax宽(内容宽, style, 包含块宽)
+
+    layout.宽度 = 内容宽
+}
+
+函数 盒模型_计算收缩宽度(layout, style, 包含块宽) {
+    // shrink-to-fit: min(max(preferred_minimum, available), preferred)
+    定义 可用 = 包含块宽 - layout.margin_left - layout.margin_right
+                - layout.border_left - layout.border_right
+                - layout.padding_left - layout.padding_right
+    如果 (可用 < 0) { 可用 = 0 }
+    // preferred和preferred_minimum需要遍历子元素计算, 这里简化
+    定义 preferred = 可用
+    定义 preferred_min = 0
+    如果 (layout.子元素数 > 0) {
+        preferred_min = layout.最小内容宽
+        preferred = layout.首选内容宽
+    }
+    定义 可变 结果 = preferred
+    如果 (结果 > 可用) { 结果 = 可用 }
+    如果 (结果 < preferred_min) { 结果 = preferred_min }
+    返回 结果
+}
+
+函数 盒模型_应用MinMax宽(宽, style, 包含块宽) {
+    定义 可变 结果 = 宽
+    如果 (style.min_width > 0) {
+        定义 最小 = CSS值_解析为像素(style.min_width, 包含块宽)
+        如果 (结果 < 最小) { 结果 = 最小 }
+    }
+    如果 (style.max_width > 0 && style.max_width != CSS_NONE) {
+        定义 最大 = CSS值_解析为像素(style.max_width, 包含块宽)
+        如果 (结果 > 最大) { 结果 = 最大 }
+    }
+    返回 结果
+}
+
+// 第7部分: Height计算
+
+函数 盒模型_计算高度(layout, style, 包含块高) {
+    全局BFCM统计.高度计算数 = 全局BFCM统计.高度计算数 + 1
+    定义 高度指定 = style.height
+
+    如果 (高度指定 == CSS_AUTO || 高度指定 == CSS_NONE) {
+        // auto: 高度由内容决定，此时不设置
+        layout.高度 = CSS_AUTO
+        返回
+    }
+
+    定义 可变 内容高 = CSS值_解析为像素(高度指定, 包含块高)
+
+    // box-sizing: border-box
+    如果 (style.box_sizing == 1) {
+        内容高 = 内容高 - layout.padding_top - layout.padding_bottom
+                 - layout.border_top - layout.border_bottom
+        如果 (内容高 < 0) { 内容高 = 0 }
+    }
+
+    // min-height / max-height 约束
+    内容高 = 盒模型_应用MinMax高(内容高, style, 包含块高)
+
+    layout.高度 = 内容高
+}
+
+函数 盒模型_应用MinMax高(高, style, 包含块高) {
+    定义 可变 结果 = 高
+    如果 (style.min_height > 0) {
+        定义 最小 = CSS值_解析为像素(style.min_height, 包含块高)
+        如果 (结果 < 最小) { 结果 = 最小 }
+    }
+    如果 (style.max_height > 0 && style.max_height != CSS_NONE) {
+        定义 最大 = CSS值_解析为像素(style.max_height, 包含块高)
+        如果 (结果 > 最大) { 结果 = 最大 }
+    }
+    返回 结果
+}
+
+函数 盒模型_确定内容高度(layout) {
+    // auto高度: 遍历子元素计算实际内容高度
+    如果 (layout.高度 != CSS_AUTO) { 返回 }
+    定义 可变 内容高 = 0
+    定义 可变 child = layout.第一子
+    当 (child != 0) {
+        // 跳过绝对定位元素(out-of-flow)
+        如果 (child.样式 != 0 && child.样式.position != 定位_绝对 && child.样式.position != 定位_固定) {
+            定义 child_bottom = child.y + child.高度 + child.margin_bottom
+                              + child.border_bottom + child.padding_bottom
+            如果 (child_bottom > 内容高) { 内容高 = child_bottom }
+        }
+        child = child.下一兄弟
+    }
+    layout.高度 = 内容高
+}
+
+// 第8部分: Margin Auto居中
+
+函数 盒模型_解决AutoMargin(layout, style, 包含块宽) {
+    // margin: 0 auto 居中算法
+    // AutoMargin = (CB_width - total_used) / auto_count
+    定义 left_auto = (style.margin_left == CSS_AUTO)
+    定义 right_auto = (style.margin_right == CSS_AUTO)
+    如果 (!left_auto && !right_auto) { 返回 }  // 无auto
+
+    全局BFCM统计.margin居中数 = 全局BFCM统计.margin居中数 + 1
+
+    定义 已用 = layout.宽度 + layout.padding_left + layout.padding_right
+                + layout.border_left + layout.border_right
+    如果 (!left_auto) { 已用 = 已用 + layout.margin_left }
+    如果 (!right_auto) { 已用 = 已用 + layout.margin_right }
+
+    定义 剩余 = 包含块宽 - 已用
+    如果 (剩余 < 0) { 剩余 = 0 }
+
+    如果 (left_auto && right_auto) {
+        // 两侧auto: 平分剩余空间(居中)
+        layout.margin_left = 剩余 / 2
+        layout.margin_right = 剩余 - layout.margin_left
+    } 否则 如果 (left_auto) {
+        layout.margin_left = 剩余
+    } 否则 {
+        layout.margin_right = 剩余
+    }
+}
+
+// 第9部分: Margin折叠
+
+函数 盒模型_计算折叠Margin(上一个margin_bottom, 当前margin_top) {
+    // CollapsedMargin = max(margin_bottom_prev, margin_top_next)
+    // 特殊: 两个都为负时取绝对值最大的负值
+    //        一正一负时相加
+    全局BFCM统计.margin折叠数 = 全局BFCM统计.margin折叠数 + 1
+
+    如果 (上一个margin_bottom >= 0 && 当前margin_top >= 0) {
+        // 两正: 取大
+        如果 (上一个margin_bottom > 当前margin_top) {
+            返回 上一个margin_bottom
+        }
+        返回 当前margin_top
+    }
+    如果 (上一个margin_bottom < 0 && 当前margin_top < 0) {
+        // 两负: 取绝对值最大的负值
+        如果 (上一个margin_bottom < 当前margin_top) {
+            返回 上一个margin_bottom
+        }
+        返回 当前margin_top
+    }
+    // 一正一负: 相加
+    返回 上一个margin_bottom + 当前margin_top
+}
+
+函数 盒模型_是否屏蔽折叠(layout, style) {
+    // 以下情况不折叠margin:
+    // 1. 建立新BFC(浮动、绝对定位、overflow非visible、display:flow-root)
+    // 2. 有border/padding分隔
+    如果 (style.overflow_x != 0 || style.overflow_y != 0) { 返回 真 }
+    如果 (style.position == 定位_绝对 || style.position == 定位_固定) { 返回 真 }
+    如果 (style.float_type != 0) { 返回 真 }
+    如果 (style.display == 显示_flex || style.display == 显示_grid) { 返回 真 }
+    如果 (layout.border_top > 0 || layout.padding_top > 0) { 返回 真 }
+    返回 假
+}
+
+// 第10部分: 浮动清除
+
+函数 盒模型_处理浮动(layout, style, 包含块宽) {
+    如果 (style.float_type == 0) { 返回 }  // 非浮动
+    全局BFCM统计.浮动清除数 = 全局BFCM统计.浮动清除数 + 1
+
+    // 浮动元素宽度为auto时收缩到内容
+    如果 (style.width == CSS_AUTO) {
+        layout.宽度 = 盒模型_计算收缩宽度(layout, style, 包含块宽)
+    }
+    // margin auto在浮动中归零
+    如果 (style.margin_left == CSS_AUTO) { layout.margin_left = 0 }
+    如果 (style.margin_right == CSS_AUTO) { layout.margin_right = 0 }
+}
+
+函数 盒模型_处理Clear(layout, style, 浮动上下文) {
+    // clear: left/right/both
+    如果 (style.clear == 0 || 浮动上下文 == 0) { 返回 0 }
+    定义 可变 清除高 = 0
+    如果 (style.clear == 1 || style.clear == 3) {
+        // clear:left 或 clear:both
+        如果 (浮动上下文.左浮动底部 > 清除高) {
+            清除高 = 浮动上下文.左浮动底部
+        }
+    }
+    如果 (style.clear == 2 || style.clear == 3) {
+        // clear:right 或 clear:both
+        如果 (浮动上下文.右浮动底部 > 清除高) {
+            清除高 = 浮动上下文.右浮动底部
+        }
+    }
+    返回 清除高
+}
+
+// 第11部分: 综合盒模型计算 + AI布局预测
+
+函数 布局Box_计算盒模型(layout, 包含块宽, 包含块高) {
+    定义 style = layout.样式
+    如果 (style == 0) { 返回 }
+    全局BFCM统计.盒模型计算数 = 全局BFCM统计.盒模型计算数 + 1
+
+    // 步骤1: 解析padding
+    盒模型_解析Padding(layout, style, 包含块宽)
+
+    // 步骤2: 解析border
+    盒模型_解析Border(layout, style)
+
+    // 步骤3: 解析margin
+    盒模型_解析Margin(layout, style, 包含块宽)
+
+    // 步骤4: 计算宽度
+    盒模型_计算宽度(layout, style, 包含块宽)
+
+    // 步骤5: 解决auto margin居中
+    盒模型_解决AutoMargin(layout, style, 包含块宽)
+
+    // 步骤6: 计算高度
+    盒模型_计算高度(layout, style, 包含块高)
+
+    // 步骤7: 处理浮动
+    盒模型_处理浮动(layout, style, 包含块宽)
+}
+
+// 第12部分: AI布局预测与统计
+
+函数 AI_BFCM布局预测(layout, style, 包含块宽) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    全局BFCM统计.AI布局预测数 = 全局BFCM统计.AI布局预测数 + 1
+
+    定义 feature = Tensor_创建(8)
+    Tensor_写(feature, 0, style.display / 10.0)
+    Tensor_写(feature, 1, style.position / 5.0)
+    Tensor_写(feature, 2, 包含块宽 / 1920.0)
+    Tensor_写(feature, 3, layout.宽度 / 1920.0)
+    Tensor_写(feature, 4, layout.padding_left / 100.0)
+    Tensor_写(feature, 5, layout.margin_left / 100.0)
+    Tensor_写(feature, 6, style.box_sizing / 2.0)
+    Tensor_写(feature, 7, style.float_type / 3.0)
+
+    定义 结果 = AI总线_推理(bus, "BFCM_布局预测", feature)
+    Tensor_释放(feature)
+}
+
+函数 盒模型_获取总宽度(layout) {
+    返回 layout.宽度 + layout.padding_left + layout.padding_right
+           + layout.border_left + layout.border_right
+           + layout.margin_left + layout.margin_right
+}
+
+函数 盒模型_获取总高度(layout) {
+    定义 h = layout.高度
+    如果 (h == CSS_AUTO) { h = 0 }
+    返回 h + layout.padding_top + layout.padding_bottom
+           + layout.border_top + layout.border_bottom
+           + layout.margin_top + layout.margin_bottom
+}
+
+函数 BFCM_获取统计() { 返回 全局BFCM统计 }
+
+函数 BFCM_打印统计() {
+    定义 s = 全局BFCM统计
+    内核打印("═══ BFCM盒模型统计 ═══")
+    内核打印("盒模型={} 宽度={} 高度={}", s.盒模型计算数, s.宽度计算数, s.高度计算数)
+    内核打印("margin[居中/折叠]={}/{} 浮动={} AI={}",
+        s.margin居中数, s.margin折叠数, s.浮动清除数, s.AI布局预测数)
+}
+
+函数 BFCM_重置统计() {
+    全局BFCM统计 = BFCM统计 {}
+}
+
+// 附加: 绝对定位盒模型计算
+
+函数 盒模型_计算绝对定位(layout, style, 包含块宽, 包含块高) {
+    // 绝对定位: left/right/top/bottom + width/height 互相约束
+    // CSS规则: left + margin_left + border_left + padding_left + width +
+    //          padding_right + border_right + margin_right + right = 包含块宽
+    如果 (style.position != 定位_绝对 && style.position != 定位_固定) { 返回 }
+
+    // 水平方向
+    定义 has_left = (style.left != CSS_AUTO)
+    定义 has_right = (style.right != CSS_AUTO)
+    定义 has_width = (style.width != CSS_AUTO)
+
+    如果 (has_left && has_right && has_width) {
+        // 三个都指定: 过度约束, margin auto吸收多余
+        定义 left_px = CSS值_解析为像素(style.left, 包含块宽)
+        定义 right_px = CSS值_解析为像素(style.right, 包含块宽)
+        layout.x = left_px + layout.margin_left + layout.border_left + layout.padding_left
+    } 否则 如果 (has_left && has_width) {
+        定义 left_px = CSS值_解析为像素(style.left, 包含块宽)
+        layout.x = left_px + layout.margin_left + layout.border_left + layout.padding_left
+    } 否则 如果 (has_right && has_width) {
+        定义 right_px = CSS值_解析为像素(style.right, 包含块宽)
+        layout.x = 包含块宽 - right_px - layout.margin_right
+                   - layout.border_right - layout.padding_right - layout.宽度
+    } 否则 如果 (has_left && has_right) {
+        // 宽度auto: 从left/right推导
+        定义 left_px = CSS值_解析为像素(style.left, 包含块宽)
+        定义 right_px = CSS值_解析为像素(style.right, 包含块宽)
+        layout.x = left_px + layout.margin_left + layout.border_left + layout.padding_left
+        layout.宽度 = 包含块宽 - left_px - right_px
+                     - layout.margin_left - layout.margin_right
+                     - layout.border_left - layout.border_right
+                     - layout.padding_left - layout.padding_right
+        如果 (layout.宽度 < 0) { layout.宽度 = 0 }
+    }
+
+    // 垂直方向
+    定义 has_top = (style.top != CSS_AUTO)
+    定义 has_bottom = (style.bottom != CSS_AUTO)
+    定义 has_height = (style.height != CSS_AUTO)
+
+    如果 (has_top && has_height) {
+        定义 top_px = CSS值_解析为像素(style.top, 包含块高)
+        layout.y = top_px + layout.margin_top + layout.border_top + layout.padding_top
+    } 否则 如果 (has_bottom && has_height) {
+        定义 bottom_px = CSS值_解析为像素(style.bottom, 包含块高)
+        定义 h = layout.高度
+        如果 (h == CSS_AUTO) { h = 0 }
+        layout.y = 包含块高 - bottom_px - layout.margin_bottom
+                   - layout.border_bottom - layout.padding_bottom - h
+    } 否则 如果 (has_top && has_bottom) {
+        定义 top_px = CSS值_解析为像素(style.top, 包含块高)
+        定义 bottom_px = CSS值_解析为像素(style.bottom, 包含块高)
+        layout.y = top_px + layout.margin_top + layout.border_top + layout.padding_top
+        layout.高度 = 包含块高 - top_px - bottom_px
+                     - layout.margin_top - layout.margin_bottom
+                     - layout.border_top - layout.border_bottom
+                     - layout.padding_top - layout.padding_bottom
+        如果 (layout.高度 < 0) { layout.高度 = 0 }
+    } 否则 如果 (has_top) {
+        layout.y = CSS值_解析为像素(style.top, 包含块高) + layout.margin_top
+    }
+}
+
+// 辅助: 获取content-box区域
+函数 盒模型_获取内容区域(layout) {
+    返回 {
+        x: layout.x + layout.border_left + layout.padding_left,
+        y: layout.y + layout.border_top + layout.padding_top,
+        宽: layout.宽度,
+        高: layout.高度
+    }
+}
+
+// 辅助: 获取border-box区域
+函数 盒模型_获取边框区域(layout) {
+    返回 {
+        x: layout.x,
+        y: layout.y,
+        宽: layout.宽度 + layout.padding_left + layout.padding_right
+             + layout.border_left + layout.border_right,
+        高: (如果 layout.高度 == CSS_AUTO { 0 } 否则 { layout.高度 })
+             + layout.padding_top + layout.padding_bottom
+             + layout.border_top + layout.border_bottom
+    }
+}
+
+// 辅助: 获取margin-box区域
+函数 盒模型_获取外边距区域(layout) {
+    定义 bb = 盒模型_获取边框区域(layout)
+    返回 {
+        x: bb.x - layout.margin_left,
+        y: bb.y - layout.margin_top,
+        宽: bb.宽 + layout.margin_left + layout.margin_right,
+        高: bb.高 + layout.margin_top + layout.margin_bottom
+    }
+}

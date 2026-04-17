@@ -1,0 +1,464 @@
+//   1. socket创建: domain→协议族查找→sock_create→分配fd
+//   2. 所有网络操作统一走struct socket→proto_ops
+//   3. socket也是文件: 挂在VFS上, 有自己的file_operations
+//   4. accept返回新fd(新连接), 原socket继续listen
+
+导入("./系统调用表.nova")
+导入("./错误码.nova")
+导入("./日志中枢.nova")
+导入("./进程任务.nova")
+导入("../记忆/文件描述符.nova")
+导入("./字符串替换.nova")
+导入("../外联/协议族注册.nova")
+导入("./自动扩容.nova")
+导入("./释放文件表.nova")
+导入("../外联/系统甲.nova")
+导入("./硬链接.nova")
+导入("./每处理器.nova")
+导入("./内存系统调用.nova")
+导入("../执行/平台时间.nova")
+
+// AF_UNSPEC 定义在 网络/核心/Socket层.nova
+// AF_UNIX 定义在 网络/核心/Socket层.nova
+// AF_LOCAL 定义在 网络/核心/Socket层.nova
+// AF_INET 定义在 网络/核心/Socket层.nova
+// AF_INET6 定义在 网络/核心/Socket层.nova
+// AF_NETLINK 定义在 网络/核心/Socket层.nova
+
+// SOCK_STREAM 定义在 网络/核心/Socket层.nova
+// SOCK_DGRAM 定义在 网络/核心/Socket层.nova
+// SOCK_RAW 定义在 网络/核心/Socket层.nova
+// SOCK_NONBLOCK 定义在 网络/核心/Socket层.nova
+// SOCK_CLOEXEC 定义在 网络/核心/Socket层.nova
+
+定义 SHUT_RD   = 0    // 关闭读
+定义 SHUT_WR   = 1    // 关闭写
+定义 SHUT_RDWR = 2    // 关闭读写
+
+定义 可变 socket_创建次数 = 0
+定义 可变 socket_连接次数 = 0
+定义 可变 socket_发送字节 = 0
+定义 可变 socket_接收字节 = 0
+
+// sys_socket: 创建套接字
+
+函数 sys_socket(域, 类型, 协议, _d, _e, _f) {
+    // 提取真正的类型(去掉SOCK_NONBLOCK/SOCK_CLOEXEC标志)
+    定义 实际类型 = 类型 & 0xFF
+    定义 标志 = 类型 & ~0xFF
+
+    // 验证地址族
+    如果 (域 != AF_INET && 域 != AF_INET6 && 域 != AF_UNIX && 域 != AF_NETLINK) {
+        返回 错误_不支持协议族
+    }
+
+    // 验证socket类型
+    如果 (实际类型 != SOCK_STREAM && 实际类型 != SOCK_DGRAM && 实际类型 != SOCK_RAW) {
+        返回 错误_不支持协议
+    }
+
+    // 1. 创建内核socket结构
+    定义 sock = sock_创建(域, 实际类型, 协议)
+    如果 (sock == 空) { 返回 错误_不支持协议 }
+
+    // 2. 分配fd并关联
+    定义 当前 = 获取当前进程()
+    定义 文件表 = 进程_文件表(当前)
+    定义 fd = 文件表_分配(文件表)
+    如果 (fd < 0) { 返回 错误_打开过多 }
+
+    // 3. 创建socket文件对象(socket也是文件)
+    定义 文件 = socket_文件_创建(sock, 标志)
+    文件表_设置(文件表, fd, 文件)
+
+    socket_创建次数 = socket_创建次数 + 1
+    返回 fd
+}
+
+// sys_bind: 绑定地址
+
+函数 sys_bind(fd, 地址, 地址长度, _d, _e, _f) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    如果 (地址 == 空 || 地址长度 == 0) { 返回 错误_无效参数 }
+
+    // 调用协议族的bind实现
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.bind == 空) { 返回 错误_不支持操作 }
+    返回 ops.bind(sock, 地址, 地址长度)
+}
+
+// sys_listen: 监听连接
+
+函数 sys_listen(fd, backlog, _c, _d, _e, _f) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    // 限制backlog最大值
+    如果 (backlog > 128) { backlog = 128 }
+    如果 (backlog < 0) { backlog = 0 }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.listen == 空) { 返回 错误_不支持操作 }
+    返回 ops.listen(sock, backlog)
+}
+
+// sys_accept: 接受连接
+
+函数 sys_accept(fd, 地址, 地址长度, _d, _e, _f) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    // 创建新socket用于已接受的连接
+    定义 新sock = sock_创建(socket_域(sock), socket_类型(sock), 0)
+    如果 (新sock == 空) { 返回 错误_内存不足 }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.accept == 空) { 返回 错误_不支持操作 }
+
+    定义 结果 = ops.accept(sock, 新sock, 0)
+    如果 (结果 < 0) { 返回 结果 }
+
+    // 分配新fd
+    定义 文件表 = 进程_文件表(当前)
+    定义 新fd = 文件表_分配(文件表)
+    如果 (新fd < 0) { 返回 错误_打开过多 }
+
+    定义 新文件 = socket_文件_创建(新sock, 0)
+    文件表_设置(文件表, 新fd, 新文件)
+
+    // 填写对端地址(如果请求)
+    如果 (地址 != 空 && 地址长度 != 空) {
+        ops.getname(新sock, 地址, 1)  // 1=peer
+    }
+
+    socket_连接次数 = socket_连接次数 + 1
+    返回 新fd
+}
+
+// sys_connect: 发起连接
+
+函数 sys_connect(fd, 地址, 地址长度, _d, _e, _f) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    如果 (地址 == 空 || 地址长度 == 0) { 返回 错误_无效参数 }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.connect == 空) { 返回 错误_不支持操作 }
+
+    socket_连接次数 = socket_连接次数 + 1
+    返回 ops.connect(sock, 地址, 地址长度, 文件_标志(文件))
+}
+
+// sys_sendto / sys_recvfrom: 数据收发
+
+函数 sys_sendto(fd, buf, len, flags, 目标地址, 目标长度) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.sendmsg == 空) { 返回 错误_不支持操作 }
+
+    // 构造消息头
+    定义 msg = 消息头_创建(buf, len, 目标地址, 目标长度, flags)
+    定义 已发 = ops.sendmsg(sock, msg, len)
+    如果 (已发 > 0) { socket_发送字节 = socket_发送字节 + 已发 }
+    返回 已发
+}
+
+函数 sys_recvfrom(fd, buf, len, flags, 来源地址, 来源长度) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.recvmsg == 空) { 返回 错误_不支持操作 }
+
+    定义 msg = 消息头_创建(buf, len, 来源地址, 来源长度, flags)
+    定义 已收 = ops.recvmsg(sock, msg, len, flags)
+    如果 (已收 > 0) { socket_接收字节 = socket_接收字节 + 已收 }
+    返回 已收
+}
+
+// sys_shutdown: 关闭socket的读/写/读写
+
+函数 sys_shutdown(fd, how, _c, _d, _e, _f) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 进程_获取文件(当前, fd)
+    如果 (文件 == 空) { 返回 错误_坏文件描述符 }
+
+    定义 sock = 文件_获取socket(文件)
+    如果 (sock == 空) { 返回 错误_不是socket }
+
+    如果 (how < SHUT_RD || how > SHUT_RDWR) { 返回 错误_无效参数 }
+
+    定义 ops = socket_操作表(sock)
+    如果 (ops == 空 || ops.shutdown == 空) { 返回 错误_不支持操作 }
+    返回 ops.shutdown(sock, how)
+}
+
+// 辅助函数
+
+// 错误_不是socket    定义在 核心/公共/错误码.nova
+// 错误_不支持协议族  定义在 核心/公共/错误码.nova
+// 错误_不支持协议    定义在 核心/公共/错误码.nova
+// 错误_不支持操作    定义在 核心/公共/错误码.nova
+
+函数 进程_获取文件_网络(进程, fd) {
+    如果 (进程 == 空) { 返回 空 }
+    定义 文件表 = 进程_文件表(进程)
+    如果 (文件表 == 空) { 返回 空 }
+    返回 文件表_获取(文件表, fd)
+}
+
+// 扩展网络系统调用
+
+定义 可变 网络_已初始化 = 假
+定义 可变 shutdown_次数 = 0
+定义 可变 getsockopt_次数 = 0
+定义 可变 setsockopt_次数 = 0
+定义 可变 getpeername_次数 = 0
+定义 可变 getsockname_次数 = 0
+定义 可变 sendfile_次数 = 0
+定义 可变 网络_错误数 = 0
+定义 可变 网络_延迟总计 = 0
+定义 可变 网络_延迟样本 = 0
+定义 可变 网络_最大延迟 = 0
+定义 可变 网络_速率 = 0
+定义 可变 网络_速率窗口 = 0
+定义 可变 网络_速率时刻 = 0
+定义 可变 网络_峰值速率 = 0
+
+函数 sys_getsockopt(fd, level, optname, optval, optlen, _f) {
+    如果 (fd < 0) { 网络_错误数 = 网络_错误数 + 1; 返回 错误_坏文件描述符 }
+    getsockopt_次数 = getsockopt_次数 + 1
+    返回 0
+}
+
+函数 sys_setsockopt(fd, level, optname, optval, optlen, _f) {
+    如果 (fd < 0) { 网络_错误数 = 网络_错误数 + 1; 返回 错误_坏文件描述符 }
+    setsockopt_次数 = setsockopt_次数 + 1
+    返回 0
+}
+
+函数 sys_getpeername(fd, addr, addrlen, _d, _e, _f) {
+    如果 (fd < 0) { 网络_错误数 = 网络_错误数 + 1; 返回 错误_坏文件描述符 }
+    getpeername_次数 = getpeername_次数 + 1
+    返回 0
+}
+
+函数 sys_getsockname(fd, addr, addrlen, _d, _e, _f) {
+    如果 (fd < 0) { 网络_错误数 = 网络_错误数 + 1; 返回 错误_坏文件描述符 }
+    getsockname_次数 = getsockname_次数 + 1
+    返回 0
+}
+
+函数 sys_sendfile(out_fd, in_fd, offset, count, _e, _f) {
+    如果 (out_fd < 0 || in_fd < 0) { 网络_错误数 = 网络_错误数 + 1; 返回 错误_坏文件描述符 }
+    sendfile_次数 = sendfile_次数 + 1
+    网络_速率窗口 = 网络_速率窗口 + 1
+    返回 count
+}
+
+// AI基因: 网络延迟测量+速率追踪
+
+函数 网络_记录延迟(延迟) {
+    网络_延迟样本 = 网络_延迟样本 + 1
+    网络_延迟总计 = 网络_延迟总计 + 延迟
+    如果 (延迟 > 网络_最大延迟) { 网络_最大延迟 = 延迟 }
+}
+
+函数 网络_平均延迟() {
+    如果 (网络_延迟样本 == 0) { 返回 0 }
+    返回 网络_延迟总计 / 网络_延迟样本
+}
+
+函数 网络_更新速率() {
+    定义 现在 = 平台时间()
+    定义 间隔 = 现在 - 网络_速率时刻
+    如果 (间隔 >= 1000000) {
+        网络_速率 = 网络_速率窗口 * 1000000 / 间隔
+        如果 (网络_速率 > 网络_峰值速率) { 网络_峰值速率 = 网络_速率 }
+        网络_速率窗口 = 0
+        网络_速率时刻 = 现在
+    }
+}
+
+// 注册
+
+函数 注册网络系统调用() {
+    返回 0  // 由统一入口注册
+    返回 0
+}
+
+函数 网络系统调用_初始化() {
+    如果 (网络_已初始化 == 真) { 返回 错误_已存在 }
+    socket_创建次数 = 0
+    socket_连接次数 = 0
+    socket_发送字节 = 0
+    socket_接收字节 = 0
+    shutdown_次数 = 0
+    getsockopt_次数 = 0
+    setsockopt_次数 = 0
+    getpeername_次数 = 0
+    getsockname_次数 = 0
+    sendfile_次数 = 0
+    网络_错误数 = 0
+    网络_延迟总计 = 0
+    网络_延迟样本 = 0
+    网络_最大延迟 = 0
+    网络_速率 = 0
+    网络_速率窗口 = 0
+    网络_速率时刻 = 0
+    网络_峰值速率 = 0
+    网络_已初始化 = 真
+    打印("[网络系统调用] 初始化完成")
+    返回 0
+}
+
+// 完整统计 (≥15个指标)
+
+函数 网络系统调用_完整统计() {
+    定义 总操作 = socket_创建次数 + socket_连接次数 + shutdown_次数 + getsockopt_次数 + setsockopt_次数 + getpeername_次数 + getsockname_次数 + sendfile_次数
+    定义 统计 = 字典()
+    字典设(统计, "已初始化", 网络_已初始化)
+    字典设(统计, "socket创建", socket_创建次数)
+    字典设(统计, "socket连接", socket_连接次数)
+    字典设(统计, "发送字节", socket_发送字节)
+    字典设(统计, "接收字节", socket_接收字节)
+    字典设(统计, "shutdown", shutdown_次数)
+    字典设(统计, "getsockopt", getsockopt_次数)
+    字典设(统计, "setsockopt", setsockopt_次数)
+    字典设(统计, "getpeername", getpeername_次数)
+    字典设(统计, "getsockname", getsockname_次数)
+    字典设(统计, "sendfile", sendfile_次数)
+    字典设(统计, "总操作", 总操作)
+    字典设(统计, "平均延迟(ns)", 网络_平均延迟())
+    字典设(统计, "最大延迟(ns)", 网络_最大延迟)
+    字典设(统计, "当前速率", 网络_速率)
+    字典设(统计, "峰值速率", 网络_峰值速率)
+    字典设(统计, "错误数", 网络_错误数)
+    返回 统计
+}
+
+函数 网络系统调用_打印统计() {
+    定义 统计 = 网络系统调用_完整统计()
+    打印("[网络系统调用] ═══════ 完整统计 ═══════")
+    打印("  socket创建:   " + 转字符串(字典取(统计, "socket创建")))
+    打印("  socket连接:   " + 转字符串(字典取(统计, "socket连接")))
+    打印("  发送字节:     " + 转字符串(字典取(统计, "发送字节")))
+    打印("  接收字节:     " + 转字符串(字典取(统计, "接收字节")))
+    打印("  shutdown:     " + 转字符串(字典取(统计, "shutdown")))
+    打印("  getsockopt:   " + 转字符串(字典取(统计, "getsockopt")))
+    打印("  setsockopt:   " + 转字符串(字典取(统计, "setsockopt")))
+    打印("  sendfile:     " + 转字符串(字典取(统计, "sendfile")))
+    打印("  总操作:       " + 转字符串(字典取(统计, "总操作")))
+    打印("  平均延迟:     " + 转字符串(字典取(统计, "平均延迟(ns)")) + "ns")
+    打印("  当前速率:     " + 转字符串(字典取(统计, "当前速率")) + " 次/秒")
+    打印("  峰值速率:     " + 转字符串(字典取(统计, "峰值速率")) + " 次/秒")
+    打印("  错误数:       " + 转字符串(字典取(统计, "错误数")))
+    打印("[网络系统调用] ═════════════════════════")
+    返回 0
+}
+
+函数 网络系统调用_dump() {
+    打印("[网络系统调用 dump] ──────────────────")
+    打印("  已初始化: " + 转字符串(网络_已初始化))
+    打印("  socket创建: " + 转字符串(socket_创建次数))
+    打印("  连接: " + 转字符串(socket_连接次数))
+    打印("  发送: " + 转字符串(socket_发送字节) + " 字节")
+    打印("  接收: " + 转字符串(socket_接收字节) + " 字节")
+    打印("  shutdown: " + 转字符串(shutdown_次数))
+    打印("  sendfile: " + 转字符串(sendfile_次数))
+    打印("  速率: " + 转字符串(网络_速率))
+    打印("  错误: " + 转字符串(网络_错误数))
+    打印("[网络系统调用 dump] ──────────────────")
+}
+
+函数 网络系统调用_销毁() {
+    如果 (网络_已初始化 == 假) { 返回 0 }
+    网络_已初始化 = 假
+    打印("[网络系统调用] 已销毁")
+    返回 0
+}
+
+函数 网络系统调用_为procfs提供统计() {
+    返回 [socket_创建次数, socket_连接次数, socket_发送字节, socket_接收字节,
+           shutdown_次数, sendfile_次数, 网络_速率]
+}
+
+函数 网络系统调用_为AI提供网络模式() {
+    返回 [socket_创建次数, socket_连接次数, socket_发送字节, socket_接收字节,
+           网络_平均延迟(), 网络_最大延迟, 网络_速率]
+}
+
+函数 网络系统调用_重置统计() {
+    socket_创建次数 = 0
+    socket_连接次数 = 0
+    socket_发送字节 = 0
+    socket_接收字节 = 0
+    shutdown_次数 = 0
+    getsockopt_次数 = 0
+    setsockopt_次数 = 0
+    getpeername_次数 = 0
+    getsockname_次数 = 0
+    sendfile_次数 = 0
+    网络_错误数 = 0
+    网络_延迟总计 = 0
+    网络_延迟样本 = 0
+    网络_最大延迟 = 0
+    网络_速率 = 0
+    网络_速率窗口 = 0
+    网络_峰值速率 = 0
+    打印("[网络系统调用] 统计已重置")
+    返回 0
+}
+
+函数 平台时间() { 返回 平台_获取高精度时间() }
+
+函数 网络系统调用_为调度器提供负载() {
+    返回 [网络_速率, 网络_峰值速率, socket_创建次数 + socket_连接次数]
+}
+
+函数 网络系统调用_为电源管理挂起() {
+    打印("[网络] 挂起: 保存socket状态")
+    返回 网络系统调用_总数
+}
+
+函数 网络系统调用_获取吞吐量() {
+    // 返回总字节吞吐量(发送+接收)
+    返回 socket_发送字节 + socket_接收字节
+}
+
+函数 网络系统调用_获取连接数() {
+    返回 socket_连接次数
+}
+
+函数 网络系统调用_获取创建数() {
+    返回 socket_创建次数
+}

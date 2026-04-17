@@ -1,0 +1,212 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("./超级块.nova")
+导入("./目录项添加.nova")
+导入("./执行移挂载.nova")
+导入("./文件系统类.nova")
+导入("./文件层文件.nova")
+导入("./路径查找.nova")
+
+//   1. struct mount: 挂载实例, 包含super_block和挂载点关系
+//   2. 挂载树: 父子关系形成挂载命名空间树
+//   3. 挂载传播: shared/private/slave/unbindable
+//   4. bind mount: 把一个目录挂载到另一个位置
+//   5. pivot_root: 切换根文件系统(initramfs→真正的rootfs)
+//   6. /proc/mounts: 列出当前所有挂载
+
+定义 MS_RDONLY      = 0x0001   // 只读
+定义 MS_NOSUID      = 0x0002   // 不尊重setuid
+定义 MS_节点V       = 0x0004   // 不允许设备节点
+定义 MS_NOEXEC      = 0x0008   // 不允许执行
+定义 MS_SYNCHRONOUS = 0x0010   // 同步写
+定义 MS_REMOUNT     = 0x0020   // 重新挂载(改变标志)
+定义 MS_BIND        = 0x1000   // bind mount
+定义 MS_MOVE        = 0x2000   // 移动挂载点
+定义 MS_NOATIME     = 0x0400   // 不更新atime
+定义 MS_RELATIME    = 0x200000 // 相对atime
+
+结构 挂载结构 {
+    mnt_id,    // u32 挂载ID (唯一)
+    mnt_parent,    // u64 父挂载
+    mnt_mountpoint,    // u64 挂载点Nova路径项
+    mnt_root,    // u64 挂载的根Nova路径项
+    mnt_sb,    // u64 关联的super_block
+    mnt_flags,    // u32 挂载标志
+    mnt_devname,    // 字符串 源设备名 ("/dev/sda1")
+    mnt_fstype,    // 字符串 文件系统类型名 ("ext4")
+    mnt_opts,    // 字符串 挂载选项字符串
+    mnt_children,    // [] 子挂载列表
+    mnt_count,    // u32 引用计数
+}
+
+定义 可变 挂载表 = []
+定义 可变 根挂载 = 空
+定义 可变 下一个挂载ID = 1
+定义 可变 挂载_总数 = 0
+
+// do_mount: 核心挂载函数
+
+函数 do_mount(源, 目标, 类型) {
+    返回 do_mount_带标志(源, 目标, 类型, 0, "")
+}
+
+函数 do_mount_带标志(源, 目标, 类型, 标志, 选项) {
+    // 分发到具体的挂载类型
+    如果 ((标志 & MS_REMOUNT) != 0) {
+        返回 do_remount(目标, 标志, 选项)
+    }
+    如果 ((标志 & MS_BIND) != 0) {
+        返回 do_bind_mount(源, 目标, 标志)
+    }
+    如果 ((标志 & MS_MOVE) != 0) {
+        返回 do_move_mount(源, 目标)
+    }
+    返回 do_new_mount(源, 目标, 类型, 标志, 选项)
+}
+
+// do_new_mount: 新建挂载
+
+函数 do_new_mount(源, 目标, 类型, 标志, 选项) {
+    // 1. 查找文件系统类型
+    定义 fs类型 = 查找文件系统(类型)
+    如果 (fs类型 == 空) {
+        内核警告("mount: 未知文件系统类型 " + 类型)
+        返回 错误_不支持设备
+    }
+
+    // 2. 需要块设备但没提供
+    如果 ((fs类型.fs_flags & FS_REQUIRES_DEV) != 0 && 源 == "") {
+        返回 错误_无效参数
+    }
+
+    // 3. 解析挂载目标路径
+    定义 根 = 获取根目录项()
+    定义 目标Nova路径项 = 路径查找(根, 目标)
+    如果 (目标Nova路径项 == 空) {
+        返回 错误_不存在
+    }
+    如果 (!目录项_是目录(目标Nova路径项)) {
+        返回 错误_非目录
+    }
+
+    // 4. 调用FS的mount回调创建super_block
+    定义 可变 sb = 空
+    如果 (fs类型.mount != 0) {
+        sb = fs类型.mount(fs类型, 标志, 源, 选项)
+    } 否则 {
+        // 默认: 创建空超级块
+        sb = 超级块_创建(0, 4096, 0, 类型)
+    }
+    如果 (sb == 空) { 返回 错误_内存不足 }
+
+    // 5. 将标志传递给超级块
+    如果 ((标志 & MS_RDONLY) != 0) { 超级块_设置只读(sb) }
+
+    // 6. 创建挂载结构
+    定义 mnt = 挂载结构 {}
+    mnt.mnt_id = 下一个挂载ID
+    下一个挂载ID = 下一个挂载ID + 1
+    mnt.mnt_parent = 空
+    mnt.mnt_mountpoint = 目标Nova路径项
+    mnt.mnt_root = sb.s_root
+    mnt.mnt_sb = sb
+    mnt.mnt_flags = 标志
+    mnt.mnt_devname = 源
+    mnt.mnt_fstype = 类型
+    mnt.mnt_opts = 选项
+    mnt.mnt_children = []
+    mnt.mnt_count = 1
+
+    // 7. 标记挂载点Nova路径项
+    目录项_设置已挂载(目标Nova路径项)
+
+    // 8. 加入全局挂载表
+    追加(挂载表, mnt)
+    挂载_总数 = 挂载_总数 + 1
+
+    // 9. 如果是根挂载
+    如果 (目标 == "/") { 根挂载 = mnt }
+
+    内核信息("mount: " + 类型 + " on " + 目标 + " (" + 源 + ")")
+    返回 成功
+}
+
+// do_remount: 重新挂载(改变标志)
+
+函数 do_remount(目标, 新标志, 选项) {
+    定义 mnt = 查找挂载_按目标(目标)
+    如果 (mnt == 空) { 返回 错误_无效参数 }
+
+    // 更新标志
+    mnt.mnt_flags = 新标志 & ~MS_REMOUNT
+    mnt.mnt_opts = 选项
+
+    // 更新super_block标志
+    如果 ((新标志 & MS_RDONLY) != 0) {
+        超级块_设置只读(mnt.mnt_sb)
+    } 否则 {
+        超级块_设置读写(mnt.mnt_sb)
+    }
+
+    // 调用FS的remount回调
+    定义 sb = mnt.mnt_sb
+    如果 (sb.s_op != 空 && sb.s_op.remount_fs != 0) {
+        sb.s_op.remount_fs(sb, 新标志, 选项)
+    }
+
+    内核信息("remount: " + 目标)
+    返回 成功
+}
+
+// do_bind_mount: bind挂载
+// mount --bind /old /new → 把/old的内容显示在/new
+
+函数 do_bind_mount(源, 目标, 标志) {
+    定义 根 = 获取根目录项()
+    定义 源Nova路径项 = 路径查找(根, 源)
+    如果 (源Nova路径项 == 空) { 返回 错误_不存在 }
+    定义 目标Nova路径项 = 路径查找(根, 目标)
+    如果 (目标Nova路径项 == 空) { 返回 错误_不存在 }
+
+    // 查找源的挂载
+    定义 源mnt = 查找挂载_按Nova路径项(源Nova路径项)
+    如果 (源mnt == 空) { 返回 错误_无效参数 }
+
+    // 创建新的挂载, 共享同一个super_block
+    定义 mnt = 挂载结构 {}
+    mnt.mnt_id = 下一个挂载ID
+    下一个挂载ID = 下一个挂载ID + 1
+    mnt.mnt_mountpoint = 目标Nova路径项
+    mnt.mnt_root = 源Nova路径项
+    mnt.mnt_sb = 源mnt.mnt_sb
+    mnt.mnt_flags = 标志 & ~MS_BIND
+    mnt.mnt_devname = 源
+    mnt.mnt_fstype = "bind"
+    mnt.mnt_children = []
+    mnt.mnt_count = 1
+
+    超级块_增引用(mnt.mnt_sb)
+    目录项_设置已挂载(目标Nova路径项)
+    追加(挂载表, mnt)
+    挂载_总数 = 挂载_总数 + 1
+
+    内核信息("bind mount: " + 源 + " on " + 目标)
+    返回 成功
+}
+
+// do_move_mount: 移动挂载点
+
+定义 可变 AI_执行挂载_调用数 = 0
+定义 可变 AI_执行挂载_异常数 = 0
+
+函数 AI_执行挂载_监控() {
+    AI_执行挂载_调用数 = AI_执行挂载_调用数 + 1
+    返回 AI_执行挂载_异常数 == 0
+}
+
+函数 AI_执行挂载_健康检查() {
+    如果 (AI_执行挂载_调用数 > 0 && AI_执行挂载_异常数 * 100 / AI_执行挂载_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

@@ -1,0 +1,174 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./正弦创建.nova")
+
+// §3 Keyframe (关键帧)
+
+结构 Keyframe {
+    offset,    // i32 Q10 (0-1024, -1=auto)
+    easing,    // u64 EasingFunction*
+    composite,    // u8 COMPOSITE_xxx
+    // 属性值对
+    属性,    // [16]u64 CSS属性ID
+    值,    // [16]i32 Q10值
+    属性数,
+}
+
+结构 KeyframeEffect {
+    // 目标
+    target,    // u64 元素*
+    pseudo元素,    // u64 "::before"/"::after"/null
+    // 关键帧
+    keyframes,    // u64 Keyframe*数组
+    帧数,
+    // 时间选项
+    duration,    // i64 毫秒
+    delay,    // i64 开始延迟(毫秒)
+    endDelay,    // i64 结束延迟
+    iterations,    // i32 Q10 (1024=1次, Infinity=-1)
+    iterationStart,    // i32 Q10 (从哪个位置开始)
+    // 方向和填充
+    direction,    // u8 DIR_xxx
+    fill,    // u8 FILL_xxx
+    // 全局缓动
+    easing,    // u64 EasingFunction*
+    // 合成
+    composite,    // u8 COMPOSITE_xxx
+}
+
+
+函数 KeyframeEffect_创建(target, keyframes, 帧数, duration) {
+    定义 kfe = 堆_分配(KeyframeEffect)
+    kfe.target = target; kfe.pseudo元素 = 0
+    kfe.keyframes = keyframes; kfe.帧数 = 帧数
+    kfe.duration = duration; kfe.delay = 0; kfe.endDelay = 0
+    kfe.iterations = 1024; kfe.iterationStart = 0  // 1次, 从头开始
+    kfe.direction = DIR_NORMAL; kfe.fill = FILL_AUTO
+    kfe.easing = Easing_创建(EASING_LINEAR)
+    kfe.composite = COMPOSITE_REPLACE
+    返回 kfe
+}
+
+// 计算关键帧在时间t的插值
+函数 KeyframeEffect_计算(kfe, localTime) {
+    如果 (kfe == 0 || kfe.帧数 < 2) { 返回 }
+
+    // 1. 计算迭代进度(0-1024)
+    定义 activeDuration = kfe.duration * kfe.iterations / 1024
+    如果 (activeDuration <= 0) { 返回 }
+
+    定义 可变 进度 = 0
+    如果 (localTime < kfe.delay) {
+        // before阶段
+        如果 (kfe.fill == FILL_BACKWARDS || kfe.fill == FILL_BOTH) {
+            进度 = kfe.iterationStart
+        } 否则 { 返回 }
+    } 否则 如果 (localTime >= kfe.delay + activeDuration) {
+        // after阶段
+        如果 (kfe.fill == FILL_FORWARDS || kfe.fill == FILL_BOTH) {
+            进度 = 1024  // 结束位置
+        } 否则 { 返回 }
+    } 否则 {
+        // active阶段
+        定义 activeTime = localTime - kfe.delay
+        定义 迭代进度 = (activeTime * 1024 / kfe.duration) % 1024
+        // 方向处理
+        如果 (kfe.direction == DIR_REVERSE) {
+            迭代进度 = 1024 - 迭代进度
+        } 否则 如果 (kfe.direction == DIR_ALTERNATE) {
+            定义 当前迭代 = activeTime / kfe.duration
+            如果 (当前迭代 % 2 == 1) { 迭代进度 = 1024 - 迭代进度 }
+        } 否则 如果 (kfe.direction == DIR_ALTERNATE_REVERSE) {
+            定义 当前迭代 = activeTime / kfe.duration
+            如果 (当前迭代 % 2 == 0) { 迭代进度 = 1024 - 迭代进度 }
+        }
+        进度 = 迭代进度
+    }
+
+    // 2. 应用全局缓动
+    如果 (kfe.easing != 0) {
+        进度 = Easing_计算(kfe.easing, 进度)
+    }
+
+    // 3. 在关键帧间插值
+    KeyframeEffect_插值(kfe, 进度)
+}
+
+函数 KeyframeEffect_插值(kfe, 进度) {
+    如果 (kfe == 0 || kfe.帧数 < 2) { 返回 }
+
+    // 找到进度所在的两个关键帧
+    定义 可变 前帧idx = 0
+    定义 可变 后帧idx = 1
+    定义 可变 i = 0
+    当 (i < kfe.帧数 - 1) {
+        定义 当前帧 = kfe.keyframes + i * 大小of(Keyframe)
+        定义 下一帧 = kfe.keyframes + (i + 1) * 大小of(Keyframe)
+        定义 当前offset = 当前帧.offset
+        定义 下一offset = 下一帧.offset
+        // 自动offset
+        如果 (当前offset < 0) { 当前offset = i * 1024 / (kfe.帧数 - 1) }
+        如果 (下一offset < 0) { 下一offset = (i + 1) * 1024 / (kfe.帧数 - 1) }
+        如果 (进度 >= 当前offset && 进度 <= 下一offset) {
+            前帧idx = i; 后帧idx = i + 1; 跳出
+        }
+        i = i + 1
+    }
+
+    定义 前帧 = kfe.keyframes + 前帧idx * 大小of(Keyframe)
+    定义 后帧 = kfe.keyframes + 后帧idx * 大小of(Keyframe)
+
+    // 计算局部t (在两帧之间)
+    定义 前offset = 前帧.offset
+    定义 后offset = 后帧.offset
+    如果 (前offset < 0) { 前offset = 前帧idx * 1024 / (kfe.帧数 - 1) }
+    如果 (后offset < 0) { 后offset = 后帧idx * 1024 / (kfe.帧数 - 1) }
+
+    定义 可变 局部t = 0
+    如果 (后offset > 前offset) {
+        局部t = (进度 - 前offset) * 1024 / (后offset - 前offset)
+    }
+
+    // 应用关键帧级缓动
+    如果 (前帧.easing != 0) {
+        局部t = Easing_计算(前帧.easing, 局部t)
+    }
+
+    // 对每个属性进行插值
+    定义 可变 p = 0
+    当 (p < 前帧.属性数) {
+        定义 propId = 前帧.属性[p]
+        定义 从值 = 前帧.值[p]
+        // 在后帧中找同属性
+        定义 可变 到值 = 从值
+        定义 可变 j = 0
+        当 (j < 后帧.属性数) {
+            如果 (后帧.属性[j] == propId) {
+                到值 = 后帧.值[j]; 跳出
+            }
+            j = j + 1
+        }
+        // 线性插值
+        定义 插值 = 从值 + (到值 - 从值) * 局部t / 1024
+        // 应用到target元素的样式
+        如果 (kfe.target != 0) {
+            // 元素_setAnimated样式(kfe.target, propId, 插值)
+        }
+        p = p + 1
+    }
+}
+
+定义 可变 AI_感知乙乙_调用数 = 0
+定义 可变 AI_感知乙乙_异常数 = 0
+
+函数 AI_感知乙乙_监控() {
+    AI_感知乙乙_调用数 = AI_感知乙乙_调用数 + 1
+    返回 AI_感知乙乙_异常数 == 0
+}
+
+函数 AI_感知乙乙_健康检查() {
+    如果 (AI_感知乙乙_调用数 > 0 && AI_感知乙乙_异常数 * 100 / AI_感知乙乙_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

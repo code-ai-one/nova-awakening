@@ -1,0 +1,223 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("../引导/寄存器定义.nova")
+导入("./内核打印.nova")
+导入("../推理/总线调度.nova")
+导入("./页表重建.nova")
+导入("./获取当前页.nova")
+
+// NovaOS KPTI + Spectre/Meltdown缓解
+// 技术: Kernel Page Table Isolation (2018) + 推测执行漏洞缓解
+// Meltdown (CVE-2017-5754): 用户态可读取内核内存
+//   缓解: KPTI — 用户态和内核态使用独立页表
+// Spectre v1 (CVE-2017-5753): 边界检查绕过
+//   缓解: 数组索引掩码 + lfence屏障
+// Spectre v2 (CVE-2017-5715): 分支目标注入
+//   缓解: Retpoline + IBRS/IBPB + eIBRS
+// NovaOS创新: AI异常检测侧信道攻击模式
+
+
+定义 可变 CPU_受Meltdown影响 = 假
+定义 可变 CPU_受Spectrev1影响 = 假
+定义 可变 CPU_受Spectrev2影响 = 假
+定义 可变 CPU_支持IBRS = 假
+定义 可变 CPU_支持IBPB = 假
+定义 可变 CPU_支持eIBRS = 假
+定义 可变 CPU_支持STIBP = 假
+定义 可变 CPU_支持SSBD = 假
+
+函数 侧信道_检测CPU漏洞() {
+    定义 厂商 = CPUID_获取厂商()
+    定义 族 = CPUID_获取族()
+    定义 模型 = CPUID_获取模型()
+
+    // Intel: 大部分2018前的CPU受影响
+    如果 (厂商 == CPU_INTEL) {
+        CPU_受Meltdown影响 = 真
+        CPU_受Spectrev1影响 = 真
+        CPU_受Spectrev2影响 = 真
+
+        // 检查微码更新提供的缓解能力
+        定义 特性 = CPUID_扩展特性()
+        CPU_支持IBRS = (特性 >> 26) & 1
+        CPU_支持IBPB = (特性 >> 26) & 1
+        CPU_支持STIBP = (特性 >> 27) & 1
+        CPU_支持SSBD = (特性 >> 31) & 1
+
+        // eIBRS: 增强IBRS(不需要每次内核入口写MSR)
+        CPU_支持eIBRS = CPUID_检查(7, 0, 2, 26)
+    }
+
+    // AMD: 不受Meltdown影响, Spectre视型号
+    如果 (厂商 == CPU_AMD) {
+        CPU_受Meltdown影响 = 假
+        CPU_受Spectrev1影响 = 真
+        CPU_受Spectrev2影响 = 真
+        CPU_支持IBPB = CPUID_检查(0x80000008, 0, 1, 12)
+    }
+
+    内核日志("侧信道检测: Meltdown=%d Sv1=%d Sv2=%d IBRS=%d eIBRS=%d",
+        CPU_受Meltdown影响, CPU_受Spectrev1影响, CPU_受Spectrev2影响,
+        CPU_支持IBRS, CPU_支持eIBRS)
+}
+
+
+定义 可变 KPTI_启用 = 假
+定义 可变 内核页表_CR3 = 0
+定义 可变 用户页表_CR3 = 0
+
+函数 KPTI_初始化() {
+    如果 (!CPU_受Meltdown影响) {
+        内核日志("KPTI: CPU不受Meltdown影响, 跳过")
+        返回
+    }
+
+    KPTI_启用 = 真
+
+    // 创建精简的用户态页表(只包含最小必要内核映射)
+    用户页表_CR3 = 页表_创建_用户模式()
+
+    // 用户页表中只映射:
+    // 1. 系统调用入口蹦床页(切换到内核页表)
+    // 2. 中断处理入口蹦床页
+    // 3. 用户空间本身
+    页表_映射(用户页表_CR3, 蹦床_系统调用入口, 蹦床_系统调用入口, 页_只读 | 页_全局)
+    页表_映射(用户页表_CR3, 蹦床_中断入口, 蹦床_中断入口, 页_只读 | 页_全局)
+
+    // 内核页表保持完整映射
+    内核页表_CR3 = 读CR3()
+
+    内核日志("KPTI: 已启用, 内核CR3=0x%x 用户CR3=0x%x", 内核页表_CR3, 用户页表_CR3)
+}
+
+// 系统调用入口蹦床: 切换页表
+函数 KPTI_进入内核() {
+    如果 (!KPTI_启用) { 返回 }
+    // 切换到内核页表(包含所有内核映射)
+    写CR3(内核页表_CR3)
+}
+
+函数 KPTI_返回用户() {
+    如果 (!KPTI_启用) { 返回 }
+    // 切换到精简用户页表(内核映射不可见)
+    写CR3(用户页表_CR3)
+}
+
+
+函数 Spectre_安全索引(索引, 数组大小) {
+    // 传统: if (索引 < 数组大小) { return 数组[索引] }
+    // 问题: 推测执行可能在边界检查前访问越界地址
+    // 缓解: 用位掩码确保索引在范围内(即使推测执行也安全)
+
+    // 1. 比较并生成掩码: 索引 < 大小 → 全1, 否则全0
+    定义 掩码 = 安全比较_掩码(索引, 数组大小)
+
+    // 2. 索引与掩码AND: 越界时索引被清零
+    返回 索引 & 掩码
+}
+
+函数 安全比较_掩码(a, b) {
+    // 如果 a < b 返回 0xFFFFFFFF, 否则返回 0
+    // 不使用分支(避免推测执行问题)
+    定义 差 = a - b
+    返回 (差 >> 63) * 0xFFFFFFFFFFFFFFFF
+}
+
+// lfence序列化屏障: 阻止后续指令推测执行
+函数 Spectre_lfence() {
+    内建_lfence()
+}
+
+// 安全的条件加载
+函数 Spectre_安全加载(地址, 索引, 大小) {
+    定义 安全idx = Spectre_安全索引(索引, 大小)
+    Spectre_lfence()
+    返回 内存_读64(地址 + 安全idx * 8)
+}
+
+
+函数 Spectrev2_初始化() {
+    如果 (CPU_支持eIBRS) {
+        // eIBRS: 最佳方案, 硬件保证跨特权级分支预测隔离
+        写MSR(MSR_IA32_SPEC_CTRL, SPEC_CTRL_IBRS)
+        内核日志("Spectre v2: eIBRS已启用")
+        返回
+    }
+
+    如果 (CPU_支持IBRS) {
+        // IBRS: 每次内核入口设置, 开销较大
+        内核日志("Spectre v2: IBRS模式(每次入口)")
+        返回
+    }
+
+    // Retpoline: 软件缓解(替换间接跳转为安全的ret序列)
+    内核日志("Spectre v2: Retpoline模式")
+}
+
+// Retpoline: 将间接调用转换为安全的ret指令
+// 原始: jmp *rax (可被分支预测注入攻击)
+// Retpoline: call retpoline_rax → push目标 → ret (推测执行到无害循环)
+函数 Retpoline_间接调用(目标) {
+    // 编译器会将此转换为:
+    //   call .Lretpoline
+    //   .Lcapture:
+    //     pause; lfence; jmp .Lcapture  (推测执行陷阱)
+    //   .Lretpoline:
+    //     mov [rsp], 目标
+    //     ret                            (实际跳转)
+    返回 调用(目标)
+}
+
+// IBPB: 间接分支预测屏障(上下文切换时刷新)
+函数 IBPB_刷新() {
+    如果 (CPU_支持IBPB) {
+        写MSR(MSR_IA32_PRED_CMD, PRED_CMD_IBPB)
+    }
+}
+
+
+函数 侧信道_上下文切换(旧进程, 新进程) {
+    // 1. KPTI: 页表切换由调度器处理
+
+    // 2. Spectre v2: 刷新分支预测(不同安全域间)
+    如果 (旧进程.安全域 != 新进程.安全域) {
+        IBPB_刷新()
+    }
+
+    // 3. SSBD: 推测存储绕过禁用(沙箱进程)
+    如果 (新进程.需要SSBD && CPU_支持SSBD) {
+        写MSR(MSR_IA32_SPEC_CTRL, 读MSR(MSR_IA32_SPEC_CTRL) | SPEC_CTRL_SSBD)
+    }
+
+    // 4. L1缓存刷新(VM切换时, 防L1TF)
+    如果 (新进程.是虚拟机) {
+        写MSR(MSR_IA32_FLUSH_CMD, L1D_FLUSH)
+    }
+}
+
+
+定义 可变 智能_侧信道检测器 = 空
+
+函数 智能_侧信道_初始化() {
+    智能_侧信道检测器 = 智能_异常检测器_创建(16, 64, 3)
+
+    // 特征: [缓存命中率, 分支预测失败率, TLB未命中率, IPC, ...]
+    // 侧信道攻击的特征: 异常高的缓存未命中 + 特定访问模式
+}
+
+函数 智能_侧信道_检查(进程) {
+    // 收集硬件性能计数器
+    定义 缓存命中率 = PMC_读取(进程, PMC_L1D_命中率)
+    定义 分支失败率 = PMC_读取(进程, PMC_分支预测失败率)
+    定义 TLB未命中 = PMC_读取(进程, PMC_DTLB未命中)
+
+    定义 特征 = [缓存命中率, 分支失败率, TLB未命中]
+    定义 异常分数 = 智能_异常检测器_评分(智能_侧信道检测器, 特征)
+
+    如果 (异常分数 > 0.95) {
+        内核日志("AI侧信道警告: 进程%d 异常分数=%.3f", 进程.pid, 异常分数)
+        // 强制启用所有缓解措施
+        进程.需要SSBD = 真
+        IBPB_刷新()
+    }
+}

@@ -1,0 +1,212 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+导入("../感知/内核直连层.nova")
+导入("./激活函数非线.nova")
+导入("./权重持久.nova")
+
+// Nova AI核心: 注意力机制 — 浏览器内嵌Nova注意力架构注意力
+// 【颠覆性创新】真正的Scaled Dot-Product Nova注意力 + 多头注意力
+// 传统浏览器: 所有DOM节点平等对待, 无"关注重点"概念
+// Nova: Nova注意力架构注意力机制动态计算每个节点的重要性
+// 核心能力:
+//   ① Scaled Dot-Product Nova注意力 — Q·Kᵀ/√d → Nova归一化指数 → ×V
+//   ② 多头注意力(Multi-Head) — 多个注意力头并行, 捕捉不同关系
+//   ③ 自注意力(Self-Nova注意力) — DOM节点间相互计算重要性
+//   ④ 交叉注意力(Cross-Nova注意力) — 用户焦点 × 页面内容
+//   ⑤ 位置编码(Positional Encoding) — DOM树位置/视口位置
+//   ⑥ 因果掩码(Causal Mask) — 用户行为序列的时序注意力
+// 应用场景:
+//   - DOM节点注意力权重计算(替代简单语义标签分类)
+//   - 渲染优先级(哪些区域用户正在看)
+//   - 资源预取(用户下一步可能点什么)
+//   - 布局预测(节点间的空间关系)
+
+// §1 Scaled Dot-Product Nova注意力
+// Nova注意力(Q,K,V) = Nova归一化指数(Q·Kᵀ / √dk) · V
+// Q[seq_q × dk] — 查询矩阵
+// K[seq_k × dk] — 键矩阵
+// V[seq_k × dv] — 值矩阵
+// 输出[seq_q × dv]
+
+函数 ScaledDotProductNova注意力(Q, K, V, 掩码) {
+    定义 dk = Q.列数
+
+    // 1. Q·Kᵀ — 注意力得分矩阵 [seq_q × seq_k]
+    定义 Kt = Tensor_转置(K)
+    定义 得分 = Tensor_矩阵乘(Q, Kt)
+    Tensor_释放(Kt)
+
+    // 2. 缩放: / √dk (防止梯度消失)
+    定义 缩放因子 = Q开方(dk * Q_ONE)
+    如果 (缩放因子 == 0) { 缩放因子 = Q_ONE }
+    定义 可变 i = 0
+    定义 总 = 得分.行数 * 得分.列数
+    当 (i < 总) {
+        定义 v = 内存_读32有符号(得分.数据 + i * 4)
+        内存_写32(得分.数据 + i * 4, Q除(v, 缩放因子))
+        i = i + 1
+    }
+
+    // 3. 掩码(可选): 被掩码位置设为极小值
+    如果 (掩码 != 0) {
+        i = 0
+        当 (i < 得分.行数) {
+            定义 可变 j = 0
+            当 (j < 得分.列数) {
+                定义 m = Tensor_读(掩码, i, j)
+                如果 (m == 0) {
+                    // 掩码=0的位置设为-10000(Nova归一化指数后≈0)
+                    Tensor_写(得分, i, j, -10000 * Q_ONE)
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+
+    // 4. Nova归一化指数 — 转为注意力权重(每行和为1)
+    激活_Nova归一化指数(得分)
+
+    // 5. 权重 × V — 加权求和
+    定义 输出 = Tensor_矩阵乘(得分, V)
+    Tensor_释放(得分)
+
+    返回 输出
+}
+
+// §2 多头注意力(Multi-Head Nova注意力)
+// MultiHead(Q,K,V) = Concat(head₁,...,headₕ)·Wᵒ
+// headᵢ = Nova注意力(Q·Wᵢᵠ, K·Wᵢᴷ, V·Wᵢⱽ)
+
+结构 MultiHeadNova注意力 {
+    头数,    // u32 h
+    模型维度,    // u32 d_model
+    头维度,    // u32 dk = d_model / h
+    Wq,    // u64 Tensor* [d_model × d_model]
+    Wk,    // u64 Tensor* [d_model × d_model]
+    Wv,    // u64 Tensor* [d_model × d_model]
+    Wo,    // u64 Tensor* [d_model × d_model] 输出投影
+}
+
+函数 MultiHeadNova注意力_创建(模型维度, 头数) {
+    定义 mha = 堆_分配(MultiHeadNova注意力)
+    mha.头数 = 头数
+    mha.模型维度 = 模型维度
+    mha.头维度 = 模型维度 / 头数
+
+    // 初始化投影矩阵(Xavier初始化)
+    mha.Wq = Tensor_创建(模型维度, 模型维度)
+    mha.Wk = Tensor_创建(模型维度, 模型维度)
+    mha.Wv = Tensor_创建(模型维度, 模型维度)
+    mha.Wo = Tensor_创建(模型维度, 模型维度)
+
+    // Xavier初始化所有权重
+    权重_Xavier初始化(mha.Wq, 模型维度, 模型维度)
+    权重_Xavier初始化(mha.Wk, 模型维度, 模型维度)
+    权重_Xavier初始化(mha.Wv, 模型维度, 模型维度)
+    权重_Xavier初始化(mha.Wo, 模型维度, 模型维度)
+
+    返回 mha
+}
+
+函数 MultiHeadNova注意力_销毁(mha) {
+    如果 (mha == 0) { 返回 }
+    如果 (mha.Wq != 0) { Tensor_释放(mha.Wq) }
+    如果 (mha.Wk != 0) { Tensor_释放(mha.Wk) }
+    如果 (mha.Wv != 0) { Tensor_释放(mha.Wv) }
+    如果 (mha.Wo != 0) { Tensor_释放(mha.Wo) }
+    堆_释放(mha)
+}
+
+函数 权重_Xavier初始化(t, 输入, 输出) {
+    定义 范围 = Q开方(Q除(6 * Q_ONE, (输入 + 输出) * Q_ONE))
+    定义 总 = t.行数 * t.列数
+    定义 可变 i = 0
+    当 (i < 总) {
+        定义 种子 = (i * 1103515245 + 12345) & 0x7FFFFFFF
+        定义 值 = (种子 % (2 * 范围 + 1)) - 范围
+        内存_写32(t.数据 + i * 4, 值)
+        i = i + 1
+    }
+}
+
+// 多头注意力前向传播
+// 输入: Q[seq × d_model], K[seq × d_model], V[seq × d_model]
+函数 MultiHeadNova注意力_前向(mha, Q_in, K_in, V_in, 掩码) {
+    定义 seq_q = Q_in.行数
+    定义 seq_k = K_in.行数
+    定义 d = mha.模型维度
+    定义 h = mha.头数
+    定义 dk = mha.头维度
+
+    // 1. 线性投影: Q·Wq, K·Wk, V·Wv
+    定义 Q_proj = Tensor_矩阵乘(Q_in, mha.Wq)
+    定义 K_proj = Tensor_矩阵乘(K_in, mha.Wk)
+    定义 V_proj = Tensor_矩阵乘(V_in, mha.Wv)
+
+    // 2. 分割为多个头并计算注意力
+    // 对每个注意力头切片独立计算Q·K^T
+    定义 输出合并 = Tensor_创建(seq_q, d)
+
+    定义 可变 头索引 = 0
+    当 (头索引 < h) {
+        定义 起始列 = 头索引 * dk
+
+        // 提取第i个头的Q/K/V切片 [seq × dk]
+        定义 Qi = Tensor_切片列(Q_proj, 起始列, dk)
+        定义 Ki = Tensor_切片列(K_proj, 起始列, dk)
+        定义 Vi = Tensor_切片列(V_proj, 起始列, dk)
+
+        // 计算注意力
+        定义 头输出 = ScaledDotProductNova注意力(Qi, Ki, Vi, 掩码)
+
+        // 写回到输出的对应列
+        Tensor_写回切片(输出合并, 头输出, 起始列)
+
+        Tensor_释放(Qi)
+        Tensor_释放(Ki)
+        Tensor_释放(Vi)
+        Tensor_释放(头输出)
+
+        头索引 = 头索引 + 1
+    }
+
+    Tensor_释放(Q_proj)
+    Tensor_释放(K_proj)
+    Tensor_释放(V_proj)
+
+    // 3. 输出投影: Concat · Wo
+    定义 最终输出 = Tensor_矩阵乘(输出合并, mha.Wo)
+    Tensor_释放(输出合并)
+
+    返回 最终输出
+}
+
+// 列切片: 从Tensor中提取[行数 × 宽度]的子矩阵
+函数 Tensor_切片列(A, 起始列, 宽度) {
+    定义 B = Tensor_创建(A.行数, 宽度)
+    定义 可变 i = 0
+    当 (i < A.行数) {
+        定义 可变 j = 0
+        当 (j < 宽度) {
+            Tensor_写(B, i, j, Tensor_读(A, i, 起始列 + j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 B
+}
+
+// 写回切片: 将小Tensor写入大Tensor的指定列
+函数 Tensor_写回切片(目标, 源, 起始列) {
+    定义 可变 i = 0
+    当 (i < 源.行数) {
+        定义 可变 j = 0
+        当 (j < 源.列数) {
+            Tensor_写(目标, i, 起始列 + j, Tensor_读(源, i, j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}

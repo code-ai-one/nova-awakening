@@ -1,0 +1,218 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("./文档创建.nova")
+导入("./合成决策.nova")
+导入("../执行/接口绑定.nova")
+导入("./文档事件.nova")
+导入("../中枢/辅助存根.nova")
+导入("../推理/小整数快速判.nova")
+导入("./从布局树构.nova")
+导入("../执行/底层内存操.nova")
+导入("./渲染管线计.nova")
+导入("./资源加载资源.nova")
+导入("../中枢/字符串替换.nova")
+导入("./原子驻留.nova")
+导入("./绝对位置计.nova")
+导入("../标准/加法运算符.nova")
+导入("./标记树构建.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./样式引擎创.nova")
+导入("./核心布局算.nova")
+导入("./文档节点.nova")
+
+// §2 渲染管线 — 从URL到像素的完整流程
+// (对应 content::渲染FrameImpl + LocalFrame)
+// 管线阶段:
+// 1. 导航 (Navigation) — 发起HTTP请求
+// 2. 解析 (Parse) — HTML→DOM, CSS→样式Sheet
+// 3. 样式 (样式) — 样式Resolver → Computed样式
+// 4. 布局 (布局) — 布局Tree → 几何信息
+// 5. 绘制 (绘制) — DisplayItemList
+// 6. 合成 (Composite) — 绘制Layer → GraphicsLayer
+// 7. 光栅化 (Raster) — DisplayItemList → Sk画布 → 像素
+// 8. 呈现 (Present) — 像素 → 帧缓冲 → 显示器
+
+函数 渲染管线_导航到URL(tab, url字符串) {
+ tab.正在加载 = 真
+ tab.加载进度 = 0
+ tab.URL = 字符串_复制(url字符串)
+
+ // 添加到历史
+ 如果 (tab.历史数量 < 100) {
+ 内存_写64(tab.历史列表 + tab.历史数量 * 8, 字符串_复制(url字符串))
+ tab.历史数量 = tab.历史数量 + 1
+ tab.历史当前 = tab.历史数量 - 1
+ }
+
+ tab.加载进度 = 10
+ 定义 可变 html内容 = 0
+ 定义 可变 html长度 = 0
+
+ // 检查特殊URL
+ 如果 (字符串_等于N(url字符串, 10, "about:blank")) {
+ html内容 = 字符串_复制("<html><head></head><body></body></html>")
+ html长度 = 字符串_长度(html内容)
+ } 否则 {
+ // 网络加载
+ 定义 loader = ResourceLoader_创建(url字符串, 资源类型_主文档)
+ ResourceLoader_开始加载(loader)
+ 如果 (loader.状态 == 请求状态_完成) {
+ html内容 = loader.接收缓冲
+ html长度 = loader.已接收字节
+ } 否则 {
+ // 加载失败
+ html内容 = 字符串_复制("<html><body><h1>无法加载页面</h1><p>网络错误</p></body></html>")
+ html长度 = 字符串_长度(html内容)
+ }
+ }
+
+ tab.加载进度 = 30
+
+ tab.文档 = Document_创建(url字符串)
+ 定义 parser = HTMLDocumentParser_创建(tab.文档)
+ HTMLDocumentParser_解析(parser, html内容)
+ tab.加载进度 = 50
+
+ // 提取<title>
+ 渲染管线_提取标题(tab)
+
+ tab.样式引擎 = 样式Engine_创建(tab.文档)
+ 渲染管线_收集样式表(tab)
+ tab.加载进度 = 60
+
+ 渲染管线_计算样式(tab)
+ tab.加载进度 = 70
+
+ tab.布局根 = 布局Tree_构建(tab.文档, tab.视口宽, tab.视口高)
+ 布局Object_布局(tab.布局根)
+ tab.加载进度 = 80
+
+ tab.绘制层根 = 绘制Layer_从布局树构建(tab.布局根)
+ tab.加载进度 = 85
+
+ 绘制Layer_更新合成(tab.绘制层根)
+ tab.加载进度 = 90
+
+ 渲染管线_绘制(tab)
+ tab.加载进度 = 100
+
+ tab.正在加载 = 假
+
+ 网接口_安装Document(tab.js_Nova运行时实例, tab.js_context, tab.文档)
+ 网接口_安装Window(tab.js_Nova运行时实例, tab.js_context, tab)
+
+ Script_执行所有脚本(tab.js_Nova运行时实例, tab.文档)
+
+ // 触发DOMContentLoaded
+ 定义 事件 = 事件_创建("DOMContentLoaded", 真, 假)
+ 事件.是受信任的 = 真
+ 事件Target_dispatch事件(tab.文档, 事件)
+
+ // 更新document.readyState
+ 定义 doc_js = Nova对象_获取属性(tab.js_Nova运行时实例, tab.js_context.全局对象, "document")
+ 如果 (doc_js != 0) {
+ Nova对象_设置属性(tab.js_Nova运行时实例, doc_js, "readyState", Nova值_创建_String(tab.js_Nova运行时实例, "interactive"))
+ }
+
+ // 触发load
+ 定义 load事件 = 事件_创建("load", 假, 假)
+ load事件.是受信任的 = 真
+ 事件Target_dispatch事件(tab.文档, load事件)
+
+ 如果 (doc_js != 0) {
+ Nova对象_设置属性(tab.js_Nova运行时实例, doc_js, "readyState", Nova值_创建_String(tab.js_Nova运行时实例, "complete"))
+ }
+
+ // 执行微任务
+ Nova运行时实例_执行微任务(tab.js_Nova运行时实例)
+}
+
+函数 渲染管线_提取标题(tab) {
+ // 遍历DOM找<title>
+ 定义 head = Document_获取head(tab.文档)
+ 如果 (head == 0) { 返回 }
+ 定义 可变 子 = head.第一子节点
+ 当 (子 != 0) {
+ 如果 (子.节点类型 == 元素_节点) {
+ 定义 扩展 = 元素_获取扩展(子)
+ 如果 (扩展 != 0 && 扩展.标签名原子 == 原子_title) {
+ // 获取title的文本内容
+ 定义 文本 = 子.第一子节点
+ 如果 (文本 != 0 && 文本.节点类型 == TEXT_节点) {
+ 定义 标题文本 = CharacterData_data(文本)
+ 如果 (标题文本 != 0) {
+ tab.标题 = 字符串_复制(标题文本)
+ }
+ }
+ 返回
+ }
+ }
+ 子 = 子.后一兄弟
+ }
+}
+
+函数 渲染管线_收集样式表(tab) {
+ // 遍历DOM中的<style>和<link rel="stylesheet">
+ 定义 head = Document_获取head(tab.文档)
+ 如果 (head == 0) { 返回 }
+ 定义 可变 子 = head.第一子节点
+ 当 (子 != 0) {
+ 如果 (子.节点类型 == 元素_节点) {
+ 定义 扩展 = 元素_获取扩展(子)
+ 如果 (扩展 != 0) {
+ // <style> 内联样式表
+ 如果 (扩展.标签名原子 == 原子_style) {
+ 定义 css文本节点 = 子.第一子节点
+ 如果 (css文本节点 != 0 && css文本节点.节点类型 == TEXT_节点) {
+ 定义 css文本 = CharacterData_data(css文本节点)
+ 如果 (css文本 != 0) {
+ 样式Engine_添加样式表(tab.样式引擎, css文本)
+ }
+ }
+ }
+ // <link rel="stylesheet" href="...">
+ 如果 (扩展.标签名原子 == 原子_link) {
+ 定义 rel = 元素_getAttribute(子, "rel")
+ 定义 href = 元素_getAttribute(子, "href")
+ 如果 (rel != 0 && 字符串_相等(rel, "stylesheet") && href != 0) {
+ // 加载外部CSS
+ 定义 loader = ResourceLoader_创建(href, 资源类型_样式表)
+ ResourceLoader_开始加载(loader)
+ 如果 (loader.状态 == 请求状态_完成) {
+ 样式Engine_添加样式表(tab.样式引擎, loader.接收缓冲)
+ }
+ }
+ }
+ }
+ }
+ 子 = 子.后一兄弟
+ }
+
+ // 也查找<body>中的<style>
+ 定义 body = Document_获取body(tab.文档)
+ 如果 (body != 0) {
+ 渲染管线_收集内联样式_递归(tab, body)
+ }
+}
+
+函数 渲染管线_收集内联样式_递归(tab, 节点) {
+ 如果 (节点 == 0) { 返回 }
+ 如果 (节点.节点类型 == 元素_节点) {
+ 定义 扩展 = 元素_获取扩展(节点)
+ 如果 (扩展 != 0 && 扩展.标签名原子 == 原子_style) {
+ 定义 css文本节点 = 节点.第一子节点
+ 如果 (css文本节点 != 0 && css文本节点.节点类型 == TEXT_节点) {
+ 定义 css文本 = CharacterData_data(css文本节点)
+ 如果 (css文本 != 0) {
+ 样式Engine_添加样式表(tab.样式引擎, css文本)
+ }
+ }
+ }
+ }
+ 定义 可变 子 = 节点.第一子节点
+ 当 (子 != 0) {
+ 渲染管线_收集内联样式_递归(tab, 子)
+ 子 = 子.后一兄弟
+ }
+}

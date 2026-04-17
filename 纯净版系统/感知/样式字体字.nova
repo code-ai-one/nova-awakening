@@ -1,0 +1,173 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./扩展归档逻辑.nova")
+导入("./超传头部创.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/创建甲.nova")
+
+//       font_face.cc (~800行)
+//       font_face_set.cc (~600行)
+//       css_font_face_rule.cc (~300行)
+//       font_cache.cc (~1500行)
+//       font_description.cc 
+// @font-face:
+//   @font-face {
+//     font-family: 'My字体';
+//     src: url('font.woff2') format('woff2'),
+//          url('font.woff') format('woff');
+//     font-weight: 400 700;      // 范围
+//     font-style: normal;
+//     font-display: swap;        // auto|block|swap|fallback|optional
+//     unicode-range: U+0025-00FF;
+//   }
+// 字体 Loading 接口:
+//   document.fonts — 字体FaceSet
+//   const face = new 字体Face('My字体', 'url(font.woff2)')
+//   await face.load()
+//   document.fonts.add(face)
+//   document.fonts.check('16px My字体') — 检查字体是否可用
+//   document.fonts.ready — 承诺(所有字体加载完成)
+// CSS Logical Properties:
+//   margin-inline-start / margin-inline-end
+//   margin-block-start / margin-block-end
+//   padding-inline / padding-block
+//   border-inline-start / border-block-end
+//   inline-size / block-size (代替width/height)
+//   inset-inline-start (代替left/right)
+//   text-align: start / end
+
+// §1 @font-face — 字体描述符
+
+定义 FONT_DISPLAY_AUTO      = 0
+定义 FONT_DISPLAY_BLOCK     = 1
+定义 FONT_DISPLAY_SWAP      = 2
+定义 FONT_DISPLAY_FALLBACK  = 3
+定义 FONT_DISPLAY_OPTIONAL  = 4
+
+定义 FF_STATUS_UNLOADED  = 0
+定义 FF_STATUS_LOADING   = 1
+定义 FF_STATUS_LOADED    = 2
+定义 FF_STATUS_ERROR     = 3
+
+结构 字体FaceSource {
+    URL,    // u64 字体文件URL
+    格式,    // u64 "woff2"/"woff"/"truetype"/"opentype"
+    下一个,    // u64 字体FaceSource* (多源)
+}
+
+结构 字体Face {
+    家族名,    // u64 font-family
+    // 源
+    源列表,    // u64 字体FaceSource*
+    源数量,
+    // 描述符
+    粗细_最小,    // u32 font-weight范围 (100-900)
+    粗细_最大,
+    风格,    // u32 0=normal 1=italic 2=oblique
+    拉伸,    // u32 font-stretch (50-200%)
+    显示策略,    // u32 FONT_DISPLAY_xxx
+    // Unicode范围
+    unicode范围,    // u64 [起始, 结束] 对数组
+    unicode范围数,
+    // 加载状态
+    状态,    // u32 FF_STATUS_xxx
+    // 加载后的字体数据
+    字体数据,    // u64 二进制字体数据(woff2解码后)
+    字体数据大小,
+    // 平台字体句柄
+    平台字体,    // u64 FreeType FT_Face 等
+    // 承诺
+    加载承诺,    // u64 承诺*
+    // 加载时间
+    加载开始时间,
+    // 引用计数
+    引用计数,
+}
+
+函数 字体Face_创建(家族名, 源URL) {
+    定义 ff = 堆_分配(字体Face)
+    ff.家族名 = 字符串_复制(家族名)
+    ff.源列表 = 0; ff.源数量 = 0
+    ff.粗细_最小 = 400; ff.粗细_最大 = 400
+    ff.风格 = 0; ff.拉伸 = 100
+    ff.显示策略 = FONT_DISPLAY_AUTO
+    ff.unicode范围 = 0; ff.unicode范围数 = 0
+    ff.状态 = FF_STATUS_UNLOADED
+    ff.字体数据 = 0; ff.字体数据大小 = 0; ff.平台字体 = 0
+    ff.加载承诺 = 0; ff.加载开始时间 = 0
+    ff.引用计数 = 1
+
+    // 添加源
+    如果 (源URL != 0) {
+        字体Face_添加源(ff, 源URL, 0)
+    }
+
+    返回 ff
+}
+
+函数 字体Face_添加源(ff, url, 格式) {
+    如果 (ff == 0) { 返回 }
+    定义 src = 堆_分配(字体FaceSource)
+    src.URL = 字符串_复制(url)
+    src.格式 = 格式 != 0 ? 字符串_复制(格式) : 0
+    src.下一个 = ff.源列表
+    ff.源列表 = src
+    ff.源数量 = ff.源数量 + 1
+}
+
+函数 字体Face_load(ff) {
+    如果 (ff == 0) { 返回 0 }
+    如果 (ff.状态 == FF_STATUS_LOADED) { 返回 ff.加载承诺 }
+    如果 (ff.状态 == FF_STATUS_LOADING) { 返回 ff.加载承诺 }
+
+    ff.状态 = FF_STATUS_LOADING
+    ff.加载开始时间 = 平台_获取高精度时间()
+
+    // 逐个尝试源
+    定义 可变 src = ff.源列表
+    当 (src != 0) {
+        定义 数据 = 网络_获取字体(src.URL)
+        如果 (数据 != 0 && 数据.长度 > 0) {
+            ff.字体数据 = 数据.数据
+            ff.字体数据大小 = 数据.长度
+
+            // WOFF2解码(如果需要)
+            如果 (src.格式 != 0 && 字符串_相等(src.格式, "woff2")) {
+                ff.字体数据 = WOFF2_解码(ff.字体数据, ff.字体数据大小)
+            }
+
+            // 创建平台字体
+            ff.平台字体 = FreeType_创建字体(ff.字体数据, ff.字体数据大小)
+            如果 (ff.平台字体 != 0) {
+                ff.状态 = FF_STATUS_LOADED
+                返回 ff.加载承诺
+            }
+        }
+        src = src.下一个
+    }
+
+    ff.状态 = FF_STATUS_ERROR
+    返回 ff.加载承诺
+}
+
+函数 字体Face_匹配(ff, 家族名, 粗细, 风格) {
+    如果 (ff == 0) { 返回 假 }
+    如果 (!字符串_相等_不区分大小写(ff.家族名, 家族名)) { 返回 假 }
+    如果 (粗细 < ff.粗细_最小 || 粗细 > ff.粗细_最大) { 返回 假 }
+    如果 (风格 != ff.风格 && ff.风格 != 0) { 返回 假 }
+    返回 真
+}
+
+定义 可变 AI_样式字体字_样式缓存命中 = 0
+
+函数 AI_样式字体字_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_样式字体字_布局缓存(元素哈希) {
+    AI_样式字体字_样式缓存命中 = AI_样式字体字_样式缓存命中 + 1
+    返回 元素哈希
+}

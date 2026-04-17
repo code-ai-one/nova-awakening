@@ -1,0 +1,204 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式.nova")
+导入("./取数网络请.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/辅助存根.nova")
+导入("./内核直连层.nova")
+导入("../中枢/字符串替换.nova")
+
+// §4 Custom 元素s — 自定义元素注册表
+// (对应 Custom元素Registry)
+// class My元素 extends HTML元素 {
+// connectedCallback() { ... }
+// disconnectedCallback() { ... }
+// attributeChangedCallback(name, old, new) { ... }
+// static get observedAttributes() { return ['attr1'] }
+// }
+// custom元素s.define('my-元素', My元素)
+
+结构 Custom元素Definition {
+ 名称,    // u64 标签名 (如 "my-component")
+ 构造函数,    // u64 JS类(JSValue* Function)
+ // 生命周期回调
+ connectedCallback,    // u64 JS函数
+ disconnectedCallback,
+ attributeChangedCallback,
+ adoptedCallback,
+ // 观察属性
+ 观察属性,    // u64 字符串数组
+ 观察属性数量,
+ // 扩展
+ extends,    // u64 继承的内置标签(is="...")
+ // 状态
+ 已定义,
+}
+
+结构 Custom元素Registry {
+ 定义列表,    // u64 Custom元素Definition*数组
+ 定义数量,
+ 定义容量,
+ // whenDefined 承诺
+ 等待列表,    // u64 [名称, 承诺] 对
+ 等待数量,
+}
+
+定义 可变 全局自定义元素注册表 = 0
+
+
+函数 Custom元素Registry_获取() {
+ 如果 (全局自定义元素注册表 == 0) {
+ 全局自定义元素注册表 = 堆_分配(Custom元素Registry)
+ 全局自定义元素注册表.定义容量 = 128
+ 全局自定义元素注册表.定义列表 = 堆_分配_数组(128 * 8)
+ 全局自定义元素注册表.定义数量 = 0
+ 全局自定义元素注册表.等待列表 = 堆_分配_数组(32 * 16)
+ 全局自定义元素注册表.等待数量 = 0
+ }
+ 返回 全局自定义元素注册表
+}
+
+函数 Custom元素s_define(名称, 构造函数, 选项) {
+ 定义 registry = Custom元素Registry_获取()
+
+ // 验证名称: 必须包含-,不能以-开头,不能是保留名
+ 如果 (!Custom元素s_验证名称(名称)) { 返回 }
+
+ // 检查重复
+ 如果 (Custom元素s_查找(名称) != 0) { 返回 }
+
+ // 创建定义
+ 定义 def = 堆_分配(Custom元素Definition)
+ def.名称 = 字符串_复制(名称)
+ def.构造函数 = 构造函数
+ def.connectedCallback = 0
+ def.disconnectedCallback = 0
+ def.attributeChangedCallback = 0
+ def.adoptedCallback = 0
+ def.观察属性 = 0; def.观察属性数量 = 0
+ def.extends = 0; def.已定义 = 真
+
+ // 从构造函数原型提取回调
+ 如果 (构造函数 != 0) {
+ 定义 原型 = Nova对象_获取属性(0, 构造函数, "prototype")
+ 如果 (原型 != 0) {
+ def.connectedCallback = Nova对象_获取属性(0, 原型, "connectedCallback")
+ def.disconnectedCallback = Nova对象_获取属性(0, 原型, "disconnectedCallback")
+ def.attributeChangedCallback = Nova对象_获取属性(0, 原型, "attributeChangedCallback")
+ def.adoptedCallback = Nova对象_获取属性(0, 原型, "adoptedCallback")
+ }
+ // observedAttributes
+ 定义 oa = Nova对象_获取属性(0, 构造函数, "observedAttributes")
+ 如果 (oa != 0) {
+ def.观察属性 = oa
+ // 读取observedAttributes数组内容
+ }
+ }
+
+ // extends选项
+ 如果 (选项 != 0) {
+ 定义 ext = Nova对象_获取属性(0, 选项, "extends")
+ 如果 (ext != 0) { def.extends = ext }
+ }
+
+ // 注册
+ 如果 (registry.定义数量 < registry.定义容量) {
+ 内存_写64(registry.定义列表 + registry.定义数量 * 8, def)
+ registry.定义数量 = registry.定义数量 + 1
+ }
+
+ // 升级已有的未定义元素
+ Custom元素s_升级已有(def)
+
+ // 解析whenDefined等待
+ Custom元素s_解析等待(名称)
+}
+
+函数 Custom元素s_查找(名称) {
+ 定义 registry = Custom元素Registry_获取()
+ 定义 可变 i = 0
+ 当 (i < registry.定义数量) {
+ 定义 def = 内存_读64(registry.定义列表 + i * 8)
+ 如果 (def != 0 && 字符串_相等(def.名称, 名称)) { 返回 def }
+ i = i + 1
+ }
+ 返回 0
+}
+
+函数 Custom元素s_get(名称) {
+ 定义 def = Custom元素s_查找(名称)
+ 如果 (def != 0) { 返回 def.构造函数 }
+ 返回 0
+}
+
+函数 Custom元素s_验证名称(名称) {
+ 如果 (名称 == 0) { 返回 假 }
+ 定义 长度 = 字符串_长度(名称)
+ 如果 (长度 < 2) { 返回 假 }
+
+ // 第一个字符必须是小写字母
+ 定义 首字符 = 内存_读8(名称)
+ 如果 (首字符 < 0x61 || 首字符 > 0x7A) { 返回 假 }
+
+ // 必须包含-
+ 定义 可变 有连字符 = 假
+ 定义 可变 i = 0
+ 当 (i < 长度) {
+ 如果 (内存_读8(名称 + i) == 0x2D) { 有连字符 = 真 }
+ i = i + 1
+ }
+ 如果 (!有连字符) { 返回 假 }
+
+ // 不能是保留名
+ 如果 (字符串_相等(名称, "annotation-xml") || 字符串_相等(名称, "color-profile") ||
+ 字符串_相等(名称, "font-face") || 字符串_相等(名称, "font-face-src") ||
+ 字符串_相等(名称, "font-face-uri") || 字符串_相等(名称, "font-face-format") ||
+ 字符串_相等(名称, "font-face-name") || 字符串_相等(名称, "missing-glyph")) {
+ 返回 假
+ }
+
+ 返回 真
+}
+
+函数 Custom元素s_升级已有(def) {
+ 如果 (def == 0 || def.名称 == 0) { 返回 }
+ // 遍历文档中所有标签名匹配的未升级元素
+ 定义 文档 = Document_获取当前()
+ 如果 (文档 == 0) { 返回 }
+ 定义 匹配列表 = DOM_查找所有标签(文档, def.名称)
+ 定义 可变 i = 0
+ 当 (i < 计数(匹配列表)) {
+ 定义 元素 = 匹配列表[i]
+ 如果 (元素 != 0 && !元素.已升级) {
+ 元素.已升级 = 真
+ 元素.自定义元素定义 = def
+ // 调用构造函数升级
+ 如果 (def.构造函数 != 0) {
+ Nova函数_Call_简(def.Nova运行时实例, def.构造函数)
+ }
+ // 触发connectedCallback
+ 如果 (def.connected回调 != 0 && 元素.已连接) {
+ Nova函数_Call_简(def.Nova运行时实例, def.connected回调)
+ }
+ }
+ i = i + 1
+ }
+}
+
+函数 Custom元素s_解析等待(名称) {
+ 定义 registry = Custom元素Registry_获取()
+ 定义 可变 i = 0
+ 当 (i < registry.等待数量) {
+ 定义 偏移 = registry.等待列表 + i * 16
+ 定义 等待名 = 内存_读64(偏移)
+ 如果 (字符串_相等(等待名, 名称)) {
+ 定义 promise = 内存_读64(偏移 + 8)
+ // resolve promise
+ 如果 (promise != 0) {
+ Nova承诺_resolve(0, promise, 0)
+ }
+ }
+ i = i + 1
+ }
+}

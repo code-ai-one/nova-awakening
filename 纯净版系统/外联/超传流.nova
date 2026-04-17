@@ -1,0 +1,141 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./处理超传.nova")
+导入("../中枢/辅助有符号读.nova")
+
+// §3 HTTP/2流(Stream)
+
+结构 H2Stream {
+    流ID,
+    状态,    // u32 H2_STREAM_xxx
+    // 请求
+    方法,
+    路径,
+    请求头,
+    请求体,
+    请求体长度,
+    // 响应
+    状态码,
+    响应头,
+    响应体,    // u64 缓冲区
+    响应体长度,
+    响应体容量,
+    // 流量控制
+    本地窗口,    // i32 本地接收窗口
+    远端窗口,    // i32 远端接收窗口
+    // 优先级
+    依赖流,    // u32 依赖的流ID
+    权重,    // u32 1-256
+    独占,
+    // 回调
+    on_headers,
+    on_data,
+    on_complete,
+}
+
+// §4 HTTP/2会话(Session)
+
+结构 H2Session {
+    // 连接
+    socket_fd,
+    安全上下文,
+    // 流管理
+    流列表,    // u64 H2Stream*数组
+    流数量,
+    流容量,
+    下一个流ID,    // u32 客户端用奇数, 服务端用偶数
+    // 连接级设置
+    本地设置,    // u64 H2Settings*
+    远端设置,
+    // 连接级流量控制
+    连接窗口_本地,    // i32 65535初始
+    连接窗口_远端,
+    // HPACK
+    编码器,    // u64 HPACK编码器
+    解码器,    // u64 HPACK解码器
+    // 状态
+    已关闭,
+    最后流ID,
+    // 接收缓冲
+    接收缓冲,
+    接收长度,
+    接收容量,
+}
+
+结构 H2Settings {
+    header_table_size,    // u32 4096 默认
+    enable_push,    // 布尔 1
+    max_concurrent_streams,    // u32 无限默认
+    initial_window_size,    // u32 65535
+    max_frame_size,    // u32 16384
+    max_header_list_size,    // u32 无限默认
+}
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 H2Session_创建(socket_fd, tls) {
+    定义 s = 堆_分配(H2Session)
+    s.socket_fd = socket_fd
+    s.安全上下文 = tls
+    s.流容量 = 256
+    s.流列表 = 堆_分配_数组(256 * 8)
+    s.流数量 = 0
+    s.下一个流ID = 1    // 客户端从1开始
+
+    // 默认设置
+    s.本地设置 = H2Settings_默认()
+    s.远端设置 = H2Settings_默认()
+    s.连接窗口_本地 = 65535
+    s.连接窗口_远端 = 65535
+
+    // HPACK
+    s.编码器 = HPACK_编码器_创建(4096)
+    s.解码器 = HPACK_解码器_创建(4096)
+
+    s.已关闭 = 假
+    s.接收容量 = 65536
+    s.接收缓冲 = 堆_分配(65536)
+    s.接收长度 = 0
+
+    // 发送连接前言 "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    H2Session_发送前言(s)
+    // 发送SETTINGS帧
+    H2Session_发送Settings(s)
+
+    返回 s
+}
+
+函数 H2Settings_默认() {
+    定义 settings = 堆_分配(H2Settings)
+    settings.header_table_size = 4096
+    settings.enable_push = 真
+    settings.max_concurrent_streams = 100
+    settings.initial_window_size = 65535
+    settings.max_frame_size = 16384
+    settings.max_header_list_size = 0xFFFFFFFF
+    返回 settings
+}
+
+函数 H2Session_发送前言(s) {
+    如果 (s == 0) { 返回 }
+    定义 前言 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    安全_发送(s.安全上下文, 前言, 24)
+}
+
+函数 H2Session_发送Settings(s) {
+    如果 (s == 0) { 返回 }
+    // 编码SETTINGS帧: 6字节/项 (id:16bit + value:32bit)
+    定义 载荷 = 堆_分配(36)    // 最多6项
+    定义 可变 偏移 = 0
+    // HEADER_TABLE_SIZE
+    内存_写16_大端(载荷 + 偏移, 1); 内存_写32_大端(载荷 + 偏移 + 2, 4096); 偏移 = 偏移 + 6
+    // MAX_CONCURRENT_STREAMS
+    内存_写16_大端(载荷 + 偏移, 3); 内存_写32_大端(载荷 + 偏移 + 2, 100); 偏移 = 偏移 + 6
+    // INITIAL_WINDOW_SIZE
+    内存_写16_大端(载荷 + 偏移, 4); 内存_写32_大端(载荷 + 偏移 + 2, 65535); 偏移 = 偏移 + 6
+
+    定义 帧 = H2Frame {}
+    帧.类型 = H2_FRAME_SETTINGS; 帧.标志 = 0; 帧.流ID = 0
+    帧.长度 = 偏移; 帧.有效载荷 = 载荷
+    H2Session_发送帧(s, 帧)
+}

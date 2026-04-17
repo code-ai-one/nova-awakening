@@ -1,0 +1,105 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §3 VAO (Vertex 数组 Object)
+
+结构 VertexAttrib {
+    启用,
+    缓冲ID,    // u32 绑定的VBO
+    大小,    // u8 1/2/3/4
+    类型,    // u16 GL_FLOAT/GL_INT/...
+    归一化,
+    步幅,
+    偏移,
+    除数,    // u32 instanced drawing divisor
+}
+
+结构 VAO {
+    ID,
+    属性,    // [16]VertexAttrib
+    索引缓冲ID,    // u32 绑定的EBO
+    已删除,
+}
+
+定义 可变 VAO_池 = 0
+定义 可变 VAO_池大小 = 0
+定义 可变 VAO_池容量 = 0
+定义 可变 VAO_下一个ID = 1
+定义 可变 当前VAO = 0
+
+函数 图绘2_createVertex数组() {
+    如果 (VAO_池 == 0) {
+        VAO_池容量 = 64
+        VAO_池 = 堆_分配_数组(64 * 大小of(VAO))
+        VAO_池大小 = 0
+    }
+    如果 (VAO_池大小 >= VAO_池容量) { 返回 0 }
+    定义 vao = VAO_池 + VAO_池大小 * 大小of(VAO)
+    vao.ID = VAO_下一个ID; VAO_下一个ID = VAO_下一个ID + 1
+    vao.索引缓冲ID = 0; vao.已删除 = 假
+    定义 可变 i = 0
+    当 (i < 16) { vao.属性[i].启用 = 假; i = i + 1 }
+    VAO_池大小 = VAO_池大小 + 1
+    返回 vao.ID
+}
+
+函数 图绘2_bindVertex数组(id) {
+    如果 (id == 0) { 当前VAO = 0; 返回 }
+    定义 可变 i = 0
+    当 (i < VAO_池大小) {
+        定义 vao = VAO_池 + i * 大小of(VAO)
+        如果 (vao.ID == id && !vao.已删除) { 当前VAO = vao; 返回 }
+        i = i + 1
+    }
+}
+
+函数 图绘2_deleteVertex数组(id) {
+    定义 可变 i = 0
+    当 (i < VAO_池大小) {
+        定义 vao = VAO_池 + i * 大小of(VAO)
+        如果 (vao.ID == id) { vao.已删除 = 真; 返回 }
+        i = i + 1
+    }
+}
+
+函数 图绘2_vertexAttribDivisor(index, divisor) {
+    如果 (当前VAO == 0 || index >= 16) { 返回 }
+    当前VAO.属性[index].除数 = divisor
+}
+
+// §4 UBO (Uniform Buffer Object)
+
+结构 Uniform块级 {
+    名称,
+    绑定点,
+    缓冲ID,
+    偏移,
+    大小,
+}
+
+定义 可变 UBO_绑定点 = [64]u64    // 缓冲绑定表(最多64个绑定点)
+
+函数 图绘2_uniform块级Binding(program, blockIndex, blockBinding) {
+    // 将program中的uniform block绑定到指定绑定点
+    如果 (program == 0 || blockBinding >= 64) { 返回 }
+}
+
+函数 图绘2_bindBufferBase(target, index, buffer) {
+    如果 (target == GL_UNIFORM_BUFFER && index < 64) {
+        UBO_绑定点[index] = buffer
+    } 否则 如果 (target == GL_TRANSFORM_FEEDBACK_BUFFER) {
+        // TF缓冲绑定
+    }
+}
+
+函数 图绘2_bindBufferRange(target, index, buffer, offset, size) {
+    如果 (target == GL_UNIFORM_BUFFER && index < 64) {
+        UBO_绑定点[index] = buffer
+        // 记录偏移和大小
+    }
+}
+
+函数 图绘2_getUniform块级Index(program, blockName) {
+    如果 (program == 0 || blockName == 0) { 返回 0xFFFFFFFF }
+    返回 0
+}

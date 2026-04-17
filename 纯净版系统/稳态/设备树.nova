@@ -1,0 +1,211 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. ACPI: x86平台标准的硬件描述(RSDP→RSDT→MADT/FADT等)
+//   2. MADT: 多处理器接口C描述(CPU/IO-接口C列表)
+//   3. FADT: 固定ACPI描述(PM Timer/电源管理端口)
+//   4. MCFG: PCIe配置空间基址
+//   5. 用于: CPU枚举/中断路由/电源管理/PCI配置
+
+定义 ACPI_SIG_RSDP = "RSD PTR "
+定义 ACPI_SIG_RSDT = "RSDT"
+定义 ACPI_SIG_XSDT = "XSDT"
+定义 ACPI_SIG_MADT = "接口C"
+定义 ACPI_SIG_FADT = "FACP"
+定义 ACPI_SIG_MCFG = "MCFG"
+定义 ACPI_SIG_HPET = "HPET"
+
+结构 ACPI_RSDP {
+    签名,    // 字符串 "RSD PTR "
+    校验和,
+    OEM_ID,
+    版本,    // u8 0=ACPI1.0, 2=ACPI2.0+
+    RSDT地址,    // u32 RSDT物理地址
+    XSDT地址,    // u64 XSDT物理地址(ACPI2.0+)
+}
+
+定义 MADT_LOCAL_接口C     = 0    // 本地接口C(每个CPU一个)
+定义 MADT_IO_接口C        = 1    // IO 接口C
+定义 MADT_INT_OVERRIDE   = 2    // 中断源覆盖
+定义 MADT_LOCAL_接口C_NMI = 4    // 本地接口C NMI
+
+结构 ACPI_CPU {
+    接口C_ID,
+    处理器ID,
+    可用,
+}
+
+定义 可变 acpi_rsdp = 空
+定义 可变 acpi_cpu列表 = []
+定义 可变 acpi_ioapic地址 = 0
+定义 可变 acpi_lapic地址 = 0xFEE00000   // 默认Local 接口C地址
+
+// RSDP查找 (在BIOS区域搜索)
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 acpi_查找RSDP() {
+    // 搜索EBDA(0x40E指向的地址)和BIOS ROM(0xE0000-0xFFFFF)
+    定义 可变 地址 = 0xE0000
+    当 (地址 < 0x100000) {
+        // 检查签名 "RSD PTR "
+        如果 (内存读64(地址) == 0x2052545020445352) {   // "RSD PTR " in little-endian
+            内核信息("ACPI: 找到RSDP @ 0x" + hex32(地址))
+            返回 地址
+        }
+        地址 = 地址 + 16   // 16字节对齐搜索
+    }
+    内核警告("ACPI: 未找到RSDP")
+    返回 0
+}
+
+// MADT解析 (获取CPU和IO 接口C信息)
+
+函数 acpi_解析MADT(madt地址) {
+    如果 (madt地址 == 0) { 返回 }
+    // MADT头: 签名(4)+长度(4)+版本(1)+校验和(1)+OEM(6)+...
+    // 偏移36: Local 接口C地址(4字节)
+    acpi_lapic地址 = 内存读32(madt地址 + 36)
+    内核信息("ACPI: Local 接口C @ 0x" + hex32(acpi_lapic地址))
+
+    // 偏移44开始: MADT条目列表
+    定义 总长度 = 内存读32(madt地址 + 4)
+    定义 可变 偏移 = 44
+    当 (偏移 < 总长度) {
+        定义 类型 = 内存读8(madt地址 + 偏移)
+        定义 长度 = 内存读8(madt地址 + 偏移 + 1)
+        如果 (长度 == 0) { 中断 }
+
+        如果 (类型 == MADT_LOCAL_接口C) {
+            定义 处理器ID = 内存读8(madt地址 + 偏移 + 2)
+            定义 apic_id = 内存读8(madt地址 + 偏移 + 3)
+            定义 标志 = 内存读32(madt地址 + 偏移 + 4)
+            如果 ((标志 & 1) != 0) {   // bit0=处理器可用
+                定义 cpu = ACPI_CPU {}
+                cpu.接口C_ID = apic_id
+                cpu.处理器ID = 处理器ID
+                cpu.可用 = 1
+                追加(acpi_cpu列表, cpu)
+                内核信息("ACPI: CPU " + 整数转字符串(处理器ID) + " 接口C=" + 整数转字符串(apic_id))
+            }
+        }
+        否则 如果 (类型 == MADT_IO_接口C) {
+            acpi_ioapic地址 = 内存读32(madt地址 + 偏移 + 4)
+            内核信息("ACPI: IO 接口C @ 0x" + hex32(acpi_ioapic地址))
+        }
+
+        偏移 = 偏移 + 长度
+    }
+    内核信息("ACPI: 检测到 " + 整数转字符串(计数(acpi_cpu列表)) + " 个CPU")
+}
+
+// ACPI初始化入口
+
+函数 acpi_初始化() {
+    定义 rsdp = acpi_查找RSDP()
+    如果 (rsdp == 0) { 返回 }
+
+    // 读取RSDT地址
+    定义 rsdt = 内存读32(rsdp + 16)
+    内核信息("ACPI: RSDT @ 0x" + hex32(rsdt))
+
+    // 遍历RSDT中的表指针, 查找MADT
+    定义 rsdt长度 = 内存读32(rsdt + 4)
+    定义 条目数 = (rsdt长度 - 36) / 4
+    定义 可变 i = 0
+    当 (i < 条目数) {
+        定义 表地址 = 内存读32(rsdt + 36 + i * 4)
+        定义 签名 = 内存读32(表地址)
+        如果 (签名 == 0x43495041) {   // "接口C" = MADT
+            acpi_解析MADT(表地址)
+        }
+        i = i + 1
+    }
+}
+
+// 查询
+
+函数 acpi_CPU数() { 返回 计数(acpi_cpu列表) }
+函数 acpi_L接口C地址() { 返回 acpi_lapic地址 }
+函数 acpi_IO接口C地址() { 返回 acpi_ioapic地址 }
+
+函数 hex32(值) {
+    定义 可变 s = ""
+    定义 可变 i = 0
+    当 (i < 8) {
+        定义 d = (值 >> (28 - i * 4)) & 0xF
+        如果 (d < 10) { s = s + 字符(48 + d) }
+        否则 { s = s + 字符(87 + d) }
+        i = i + 1
+    }
+    返回 s
+}
+
+// ACPI表校验和验证
+
+函数 acpi_验证校验和(表地址) {
+    定义 长度 = 内存读32(表地址 + 4)
+    如果 (长度 == 0 || 长度 > 0x100000) { 返回 假 }
+    定义 可变 和 = 0
+    定义 可变 i = 0
+    当 (i < 长度) {
+        和 = 和 + 内存读8(表地址 + i)
+        i = i + 1
+    }
+    返回 (和 & 0xFF) == 0
+}
+
+// ACPI表查找 (通用)
+
+函数 acpi_查找表(签名32) {
+    定义 rsdp = acpi_查找RSDP()
+    如果 (rsdp == 0) { 返回 0 }
+    定义 rsdt = 内存读32(rsdp + 16)
+    定义 rsdt长度 = 内存读32(rsdt + 4)
+    定义 条目数 = (rsdt长度 - 36) / 4
+    定义 可变 i = 0
+    当 (i < 条目数) {
+        定义 表地址 = 内存读32(rsdt + 36 + i * 4)
+        如果 (内存读32(表地址) == 签名32) {
+            返回 表地址
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+// CPU按接口C ID查找
+
+函数 acpi_CPU查找(apic_id) {
+    定义 可变 i = 0
+    当 (i < 计数(acpi_cpu列表)) {
+        如果 (acpi_cpu列表[i].接口C_ID == apic_id) {
+            返回 acpi_cpu列表[i]
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 acpi_BSP_接口C_ID() {
+    如果 (计数(acpi_cpu列表) > 0) { 返回 acpi_cpu列表[0].接口C_ID }
+    返回 0
+}
+
+// 完整统计
+
+函数 acpi_完整统计() {
+    返回 [计数(acpi_cpu列表), acpi_BSP_接口C_ID()]
+}
+
+定义 可变 AI_设备树_故障预警数 = 0
+
+函数 AI_设备树_设备健康(错误率, 响应时间, 温度) {
+    定义 可变 分 = 1000
+    如果 (错误率 > 10) { 分 = 分 - 错误率 * 5 }
+    如果 (响应时间 > 1000) { 分 = 分 - 200 }
+    如果 (温度 > 80) { 分 = 分 - 300 }
+    如果 (分 < 300) { AI_设备树_故障预警数 = AI_设备树_故障预警数 + 1 }
+    返回 分
+}

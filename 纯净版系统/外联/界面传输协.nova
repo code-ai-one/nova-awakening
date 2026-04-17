@@ -1,0 +1,316 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/哈希整数.nova")
+导入("../中枢/主循环.nova")
+导入("../推理/总线调度.nova")
+导入("../中枢/新系统张量乙.nova")
+导入("../中枢/环形缓冲.nova")
+
+// NovaOS QUIC传输协议 — HTTP/3底层传输
+// 标准: Nova协议规范 9000 (QUIC), Nova协议规范 9114 (HTTP/3), Nova协议规范 9001 (QUIC-安全)
+// 核心创新(相对传控+安全):
+//   - 0-Nova往返时间连接建立(安全 1.3集成到传输层)
+//   - 多路复用无队头阻塞(每个流独立)
+//   - 连接迁移(Connection ID, 换WiFi不断线)
+//   - 前向纠错(FEC可选)
+//   - 基于数报, 用户态可控拥塞算法
+// NovaOS创新: AI拥塞预测 + 神经网络丢包恢复
+
+
+定义 QUIC_VERSION_1 = 0x00000001   // Nova协议规范 9000
+定义 QUIC_VERSION_2 = 0x6B3343CF   // Nova协议规范 9369
+定义 QUIC_最大数据报 = 1350        // 数报负载上限(考虑IPv6)
+定义 QUIC_初始窗口 = 14720         // 初始拥塞窗口(10个包)
+定义 QUIC_最小窗口 = 2 * 1350
+定义 QUIC_最大流ID = 0x3FFFFFFFFFFFFFFF
+定义 QUIC_空闲超时 = 30000         // 30秒
+
+// 包类型
+定义 QUIC_PKT_INITIAL   = 0        // 初始握手
+定义 QUIC_PKT_0Nova往返时间      = 1        // 0-Nova往返时间早期数据
+定义 QUIC_PKT_HANDSHAKE = 2        // 握手完成
+定义 QUIC_PKT_RETRY     = 3        // 重试(地址验证)
+定义 QUIC_PKT_1Nova往返时间      = 4        // 短包头(数据传输)
+
+// 帧类型
+定义 QUIC_FRAME_PADDING       = 0x00
+定义 QUIC_FRAME_PING          = 0x01
+定义 QUIC_FRAME_ACK           = 0x02
+定义 QUIC_FRAME_CRYPTO        = 0x06
+定义 QUIC_FRAME_NEW_令牌     = 0x07
+定义 QUIC_FRAME_STREAM        = 0x08  // 0x08-0x0f
+定义 QUIC_FRAME_MAX_DATA      = 0x10
+定义 QUIC_FRAME_MAX_STREAM    = 0x12
+定义 QUIC_FRAME_CONN_CLOSE    = 0x1C
+定义 QUIC_FRAME_HANDSHAKE_DONE = 0x1E
+定义 QUIC_FRAME_NEW_CONN_ID   = 0x18
+定义 QUIC_FRAME_PATH_CHALLENGE = 0x1A
+定义 QUIC_FRAME_PATH_RESPONSE  = 0x1B
+
+// 流状态
+定义 流状态_空闲   = 0
+定义 流状态_打开   = 1
+定义 流状态_半关闭 = 2
+定义 流状态_关闭   = 3
+
+
+结构 QUIC连接 {
+    // 连接标识
+    本地CID,    // u64 Connection ID (支持迁移)
+    远程CID,
+    版本,
+    // 安全 1.3状态
+    安全状态,    // u64 安全握手上下文
+    加密级别,    // u32 0=初始 1=握手 2=1-Nova往返时间
+    已握手完成,
+    // 0-Nova往返时间
+    可以0Nova往返时间,
+    PSK,    // u64 预共享密钥(恢复会话)
+    早期数据,
+    // 流管理
+    流表,    // u64 哈希Map<流ID, QUIC流>
+    下一个本地双向流,
+    下一个本地单向流,
+    // 拥塞控制
+    拥塞窗口,
+    慢启动阈值,
+    在途字节,
+    Nova往返时间平滑,    // u64 平滑Nova往返时间(微秒)
+    Nova往返时间变化,    // u64 Nova往返时间方差
+    Nova往返时间最小,
+    拥塞算法,    // u32 0=NewNova经典, 1=Nova三次方, 2=Nova带宽v2
+
+    // 丢包检测
+    最大已确认,
+    丢包超时,
+    PTO计数,    // u32 Probe Timeout次数
+
+    // 流控
+    最大数据_本地,
+    最大数据_远程,
+    已发送数据,
+    已接收数据,
+    // 路径
+    本地地址,
+    远程地址,
+    路径MTU,
+    // AI增强
+    AI拥塞预测,
+}
+
+
+函数 QUIC_连接_创建(远程地址, 远程端口) {
+    定义 可变 conn = QUIC连接 {}
+    conn.本地CID = 加密_随机64()
+    conn.远程CID = 0
+    conn.版本 = QUIC_VERSION_1
+    conn.已握手完成 = 假
+
+    // 初始化安全 1.3
+    conn.安全状态 = 安全13_客户端_创建()
+
+    // 初始化拥塞控制(默认Nova带宽v2)
+    conn.拥塞算法 = 2
+    conn.拥塞窗口 = QUIC_初始窗口
+    conn.慢启动阈值 = 0xFFFFFFFF
+    conn.Nova往返时间平滑 = 333000    // 初始333ms
+    conn.Nova往返时间变化 = 166000
+
+    // 流表
+    conn.流表 = 哈希表_创建(64)
+    conn.下一个本地双向流 = 0
+    conn.下一个本地单向流 = 2
+
+    // 流控
+    conn.最大数据_本地 = 1048576     // 1MB初始
+    conn.最大数据_远程 = 1048576
+
+    // AI拥塞预测
+    conn.AI拥塞预测 = 智能_拥塞预测器_创建()
+
+    返回 conn
+}
+
+
+函数 QUIC_连接_0Nova往返时间(conn, PSK, 早期数据) {
+    如果 (PSK == 空) {
+        // 无PSK: 标准1-Nova往返时间握手
+        返回 QUIC_握手_发送Initial(conn)
+    }
+
+    conn.PSK = PSK
+    conn.可以0Nova往返时间 = 真
+
+    // 构造Initial包(含ClientHello + 0-Nova往返时间密钥)
+    定义 初始包 = QUIC_构造包(conn, QUIC_PKT_INITIAL)
+    定义 CH = 安全13_生成ClientHello_PSK(conn.安全状态, PSK)
+    QUIC_包_添加帧(初始包, QUIC_FRAME_CRYPTO, CH)
+
+    QUIC_发送包(conn, 初始包)
+
+    // 立即发送0-Nova往返时间数据(不等握手完成!)
+    如果 (早期数据 != 空) {
+        定义 密钥_0Nova往返时间 = 安全13_导出0Nova往返时间密钥(conn.安全状态, PSK)
+        定义 零Nova往返时间包 = QUIC_构造包(conn, QUIC_PKT_0Nova往返时间)
+        QUIC_包_添加帧(零Nova往返时间包, QUIC_FRAME_STREAM, 早期数据)
+        QUIC_加密发送(conn, 零Nova往返时间包, 密钥_0Nova往返时间)
+    }
+
+    返回 0
+}
+
+
+结构 QUIC流 {
+    流ID,
+    状态,
+    发送偏移,
+    接收偏移,
+    发送缓冲,
+    接收缓冲,    // u64 有序重组缓冲区
+    最大数据,
+    FIN已发送,
+    FIN已接收,
+}
+
+函数 QUIC_创建流(conn) {
+    定义 流ID = conn.下一个本地双向流
+    conn.下一个本地双向流 = conn.下一个本地双向流 + 4
+
+    定义 可变 流 = QUIC流 {}
+    流.流ID = 流ID
+    流.状态 = 流状态_打开
+    流.发送偏移 = 0
+    流.接收偏移 = 0
+    流.发送缓冲 = 环形缓冲_创建(65536)
+    流.接收缓冲 = 有序缓冲_创建()
+    流.最大数据 = 262144    // 256KB初始流窗口
+
+    哈希表_插入(conn.流表, 流ID, 流)
+    返回 流ID
+}
+
+函数 QUIC_流_发送(conn, 流ID, 数据, 长度) {
+    定义 流 = 哈希表_查找(conn.流表, 流ID)
+    如果 (流 == 空) { 返回 错误_流不存在 }
+
+    // 流控检查
+    如果 (流.发送偏移 + 长度 > 流.最大数据) {
+        返回 错误_流控阻塞
+    }
+    如果 (conn.已发送数据 + 长度 > conn.最大数据_远程) {
+        返回 错误_连接流控阻塞
+    }
+
+    // 写入发送缓冲
+    环形缓冲_写入(流.发送缓冲, 数据, 长度)
+    流.发送偏移 = 流.发送偏移 + 长度
+    conn.已发送数据 = conn.已发送数据 + 长度
+
+    // 触发发送
+    QUIC_刷新发送(conn)
+    返回 长度
+}
+
+
+函数 QUIC_处理STREAM帧(conn, 流ID, 偏移, 数据, 长度, FIN) {
+    定义 流 = 哈希表_查找(conn.流表, 流ID)
+    如果 (流 == 空) {
+        // 远程发起的新流
+        流 = QUIC_接受流(conn, 流ID)
+    }
+
+    // 插入有序缓冲区(处理乱序和重复)
+    有序缓冲_插入(流.接收缓冲, 偏移, 数据, 长度)
+
+    如果 (FIN) { 流.FIN已接收 = 真 }
+
+    // 尝试交付连续数据给应用层
+    当 (有序缓冲_可读(流.接收缓冲, 流.接收偏移)) {
+        定义 块 = 有序缓冲_读取(流.接收缓冲, 流.接收偏移)
+        流_回调_数据到达(流ID, 块.数据, 块.长度)
+        流.接收偏移 = 流.接收偏移 + 块.长度
+    }
+
+    conn.已接收数据 = conn.已接收数据 + 长度
+}
+
+
+函数 QUIC_Nova带宽v2_更新(conn, 已确认字节, Nova往返时间样本) {
+    // 更新Nova往返时间估计
+    如果 (Nova往返时间样本 < conn.Nova往返时间最小 || conn.Nova往返时间最小 == 0) {
+        conn.Nova往返时间最小 = Nova往返时间样本
+    }
+    conn.Nova往返时间平滑 = conn.Nova往返时间平滑 * 7 / 8 + Nova往返时间样本 / 8
+    定义 差 = 绝对值(Nova往返时间样本 - conn.Nova往返时间平滑)
+    conn.Nova往返时间变化 = conn.Nova往返时间变化 * 3 / 4 + 差 / 4
+
+    // 估算带宽: BtlBw = max(已确认/Nova往返时间)
+    定义 当前带宽 = 已确认字节 * 1000000 / Nova往返时间样本
+
+    // Nova带宽v2状态机: Startup → Drain → ProbeBW → ProbeNova往返时间
+    // 拥塞窗口 = BtlBw * Nova往返时间min * 增益系数
+    定义 BDP = 当前带宽 * conn.Nova往返时间最小 / 1000000
+    conn.拥塞窗口 = 最大值(BDP * 2, QUIC_最小窗口)
+
+    // AI增强: 预测即将到来的拥塞
+    定义 AI预测 = 智能_拥塞预测器_评估(conn.AI拥塞预测, 当前带宽, Nova往返时间样本, conn.在途字节)
+    如果 (AI预测.即将拥塞) {
+        conn.拥塞窗口 = conn.拥塞窗口 * AI预测.建议缩减比 / 100
+    }
+
+    conn.在途字节 = conn.在途字节 - 已确认字节
+}
+
+
+函数 QUIC_处理路径迁移(conn, 新源地址) {
+    如果 (新源地址 == conn.远程地址) { 返回 }
+
+    // 发送PATH_CHALLENGE验证新路径
+    定义 挑战 = 加密_随机64()
+    定义 包 = QUIC_构造包(conn, QUIC_PKT_1Nova往返时间)
+    QUIC_包_添加帧(包, QUIC_FRAME_PATH_CHALLENGE, 挑战)
+    QUIC_发送到(conn, 包, 新源地址)
+
+    conn.远程地址 = 新源地址
+
+    // 重置拥塞状态(新路径特性未知)
+    conn.拥塞窗口 = QUIC_初始窗口
+    conn.Nova往返时间平滑 = 333000
+    conn.Nova往返时间最小 = 0
+}
+
+
+函数 HTTP3_发送请求(conn, 方法, 路径, 头部, 体) {
+    // 创建新的请求流
+    定义 流ID = QUIC_创建流(conn)
+
+    // QPACK编码头部
+    定义 编码头 = QPACK_编码(头部)
+
+    // HEADERS帧
+    定义 可变 帧 = []
+    追加(帧, [0x01, 编码头])    // HEADERS帧类型=0x01
+
+    // DATA帧
+    如果 (体 != 空 && 计数(体) > 0) {
+        追加(帧, [0x00, 体])    // DATA帧类型=0x00
+    }
+
+    // 通过QUIC流发送
+    定义 可变 i = 0
+    当 (i < 计数(帧)) {
+        定义 类型 = 帧[i][0]
+        定义 数据 = 帧[i][1]
+        定义 长度 = 计数(数据)
+
+        // HTTP/3帧格式: Type(varint) + Length(varint) + Payload
+        定义 帧头 = QUIC变长编码(类型) + QUIC变长编码(长度)
+        QUIC_流_发送(conn, 流ID, 帧头 + 数据, 计数(帧头) + 长度)
+        i = i + 1
+    }
+
+    // FIN标记(请求结束)
+    QUIC_流_FIN(conn, 流ID)
+
+    返回 流ID
+}

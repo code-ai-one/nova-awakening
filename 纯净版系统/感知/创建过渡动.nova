@@ -1,0 +1,120 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/时钟中枢.nova")
+
+// §5 创建过渡动画
+// 每个参与元素: 旧快照→新快照的动画
+
+
+函数 VT_创建动画(vt) {
+    如果 (vt == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < vt.快照数量) {
+        定义 旧 = 内存_读64(vt.旧快照列表 + i * 8)
+        定义 新 = 内存_读64(vt.新快照列表 + i * 8)
+        如果 (旧 != 0 && 新 != 0) {
+            VT_创建元素动画(vt, 旧, 新)
+        } 否则 如果 (旧 != 0) {
+            // 元素被移除: 淡出
+            VT_创建淡出动画(vt, 旧)
+        } 否则 如果 (新 != 0) {
+            // 元素新增: 淡入
+            VT_创建淡入动画(vt, 新)
+        }
+        i = i + 1
+    }
+}
+
+函数 VT_创建元素动画(vt, 旧snap, 新snap) {
+    如果 (vt == 0 || 旧snap == 0 || 新snap == 0) { 返回 }
+    定义 now = 读取纳秒()
+
+    // ::view-transition-group: 从旧位置/大小 → 新位置/大小
+    旧snap.动画类型 = VT_ANIM_GROUP
+    旧snap.动画开始 = now
+    旧snap.动画持续 = vt.持续时间
+    旧snap.起始x = 旧snap.x; 旧snap.结束x = 新snap.x
+    旧snap.起始y = 旧snap.y; 旧snap.结束y = 新snap.y
+    旧snap.起始宽 = 旧snap.宽; 旧snap.结束宽 = 新snap.宽
+    旧snap.起始高 = 旧snap.高; 旧snap.结束高 = 新snap.高
+
+    // ::view-transition-old: opacity 1→0 (淡出)
+    旧snap.起始透明度 = 10000
+    旧snap.结束透明度 = 0
+
+    // ::view-transition-new: opacity 0→1 (淡入)
+    新snap.动画类型 = VT_ANIM_FADE_IN
+    新snap.动画开始 = now
+    新snap.动画持续 = vt.持续时间
+    新snap.起始透明度 = 0
+    新snap.结束透明度 = 10000
+}
+
+函数 VT_创建淡出动画(vt, snap) {
+    如果 (vt == 0 || snap == 0) { 返回 }
+    snap.动画类型 = VT_ANIM_FADE_OUT
+    snap.起始透明度 = 10000  // 1.0 * 10000
+    snap.结束透明度 = 0
+    snap.动画开始 = 读取纳秒()
+    snap.动画持续 = vt.持续时间
+}
+
+函数 VT_创建淡入动画(vt, snap) {
+    如果 (vt == 0 || snap == 0) { 返回 }
+    snap.动画类型 = VT_ANIM_FADE_IN
+    snap.起始透明度 = 0
+    snap.结束透明度 = 10000  // 1.0 * 10000
+    snap.动画开始 = 读取纳秒()
+    snap.动画持续 = vt.持续时间
+}
+
+// §6 动画帧更新
+
+函数 VT_帧更新(vt, 当前时间) {
+    如果 (vt == 0 || vt.状态 != VT_STATE_ANIMATING) { 返回 }
+
+    // 更新所有动画
+    定义 可变 全部完成 = 真
+    定义 可变 i = 0
+    当 (i < vt.动画数量) {
+        定义 anim = 内存_读64(vt.动画列表 + i * 8)
+        如果 (anim != 0) {
+            // 更新动画进度
+            // 如果未完成: 全部完成 = false
+        }
+        i = i + 1
+    }
+
+    如果 (全部完成) {
+        vt.状态 = VT_STATE_DONE
+        // resolve finished promise
+    }
+}
+
+函数 VT_绘制(vt, canvas) {
+    如果 (vt == 0 || vt.状态 != VT_STATE_ANIMATING) { 返回 }
+
+    // 绘制过渡层(在正常内容之上)
+    定义 可变 i = 0
+    当 (i < vt.快照数量) {
+        定义 旧 = 内存_读64(vt.旧快照列表 + i * 8)
+        定义 新 = 内存_读64(vt.新快照列表 + i * 8)
+
+        // 绘制旧快照(带opacity)
+        如果 (旧 != 0 && 旧.像素 != 0) {
+            // canvas.draw图像(旧.像素, x, y, w, h, alpha)
+        }
+
+        // 绘制新快照(带opacity)
+        如果 (新 != 0 && 新.像素 != 0) {
+            // canvas.draw图像(新.像素, x, y, w, h, alpha)
+        }
+        i = i + 1
+    }
+}
+
+函数 ViewTransition_skipTransition(vt) {
+    如果 (vt == 0) { 返回 }
+    vt.状态 = VT_STATE_SKIPPED
+    // 立即完成所有动画
+}

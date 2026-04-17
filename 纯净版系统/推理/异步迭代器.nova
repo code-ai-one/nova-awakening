@@ -1,0 +1,493 @@
+// NovaOS 脚本引擎 / 现代语法 / 生成迭代
+// 模块: for-await-of 异步迭代器运行时
+// 功能:
+//  §1 常量与数据结构
+//  §2 异步迭代器协议: [Symbol.asyncIterator]解析
+//  §3 for-await-of完整执行循环
+//  §4 同步迭代器到异步迭代器适配器
+//  §5 异步生成器引擎: yield/await交织
+//  §6 Promise微任务流水线: microtask调度
+//  §7 背压控制: 生产者-消费者速率匹配
+//  §8 AI总线集成: 热路径预测/优化决策
+//  §9 运行时辅助存根
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("./承诺完整辅助.nova")
+导入("./脚本承诺创建.nova")
+导入("./值乘.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("./小整数快速判.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("./总线悬浮球.nova")
+导入("./智能总线鼠标.nova")
+导入("../中枢/内核打印.nova")
+导入("../标准/原生列表.nova")
+
+// §1 常量与数据结构
+
+定义 Q_ONE = 1024
+定义 ITER_状态_初始 = 0
+定义 ITER_状态_运行 = 1
+定义 ITER_状态_挂起 = 2
+定义 ITER_状态_完成 = 3
+定义 ITER_状态_错误 = 4
+
+定义 BACKPRESSURE_高水位 = 64
+定义 BACKPRESSURE_低水位 = 16
+
+结构 IteratorResult {
+    值,
+    完成,
+}
+
+结构 异步迭代器 {
+    对象,         // 源对象
+    next方法,     // asyncIterator.next
+    return方法,   // asyncIterator.return
+    throw方法,    // asyncIterator.throw
+    状态,
+    当前值,
+    累计迭代数,
+    总耗时_us,
+}
+
+结构 异步生成器 {
+    字节码,
+    字节码长度,
+    上下文,       // 闭包环境
+    PC,            // 程序计数器
+    状态,
+    挂起值,       // yield的值
+    异常,         // 捕获的异常
+    背压队列,     // 待发送值队列
+    背压水位,
+    最大水位,
+}
+
+结构 微任务 {
+    回调,
+    参数,
+    下一个,       // 链表指针
+}
+
+定义 可变 微任务_队列头 = 0
+定义 可变 微任务_队列尾 = 0
+定义 可变 微任务_计数 = 0
+定义 可变 微任务_总处理数 = 0
+
+// §2 异步迭代器协议
+
+函数 ForAwaitOf_获取异步迭代器(rt, 对象) {
+    // 1) 先查找 [Symbol.asyncIterator]
+    定义 异步方法 = Nova对象_获取属性(rt, 对象, 符号_asyncIterator)
+    如果 (异步方法 != 0 && JSValue_IsFunction(异步方法)) {
+        定义 iter_obj = Nova函数_Call(rt, 异步方法, 对象)
+        如果 (iter_obj == 0) {
+            TryCatch_抛出(rt, "异步迭代器初始化失败")
+            返回 0
+        }
+        返回 异步迭代器_包装(rt, iter_obj)
+    }
+    // 2) 降级: 查找 [Symbol.iterator] 并包装为异步
+    定义 同步方法 = Nova对象_获取属性(rt, 对象, 符号_iterator)
+    如果 (同步方法 != 0 && JSValue_IsFunction(同步方法)) {
+        定义 sync_iter = Nova函数_Call(rt, 同步方法, 对象)
+        返回 同步转异步适配器_创建(rt, sync_iter)
+    }
+    TryCatch_抛出(rt, "对象不可迭代")
+    返回 0
+}
+
+函数 异步迭代器_包装(rt, iter_obj) {
+    定义 ai = 异步迭代器 {}
+    ai.对象 = iter_obj
+    ai.next方法 = Nova对象_获取属性(rt, iter_obj, "next")
+    ai.return方法 = Nova对象_获取属性(rt, iter_obj, "return")
+    ai.throw方法 = Nova对象_获取属性(rt, iter_obj, "throw")
+    ai.状态 = ITER_状态_初始
+    ai.累计迭代数 = 0
+    ai.总耗时_us = 0
+    返回 ai
+}
+
+函数 IteratorResult_创建(值, 完成) {
+    定义 r = IteratorResult {}
+    r.值 = 值; r.完成 = 完成
+    返回 r
+}
+
+函数 IteratorResult_从对象(rt, obj) {
+    如果 (obj == 0) { 返回 IteratorResult_创建(0, 真) }
+    定义 done_val = Nova对象_获取属性(rt, obj, "done")
+    定义 value_val = Nova对象_获取属性(rt, obj, "value")
+    返回 IteratorResult_创建(value_val, JSValue_ToBoolean(done_val))
+}
+
+// §3 for-await-of 完整执行循环
+
+函数 ForAwaitOf_执行(rt, 迭代器, 循环体回调, 上下文) {
+    如果 (迭代器 == 0) { 返回 }
+    迭代器.状态 = ITER_状态_运行
+
+    // 启动迭代链
+    ForAwaitOf_下一步(rt, 迭代器, 循环体回调, 上下文)
+}
+
+函数 ForAwaitOf_下一步(rt, 迭代器, 循环体回调, 上下文) {
+    如果 (迭代器.状态 != ITER_状态_运行) { 返回 }
+
+    // 调用 iterator.next()
+    定义 next_promise = 0
+    如果 (迭代器.next方法 != 0) {
+        next_promise = Nova函数_Call(rt, 迭代器.next方法, 迭代器.对象)
+    } 否则 {
+        迭代器.状态 = ITER_状态_错误
+        TryCatch_抛出(rt, "iterator.next不是函数")
+        返回
+    }
+
+    // await这个promise
+    如果 (next_promise == 0 || !JSValue_IsPromise(next_promise)) {
+        // 如果返回的不是Promise, 包装为Promise.resolve
+        next_promise = Promise_Resolve(rt, next_promise)
+    }
+
+    // 注册 then 回调
+    定义 当前时间 = 平台_获取时间戳_us()
+    Promise_Then(rt, next_promise,
+        // onFulfilled: 处理结果
+        函数(结果) {
+            定义 耗时 = 平台_获取时间戳_us() - 当前时间
+            迭代器.总耗时_us = 迭代器.总耗时_us + 耗时
+            迭代器.累计迭代数 = 迭代器.累计迭代数 + 1
+
+            定义 ir = IteratorResult_从对象(rt, 结果)
+            如果 (ir.完成) {
+                迭代器.状态 = ITER_状态_完成
+                // AI反馈: 迭代完成统计
+                智能_异步迭代_AI完成反馈(迭代器)
+                返回
+            }
+            // 执行循环体
+            定义 继续 = 循环体回调(rt, ir.值, 上下文)
+            如果 (继续) {
+                // 下一轮迭代, 通过微任务调度避免栈溢出
+                微任务_入队(函数() {
+                    ForAwaitOf_下一步(rt, 迭代器, 循环体回调, 上下文)
+                }, 0)
+            } 否则 {
+                // break/return提前退出
+                ForAwaitOf_关闭迭代器(rt, 迭代器)
+            }
+        },
+        // onRejected: 处理异常
+        函数(错误) {
+            迭代器.状态 = ITER_状态_错误
+            TryCatch_抛出(rt, 错误)
+        }
+    )
+}
+
+函数 ForAwaitOf_关闭迭代器(rt, 迭代器) {
+    迭代器.状态 = ITER_状态_完成
+    // 调用 iterator.return() 如果存在
+    如果 (迭代器.return方法 != 0 && JSValue_IsFunction(迭代器.return方法)) {
+        定义 ret = Nova函数_Call(rt, 迭代器.return方法, 迭代器.对象)
+        // 忽略return的结果, 但如果它抛异常则传播
+        如果 (JSValue_IsPromise(ret)) {
+            Promise_Then(rt, ret,
+                函数(v) { /* 忽略 */ },
+                函数(e) { TryCatch_抛出(rt, e) }
+            )
+        }
+    }
+}
+
+// §4 同步迭代器→异步迭代器适配器
+
+结构 同步转异步适配器 {
+    同步迭代器,
+    运行时,
+}
+
+函数 同步转异步适配器_创建(rt, sync_iter) {
+    定义 adapter = 同步转异步适配器 {}
+    adapter.同步迭代器 = sync_iter
+    adapter.运行时 = rt
+    // 包装为异步迭代器接口
+    定义 ai = 异步迭代器 {}
+    ai.对象 = adapter
+    ai.next方法 = 同步转异步_next
+    ai.return方法 = 同步转异步_return
+    ai.throw方法 = 0
+    ai.状态 = ITER_状态_初始
+    ai.累计迭代数 = 0
+    ai.总耗时_us = 0
+    返回 ai
+}
+
+函数 同步转异步_next(adapter) {
+    定义 rt = adapter.运行时
+    定义 sync = adapter.同步迭代器
+    // 调用同步iterator.next()
+    定义 next_fn = Nova对象_获取属性(rt, sync, "next")
+    如果 (next_fn == 0) { 返回 Promise_Resolve(rt, IteratorResult_创建(0, 真)) }
+    定义 result = Nova函数_Call(rt, next_fn, sync)
+    // 将同步结果包装为Promise
+    返回 Promise_Resolve(rt, result)
+}
+
+函数 同步转异步_return(adapter) {
+    定义 rt = adapter.运行时
+    定义 sync = adapter.同步迭代器
+    定义 ret_fn = Nova对象_获取属性(rt, sync, "return")
+    如果 (ret_fn != 0 && JSValue_IsFunction(ret_fn)) {
+        定义 result = Nova函数_Call(rt, ret_fn, sync)
+        返回 Promise_Resolve(rt, result)
+    }
+    返回 Promise_Resolve(rt, IteratorResult_创建(0, 真))
+}
+
+// §5 异步生成器引擎
+// yield/await 交织: 生成器内部可同时 yield 和 await
+
+函数 异步生成器_创建(rt, 字节码, 长度, 上下文) {
+    定义 gen = 异步生成器 {}
+    gen.字节码 = 字节码
+    gen.字节码长度 = 长度
+    gen.上下文 = 上下文
+    gen.PC = 0
+    gen.状态 = ITER_状态_初始
+    gen.背压队列 = []
+    gen.背压水位 = 0
+    gen.最大水位 = BACKPRESSURE_高水位
+    返回 gen
+}
+
+函数 异步生成器_next(rt, gen, 参数) {
+    如果 (gen.状态 == ITER_状态_完成) {
+        返回 Promise_Resolve(rt, IteratorResult_创建(0, 真))
+    }
+    如果 (gen.状态 == ITER_状态_错误) {
+        返回 Promise_Reject(rt, gen.异常)
+    }
+
+    gen.状态 = ITER_状态_运行
+    gen.挂起值 = 参数
+
+    // 创建结果Promise
+    定义 p = 脚本承诺_创建桥接(rt)
+
+    // 从上次yield点继续执行字节码
+    定义 结果 = Bytecode_执行_从偏移(rt, gen.字节码, gen.字节码长度, gen.PC, gen.上下文)
+
+    如果 (rt.异常标记) {
+        gen.状态 = ITER_状态_错误
+        gen.异常 = rt.异常
+        脚本承诺_拒绝桥接(rt, p, rt.异常)
+    } 否则如果 (rt.返回标记) {
+        gen.状态 = ITER_状态_完成
+        脚本承诺_解决桥接(rt, p, IteratorResult_创建(rt.累加器, 真))
+    } 否则 {
+        // yield挂起
+        gen.状态 = ITER_状态_挂起
+        gen.PC = rt.PC
+        定义 yield_val = rt.累加器
+        // yield的值可能是Promise, 需要await
+        如果 (JSValue_IsPromise(yield_val)) {
+            Promise_Then(rt, yield_val,
+                函数(v) {
+                脚本承诺_解决桥接(rt, p, IteratorResult_创建(v, 假))
+                },
+                函数(e) {
+                脚本承诺_拒绝桥接(rt, p, e)
+                }
+            )
+        } 否则 {
+            脚本承诺_解决桥接(rt, p, IteratorResult_创建(yield_val, 假))
+        }
+    }
+    返回 p
+}
+
+函数 异步生成器_return(rt, gen, 值) {
+    gen.状态 = ITER_状态_完成
+    返回 Promise_Resolve(rt, IteratorResult_创建(值, 真))
+}
+
+函数 异步生成器_throw(rt, gen, 异常) {
+    如果 (gen.状态 == ITER_状态_挂起) {
+        gen.状态 = ITER_状态_运行
+        gen.异常 = 异常
+        // 恢复执行, 让生成器内部的try-catch处理
+        返回 异步生成器_next(rt, gen, 0)
+    }
+    gen.状态 = ITER_状态_错误
+    返回 Promise_Reject(rt, 异常)
+}
+
+// §6 Promise微任务流水线
+
+函数 微任务_入队(回调, 参数) {
+    定义 task = 微任务 {}
+    task.回调 = 回调
+    task.参数 = 参数
+    task.下一个 = 0
+    如果 (微任务_队列尾 != 0) {
+        微任务_队列尾.下一个 = task
+    } 否则 {
+        微任务_队列头 = task
+    }
+    微任务_队列尾 = task
+    微任务_计数 = 微任务_计数 + 1
+}
+
+函数 微任务_处理队列() {
+    // 排空微任务队列
+    定义 可变 处理数 = 0
+    定义 可变 最大批次 = 1000  // 防止无限微任务
+    当 (微任务_队列头 != 0 && 处理数 < 最大批次) {
+        定义 task = 微任务_队列头
+        微任务_队列头 = task.下一个
+        如果 (微任务_队列头 == 0) { 微任务_队列尾 = 0 }
+        微任务_计数 = 微任务_计数 - 1
+        // 执行回调
+        task.回调(task.参数)
+        处理数 = 处理数 + 1
+        微任务_总处理数 = 微任务_总处理数 + 1
+    }
+    返回 处理数
+}
+
+// §7 背压控制
+// 创新: 生产者-消费者速率匹配, EWMA速率估计
+
+定义 EWMA_ALPHA = 205  // 0.2 * 1024
+
+函数 背压_检查(gen) {
+    返回 gen.背压水位 >= gen.最大水位
+}
+
+函数 背压_生产(gen, 值) {
+    如果 (背压_检查(gen)) {
+        // 队列已满, 等待消费者
+        返回 假
+    }
+    追加(gen.背压队列, 值)
+    gen.背压水位 = gen.背压水位 + 1
+    返回 真
+}
+
+函数 背压_消费(gen) {
+    如果 (gen.背压水位 == 0) { 返回 0 }
+    定义 值 = gen.背压队列[0]
+    gen.背压队列 = 列表_切片(gen.背压队列, 1, gen.背压水位)
+    gen.背压水位 = gen.背压水位 - 1
+    返回 值
+}
+
+函数 背压_自适应水位(gen, 生产速率, 消费速率) {
+    // EWMA速率估计动态调整水位
+    定义 比率 = 0
+    如果 (消费速率 > 0) {
+        比率 = 生产速率 * Q_ONE / 消费速率
+    }
+    如果 (比率 > Q_ONE * 2) {
+        // 生产远快于消费, 提高水位
+        gen.最大水位 = gen.最大水位 + 8
+        如果 (gen.最大水位 > 256) { gen.最大水位 = 256 }
+    } 否则如果 (比率 < Q_ONE / 2) {
+        // 消费远快于生产, 降低水位
+        gen.最大水位 = gen.最大水位 - 4
+        如果 (gen.最大水位 < BACKPRESSURE_低水位) { gen.最大水位 = BACKPRESSURE_低水位 }
+    }
+}
+
+// §8 AI总线集成
+// 创新: 经典V8纯计数器→Nova AI注意力权重预测
+
+函数 智能_异步迭代_AI初始化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    // 注册for-await-of模块到AI总线
+}
+
+函数 智能_异步迭代_AI热路径反馈(函数哈希, 执行时间) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    // 将执行统计反馈给AI总线的行为预测器
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, 函数哈希 & 0xFFFF)
+    Tensor_写(特征, 0, 1, 如果(执行时间 > 10000, Q_ONE, 执行时间 * Q_ONE / 10000))
+    AI总线_反馈(bus, "async_iter_hot", 特征)
+    Tensor_释放(特征)
+}
+
+函数 智能_异步迭代_AI应该优化(函数哈希, 执行次数, 平均时间) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 假 }
+    // 8维特征向量输入AI总线的多层感知器
+    定义 特征 = Tensor_创建(1, 8)
+    Tensor_写(特征, 0, 0, 如果(执行次数 > 2000, Q_ONE, 执行次数 * Q_ONE / 2000))
+    Tensor_写(特征, 0, 1, 如果(平均时间 > 1000, Q_ONE, 平均时间 * Q_ONE / 1000))
+    // 特征2: 执行次数增长率 (保留)
+    // 特征3: 热度指数 (保留)
+    定义 分数 = AI总线_注意力权重(bus, 特征)
+    Tensor_释放(特征)
+    返回 分数 > 512
+}
+
+函数 智能_异步迭代_AI完成反馈(迭代器) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    如果 (迭代器.累计迭代数 == 0) { 返回 }
+    // 反馈迭代完成统计
+    定义 平均耗时 = 迭代器.总耗时_us / 迭代器.累计迭代数
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, 如果(迭代器.累计迭代数 > 10000, Q_ONE, 迭代器.累计迭代数 * Q_ONE / 10000))
+    Tensor_写(特征, 0, 1, 如果(平均耗时 > 5000, Q_ONE, 平均耗时 * Q_ONE / 5000))
+    Tensor_写(特征, 0, 2, 如果(迭代器.总耗时_us > 1000000, Q_ONE, 迭代器.总耗时_us * Q_ONE / 1000000))
+    AI总线_反馈(bus, "async_iter_done", 特征)
+    Tensor_释放(特征)
+}
+
+// §9 运行时辅助存根
+
+函数 Nova运行时实例_获取当前执行帧(i) {
+    如果 (i == 0) { 返回 0 }
+    返回 i.当前栈帧
+}
+函数 Nova运行时实例_设置寄存器(i, idx, v) { 如果 (i != 0 && idx >= 0 && idx < 256) { i.寄存器[idx] = v } }
+函数 Nova运行时实例_获取寄存器(i, idx) { 如果 (i != 0 && idx >= 0 && idx < 256) { 返回 i.寄存器[idx] } 返回 0 }
+函数 Nova运行时实例_栈推入(i, v) { 如果 (i != 0) { 追加(i.操作数栈, v); i.栈深度 = i.栈深度 + 1 } }
+函数 Nova运行时实例_栈读取(i, idx) { 如果 (i != 0 && idx < 计数(i.操作数栈)) { 返回 i.操作数栈[idx] } 返回 0 }
+函数 Nova运行时实例_设置累加器(i, v) { 如果 (i != 0) { i.累加器 = v } }
+函数 Nova运行时实例_设置返回标记(i, v) { 如果 (i != 0) { i.返回标记 = v } }
+函数 Nova运行时实例_设置异常标记(i, v) { 如果 (i != 0) { i.异常标记 = v } }
+函数 Nova运行时实例_获取栈深度2(i) { 如果 (i != 0) { 返回 计数(i.操作数栈) } 返回 0 }
+函数 Bytecode_执行_从偏移(i, bc, len, pc, ctx) { 如果 (i == 0 || bc == 0) { 返回 0 } i.PC = pc; 返回 Bytecode_执行(i, bc, len, ctx) }
+函数 异步迭代_创建承诺(i) { 返回 脚本承诺_创建桥接(i) }
+函数 异步迭代_解决承诺(i, p, v) { 脚本承诺_解决桥接(i, p, v) }
+函数 异步迭代_拒绝承诺(i, p, e) { 脚本承诺_拒绝桥接(i, p, e) }
+函数 TryCatch_抛出(i, e) { 如果 (i != 0) { i.异常 = e; i.异常标记 = 真 } }
+
+// §10 微任务与异步迭代统计
+
+函数 微任务_统计() {
+    返回 [微任务_计数, 微任务_总处理数]
+}
+
+函数 异步迭代_打印统计() {
+    打印行("=== 异步迭代统计 ===")
+    打印行("微任务待处理: " + 整数转字符串(微任务_计数))
+    打印行("微任务已处理: " + 整数转字符串(微任务_总处理数))
+}
+
+// NAIL — Nova Async Iteration Logic
+// 公理1(协议完备): asyncIterator/iterator双协议降级
+// 公理2(背压收敛): 生产消费速率自适应在有限步内均衡
+// 公理3(微任务有序): 微任务严格按FIFO顺序执行
+// 定理1(无栈溢出): 微任务调度避免递归栈溢出
+// 定理2(结束一致): iterator.return()保证资源释放

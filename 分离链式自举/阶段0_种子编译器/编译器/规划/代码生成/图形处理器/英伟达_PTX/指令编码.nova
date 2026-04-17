@@ -1,0 +1,618 @@
+// ║ 覆盖: 算术/逻辑/内存/控制流/纹理/表面/张量核心/特殊函数 ║
+
+// PTX编码辅助 (PTX是文本ISA，此处用操作码ID编码)
+函数 ptx_算术指令(op, ty) { 返回 0x10000000|((op&0xFF)<<16)|(ty&0xFFFF) }
+函数 ptx_内存指令(op, space, ty) { 返回 0x20000000|((op&0xFF)<<20)|((space&0xF)<<16)|(ty&0xFFFF) }
+函数 ptx_控制流指令(op) { 返回 0x30000000|(op&0xFFFFFF) }
+函数 ptx_纹理指令(op) { 返回 0x40000000|(op&0xFFFFFF) }
+函数 ptx_特殊指令(op) { 返回 0x50000000|(op&0xFFFFFF) }
+函数 ptx_张量指令(op) { 返回 0x60000000|(op&0xFFFFFF) }
+函数 ptx_杂项指令(op) { 返回 0x70000000|(op&0xFFFFFF) }
+
+// 整数算术 (s16/s32/s64/u16/u32/u64)
+函数 编码_ptx_add_s16(d, a, b) { 返回 ptx_算术指令(0,16) }
+函数 编码_ptx_add_s32(d, a, b) { 返回 ptx_算术指令(0,32) }
+函数 编码_ptx_add_s64(d, a, b) { 返回 ptx_算术指令(0,64) }
+函数 编码_ptx_add_u16(d, a, b) { 返回 ptx_算术指令(1,16) }
+函数 编码_ptx_add_u32(d, a, b) { 返回 ptx_算术指令(1,32) }
+函数 编码_ptx_add_u64(d, a, b) { 返回 ptx_算术指令(1,64) }
+函数 编码_ptx_sub_s16(d, a, b) { 返回 ptx_算术指令(2,16) }
+函数 编码_ptx_sub_s32(d, a, b) { 返回 ptx_算术指令(2,32) }
+函数 编码_ptx_sub_s64(d, a, b) { 返回 ptx_算术指令(2,64) }
+函数 编码_ptx_sub_u16(d, a, b) { 返回 ptx_算术指令(3,16) }
+函数 编码_ptx_sub_u32(d, a, b) { 返回 ptx_算术指令(3,32) }
+函数 编码_ptx_sub_u64(d, a, b) { 返回 ptx_算术指令(3,64) }
+函数 编码_ptx_mul_lo_s16(d, a, b) { 返回 ptx_算术指令(4,16) }
+函数 编码_ptx_mul_lo_s32(d, a, b) { 返回 ptx_算术指令(4,32) }
+函数 编码_ptx_mul_lo_s64(d, a, b) { 返回 ptx_算术指令(4,64) }
+函数 编码_ptx_mul_lo_u16(d, a, b) { 返回 ptx_算术指令(5,16) }
+函数 编码_ptx_mul_lo_u32(d, a, b) { 返回 ptx_算术指令(5,32) }
+函数 编码_ptx_mul_lo_u64(d, a, b) { 返回 ptx_算术指令(5,64) }
+函数 编码_ptx_mul_hi_s16(d, a, b) { 返回 ptx_算术指令(6,16) }
+函数 编码_ptx_mul_hi_s32(d, a, b) { 返回 ptx_算术指令(6,32) }
+函数 编码_ptx_mul_hi_s64(d, a, b) { 返回 ptx_算术指令(6,64) }
+函数 编码_ptx_mul_hi_u16(d, a, b) { 返回 ptx_算术指令(7,16) }
+函数 编码_ptx_mul_hi_u32(d, a, b) { 返回 ptx_算术指令(7,32) }
+函数 编码_ptx_mul_hi_u64(d, a, b) { 返回 ptx_算术指令(7,64) }
+函数 编码_ptx_mul_wide_s16(d, a, b) { 返回 ptx_算术指令(8,16) }
+函数 编码_ptx_mul_wide_s32(d, a, b) { 返回 ptx_算术指令(8,32) }
+函数 编码_ptx_mul_wide_u16(d, a, b) { 返回 ptx_算术指令(9,16) }
+函数 编码_ptx_mul_wide_u32(d, a, b) { 返回 ptx_算术指令(9,32) }
+函数 编码_ptx_mad_lo_s32(d, a, b, c) { 返回 ptx_算术指令(10,32) }
+函数 编码_ptx_mad_lo_s64(d, a, b, c) { 返回 ptx_算术指令(10,64) }
+函数 编码_ptx_mad_lo_u32(d, a, b, c) { 返回 ptx_算术指令(11,32) }
+函数 编码_ptx_mad_lo_u64(d, a, b, c) { 返回 ptx_算术指令(11,64) }
+函数 编码_ptx_mad_hi_s32(d, a, b, c) { 返回 ptx_算术指令(12,32) }
+函数 编码_ptx_mad_hi_s64(d, a, b, c) { 返回 ptx_算术指令(12,64) }
+函数 编码_ptx_mad_hi_u32(d, a, b, c) { 返回 ptx_算术指令(13,32) }
+函数 编码_ptx_mad_hi_u64(d, a, b, c) { 返回 ptx_算术指令(13,64) }
+函数 编码_ptx_mad_wide_s16(d, a, b, c) { 返回 ptx_算术指令(14,16) }
+函数 编码_ptx_mad_wide_s32(d, a, b, c) { 返回 ptx_算术指令(14,32) }
+函数 编码_ptx_mad_wide_u16(d, a, b, c) { 返回 ptx_算术指令(15,16) }
+函数 编码_ptx_mad_wide_u32(d, a, b, c) { 返回 ptx_算术指令(15,32) }
+函数 编码_ptx_div_s16(d, a, b) { 返回 ptx_算术指令(16,16) }
+函数 编码_ptx_div_s32(d, a, b) { 返回 ptx_算术指令(16,32) }
+函数 编码_ptx_div_s64(d, a, b) { 返回 ptx_算术指令(16,64) }
+函数 编码_ptx_div_u16(d, a, b) { 返回 ptx_算术指令(17,16) }
+函数 编码_ptx_div_u32(d, a, b) { 返回 ptx_算术指令(17,32) }
+函数 编码_ptx_div_u64(d, a, b) { 返回 ptx_算术指令(17,64) }
+函数 编码_ptx_rem_s16(d, a, b) { 返回 ptx_算术指令(18,16) }
+函数 编码_ptx_rem_s32(d, a, b) { 返回 ptx_算术指令(18,32) }
+函数 编码_ptx_rem_s64(d, a, b) { 返回 ptx_算术指令(18,64) }
+函数 编码_ptx_rem_u16(d, a, b) { 返回 ptx_算术指令(19,16) }
+函数 编码_ptx_rem_u32(d, a, b) { 返回 ptx_算术指令(19,32) }
+函数 编码_ptx_rem_u64(d, a, b) { 返回 ptx_算术指令(19,64) }
+函数 编码_ptx_abs_s16(d, a) { 返回 ptx_算术指令(20,16) }
+函数 编码_ptx_abs_s32(d, a) { 返回 ptx_算术指令(20,32) }
+函数 编码_ptx_abs_s64(d, a) { 返回 ptx_算术指令(20,64) }
+函数 编码_ptx_neg_s16(d, a) { 返回 ptx_算术指令(21,16) }
+函数 编码_ptx_neg_s32(d, a) { 返回 ptx_算术指令(21,32) }
+函数 编码_ptx_neg_s64(d, a) { 返回 ptx_算术指令(21,64) }
+函数 编码_ptx_min_s16(d, a, b) { 返回 ptx_算术指令(22,16) }
+函数 编码_ptx_min_s32(d, a, b) { 返回 ptx_算术指令(22,32) }
+函数 编码_ptx_min_s64(d, a, b) { 返回 ptx_算术指令(22,64) }
+函数 编码_ptx_min_u16(d, a, b) { 返回 ptx_算术指令(23,16) }
+函数 编码_ptx_min_u32(d, a, b) { 返回 ptx_算术指令(23,32) }
+函数 编码_ptx_min_u64(d, a, b) { 返回 ptx_算术指令(23,64) }
+函数 编码_ptx_max_s16(d, a, b) { 返回 ptx_算术指令(24,16) }
+函数 编码_ptx_max_s32(d, a, b) { 返回 ptx_算术指令(24,32) }
+函数 编码_ptx_max_s64(d, a, b) { 返回 ptx_算术指令(24,64) }
+函数 编码_ptx_max_u16(d, a, b) { 返回 ptx_算术指令(25,16) }
+函数 编码_ptx_max_u32(d, a, b) { 返回 ptx_算术指令(25,32) }
+函数 编码_ptx_max_u64(d, a, b) { 返回 ptx_算术指令(25,64) }
+函数 编码_ptx_popc_b32(d, a) { 返回 ptx_算术指令(26,32) }
+函数 编码_ptx_popc_b64(d, a) { 返回 ptx_算术指令(26,64) }
+函数 编码_ptx_clz_b32(d, a) { 返回 ptx_算术指令(27,32) }
+函数 编码_ptx_clz_b64(d, a) { 返回 ptx_算术指令(27,64) }
+函数 编码_ptx_bfind_s32(d, a) { 返回 ptx_算术指令(28,32) }
+函数 编码_ptx_bfind_s64(d, a) { 返回 ptx_算术指令(28,64) }
+函数 编码_ptx_bfind_u32(d, a) { 返回 ptx_算术指令(29,32) }
+函数 编码_ptx_bfind_u64(d, a) { 返回 ptx_算术指令(29,64) }
+函数 编码_ptx_brev_b32(d, a) { 返回 ptx_算术指令(30,32) }
+函数 编码_ptx_brev_b64(d, a) { 返回 ptx_算术指令(30,64) }
+函数 编码_ptx_bfe_s32(d, a, b, c) { 返回 ptx_算术指令(31,32) }
+函数 编码_ptx_bfe_s64(d, a, b, c) { 返回 ptx_算术指令(31,64) }
+函数 编码_ptx_bfe_u32(d, a, b, c) { 返回 ptx_算术指令(32,32) }
+函数 编码_ptx_bfe_u64(d, a, b, c) { 返回 ptx_算术指令(32,64) }
+函数 编码_ptx_bfi_b32(d, a, b, c, e) { 返回 ptx_算术指令(33,32) }
+函数 编码_ptx_bfi_b64(d, a, b, c, e) { 返回 ptx_算术指令(33,64) }
+函数 编码_ptx_dp4a_s32_s32(d, a, b, c) { 返回 ptx_算术指令(34,32) }
+函数 编码_ptx_dp4a_u32_u32(d, a, b, c) { 返回 ptx_算术指令(35,32) }
+函数 编码_ptx_dp2a_lo_s32_s32(d, a, b, c) { 返回 ptx_算术指令(36,32) }
+函数 编码_ptx_dp2a_hi_s32_s32(d, a, b, c) { 返回 ptx_算术指令(37,32) }
+函数 编码_ptx_dp2a_lo_u32_u32(d, a, b, c) { 返回 ptx_算术指令(38,32) }
+函数 编码_ptx_dp2a_hi_u32_u32(d, a, b, c) { 返回 ptx_算术指令(39,32) }
+函数 编码_ptx_sad_s32(d, a, b, c) { 返回 ptx_算术指令(40,32) }
+函数 编码_ptx_sad_u32(d, a, b, c) { 返回 ptx_算术指令(41,32) }
+
+// 逻辑/位操作
+函数 编码_ptx_and_b16(d, a, b) { 返回 ptx_算术指令(50,16) }
+函数 编码_ptx_and_b32(d, a, b) { 返回 ptx_算术指令(50,32) }
+函数 编码_ptx_and_b64(d, a, b) { 返回 ptx_算术指令(50,64) }
+函数 编码_ptx_or_b16(d, a, b) { 返回 ptx_算术指令(51,16) }
+函数 编码_ptx_or_b32(d, a, b) { 返回 ptx_算术指令(51,32) }
+函数 编码_ptx_or_b64(d, a, b) { 返回 ptx_算术指令(51,64) }
+函数 编码_ptx_xor_b16(d, a, b) { 返回 ptx_算术指令(52,16) }
+函数 编码_ptx_xor_b32(d, a, b) { 返回 ptx_算术指令(52,32) }
+函数 编码_ptx_xor_b64(d, a, b) { 返回 ptx_算术指令(52,64) }
+函数 编码_ptx_not_b16(d, a) { 返回 ptx_算术指令(53,16) }
+函数 编码_ptx_not_b32(d, a) { 返回 ptx_算术指令(53,32) }
+函数 编码_ptx_not_b64(d, a) { 返回 ptx_算术指令(53,64) }
+函数 编码_ptx_cnot_b16(d, a) { 返回 ptx_算术指令(54,16) }
+函数 编码_ptx_cnot_b32(d, a) { 返回 ptx_算术指令(54,32) }
+函数 编码_ptx_cnot_b64(d, a) { 返回 ptx_算术指令(54,64) }
+函数 编码_ptx_shl_b16(d, a, b) { 返回 ptx_算术指令(55,16) }
+函数 编码_ptx_shl_b32(d, a, b) { 返回 ptx_算术指令(55,32) }
+函数 编码_ptx_shl_b64(d, a, b) { 返回 ptx_算术指令(55,64) }
+函数 编码_ptx_shr_s16(d, a, b) { 返回 ptx_算术指令(56,16) }
+函数 编码_ptx_shr_s32(d, a, b) { 返回 ptx_算术指令(56,32) }
+函数 编码_ptx_shr_s64(d, a, b) { 返回 ptx_算术指令(56,64) }
+函数 编码_ptx_shr_u16(d, a, b) { 返回 ptx_算术指令(57,16) }
+函数 编码_ptx_shr_u32(d, a, b) { 返回 ptx_算术指令(57,32) }
+函数 编码_ptx_shr_u64(d, a, b) { 返回 ptx_算术指令(57,64) }
+函数 编码_ptx_shf_l_wrap_b32(d, a, b, c) { 返回 ptx_算术指令(58,32) }
+函数 编码_ptx_shf_l_clamp_b32(d, a, b, c) { 返回 ptx_算术指令(59,32) }
+函数 编码_ptx_shf_r_wrap_s32(d, a, b, c) { 返回 ptx_算术指令(60,32) }
+函数 编码_ptx_shf_r_clamp_s32(d, a, b, c) { 返回 ptx_算术指令(61,32) }
+函数 编码_ptx_shf_r_wrap_u32(d, a, b, c) { 返回 ptx_算术指令(62,32) }
+函数 编码_ptx_shf_r_clamp_u32(d, a, b, c) { 返回 ptx_算术指令(63,32) }
+函数 编码_ptx_prmt_b32(d, a, b, c) { 返回 ptx_算术指令(64,32) }
+函数 编码_ptx_lop3_b32(d, a, b, c, imm) { 返回 ptx_算术指令(65,32) }
+
+// 浮点算术 (f16/f32/f64/bf16)
+函数 编码_ptx_add_f16(d, a, b) { 返回 ptx_算术指令(70,16) }
+函数 编码_ptx_add_f16x2(d, a, b) { 返回 ptx_算术指令(70,17) }
+函数 编码_ptx_add_f32(d, a, b) { 返回 ptx_算术指令(70,32) }
+函数 编码_ptx_add_f64(d, a, b) { 返回 ptx_算术指令(70,64) }
+函数 编码_ptx_add_bf16(d, a, b) { 返回 ptx_算术指令(70,8) }
+函数 编码_ptx_add_bf16x2(d, a, b) { 返回 ptx_算术指令(70,9) }
+函数 编码_ptx_sub_f16(d, a, b) { 返回 ptx_算术指令(71,16) }
+函数 编码_ptx_sub_f32(d, a, b) { 返回 ptx_算术指令(71,32) }
+函数 编码_ptx_sub_f64(d, a, b) { 返回 ptx_算术指令(71,64) }
+函数 编码_ptx_mul_f16(d, a, b) { 返回 ptx_算术指令(72,16) }
+函数 编码_ptx_mul_f16x2(d, a, b) { 返回 ptx_算术指令(72,17) }
+函数 编码_ptx_mul_f32(d, a, b) { 返回 ptx_算术指令(72,32) }
+函数 编码_ptx_mul_f64(d, a, b) { 返回 ptx_算术指令(72,64) }
+函数 编码_ptx_div_approx_f32(d, a, b) { 返回 ptx_算术指令(73,32) }
+函数 编码_ptx_div_full_f32(d, a, b) { 返回 ptx_算术指令(74,32) }
+函数 编码_ptx_div_rn_f32(d, a, b) { 返回 ptx_算术指令(75,32) }
+函数 编码_ptx_div_rn_f64(d, a, b) { 返回 ptx_算术指令(75,64) }
+函数 编码_ptx_fma_rn_f16(d, a, b, c) { 返回 ptx_算术指令(76,16) }
+函数 编码_ptx_fma_rn_f16x2(d, a, b, c) { 返回 ptx_算术指令(76,17) }
+函数 编码_ptx_fma_rn_f32(d, a, b, c) { 返回 ptx_算术指令(76,32) }
+函数 编码_ptx_fma_rn_f64(d, a, b, c) { 返回 ptx_算术指令(76,64) }
+函数 编码_ptx_fma_rn_bf16(d, a, b, c) { 返回 ptx_算术指令(76,8) }
+函数 编码_ptx_fma_rn_bf16x2(d, a, b, c) { 返回 ptx_算术指令(76,9) }
+函数 编码_ptx_mad_f32(d, a, b, c) { 返回 ptx_算术指令(77,32) }
+函数 编码_ptx_mad_f64(d, a, b, c) { 返回 ptx_算术指令(77,64) }
+函数 编码_ptx_abs_f16(d, a) { 返回 ptx_算术指令(78,16) }
+函数 编码_ptx_abs_f16x2(d, a) { 返回 ptx_算术指令(78,17) }
+函数 编码_ptx_abs_f32(d, a) { 返回 ptx_算术指令(78,32) }
+函数 编码_ptx_abs_f64(d, a) { 返回 ptx_算术指令(78,64) }
+函数 编码_ptx_neg_f16(d, a) { 返回 ptx_算术指令(79,16) }
+函数 编码_ptx_neg_f16x2(d, a) { 返回 ptx_算术指令(79,17) }
+函数 编码_ptx_neg_f32(d, a) { 返回 ptx_算术指令(79,32) }
+函数 编码_ptx_neg_f64(d, a) { 返回 ptx_算术指令(79,64) }
+函数 编码_ptx_min_f16(d, a, b) { 返回 ptx_算术指令(80,16) }
+函数 编码_ptx_min_f16x2(d, a, b) { 返回 ptx_算术指令(80,17) }
+函数 编码_ptx_min_f32(d, a, b) { 返回 ptx_算术指令(80,32) }
+函数 编码_ptx_min_f64(d, a, b) { 返回 ptx_算术指令(80,64) }
+函数 编码_ptx_max_f16(d, a, b) { 返回 ptx_算术指令(81,16) }
+函数 编码_ptx_max_f16x2(d, a, b) { 返回 ptx_算术指令(81,17) }
+函数 编码_ptx_max_f32(d, a, b) { 返回 ptx_算术指令(81,32) }
+函数 编码_ptx_max_f64(d, a, b) { 返回 ptx_算术指令(81,64) }
+函数 编码_ptx_rcp_approx_f32(d, a) { 返回 ptx_算术指令(82,32) }
+函数 编码_ptx_rcp_rn_f32(d, a) { 返回 ptx_算术指令(83,32) }
+函数 编码_ptx_rcp_rn_f64(d, a) { 返回 ptx_算术指令(83,64) }
+函数 编码_ptx_sqrt_approx_f32(d, a) { 返回 ptx_算术指令(84,32) }
+函数 编码_ptx_sqrt_rn_f32(d, a) { 返回 ptx_算术指令(85,32) }
+函数 编码_ptx_sqrt_rn_f64(d, a) { 返回 ptx_算术指令(85,64) }
+函数 编码_ptx_rsqrt_approx_f32(d, a) { 返回 ptx_算术指令(86,32) }
+函数 编码_ptx_rsqrt_approx_f64(d, a) { 返回 ptx_算术指令(86,64) }
+函数 编码_ptx_sin_approx_f32(d, a) { 返回 ptx_算术指令(87,32) }
+函数 编码_ptx_cos_approx_f32(d, a) { 返回 ptx_算术指令(88,32) }
+函数 编码_ptx_lg2_approx_f32(d, a) { 返回 ptx_算术指令(89,32) }
+函数 编码_ptx_ex2_approx_f32(d, a) { 返回 ptx_算术指令(90,32) }
+函数 编码_ptx_tanh_approx_f32(d, a) { 返回 ptx_算术指令(91,32) }
+函数 编码_ptx_copysign_f32(d, a, b) { 返回 ptx_算术指令(92,32) }
+函数 编码_ptx_copysign_f64(d, a, b) { 返回 ptx_算术指令(92,64) }
+函数 编码_ptx_testp_finite_f32(d, a) { 返回 ptx_算术指令(93,32) }
+函数 编码_ptx_testp_infinite_f32(d, a) { 返回 ptx_算术指令(94,32) }
+函数 编码_ptx_testp_number_f32(d, a) { 返回 ptx_算术指令(95,32) }
+函数 编码_ptx_testp_notanumber_f32(d, a) { 返回 ptx_算术指令(96,32) }
+函数 编码_ptx_testp_normal_f32(d, a) { 返回 ptx_算术指令(97,32) }
+函数 编码_ptx_testp_subnormal_f32(d, a) { 返回 ptx_算术指令(98,32) }
+函数 编码_ptx_testp_finite_f64(d, a) { 返回 ptx_算术指令(93,64) }
+函数 编码_ptx_testp_infinite_f64(d, a) { 返回 ptx_算术指令(94,64) }
+函数 编码_ptx_testp_number_f64(d, a) { 返回 ptx_算术指令(95,64) }
+函数 编码_ptx_testp_notanumber_f64(d, a) { 返回 ptx_算术指令(96,64) }
+
+// 类型转换 (cvt)
+函数 编码_ptx_cvt_s32_f32(d, a) { 返回 ptx_算术指令(100,1) }
+函数 编码_ptx_cvt_s32_f64(d, a) { 返回 ptx_算术指令(100,2) }
+函数 编码_ptx_cvt_s64_f32(d, a) { 返回 ptx_算术指令(100,3) }
+函数 编码_ptx_cvt_s64_f64(d, a) { 返回 ptx_算术指令(100,4) }
+函数 编码_ptx_cvt_u32_f32(d, a) { 返回 ptx_算术指令(101,1) }
+函数 编码_ptx_cvt_u32_f64(d, a) { 返回 ptx_算术指令(101,2) }
+函数 编码_ptx_cvt_u64_f32(d, a) { 返回 ptx_算术指令(101,3) }
+函数 编码_ptx_cvt_u64_f64(d, a) { 返回 ptx_算术指令(101,4) }
+函数 编码_ptx_cvt_f32_s32(d, a) { 返回 ptx_算术指令(102,1) }
+函数 编码_ptx_cvt_f32_s64(d, a) { 返回 ptx_算术指令(102,2) }
+函数 编码_ptx_cvt_f32_u32(d, a) { 返回 ptx_算术指令(102,3) }
+函数 编码_ptx_cvt_f32_u64(d, a) { 返回 ptx_算术指令(102,4) }
+函数 编码_ptx_cvt_f32_f64(d, a) { 返回 ptx_算术指令(102,5) }
+函数 编码_ptx_cvt_f32_f16(d, a) { 返回 ptx_算术指令(102,6) }
+函数 编码_ptx_cvt_f64_s32(d, a) { 返回 ptx_算术指令(103,1) }
+函数 编码_ptx_cvt_f64_s64(d, a) { 返回 ptx_算术指令(103,2) }
+函数 编码_ptx_cvt_f64_u32(d, a) { 返回 ptx_算术指令(103,3) }
+函数 编码_ptx_cvt_f64_u64(d, a) { 返回 ptx_算术指令(103,4) }
+函数 编码_ptx_cvt_f64_f32(d, a) { 返回 ptx_算术指令(103,5) }
+函数 编码_ptx_cvt_f16_f32(d, a) { 返回 ptx_算术指令(104,1) }
+函数 编码_ptx_cvt_f16_f64(d, a) { 返回 ptx_算术指令(104,2) }
+函数 编码_ptx_cvt_bf16_f32(d, a) { 返回 ptx_算术指令(105,1) }
+函数 编码_ptx_cvt_f32_bf16(d, a) { 返回 ptx_算术指令(105,2) }
+函数 编码_ptx_cvt_s8_s32(d, a) { 返回 ptx_算术指令(106,1) }
+函数 编码_ptx_cvt_s16_s32(d, a) { 返回 ptx_算术指令(106,2) }
+函数 编码_ptx_cvt_s32_s16(d, a) { 返回 ptx_算术指令(106,3) }
+函数 编码_ptx_cvt_s32_s8(d, a) { 返回 ptx_算术指令(106,4) }
+函数 编码_ptx_cvt_u8_u32(d, a) { 返回 ptx_算术指令(107,1) }
+函数 编码_ptx_cvt_u16_u32(d, a) { 返回 ptx_算术指令(107,2) }
+函数 编码_ptx_cvt_u32_u16(d, a) { 返回 ptx_算术指令(107,3) }
+函数 编码_ptx_cvt_u32_u8(d, a) { 返回 ptx_算术指令(107,4) }
+
+// 比较/选择 (setp/selp/set)
+函数 编码_ptx_setp_eq_s32(d, a, b) { 返回 ptx_算术指令(110,32) }
+函数 编码_ptx_setp_ne_s32(d, a, b) { 返回 ptx_算术指令(111,32) }
+函数 编码_ptx_setp_lt_s32(d, a, b) { 返回 ptx_算术指令(112,32) }
+函数 编码_ptx_setp_le_s32(d, a, b) { 返回 ptx_算术指令(113,32) }
+函数 编码_ptx_setp_gt_s32(d, a, b) { 返回 ptx_算术指令(114,32) }
+函数 编码_ptx_setp_ge_s32(d, a, b) { 返回 ptx_算术指令(115,32) }
+函数 编码_ptx_setp_eq_u32(d, a, b) { 返回 ptx_算术指令(110,33) }
+函数 编码_ptx_setp_ne_u32(d, a, b) { 返回 ptx_算术指令(111,33) }
+函数 编码_ptx_setp_lt_u32(d, a, b) { 返回 ptx_算术指令(112,33) }
+函数 编码_ptx_setp_le_u32(d, a, b) { 返回 ptx_算术指令(113,33) }
+函数 编码_ptx_setp_gt_u32(d, a, b) { 返回 ptx_算术指令(114,33) }
+函数 编码_ptx_setp_ge_u32(d, a, b) { 返回 ptx_算术指令(115,33) }
+函数 编码_ptx_setp_eq_f32(d, a, b) { 返回 ptx_算术指令(110,34) }
+函数 编码_ptx_setp_ne_f32(d, a, b) { 返回 ptx_算术指令(111,34) }
+函数 编码_ptx_setp_lt_f32(d, a, b) { 返回 ptx_算术指令(112,34) }
+函数 编码_ptx_setp_le_f32(d, a, b) { 返回 ptx_算术指令(113,34) }
+函数 编码_ptx_setp_gt_f32(d, a, b) { 返回 ptx_算术指令(114,34) }
+函数 编码_ptx_setp_ge_f32(d, a, b) { 返回 ptx_算术指令(115,34) }
+函数 编码_ptx_setp_eq_f64(d, a, b) { 返回 ptx_算术指令(110,64) }
+函数 编码_ptx_setp_ne_f64(d, a, b) { 返回 ptx_算术指令(111,64) }
+函数 编码_ptx_setp_lt_f64(d, a, b) { 返回 ptx_算术指令(112,64) }
+函数 编码_ptx_setp_le_f64(d, a, b) { 返回 ptx_算术指令(113,64) }
+函数 编码_ptx_setp_gt_f64(d, a, b) { 返回 ptx_算术指令(114,64) }
+函数 编码_ptx_setp_ge_f64(d, a, b) { 返回 ptx_算术指令(115,64) }
+函数 编码_ptx_selp_s32(d, a, b, c) { 返回 ptx_算术指令(120,32) }
+函数 编码_ptx_selp_s64(d, a, b, c) { 返回 ptx_算术指令(120,64) }
+函数 编码_ptx_selp_f32(d, a, b, c) { 返回 ptx_算术指令(120,34) }
+函数 编码_ptx_selp_f64(d, a, b, c) { 返回 ptx_算术指令(120,66) }
+函数 编码_ptx_selp_b16(d, a, b, c) { 返回 ptx_算术指令(120,16) }
+函数 编码_ptx_selp_b32(d, a, b, c) { 返回 ptx_算术指令(121,32) }
+函数 编码_ptx_selp_b64(d, a, b, c) { 返回 ptx_算术指令(121,64) }
+函数 编码_ptx_slct_f32_s32(d, a, b, c) { 返回 ptx_算术指令(122,32) }
+函数 编码_ptx_slct_f32_u32(d, a, b, c) { 返回 ptx_算术指令(123,32) }
+
+// 内存操作 (ld/st/atom/red)
+函数 编码_ptx_ld_global_b8(d, addr) { 返回 ptx_内存指令(0,1,8) }
+函数 编码_ptx_ld_global_b16(d, addr) { 返回 ptx_内存指令(0,1,16) }
+函数 编码_ptx_ld_global_b32(d, addr) { 返回 ptx_内存指令(0,1,32) }
+函数 编码_ptx_ld_global_b64(d, addr) { 返回 ptx_内存指令(0,1,64) }
+函数 编码_ptx_ld_global_b128(d, addr) { 返回 ptx_内存指令(0,1,128) }
+函数 编码_ptx_ld_shared_b8(d, addr) { 返回 ptx_内存指令(0,2,8) }
+函数 编码_ptx_ld_shared_b16(d, addr) { 返回 ptx_内存指令(0,2,16) }
+函数 编码_ptx_ld_shared_b32(d, addr) { 返回 ptx_内存指令(0,2,32) }
+函数 编码_ptx_ld_shared_b64(d, addr) { 返回 ptx_内存指令(0,2,64) }
+函数 编码_ptx_ld_local_b32(d, addr) { 返回 ptx_内存指令(0,3,32) }
+函数 编码_ptx_ld_local_b64(d, addr) { 返回 ptx_内存指令(0,3,64) }
+函数 编码_ptx_ld_const_b32(d, addr) { 返回 ptx_内存指令(0,4,32) }
+函数 编码_ptx_ld_const_b64(d, addr) { 返回 ptx_内存指令(0,4,64) }
+函数 编码_ptx_ld_param_b32(d, addr) { 返回 ptx_内存指令(0,5,32) }
+函数 编码_ptx_ld_param_b64(d, addr) { 返回 ptx_内存指令(0,5,64) }
+函数 编码_ptx_st_global_b8(addr, s) { 返回 ptx_内存指令(1,1,8) }
+函数 编码_ptx_st_global_b16(addr, s) { 返回 ptx_内存指令(1,1,16) }
+函数 编码_ptx_st_global_b32(addr, s) { 返回 ptx_内存指令(1,1,32) }
+函数 编码_ptx_st_global_b64(addr, s) { 返回 ptx_内存指令(1,1,64) }
+函数 编码_ptx_st_global_b128(addr, s) { 返回 ptx_内存指令(1,1,128) }
+函数 编码_ptx_st_shared_b8(addr, s) { 返回 ptx_内存指令(1,2,8) }
+函数 编码_ptx_st_shared_b16(addr, s) { 返回 ptx_内存指令(1,2,16) }
+函数 编码_ptx_st_shared_b32(addr, s) { 返回 ptx_内存指令(1,2,32) }
+函数 编码_ptx_st_shared_b64(addr, s) { 返回 ptx_内存指令(1,2,64) }
+函数 编码_ptx_st_local_b32(addr, s) { 返回 ptx_内存指令(1,3,32) }
+函数 编码_ptx_st_local_b64(addr, s) { 返回 ptx_内存指令(1,3,64) }
+函数 编码_ptx_atom_global_add_s32(d, addr, v) { 返回 ptx_内存指令(2,1,32) }
+函数 编码_ptx_atom_global_add_u32(d, addr, v) { 返回 ptx_内存指令(3,1,32) }
+函数 编码_ptx_atom_global_add_u64(d, addr, v) { 返回 ptx_内存指令(3,1,64) }
+函数 编码_ptx_atom_global_add_f32(d, addr, v) { 返回 ptx_内存指令(3,1,33) }
+函数 编码_ptx_atom_global_add_f64(d, addr, v) { 返回 ptx_内存指令(3,1,65) }
+函数 编码_ptx_atom_global_min_s32(d, addr, v) { 返回 ptx_内存指令(4,1,32) }
+函数 编码_ptx_atom_global_min_u32(d, addr, v) { 返回 ptx_内存指令(5,1,32) }
+函数 编码_ptx_atom_global_max_s32(d, addr, v) { 返回 ptx_内存指令(6,1,32) }
+函数 编码_ptx_atom_global_max_u32(d, addr, v) { 返回 ptx_内存指令(7,1,32) }
+函数 编码_ptx_atom_global_and_b32(d, addr, v) { 返回 ptx_内存指令(8,1,32) }
+函数 编码_ptx_atom_global_or_b32(d, addr, v) { 返回 ptx_内存指令(9,1,32) }
+函数 编码_ptx_atom_global_xor_b32(d, addr, v) { 返回 ptx_内存指令(10,1,32) }
+函数 编码_ptx_atom_global_exch_b32(d, addr, v) { 返回 ptx_内存指令(11,1,32) }
+函数 编码_ptx_atom_global_exch_b64(d, addr, v) { 返回 ptx_内存指令(11,1,64) }
+函数 编码_ptx_atom_global_cas_b32(d, addr, b, c) { 返回 ptx_内存指令(12,1,32) }
+函数 编码_ptx_atom_global_cas_b64(d, addr, b, c) { 返回 ptx_内存指令(12,1,64) }
+函数 编码_ptx_atom_global_inc_u32(d, addr, v) { 返回 ptx_内存指令(13,1,32) }
+函数 编码_ptx_atom_global_dec_u32(d, addr, v) { 返回 ptx_内存指令(14,1,32) }
+函数 编码_ptx_atom_shared_add_u32(d, addr, v) { 返回 ptx_内存指令(3,2,32) }
+函数 编码_ptx_atom_shared_add_f32(d, addr, v) { 返回 ptx_内存指令(3,2,33) }
+函数 编码_ptx_atom_shared_min_s32(d, addr, v) { 返回 ptx_内存指令(4,2,32) }
+函数 编码_ptx_atom_shared_max_s32(d, addr, v) { 返回 ptx_内存指令(6,2,32) }
+函数 编码_ptx_atom_shared_and_b32(d, addr, v) { 返回 ptx_内存指令(8,2,32) }
+函数 编码_ptx_atom_shared_or_b32(d, addr, v) { 返回 ptx_内存指令(9,2,32) }
+函数 编码_ptx_atom_shared_xor_b32(d, addr, v) { 返回 ptx_内存指令(10,2,32) }
+函数 编码_ptx_atom_shared_exch_b32(d, addr, v) { 返回 ptx_内存指令(11,2,32) }
+函数 编码_ptx_atom_shared_cas_b32(d, addr, b, c) { 返回 ptx_内存指令(12,2,32) }
+函数 编码_ptx_red_global_add_u32(addr, v) { 返回 ptx_内存指令(15,1,32) }
+函数 编码_ptx_red_global_add_f32(addr, v) { 返回 ptx_内存指令(15,1,33) }
+函数 编码_ptx_red_global_min_s32(addr, v) { 返回 ptx_内存指令(16,1,32) }
+函数 编码_ptx_red_global_max_s32(addr, v) { 返回 ptx_内存指令(17,1,32) }
+函数 编码_ptx_red_global_and_b32(addr, v) { 返回 ptx_内存指令(18,1,32) }
+函数 编码_ptx_red_global_or_b32(addr, v) { 返回 ptx_内存指令(19,1,32) }
+函数 编码_ptx_red_global_xor_b32(addr, v) { 返回 ptx_内存指令(20,1,32) }
+函数 编码_ptx_prefetch_global_L1(addr) { 返回 ptx_内存指令(21, 1, 0) }
+函数 编码_ptx_prefetch_global_L2(addr) { 返回 ptx_内存指令(22, 1, 0) }
+函数 编码_ptx_prefetchu_L1(addr) { 返回 ptx_内存指令(23, 0, 0) }
+
+// 控制流
+函数 编码_ptx_bra(tgt) { 返回 ptx_控制流指令(0) }
+函数 编码_ptx_bra_uni(tgt) { 返回 ptx_控制流指令(1) }
+函数 编码_ptx_call(tgt) { 返回 ptx_控制流指令(2) }
+函数 编码_ptx_call_uni(tgt) { 返回 ptx_控制流指令(3) }
+函数 编码_ptx_ret() { 返回 ptx_控制流指令(4) }
+函数 编码_ptx_ret_uni() { 返回 ptx_控制流指令(5) }
+函数 编码_ptx_exit() { 返回 ptx_控制流指令(6) }
+函数 编码_ptx_trap() { 返回 ptx_控制流指令(7) }
+函数 编码_ptx_brkpt() { 返回 ptx_控制流指令(8) }
+
+// 同步/屏障
+函数 编码_ptx_bar_sync(id) { 返回 ptx_控制流指令(10) }
+函数 编码_ptx_bar_arrive(id, cnt) { 返回 ptx_控制流指令(11) }
+函数 编码_ptx_bar_red_and(d, id, cnt, p) { 返回 ptx_控制流指令(12) }
+函数 编码_ptx_bar_red_or(d, id, cnt, p) { 返回 ptx_控制流指令(13) }
+函数 编码_ptx_bar_red_popc(d, id, cnt, p) { 返回 ptx_控制流指令(14) }
+函数 编码_ptx_membar_cta() { 返回 ptx_控制流指令(15) }
+函数 编码_ptx_membar_gl() { 返回 ptx_控制流指令(16) }
+函数 编码_ptx_membar_sys() { 返回 ptx_控制流指令(17) }
+函数 编码_ptx_fence_sc_cta() { 返回 ptx_控制流指令(18) }
+函数 编码_ptx_fence_sc_gpu() { 返回 ptx_控制流指令(19) }
+函数 编码_ptx_fence_sc_sys() { 返回 ptx_控制流指令(20) }
+函数 编码_ptx_fence_acq_rel_cta() { 返回 ptx_控制流指令(21) }
+函数 编码_ptx_fence_acq_rel_gpu() { 返回 ptx_控制流指令(22) }
+函数 编码_ptx_fence_acq_rel_sys() { 返回 ptx_控制流指令(23) }
+
+// 数据移动 (mov/shfl)
+函数 编码_ptx_mov_b16(d, a) { 返回 ptx_杂项指令(0) }
+函数 编码_ptx_mov_b32(d, a) { 返回 ptx_杂项指令(1) }
+函数 编码_ptx_mov_b64(d, a) { 返回 ptx_杂项指令(2) }
+函数 编码_ptx_mov_u16(d, a) { 返回 ptx_杂项指令(3) }
+函数 编码_ptx_mov_u32(d, a) { 返回 ptx_杂项指令(4) }
+函数 编码_ptx_mov_u64(d, a) { 返回 ptx_杂项指令(5) }
+函数 编码_ptx_mov_f32(d, a) { 返回 ptx_杂项指令(6) }
+函数 编码_ptx_mov_f64(d, a) { 返回 ptx_杂项指令(7) }
+函数 编码_ptx_mov_pred(d, a) { 返回 ptx_杂项指令(8) }
+函数 编码_ptx_shfl_sync_up_b32(d, a, b, c, mask) { 返回 ptx_杂项指令(10) }
+函数 编码_ptx_shfl_sync_down_b32(d, a, b, c, mask) { 返回 ptx_杂项指令(11) }
+函数 编码_ptx_shfl_sync_bfly_b32(d, a, b, c, mask) { 返回 ptx_杂项指令(12) }
+函数 编码_ptx_shfl_sync_idx_b32(d, a, b, c, mask) { 返回 ptx_杂项指令(13) }
+函数 编码_ptx_vote_sync_all(d, mask, p) { 返回 ptx_杂项指令(14) }
+函数 编码_ptx_vote_sync_any(d, mask, p) { 返回 ptx_杂项指令(15) }
+函数 编码_ptx_vote_sync_uni(d, mask, p) { 返回 ptx_杂项指令(16) }
+函数 编码_ptx_vote_sync_ballot(d, mask, p) { 返回 ptx_杂项指令(17) }
+函数 编码_ptx_match_any_sync_b32(d, mask, a) { 返回 ptx_杂项指令(18) }
+函数 编码_ptx_match_all_sync_b32(d, mask, a) { 返回 ptx_杂项指令(19) }
+函数 编码_ptx_redux_sync_add_s32(d, a, mask) { 返回 ptx_杂项指令(20) }
+函数 编码_ptx_redux_sync_min_s32(d, a, mask) { 返回 ptx_杂项指令(21) }
+函数 编码_ptx_redux_sync_max_s32(d, a, mask) { 返回 ptx_杂项指令(22) }
+函数 编码_ptx_redux_sync_add_u32(d, a, mask) { 返回 ptx_杂项指令(23) }
+函数 编码_ptx_redux_sync_min_u32(d, a, mask) { 返回 ptx_杂项指令(24) }
+函数 编码_ptx_redux_sync_max_u32(d, a, mask) { 返回 ptx_杂项指令(25) }
+函数 编码_ptx_redux_sync_and_b32(d, a, mask) { 返回 ptx_杂项指令(26) }
+函数 编码_ptx_redux_sync_or_b32(d, a, mask) { 返回 ptx_杂项指令(27) }
+函数 编码_ptx_redux_sync_xor_b32(d, a, mask) { 返回 ptx_杂项指令(28) }
+函数 编码_ptx_activemask_b32(d) { 返回 ptx_杂项指令(29) }
+
+// 纹理/表面
+函数 编码_ptx_tex_1d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(0) }
+函数 编码_ptx_tex_1d_v4_s32_f32(d, t, s) { 返回 ptx_纹理指令(1) }
+函数 编码_ptx_tex_1d_v4_u32_f32(d, t, s) { 返回 ptx_纹理指令(2) }
+函数 编码_ptx_tex_2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(3) }
+函数 编码_ptx_tex_2d_v4_s32_f32(d, t, s) { 返回 ptx_纹理指令(4) }
+函数 编码_ptx_tex_2d_v4_u32_f32(d, t, s) { 返回 ptx_纹理指令(5) }
+函数 编码_ptx_tex_3d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(6) }
+函数 编码_ptx_tex_3d_v4_s32_f32(d, t, s) { 返回 ptx_纹理指令(7) }
+函数 编码_ptx_tex_3d_v4_u32_f32(d, t, s) { 返回 ptx_纹理指令(8) }
+函数 编码_ptx_tex_a1d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(9) }
+函数 编码_ptx_tex_a2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(10) }
+函数 编码_ptx_tex_cube_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(11) }
+函数 编码_ptx_tex_acube_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(12) }
+函数 编码_ptx_tld4_r_2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(13) }
+函数 编码_ptx_tld4_g_2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(14) }
+函数 编码_ptx_tld4_b_2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(15) }
+函数 编码_ptx_tld4_a_2d_v4_f32_f32(d, t, s) { 返回 ptx_纹理指令(16) }
+函数 编码_ptx_txq_width(d, t) { 返回 ptx_纹理指令(17) }
+函数 编码_ptx_txq_height(d, t) { 返回 ptx_纹理指令(18) }
+函数 编码_ptx_txq_depth(d, t) { 返回 ptx_纹理指令(19) }
+函数 编码_ptx_txq_num_mipmap_levels(d, t) { 返回 ptx_纹理指令(20) }
+函数 编码_ptx_suld_b_1d_v4_b32(d, s, x) { 返回 ptx_纹理指令(21) }
+函数 编码_ptx_suld_b_2d_v4_b32(d, s, x, y) { 返回 ptx_纹理指令(22) }
+函数 编码_ptx_suld_b_3d_v4_b32(d, s, x, y, z) { 返回 ptx_纹理指令(23) }
+函数 编码_ptx_sust_b_1d_v4_b32(s, x, v) { 返回 ptx_纹理指令(24) }
+函数 编码_ptx_sust_b_2d_v4_b32(s, x, y, v) { 返回 ptx_纹理指令(25) }
+函数 编码_ptx_sust_b_3d_v4_b32(s, x, y, z, v) { 返回 ptx_纹理指令(26) }
+函数 编码_ptx_suq_width(d, s) { 返回 ptx_纹理指令(27) }
+函数 编码_ptx_suq_height(d, s) { 返回 ptx_纹理指令(28) }
+函数 编码_ptx_suq_depth(d, s) { 返回 ptx_纹理指令(29) }
+
+// 张量核心 (wmma/mma)
+函数 编码_ptx_wmma_load_a_m16n16k16_f16(d, addr) { 返回 ptx_张量指令(0) }
+函数 编码_ptx_wmma_load_b_m16n16k16_f16(d, addr) { 返回 ptx_张量指令(1) }
+函数 编码_ptx_wmma_load_c_m16n16k16_f32(d, addr) { 返回 ptx_张量指令(2) }
+函数 编码_ptx_wmma_load_c_m16n16k16_f16(d, addr) { 返回 ptx_张量指令(3) }
+函数 编码_ptx_wmma_store_d_m16n16k16_f32(addr, d) { 返回 ptx_张量指令(4) }
+函数 编码_ptx_wmma_store_d_m16n16k16_f16(addr, d) { 返回 ptx_张量指令(5) }
+函数 编码_ptx_wmma_mma_m16n16k16_f32_f16(d, a, b, c) { 返回 ptx_张量指令(6) }
+函数 编码_ptx_wmma_mma_m16n16k16_f16_f16(d, a, b, c) { 返回 ptx_张量指令(7) }
+函数 编码_ptx_wmma_load_a_m8n32k16_f16(d, addr) { 返回 ptx_张量指令(8) }
+函数 编码_ptx_wmma_load_b_m8n32k16_f16(d, addr) { 返回 ptx_张量指令(9) }
+函数 编码_ptx_wmma_mma_m8n32k16_f32_f16(d, a, b, c) { 返回 ptx_张量指令(10) }
+函数 编码_ptx_wmma_load_a_m32n8k16_f16(d, addr) { 返回 ptx_张量指令(11) }
+函数 编码_ptx_wmma_load_b_m32n8k16_f16(d, addr) { 返回 ptx_张量指令(12) }
+函数 编码_ptx_wmma_mma_m32n8k16_f32_f16(d, a, b, c) { 返回 ptx_张量指令(13) }
+函数 编码_ptx_mma_m16n8k16_f32_f16(d, a, b, c) { 返回 ptx_张量指令(14) }
+函数 编码_ptx_mma_m16n8k8_f32_tf32(d, a, b, c) { 返回 ptx_张量指令(15) }
+函数 编码_ptx_mma_m16n8k16_s32_s8(d, a, b, c) { 返回 ptx_张量指令(16) }
+函数 编码_ptx_mma_m16n8k16_s32_u8(d, a, b, c) { 返回 ptx_张量指令(17) }
+函数 编码_ptx_mma_m16n8k32_s32_s8(d, a, b, c) { 返回 ptx_张量指令(18) }
+函数 编码_ptx_mma_m16n8k64_s32_s4(d, a, b, c) { 返回 ptx_张量指令(19) }
+函数 编码_ptx_mma_m16n8k256_s32_b1(d, a, b, c) { 返回 ptx_张量指令(20) }
+函数 编码_ptx_mma_m16n8k4_f32_f64(d, a, b, c) { 返回 ptx_张量指令(21) }
+函数 编码_ptx_mma_m16n8k16_f32_bf16(d, a, b, c) { 返回 ptx_张量指令(22) }
+函数 编码_ptx_ldmatrix_sync_x1_m8n8_b16(d, addr) { 返回 ptx_张量指令(30) }
+函数 编码_ptx_ldmatrix_sync_x2_m8n8_b16(d, addr) { 返回 ptx_张量指令(31) }
+函数 编码_ptx_ldmatrix_sync_x4_m8n8_b16(d, addr) { 返回 ptx_张量指令(32) }
+函数 编码_ptx_stmatrix_sync_x1_m8n8_b16(addr, s) { 返回 ptx_张量指令(33) }
+函数 编码_ptx_stmatrix_sync_x2_m8n8_b16(addr, s) { 返回 ptx_张量指令(34) }
+函数 编码_ptx_stmatrix_sync_x4_m8n8_b16(addr, s) { 返回 ptx_张量指令(35) }
+函数 编码_ptx_cp_async_ca_shared_global_4(dst, src) { 返回 ptx_张量指令(40) }
+函数 编码_ptx_cp_async_ca_shared_global_8(dst, src) { 返回 ptx_张量指令(41) }
+函数 编码_ptx_cp_async_ca_shared_global_16(dst, src) { 返回 ptx_张量指令(42) }
+函数 编码_ptx_cp_async_cg_shared_global_16(dst, src) { 返回 ptx_张量指令(43) }
+函数 编码_ptx_cp_async_commit_group() { 返回 ptx_张量指令(44) }
+函数 编码_ptx_cp_async_wait_group(n) { 返回 ptx_张量指令(45) }
+函数 编码_ptx_cp_async_wait_all() { 返回 ptx_张量指令(46) }
+
+// 特殊寄存器
+函数 编码_ptx_mov_tid_x(d) { 返回 ptx_特殊指令(0) }
+函数 编码_ptx_mov_tid_y(d) { 返回 ptx_特殊指令(1) }
+函数 编码_ptx_mov_tid_z(d) { 返回 ptx_特殊指令(2) }
+函数 编码_ptx_mov_ntid_x(d) { 返回 ptx_特殊指令(3) }
+函数 编码_ptx_mov_ntid_y(d) { 返回 ptx_特殊指令(4) }
+函数 编码_ptx_mov_ntid_z(d) { 返回 ptx_特殊指令(5) }
+函数 编码_ptx_mov_ctaid_x(d) { 返回 ptx_特殊指令(6) }
+函数 编码_ptx_mov_ctaid_y(d) { 返回 ptx_特殊指令(7) }
+函数 编码_ptx_mov_ctaid_z(d) { 返回 ptx_特殊指令(8) }
+函数 编码_ptx_mov_nctaid_x(d) { 返回 ptx_特殊指令(9) }
+函数 编码_ptx_mov_nctaid_y(d) { 返回 ptx_特殊指令(10) }
+函数 编码_ptx_mov_nctaid_z(d) { 返回 ptx_特殊指令(11) }
+函数 编码_ptx_mov_laneid(d) { 返回 ptx_特殊指令(12) }
+函数 编码_ptx_mov_warpid(d) { 返回 ptx_特殊指令(13) }
+函数 编码_ptx_mov_nwarpid(d) { 返回 ptx_特殊指令(14) }
+函数 编码_ptx_mov_smid(d) { 返回 ptx_特殊指令(15) }
+函数 编码_ptx_mov_nsmid(d) { 返回 ptx_特殊指令(16) }
+函数 编码_ptx_mov_gridid(d) { 返回 ptx_特殊指令(17) }
+函数 编码_ptx_mov_clock(d) { 返回 ptx_特殊指令(18) }
+函数 编码_ptx_mov_clock64(d) { 返回 ptx_特殊指令(19) }
+函数 编码_ptx_mov_globaltimer(d) { 返回 ptx_特殊指令(20) }
+函数 编码_ptx_mov_pm0(d) { 返回 ptx_特殊指令(21) }
+函数 编码_ptx_mov_pm1(d) { 返回 ptx_特殊指令(22) }
+函数 编码_ptx_mov_pm2(d) { 返回 ptx_特殊指令(23) }
+函数 编码_ptx_mov_pm3(d) { 返回 ptx_特殊指令(24) }
+函数 编码_ptx_mov_lanemask_eq(d) { 返回 ptx_特殊指令(25) }
+函数 编码_ptx_mov_lanemask_le(d) { 返回 ptx_特殊指令(26) }
+函数 编码_ptx_mov_lanemask_lt(d) { 返回 ptx_特殊指令(27) }
+函数 编码_ptx_mov_lanemask_ge(d) { 返回 ptx_特殊指令(28) }
+函数 编码_ptx_mov_lanemask_gt(d) { 返回 ptx_特殊指令(29) }
+函数 编码_ptx_mov_dynamic_smem_size(d) { 返回 ptx_特殊指令(30) }
+函数 编码_ptx_mov_total_smem_size(d) { 返回 ptx_特殊指令(31) }
+
+// Hopper wgmma (SM90+)
+函数 编码_ptx_wgmma_mma_async_m64n8k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(50) }
+函数 编码_ptx_wgmma_mma_async_m64n16k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(51) }
+函数 编码_ptx_wgmma_mma_async_m64n32k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(52) }
+函数 编码_ptx_wgmma_mma_async_m64n64k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(53) }
+函数 编码_ptx_wgmma_mma_async_m64n128k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(54) }
+函数 编码_ptx_wgmma_mma_async_m64n256k16_f32_f16(d, adesc, bdesc) { 返回 ptx_张量指令(55) }
+函数 编码_ptx_wgmma_mma_async_m64n8k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(56) }
+函数 编码_ptx_wgmma_mma_async_m64n16k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(57) }
+函数 编码_ptx_wgmma_mma_async_m64n32k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(58) }
+函数 编码_ptx_wgmma_mma_async_m64n64k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(59) }
+函数 编码_ptx_wgmma_mma_async_m64n128k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(60) }
+函数 编码_ptx_wgmma_mma_async_m64n256k16_f32_bf16(d, adesc, bdesc) { 返回 ptx_张量指令(61) }
+函数 编码_ptx_wgmma_mma_async_m64n8k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(62) }
+函数 编码_ptx_wgmma_mma_async_m64n16k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(63) }
+函数 编码_ptx_wgmma_mma_async_m64n32k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(64) }
+函数 编码_ptx_wgmma_mma_async_m64n64k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(65) }
+函数 编码_ptx_wgmma_mma_async_m64n128k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(66) }
+函数 编码_ptx_wgmma_mma_async_m64n256k8_f32_tf32(d, adesc, bdesc) { 返回 ptx_张量指令(67) }
+函数 编码_ptx_wgmma_mma_async_m64n32k32_s32_s8(d, adesc, bdesc) { 返回 ptx_张量指令(68) }
+函数 编码_ptx_wgmma_mma_async_m64n64k32_s32_s8(d, adesc, bdesc) { 返回 ptx_张量指令(69) }
+函数 编码_ptx_wgmma_mma_async_m64n128k32_s32_s8(d, adesc, bdesc) { 返回 ptx_张量指令(70) }
+函数 编码_ptx_wgmma_mma_async_m64n256k32_s32_s8(d, adesc, bdesc) { 返回 ptx_张量指令(71) }
+函数 编码_ptx_wgmma_fence_aligned() { 返回 ptx_张量指令(72) }
+函数 编码_ptx_wgmma_commit_group_aligned() { 返回 ptx_张量指令(73) }
+函数 编码_ptx_wgmma_wait_group_aligned(n) { 返回 ptx_张量指令(74) }
+// FP8 wgmma
+函数 编码_ptx_wgmma_mma_async_m64n32k32_f32_e4m3(d, adesc, bdesc) { 返回 ptx_张量指令(80) }
+函数 编码_ptx_wgmma_mma_async_m64n64k32_f32_e4m3(d, adesc, bdesc) { 返回 ptx_张量指令(81) }
+函数 编码_ptx_wgmma_mma_async_m64n128k32_f32_e4m3(d, adesc, bdesc) { 返回 ptx_张量指令(82) }
+函数 编码_ptx_wgmma_mma_async_m64n256k32_f32_e4m3(d, adesc, bdesc) { 返回 ptx_张量指令(83) }
+函数 编码_ptx_wgmma_mma_async_m64n32k32_f32_e5m2(d, adesc, bdesc) { 返回 ptx_张量指令(84) }
+函数 编码_ptx_wgmma_mma_async_m64n64k32_f32_e5m2(d, adesc, bdesc) { 返回 ptx_张量指令(85) }
+函数 编码_ptx_wgmma_mma_async_m64n128k32_f32_e5m2(d, adesc, bdesc) { 返回 ptx_张量指令(86) }
+函数 编码_ptx_wgmma_mma_async_m64n256k32_f32_e5m2(d, adesc, bdesc) { 返回 ptx_张量指令(87) }
+
+// TMA (Tensor Memory Accelerator - Hopper)
+函数 编码_ptx_cp_async_bulk_tensor_1d_shared_global(dst, src, mbar) { 返回 ptx_张量指令(90) }
+函数 编码_ptx_cp_async_bulk_tensor_2d_shared_global(dst, src, mbar) { 返回 ptx_张量指令(91) }
+函数 编码_ptx_cp_async_bulk_tensor_3d_shared_global(dst, src, mbar) { 返回 ptx_张量指令(92) }
+函数 编码_ptx_cp_async_bulk_tensor_4d_shared_global(dst, src, mbar) { 返回 ptx_张量指令(93) }
+函数 编码_ptx_cp_async_bulk_tensor_5d_shared_global(dst, src, mbar) { 返回 ptx_张量指令(94) }
+函数 编码_ptx_cp_async_bulk_tensor_1d_global_shared(dst, src) { 返回 ptx_张量指令(95) }
+函数 编码_ptx_cp_async_bulk_tensor_2d_global_shared(dst, src) { 返回 ptx_张量指令(96) }
+函数 编码_ptx_cp_async_bulk_tensor_3d_global_shared(dst, src) { 返回 ptx_张量指令(97) }
+函数 编码_ptx_cp_async_bulk_shared_shared(dst, src, mbar, sz) { 返回 ptx_张量指令(98) }
+函数 编码_ptx_cp_async_bulk_global_shared(dst, src, sz) { 返回 ptx_张量指令(99) }
+函数 编码_ptx_cp_async_bulk_prefetch_tensor_1d(src) { 返回 ptx_张量指令(100) }
+函数 编码_ptx_cp_async_bulk_prefetch_tensor_2d(src) { 返回 ptx_张量指令(101) }
+函数 编码_ptx_cp_async_bulk_commit_group() { 返回 ptx_张量指令(102) }
+函数 编码_ptx_cp_async_bulk_wait_group(n) { 返回 ptx_张量指令(103) }
+
+// Cluster/分布式共享内存 (Hopper)
+函数 编码_ptx_barrier_cluster_arrive() { 返回 ptx_控制流指令(30) }
+函数 编码_ptx_barrier_cluster_wait() { 返回 ptx_控制流指令(31) }
+函数 编码_ptx_mbarrier_init_shared(addr, cnt) { 返回 ptx_控制流指令(32) }
+函数 编码_ptx_mbarrier_arrive_shared(addr) { 返回 ptx_控制流指令(33) }
+函数 编码_ptx_mbarrier_arrive_expect_tx(addr, tx) { 返回 ptx_控制流指令(34) }
+函数 编码_ptx_mbarrier_try_wait_shared(addr, phase) { 返回 ptx_控制流指令(35) }
+函数 编码_ptx_mbarrier_try_wait_parity(addr, ph) { 返回 ptx_控制流指令(36) }
+函数 编码_ptx_mbarrier_test_wait(d, addr, phase) { 返回 ptx_控制流指令(37) }
+函数 编码_ptx_mbarrier_pending_count(d, addr) { 返回 ptx_控制流指令(38) }
+函数 编码_ptx_mbarrier_inval(addr) { 返回 ptx_控制流指令(39) }
+函数 编码_ptx_ld_shared_cluster_b32(d, addr) { 返回 ptx_内存指令(30,2,32) }
+函数 编码_ptx_ld_shared_cluster_b64(d, addr) { 返回 ptx_内存指令(30,2,64) }
+函数 编码_ptx_st_shared_cluster_b32(addr, s) { 返回 ptx_内存指令(31,2,32) }
+函数 编码_ptx_st_shared_cluster_b64(addr, s) { 返回 ptx_内存指令(31,2,64) }
+函数 编码_ptx_mapa_shared_cluster(d, addr, rank) { 返回 ptx_杂项指令(40) }
+函数 编码_ptx_getctarank(d, addr) { 返回 ptx_杂项指令(41) }
+
+// FP8转换 (SM89/SM90+)
+函数 编码_ptx_cvt_e4m3x2_f32(d, a, b) { 返回 ptx_算术指令(130,1) }
+函数 编码_ptx_cvt_e5m2x2_f32(d, a, b) { 返回 ptx_算术指令(131,1) }
+函数 编码_ptx_cvt_f32_e4m3(d, a) { 返回 ptx_算术指令(132,1) }
+函数 编码_ptx_cvt_f32_e5m2(d, a) { 返回 ptx_算术指令(133,1) }
+函数 编码_ptx_cvt_f16x2_e4m3x2(d, a) { 返回 ptx_算术指令(134,1) }
+函数 编码_ptx_cvt_f16x2_e5m2x2(d, a) { 返回 ptx_算术指令(135,1) }
+函数 编码_ptx_cvt_e4m3x2_f16x2(d, a) { 返回 ptx_算术指令(136,1) }
+函数 编码_ptx_cvt_e5m2x2_f16x2(d, a) { 返回 ptx_算术指令(137,1) }
+
+// 更多内存操作 (multimem/ld.global.nc等)
+函数 编码_ptx_ld_global_nc_b32(d, addr) { 返回 ptx_内存指令(25,1,32) }
+函数 编码_ptx_ld_global_nc_b64(d, addr) { 返回 ptx_内存指令(25,1,64) }
+函数 编码_ptx_ld_global_nc_b128(d, addr) { 返回 ptx_内存指令(25,1,128) }
+函数 编码_ptx_multimem_ld_reduce_add_f32(d, addr) { 返回 ptx_内存指令(26,1,32) }
+函数 编码_ptx_multimem_ld_reduce_min_u32(d, addr) { 返回 ptx_内存指令(27,1,32) }
+函数 编码_ptx_multimem_ld_reduce_max_u32(d, addr) { 返回 ptx_内存指令(28,1,32) }
+函数 编码_ptx_multimem_st_global_b32(addr, s) { 返回 ptx_内存指令(29,1,32) }
+函数 编码_ptx_multimem_st_global_b64(addr, s) { 返回 ptx_内存指令(29,1,64) }
+函数 编码_ptx_ld_global_acquire_b32(d, addr) { 返回 ptx_内存指令(32,1,32) }
+函数 编码_ptx_ld_global_acquire_b64(d, addr) { 返回 ptx_内存指令(32,1,64) }
+函数 编码_ptx_st_global_release_b32(addr, s) { 返回 ptx_内存指令(33,1,32) }
+函数 编码_ptx_st_global_release_b64(addr, s) { 返回 ptx_内存指令(33,1,64) }
+函数 编码_ptx_atom_global_add_f16x2(d, addr, v) { 返回 ptx_内存指令(3,1,17) }
+函数 编码_ptx_atom_global_add_bf16x2(d, addr, v) { 返回 ptx_内存指令(3,1,9) }
+函数 编码_ptx_red_global_add_f16x2(addr, v) { 返回 ptx_内存指令(15,1,17) }
+函数 编码_ptx_red_global_add_bf16x2(addr, v) { 返回 ptx_内存指令(15,1,9) }
+
+// setmaxnreg/elect/stacksave/stackrestore
+函数 编码_ptx_setmaxnreg_inc(n) { 返回 ptx_杂项指令(50) }
+函数 编码_ptx_setmaxnreg_dec(n) { 返回 ptx_杂项指令(51) }
+函数 编码_ptx_elect_sync(d, mask) { 返回 ptx_杂项指令(52) }
+函数 编码_ptx_stacksave_u32(d) { 返回 ptx_杂项指令(53) }
+函数 编码_ptx_stackrestore_u32(a) { 返回 ptx_杂项指令(54) }
+函数 编码_ptx_nanosleep(ns) { 返回 ptx_杂项指令(55) }
+函数 编码_ptx_isspacep_global(d, addr) { 返回 ptx_杂项指令(56) }
+函数 编码_ptx_isspacep_shared(d, addr) { 返回 ptx_杂项指令(57) }
+函数 编码_ptx_isspacep_local(d, addr) { 返回 ptx_杂项指令(58) }
+函数 编码_ptx_cvta_global_u64(d, a) { 返回 ptx_杂项指令(59) }
+函数 编码_ptx_cvta_shared_u64(d, a) { 返回 ptx_杂项指令(60) }
+函数 编码_ptx_cvta_local_u64(d, a) { 返回 ptx_杂项指令(61) }
+函数 编码_ptx_cvta_to_global_u64(d, a) { 返回 ptx_杂项指令(62) }
+函数 编码_ptx_cvta_to_shared_u64(d, a) { 返回 ptx_杂项指令(63) }
+函数 编码_ptx_cvta_to_local_u64(d, a) { 返回 ptx_杂项指令(64) }

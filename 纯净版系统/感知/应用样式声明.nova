@@ -1,0 +1,399 @@
+// §3 应用CSS声明到Computed样式
+// (对应 样式Resolver::ApplyMatchedProperties)
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+
+函数 Computed样式_应用声明(style, 声明) {
+ 定义 属性 = 声明.属性ID
+ 定义 值 = 声明.值
+ 如果 (值 == 0) { 返回 }
+
+ 如果 (属性 == CSS属性_display) {
+ 如果 (值.类型 == CSS值_关键字) {
+ 如果 (值.关键字ID == 5) { style.display = Display_none }
+ 否则 如果 (值.关键字ID == 6) { style.display = Display_block }
+ 否则 如果 (值.关键字ID == 7) { style.display = Display_inline }
+ 否则 如果 (值.关键字ID == 8) { style.display = Display_inline_block }
+ 否则 如果 (值.关键字ID == 9) { style.display = Display_flex }
+ 否则 如果 (值.关键字ID == 10) { style.display = Display_grid }
+ }
+ }
+ 否则 如果 (属性 == CSS属性_position) {
+ 如果 (值.类型 == CSS值_关键字) {
+ 如果 (值.关键字ID == 17) { style.position = Position_static }
+ 否则 如果 (值.关键字ID == 13) { style.position = Position_relative }
+ 否则 如果 (值.关键字ID == 14) { style.position = Position_absolute }
+ 否则 如果 (值.关键字ID == 15) { style.position = Position_fixed }
+ 否则 如果 (值.关键字ID == 16) { style.position = Position_sticky }
+ }
+ }
+ 否则 如果 (属性 == CSS属性_width) { style.width = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_height) { style.height = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_min_width) { style.min_width = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_max_width) { style.max_width = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_min_height) { style.min_height = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_max_height) { style.max_height = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_margin_top) { style.margin_top = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_margin_right) { style.margin_right = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_margin_bottom) { style.margin_bottom = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_margin_left) { style.margin_left = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_padding_top) { style.padding_top = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_padding_right) { style.padding_right = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_padding_bottom) { style.padding_bottom = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_padding_left) { style.padding_left = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_top) { style.top = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_right) { style.right_pos = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_bottom) { style.bottom = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_left) { style.left_pos = Computed样式_解析长度值(值) }
+ 否则 如果 (属性 == CSS属性_color) {
+ 如果 (值.类型 == CSS值_颜色) { style.color = 值.颜色 }
+ }
+ 否则 如果 (属性 == CSS属性_background_color) {
+ 如果 (值.类型 == CSS值_颜色) { style.background_color = 值.颜色 }
+ }
+ 否则 如果 (属性 == CSS属性_font_size) {
+ 如果 (值.类型 == CSS值_长度) { style.font_size = 值.数值 }
+ 否则 如果 (值.类型 == CSS值_数字) { style.font_size = 值.数值 }
+ }
+ 否则 如果 (属性 == CSS属性_font_weight) {
+ 如果 (值.类型 == CSS值_数字) { style.font_weight = 值.数值 / 100 }
+ 否则 如果 (值.类型 == CSS值_关键字 && 值.关键字ID == 21) { style.font_weight = 700 }
+ 否则 如果 (值.类型 == CSS值_关键字 && 值.关键字ID == 22) { style.font_weight = 400 }
+ }
+ 否则 如果 (属性 == CSS属性_text_align) {
+ 如果 (值.关键字ID == 18) { style.text_align = TextAlign_center }
+ 否则 如果 (值.关键字ID == 19) { style.text_align = TextAlign_left }
+ 否则 如果 (值.关键字ID == 20) { style.text_align = TextAlign_right }
+ }
+ 否则 如果 (属性 == CSS属性_opacity) {
+ 如果 (值.类型 == CSS值_数字) { style.opacity = 值.数值 }
+ }
+ 否则 如果 (属性 == CSS属性_z_index) {
+ 如果 (值.类型 == CSS值_数字) {
+ style.z_index = 值.数值 / 100
+ style.z_index_auto = 假
+ }
+ 否则 如果 (值.类型 == CSS值_关键字 && 值.关键字ID == 4) {
+ style.z_index_auto = 真
+ }
+ }
+ 否则 如果 (属性 == CSS属性_overflow) {
+ 如果 (值.关键字ID == 11) { style.overflow_x = Overflow_hidden; style.overflow_y = Overflow_hidden }
+ 否则 如果 (值.关键字ID == 12) { style.overflow_x = Overflow_visible; style.overflow_y = Overflow_visible }
+ }
+ 否则 如果 (属性 == CSS属性_flex_direction) {
+ 如果 (值.关键字ID == 23) { style.flex_direction = 弹性Dir_row }
+ 否则 如果 (值.关键字ID == 24) { style.flex_direction = 弹性Dir_column }
+ }
+ 否则 如果 (属性 == CSS属性_justify_content) {
+ 如果 (值.关键字ID == 18) { style.justify_content = JC_center }
+ 否则 如果 (值.关键字ID == 27) { style.justify_content = JC_space_between }
+ 否则 如果 (值.关键字ID == 28) { style.justify_content = JC_space_around }
+ }
+ 否则 如果 (属性 == CSS属性_align_items) {
+ 如果 (值.关键字ID == 18) { style.align_items = JC_center }
+ 否则 如果 (值.关键字ID == 29) { style.align_items = JC_stretch }
+ }
+ 否则 如果 (属性 == CSS属性_gap) {
+ 如果 (值.类型 == CSS值_长度) { style.gap = 值.数值 }
+ }
+ 否则 如果 (属性 == CSS属性_box_sizing) {
+ 如果 (值.关键字ID == 31) { style.box_sizing = BoxSizing_border }
+ 否则 如果 (值.关键字ID == 32) { style.box_sizing = BoxSizing_content }
+ }
+ 否则 如果 (属性 == CSS属性_border_radius) {
+ 如果 (值.类型 == CSS值_长度) {
+ style.border_radius_tl = 值.数值
+ style.border_radius_tr = 值.数值
+ style.border_radius_bl = 值.数值
+ style.border_radius_br = 值.数值
+ }
+ }
+ 否则 如果 (属性 == CSS属性_visibility) {
+ 如果 (值.关键字ID == 12) { style.visibility = Visibility_visible }
+ 否则 如果 (值.关键字ID == 11) { style.visibility = Visibility_hidden }
+ }
+ 否则 如果 (属性 == CSS属性_line_height) {
+ 如果 (值.类型 == CSS值_长度) { style.line_height = 值.数值 }
+ 否则 如果 (值.类型 == CSS值_数字) { style.line_height = 值.数值 * style.font_size / 100 }
+ }
+ 否则 如果 (属性 == CSS属性_font_family) {
+ 如果 (值.字符串值 != 0) { style.font_family = 值.字符串值 }
+ }
+ 否则 如果 (属性 == CSS属性_cursor) {
+ 如果 (值.关键字ID == 30) { style.cursor = 30 }
+ }
+}
+
+函数 Computed样式_解析长度值(值) {
+ 如果 (值.类型 == CSS值_长度) {
+ 返回 计算长度_px(值.数值)
+ }
+ 如果 (值.类型 == CSS值_百分比) {
+ 定义 l = 计算长度 {}
+ l.值 = 值.数值; l.是auto = 假; l.单位 = 单位_百分比
+ 返回 l
+ }
+ 如果 (值.类型 == CSS值_数字 && 值.数值 == 0) {
+ 返回 计算长度_零()
+ }
+ 如果 (值.类型 == CSS值_关键字) {
+ 如果 (值.关键字ID == 4) { 返回 计算长度_auto() }
+ }
+ 返回 计算长度_auto()
+}
+
+// §4 CSS属性ID常量
+
+定义 CSS属性_display = 0
+定义 CSS属性_position = 1
+定义 CSS属性_width = 2
+定义 CSS属性_height = 3
+定义 CSS属性_min_width = 4
+定义 CSS属性_max_width = 5
+定义 CSS属性_min_height = 6
+定义 CSS属性_max_height = 7
+定义 CSS属性_margin_top = 8
+定义 CSS属性_margin_right = 9
+定义 CSS属性_margin_bottom = 10
+定义 CSS属性_margin_left = 11
+定义 CSS属性_padding_top = 12
+定义 CSS属性_padding_right = 13
+定义 CSS属性_padding_bottom = 14
+定义 CSS属性_padding_left = 15
+定义 CSS属性_top = 16
+定义 CSS属性_right = 17
+定义 CSS属性_bottom = 18
+定义 CSS属性_left = 19
+定义 CSS属性_color = 20
+定义 CSS属性_background_color = 21
+定义 CSS属性_font_size = 22
+定义 CSS属性_font_weight = 23
+定义 CSS属性_font_family = 24
+定义 CSS属性_text_align = 25
+定义 CSS属性_opacity = 26
+定义 CSS属性_z_index = 27
+定义 CSS属性_overflow = 28
+定义 CSS属性_flex_direction = 29
+定义 CSS属性_justify_content = 30
+定义 CSS属性_align_items = 31
+定义 CSS属性_gap = 32
+定义 CSS属性_box_sizing = 33
+定义 CSS属性_border_radius = 34
+定义 CSS属性_visibility = 35
+定义 CSS属性_line_height = 36
+定义 CSS属性_cursor = 37
+定义 CSS属性_transform = 38
+定义 CSS属性_transition = 39
+定义 CSS属性_animation = 40
+定义 CSS属性_border_width = 41
+定义 CSS属性_border_color = 42
+定义 CSS属性_border_style = 43
+定义 CSS属性_flex_grow = 44
+定义 CSS属性_flex_shrink = 45
+定义 CSS属性_flex_basis = 46
+定义 CSS属性_order = 47
+定义 CSS属性_white_space = 48
+定义 CSS属性_text_decoration = 49
+定义 CSS属性_float = 50
+定义 CSS属性_clear = 51
+定义 CSS属性_总数 = 52
+
+函数 CSS属性_名称(id) {
+    如果 (id == CSS属性_display) { 返回 "display" }
+    如果 (id == CSS属性_position) { 返回 "position" }
+    如果 (id == CSS属性_width) { 返回 "width" }
+    如果 (id == CSS属性_height) { 返回 "height" }
+    如果 (id == CSS属性_color) { 返回 "color" }
+    如果 (id == CSS属性_background_color) { 返回 "background-color" }
+    如果 (id == CSS属性_font_size) { 返回 "font-size" }
+    如果 (id == CSS属性_font_weight) { 返回 "font-weight" }
+    如果 (id == CSS属性_font_family) { 返回 "font-family" }
+    如果 (id == CSS属性_text_align) { 返回 "text-align" }
+    如果 (id == CSS属性_opacity) { 返回 "opacity" }
+    如果 (id == CSS属性_z_index) { 返回 "z-index" }
+    如果 (id == CSS属性_overflow) { 返回 "overflow" }
+    如果 (id == CSS属性_flex_direction) { 返回 "flex-direction" }
+    如果 (id == CSS属性_justify_content) { 返回 "justify-content" }
+    如果 (id == CSS属性_align_items) { 返回 "align-items" }
+    如果 (id == CSS属性_gap) { 返回 "gap" }
+    如果 (id == CSS属性_border_radius) { 返回 "border-radius" }
+    如果 (id == CSS属性_visibility) { 返回 "visibility" }
+    如果 (id == CSS属性_line_height) { 返回 "line-height" }
+    如果 (id == CSS属性_transform) { 返回 "transform" }
+    如果 (id == CSS属性_transition) { 返回 "transition" }
+    如果 (id == CSS属性_animation) { 返回 "animation" }
+    返回 "prop_" + 整数转字符串(id)
+}
+
+// §5 CSS值类型与枚举常量
+
+定义 CSS值_关键字 = 0
+定义 CSS值_长度 = 1
+定义 CSS值_百分比 = 2
+定义 CSS值_颜色 = 3
+定义 CSS值_数字 = 4
+定义 CSS值_字符串 = 5
+
+定义 Display_none = 0
+定义 Display_block = 1
+定义 Display_inline = 2
+定义 Display_inline_block = 3
+定义 Display_flex = 4
+定义 Display_grid = 5
+定义 Display_table = 6
+定义 Display_contents = 7
+
+定义 Position_static = 0
+定义 Position_relative = 1
+定义 Position_absolute = 2
+定义 Position_fixed = 3
+定义 Position_sticky = 4
+
+定义 Overflow_visible = 0
+定义 Overflow_hidden = 1
+定义 Overflow_scroll = 2
+定义 Overflow_auto = 3
+
+定义 TextAlign_left = 0
+定义 TextAlign_center = 1
+定义 TextAlign_right = 2
+定义 TextAlign_justify = 3
+
+定义 Visibility_visible = 0
+定义 Visibility_hidden = 1
+定义 Visibility_collapse = 2
+
+定义 弹性Dir_row = 0
+定义 弹性Dir_row_reverse = 1
+定义 弹性Dir_column = 2
+定义 弹性Dir_column_reverse = 3
+
+定义 JC_flex_start = 0
+定义 JC_flex_end = 1
+定义 JC_center = 2
+定义 JC_space_between = 3
+定义 JC_space_around = 4
+定义 JC_space_evenly = 5
+定义 JC_stretch = 6
+
+定义 BoxSizing_content = 0
+定义 BoxSizing_border = 1
+
+// §6 计算长度辅助
+
+定义 单位_px = 0
+定义 单位_百分比 = 1
+定义 单位_em = 2
+定义 单位_rem = 3
+定义 单位_vw = 4
+定义 单位_vh = 5
+
+结构 计算长度 {
+    值,
+    是auto,
+    单位,
+}
+
+函数 计算长度_px(数值) {
+    定义 l = 计算长度 {}
+    l.值 = 数值
+    l.是auto = 假
+    l.单位 = 单位_px
+    返回 l
+}
+
+函数 计算长度_零() {
+    定义 l = 计算长度 {}
+    l.值 = 0
+    l.是auto = 假
+    l.单位 = 单位_px
+    返回 l
+}
+
+函数 计算长度_auto() {
+    定义 l = 计算长度 {}
+    l.值 = 0
+    l.是auto = 真
+    l.单位 = 单位_px
+    返回 l
+}
+
+函数 计算长度_是零(l) {
+    返回 !l.是auto && l.值 == 0
+}
+
+函数 计算长度_是auto(l) {
+    返回 l.是auto
+}
+
+函数 计算长度_解析为px(l, 容器大小, 字体大小) {
+    如果 (l.是auto) { 返回 0 }
+    如果 (l.单位 == 单位_px) { 返回 l.值 }
+    如果 (l.单位 == 单位_百分比) { 返回 l.值 * 容器大小 / 10000 }
+    如果 (l.单位 == 单位_em) { 返回 l.值 * 字体大小 / 100 }
+    如果 (l.单位 == 单位_rem) { 返回 l.值 * 16 / 100 }
+    返回 l.值
+}
+
+// §7 批量应用声明列表
+
+函数 Computed样式_应用声明列表(style, 声明列表, 数量) {
+    定义 可变 i = 0
+    当 (i < 数量) {
+        Computed样式_应用声明(style, 声明列表[i])
+        i = i + 1
+    }
+}
+
+函数 Computed样式_应用匹配结果(style, 匹配列表, 数量) {
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 匹配 = 匹配列表[i]
+        Computed样式_应用声明列表(style, 匹配.声明, 匹配.声明数)
+        i = i + 1
+    }
+}
+
+// §8 样式应用统计
+
+定义 可变 样式应用_总次数 = 0
+定义 可变 样式应用_属性设置数 = 0
+定义 可变 样式应用_继承数 = 0
+
+函数 样式应用_统计() {
+    返回 {
+        总次数: 样式应用_总次数,
+        属性设置: 样式应用_属性设置数,
+        继承: 样式应用_继承数,
+    }
+}
+
+函数 样式应用_健康检查() {
+    返回 "样式应用子系统健康"
+}
+
+函数 样式应用_重置() {
+    样式应用_总次数 = 0
+    样式应用_属性设置数 = 0
+    样式应用_继承数 = 0
+}
+
+函数 样式应用_完整统计() {
+    返回 [样式应用_总次数, 样式应用_属性设置数, 样式应用_继承数]
+}
+
+定义 可变 AI_应用样式声_样式缓存命中 = 0
+
+函数 AI_应用样式声_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_应用样式声_布局缓存(元素哈希) {
+    AI_应用样式声_样式缓存命中 = AI_应用样式声_样式缓存命中 + 1
+    返回 元素哈希
+}

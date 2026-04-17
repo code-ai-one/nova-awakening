@@ -1,0 +1,230 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+
+//   1. 传控状态: CLOSED→LISTEN→SYN_SENT→SYN_RECV→ESTABLISHED→...→CLOSED
+//   2. 三次握手: SYN → SYN+ACK → ACK
+//   3. 四次挥手: FIN → ACK → FIN → ACK
+//   4. 序列号管理: 每个字节有序列号, ACK确认收到的字节
+//   5. 重传: 超时未收到ACK则重传(指数退避)
+//   6. 拥塞控制: 慢启动→拥塞避免→快恢复
+
+定义 传控_CLOSED      = 0
+定义 传控_LISTEN      = 1
+定义 传控_SYN_SENT    = 2
+定义 传控_SYN_RECV    = 3
+定义 传控_ESTABLISHED = 4
+定义 传控_FIN_WAIT1   = 5
+定义 传控_FIN_WAIT2   = 6
+定义 传控_CLOSE_WAIT  = 7
+定义 传控_CLOSING     = 8
+定义 传控_LAST_ACK    = 9
+定义 传控_TIME_WAIT   = 10
+
+定义 传控_FLAG_FIN = 0x01
+定义 传控_FLAG_SYN = 0x02
+定义 传控_FLAG_RST = 0x04
+定义 传控_FLAG_PSH = 0x08
+定义 传控_FLAG_ACK = 0x10
+定义 传控_FLAG_URG = 0x20
+
+结构 传控控制块 {
+    状态,
+    // 序列号
+    snd_una,    // u32 最早未确认的序列号
+    snd_nxt,    // u32 下一个要发送的序列号
+    rcv_nxt,    // u32 期望接收的下一个序列号
+    // 窗口
+    snd_wnd,    // u32 对方的接收窗口
+    rcv_wnd,    // u32 本端的接收窗口
+    // 拥塞控制
+    Nova拥塞窗口,    // u32 拥塞窗口(段数)
+    Nova慢启动阈值,    // u32 慢启动阈值
+    // 重传
+    rto_ms,    // u32 重传超时(毫秒)
+    重传次数,
+}
+
+// 状态转换 
+
+函数 传控_处理段(tcb, 标志, seq, ack, 数据长度) {
+    如果 (tcb.状态 == 传控_LISTEN) {
+        // 收到SYN: 进入SYN_RECV, 发送SYN+ACK
+        如果 ((标志 & 传控_FLAG_SYN) != 0) {
+            tcb.rcv_nxt = seq + 1
+            tcb.状态 = 传控_SYN_RECV
+            // 发送SYN+ACK
+            返回 传控_FLAG_SYN | 传控_FLAG_ACK
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_SYN_SENT) {
+        // 收到SYN+ACK: 进入ESTABLISHED, 发送ACK
+        如果 ((标志 & (传控_FLAG_SYN | 传控_FLAG_ACK)) == (传控_FLAG_SYN | 传控_FLAG_ACK)) {
+            tcb.rcv_nxt = seq + 1
+            tcb.snd_una = ack
+            tcb.状态 = 传控_ESTABLISHED
+            返回 传控_FLAG_ACK
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_SYN_RECV) {
+        // 收到ACK: 进入ESTABLISHED
+        如果 ((标志 & 传控_FLAG_ACK) != 0) {
+            tcb.snd_una = ack
+            tcb.状态 = 传控_ESTABLISHED
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_ESTABLISHED) {
+        // 处理ACK
+        如果 ((标志 & 传控_FLAG_ACK) != 0) {
+            tcb.snd_una = ack
+        }
+        // 处理数据
+        如果 (数据长度 > 0) {
+            tcb.rcv_nxt = tcb.rcv_nxt + 数据长度
+            返回 传控_FLAG_ACK
+        }
+        // 收到FIN: 进入CLOSE_WAIT
+        如果 ((标志 & 传控_FLAG_FIN) != 0) {
+            tcb.rcv_nxt = tcb.rcv_nxt + 1
+            tcb.状态 = 传控_CLOSE_WAIT
+            返回 传控_FLAG_ACK
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_FIN_WAIT1) {
+        如果 ((标志 & 传控_FLAG_ACK) != 0) {
+            tcb.状态 = 传控_FIN_WAIT2
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_FIN_WAIT2) {
+        如果 ((标志 & 传控_FLAG_FIN) != 0) {
+            tcb.rcv_nxt = tcb.rcv_nxt + 1
+            tcb.状态 = 传控_TIME_WAIT
+            返回 传控_FLAG_ACK
+        }
+    }
+    否则 如果 (tcb.状态 == 传控_LAST_ACK) {
+        如果 ((标志 & 传控_FLAG_ACK) != 0) {
+            tcb.状态 = 传控_CLOSED
+        }
+    }
+    返回 0
+}
+
+// 主动操作
+
+函数 传控_发起连接(tcb) {
+    tcb.状态 = 传控_SYN_SENT
+    tcb.snd_nxt = tcb.snd_nxt + 1
+    // 发送SYN
+}
+
+函数 传控_发起关闭(tcb) {
+    如果 (tcb.状态 == 传控_ESTABLISHED) {
+        tcb.状态 = 传控_FIN_WAIT1
+        // 发送FIN
+    } 否则 如果 (tcb.状态 == 传控_CLOSE_WAIT) {
+        tcb.状态 = 传控_LAST_ACK
+        // 发送FIN
+    }
+}
+
+函数 传控_创建控制块() {
+    定义 tcb = 传控控制块 {}
+    tcb.状态 = 传控_CLOSED
+    tcb.snd_una = 0
+    tcb.snd_nxt = 1000    // 初始序列号(应该随机)
+    tcb.rcv_nxt = 0
+    tcb.snd_wnd = 65535
+    tcb.rcv_wnd = 65535
+    tcb.Nova拥塞窗口 = 10          // 初始拥塞窗口(10个MSS)
+    tcb.Nova慢启动阈值 = 65535
+    tcb.rto_ms = 1000      // 初始RTO 1秒
+    tcb.重传次数 = 0
+    返回 tcb
+}
+
+// 拥塞控制 
+
+函数 传控_拥塞控制_ACK(tcb) {
+    如果 (tcb.Nova拥塞窗口 < tcb.Nova慢启动阈值) {
+        // 慢启动: Nova拥塞窗口每ACK增加1 MSS
+        tcb.Nova拥塞窗口 = tcb.Nova拥塞窗口 + 1
+    } 否则 {
+        // 拥塞避免: Nova拥塞窗口每Nova往返时间增加约1 MSS
+        // Nova拥塞窗口 += 1/Nova拥塞窗口 (近似)
+    }
+}
+
+函数 传控_拥塞控制_丢包(tcb) {
+    // 丢包: Nova慢启动阈值 = Nova拥塞窗口/2, Nova拥塞窗口重置
+    tcb.Nova慢启动阈值 = tcb.Nova拥塞窗口 / 2
+    如果 (tcb.Nova慢启动阈值 < 2) { tcb.Nova慢启动阈值 = 2 }
+    tcb.Nova拥塞窗口 = 1   // 重新慢启动
+}
+
+// 状态名称
+
+函数 传控_状态名_详细(状态) {    // 详细版(权威版在传控核心.nova)
+    如果 (状态 == 传控_CLOSED)      { 返回 "CLOSED" }
+    如果 (状态 == 传控_LISTEN)      { 返回 "LISTEN" }
+    如果 (状态 == 传控_SYN_SENT)    { 返回 "SYN_SENT" }
+    如果 (状态 == 传控_SYN_RECV)    { 返回 "SYN_RECV" }
+    如果 (状态 == 传控_ESTABLISHED) { 返回 "ESTABLISHED" }
+    如果 (状态 == 传控_FIN_WAIT1)   { 返回 "FIN_WAIT1" }
+    如果 (状态 == 传控_FIN_WAIT2)   { 返回 "FIN_WAIT2" }
+    如果 (状态 == 传控_CLOSE_WAIT)  { 返回 "CLOSE_WAIT" }
+    如果 (状态 == 传控_CLOSING)     { 返回 "CLOSING" }
+    如果 (状态 == 传控_LAST_ACK)    { 返回 "LAST_ACK" }
+    如果 (状态 == 传控_TIME_WAIT)   { 返回 "TIME_WAIT" }
+    返回 "UNKNOWN"
+}
+
+// 重传超时处理 
+
+函数 传控_重传超时(tcb) {
+    tcb.重传次数 = tcb.重传次数 + 1
+    // 指数退避: RTO翻倍
+    tcb.rto_ms = tcb.rto_ms * 2
+    如果 (tcb.rto_ms > 120000) { tcb.rto_ms = 120000 }  // 上限120秒
+    // 触发拥塞控制丢包处理
+    传控_拥塞控制_丢包(tcb)
+}
+
+函数 传控_RST处理(tcb) {
+    tcb.状态 = 传控_CLOSED
+    tcb.Nova拥塞窗口 = 1
+    tcb.重传次数 = 0
+}
+
+函数 传控_是已建立(tcb) {
+    返回 tcb.状态 == 传控_ESTABLISHED
+}
+
+函数 传控_飞行中字节数(tcb) {
+    // 已发送但未确认的字节数
+    如果 (tcb.snd_nxt >= tcb.snd_una) {
+        返回 tcb.snd_nxt - tcb.snd_una
+    }
+    返回 0
+}
+
+// 传控标志名称 + 连接摘要
+
+函数 传控_标志名(标志) {
+    定义 可变 名 = ""
+    如果 ((标志 & 传控_FLAG_SYN) != 0) { 名 = 名 + "S" }
+    如果 ((标志 & 传控_FLAG_ACK) != 0) { 名 = 名 + "A" }
+    如果 ((标志 & 传控_FLAG_FIN) != 0) { 名 = 名 + "F" }
+    如果 ((标志 & 传控_FLAG_RST) != 0) { 名 = 名 + "R" }
+    如果 ((标志 & 传控_FLAG_PSH) != 0) { 名 = 名 + "P" }
+    如果 ((标志 & 传控_FLAG_URG) != 0) { 名 = 名 + "U" }
+    返回 名
+}
+
+函数 传控_连接摘要(tcb) {
+    返回 [tcb.状态, tcb.Nova拥塞窗口, tcb.Nova慢启动阈值, tcb.rto_ms, tcb.重传次数]
+}
+
+
+函数 传控状态机_完整统计() {
+    返回 [传控_状态转换总数]
+}

@@ -1,0 +1,122 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("./拖动放置控制.nova")
+导入("./原子驻留.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./文档事件.nova")
+
+// §3 拖放控制器
+
+结构 DragController {
+    正在拖放,
+    拖放源,    // u64 被拖拽的元素
+    数据传输,    // u64 DataTransfer*
+    当前目标,    // u64 当前dragover的元素
+    起始x,
+    起始y,
+    当前x,
+    当前y,
+}
+
+定义 可变 全局拖放控制器 = 0
+
+函数 DragController_获取() {
+    如果 (全局拖放控制器 == 0) {
+        全局拖放控制器 = 堆_分配(DragController)
+        全局拖放控制器.正在拖放 = 假
+        全局拖放控制器.拖放源 = 0
+        全局拖放控制器.数据传输 = 0
+        全局拖放控制器.当前目标 = 0
+    }
+    返回 全局拖放控制器
+}
+
+函数 DragController_开始拖放(元素, x, y) {
+    定义 dc = DragController_获取()
+    如果 (dc.正在拖放) { 返回 }
+
+    // 检查draggable属性
+    定义 draggable = 元素_getAttribute(元素, "draggable")
+    如果 (draggable == 0 || !字符串_相等(draggable, "true")) { 返回 }
+
+    dc.正在拖放 = 真
+    dc.拖放源 = 元素
+    dc.起始x = x; dc.起始y = y
+    dc.当前x = x; dc.当前y = y
+
+    // 创建DataTransfer
+    dc.数据传输 = DataTransfer_创建()
+
+    // 触发dragstart
+    定义 事件 = Drag事件_创建("dragstart", x, y, dc.数据传输)
+    事件Target_dispatch事件(元素, 事件)
+}
+
+函数 DragController_拖动中(x, y) {
+    定义 dc = DragController_获取()
+    如果 (!dc.正在拖放) { 返回 }
+    dc.当前x = x; dc.当前y = y
+
+    // 触发drag事件(在源元素上)
+    定义 drag事件 = Drag事件_创建("drag", x, y, dc.数据传输)
+    事件Target_dispatch事件(dc.拖放源, drag事件)
+
+    // 命中测试: 找到当前位置下的元素
+    定义 目标 = 命中测试_查找元素(x, y)
+
+    // dr智能体er / dragleave
+    如果 (目标 != dc.当前目标) {
+        如果 (dc.当前目标 != 0) {
+            定义 leave事件 = Drag事件_创建("dragleave", x, y, dc.数据传输)
+            事件Target_dispatch事件(dc.当前目标, leave事件)
+        }
+        如果 (目标 != 0) {
+            定义 enter事件 = Drag事件_创建("dr智能体er", x, y, dc.数据传输)
+            事件Target_dispatch事件(目标, enter事件)
+        }
+        dc.当前目标 = 目标
+    }
+
+    // dragover(需要pr事件Default才能接受drop)
+    如果 (目标 != 0) {
+        dc.数据传输.是只读 = 真
+        定义 over事件 = Drag事件_创建("dragover", x, y, dc.数据传输)
+        over事件.可取消 = 真
+        事件Target_dispatch事件(目标, over事件)
+    }
+}
+
+函数 DragController_释放(x, y) {
+    定义 dc = DragController_获取()
+    如果 (!dc.正在拖放) { 返回 }
+
+    定义 目标 = 命中测试_查找元素(x, y)
+
+    // 触发drop(在目标上)
+    如果 (目标 != 0) {
+        dc.数据传输.是只读 = 真
+        定义 drop事件 = Drag事件_创建("drop", x, y, dc.数据传输)
+        drop事件.可取消 = 真
+        事件Target_dispatch事件(目标, drop事件)
+    }
+
+    // 触发dragend(在源元素上)
+    定义 end事件 = Drag事件_创建("dragend", x, y, dc.数据传输)
+    事件Target_dispatch事件(dc.拖放源, end事件)
+
+    // 清理
+    dc.正在拖放 = 假
+    dc.拖放源 = 0
+    dc.当前目标 = 0
+    dc.数据传输 = 0
+}
+
+函数 Drag事件_创建(类型, x, y, dataTransfer) {
+    定义 事件 = 事件_创建(类型, 真, 真)
+    事件.是受信任的 = 真
+    // 附加Drag事件特有属性
+    // 事件.clientX = x; 事件.clientY = y
+    // 事件.dataTransfer = dataTransfer
+    返回 事件
+}

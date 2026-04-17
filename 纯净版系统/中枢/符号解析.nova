@@ -1,0 +1,136 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./哈希函数.nova")
+导入("../引导/端口输入.nova")
+
+// §7 符号解析
+
+函数 查找符号(名称) {
+    // 先查缓存
+    定义 可变 c = 0
+    当 (c < 计数(链接器_符号缓存)) {
+        如果 (链接器_符号缓存[c][0] == 名称) {
+            返回 链接器_符号缓存[c][1]
+        }
+        c = c + 1
+    }
+
+    // 遍历所有已加载对象的符号表(广度优先)
+    定义 可变 i = 0
+    当 (i < 计数(已加载对象列表)) {
+        定义 obj = 已加载对象列表[i]
+        定义 addr = 在对象中查找符号(obj, 名称)
+        如果 (addr != 0) {
+            追加(链接器_符号缓存, [名称, addr])
+            返回 addr
+        }
+        i = i + 1
+    }
+
+    返回 0  // 未找到
+}
+
+函数 在对象中查找符号(obj, 名称) {
+    如果 (obj.符号表 == 0 || obj.字符串表 == 0) { 返回 0 }
+
+    // 如果有GNU hash表, 用GNU hash查找(更快)
+    如果 (obj.GNU哈希表 != 0) {
+        返回 GNU哈希查找(obj, 名称)
+    }
+
+    // 退而用ELF hash表
+    如果 (obj.哈希表 != 0) {
+        返回 ELF哈希查找(obj, 名称)
+    }
+
+    // 最后线性搜索(慢)
+    返回 线性查找符号(obj, 名称)
+}
+
+函数 ELF哈希查找(obj, 名称) {
+    // ELF hash表: [nbucket, nchain, bucket[nbucket], chain[nchain]]
+    定义 nbucket = 内存读32(obj.哈希表)
+    定义 nchain  = 内存读32(obj.哈希表 + 4)
+    定义 bucket_base = obj.哈希表 + 8
+    定义 chain_base  = bucket_base + nbucket * 4
+
+    定义 h = elf_hash(名称)
+    定义 可变 idx = 内存读32(bucket_base + (h % nbucket) * 4)
+
+    当 (idx != 0 && idx < nchain) {
+        定义 sym = obj.符号表 + idx * 24   // Elf64_Sym = 24字节
+        定义 st_name = 内存读32(sym)
+        定义 sym_name = 读取C字符串(obj.字符串表 + st_name)
+        如果 (sym_name == 名称) {
+            定义 st_value = 内存读64(sym + 8)
+            定义 st_shndx = 内存读16(sym + 6)
+            如果 (st_shndx != 0 && st_value != 0) {  // SHN_UNDEF=0
+                返回 obj.基地址 + st_value
+            }
+        }
+        idx = 内存读32(chain_base + idx * 4)
+    }
+    返回 0
+}
+
+函数 GNU哈希查找(obj, 名称) {
+    定义 ght = obj.GNU哈希表
+    定义 nbuckets  = 内存读32(ght)
+    定义 symoffset = 内存读32(ght + 4)
+    定义 bloom_size = 内存读32(ght + 8)
+    定义 bloom_shift = 内存读32(ght + 12)
+    定义 bloom = ght + 16
+    定义 buckets = bloom + bloom_size * 8
+    定义 chains = buckets + nbuckets * 4
+
+    定义 h = gnu_hash(名称)
+
+    // Bloom filter检查
+    定义 word = 内存读64(bloom + ((h / 64) % bloom_size) * 8)
+    定义 mask = (1 << (h % 64)) | (1 << ((h >> bloom_shift) % 64))
+    如果 ((word & mask) != mask) { 返回 0 }
+
+    // Bucket查找
+    定义 可变 idx = 内存读32(buckets + (h % nbuckets) * 4)
+    如果 (idx == 0) { 返回 0 }
+
+    定义 h1 = h & ~1
+    当 (真) {
+        定义 chain_val = 内存读32(chains + (idx - symoffset) * 4)
+        如果 ((chain_val & ~1) == h1) {
+            定义 sym = obj.符号表 + idx * 24
+            定义 st_name = 内存读32(sym)
+            如果 (读取C字符串(obj.字符串表 + st_name) == 名称) {
+                定义 st_value = 内存读64(sym + 8)
+                如果 (st_value != 0) {
+                    返回 obj.基地址 + st_value
+                }
+            }
+        }
+        如果 ((chain_val & 1) != 0) { 跳出 }  // 链结束
+        idx = idx + 1
+    }
+    返回 0
+}
+
+函数 线性查找符号(obj, 名称) {
+    // 通过哈希表的nchain确定符号数(或设一个上限)
+    定义 可变 idx = 0
+    定义 上限 = 10000
+    当 (idx < 上限) {
+        定义 sym = obj.符号表 + idx * 24
+        定义 st_name = 内存读32(sym)
+        如果 (st_name != 0) {
+            定义 sym_name = 读取C字符串(obj.字符串表 + st_name)
+            如果 (sym_name == 名称) {
+                定义 st_value = 内存读64(sym + 8)
+                定义 st_shndx = 内存读16(sym + 6)
+                如果 (st_shndx != 0 && st_value != 0) {
+                    返回 obj.基地址 + st_value
+                }
+            }
+        }
+        idx = idx + 1
+    }
+    返回 0
+}

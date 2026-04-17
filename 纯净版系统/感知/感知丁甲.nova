@@ -1,0 +1,121 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./取数脚本绑.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+
+// §3 Body
+
+结构 Body {
+    数据,
+    长度,
+    已消费,
+    // MIME
+    contentType,
+    // ReadableStream
+    stream,    // u64 ReadableStream*
+}
+
+函数 Body_创建(数据, 长度) {
+    定义 b = 堆_分配(Body)
+    如果 (数据 != 0 && 长度 > 0) {
+        b.数据 = 堆_分配(长度)
+        内存_复制(b.数据, 数据, 长度)
+    } 否则 {
+        b.数据 = 0
+    }
+    b.长度 = 长度; b.已消费 = 假
+    b.contentType = 0; b.stream = 0
+    返回 b
+}
+
+// body.text()
+函数 Body_text(b) {
+    如果 (b == 0 || b.已消费) { 返回 0 }
+    b.已消费 = 真
+    // 解码为UTF-8字符串
+    返回 b.数据
+}
+
+// body.json()
+函数 Body_json(b) {
+    如果 (b == 0 || b.已消费) { 返回 0 }
+    b.已消费 = 真
+    // 序列.parse(text)
+    返回 0
+}
+
+// body.arrayBuffer()
+函数 Body_arrayBuffer(b) {
+    如果 (b == 0 || b.已消费) { 返回 0 }
+    b.已消费 = 真
+    返回 b.数据
+}
+
+// body.blob()
+函数 Body_blob(b) {
+    如果 (b == 0 || b.已消费) { 返回 0 }
+    b.已消费 = 真
+    // 封装为Blob对象
+    定义 blob = 堆_分配(Blob对象)
+    blob.数据 = b.数据
+    blob.大小 = b.数据大小
+    blob.类型 = b.MIME类型
+    返回 blob
+}
+
+// body.formData()
+函数 Body_formData(b) {
+    如果 (b == 0 || b.已消费) { 返回 0 }
+    b.已消费 = 真
+    // 解析multipart/form-data或application/x-www-form-urlencoded
+    返回 0
+}
+
+// §4 Request
+
+结构 取数Request {
+    url,
+    method,    // u8 METHOD_xxx
+    headers,    // u64 Headers*
+    body,    // u64 Body*
+    mode,    // u8 MODE_xxx
+    credentials,    // u8 CRED_xxx
+    cache,    // u8 CACHE_xxx
+    redirect,    // u8 REDIRECT_xxx
+    referrer,
+    referrerPolicy,
+    integrity,    // u64 SRI哈希
+    keepalive,
+    signal,    // u64 AbortSignal*
+    priority,    // u8 PRIORITY_xxx
+    // 内部
+    已发送,
+}
+
+函数 Request_创建(url, method) {
+    定义 req = 堆_分配(取数Request)
+    req.url = 字符串_复制(url)
+    req.method = method
+    req.headers = Headers_创建()
+    req.body = 0
+    req.mode = MODE_CORS; req.credentials = CRED_SAME_ORIGIN
+    req.cache = CACHE_DEFAULT; req.redirect = REDIRECT_FOLLOW
+    req.referrer = "about:client"; req.referrerPolicy = 0
+    req.integrity = 0; req.keepalive = 假
+    req.signal = 0; req.priority = PRIORITY_AUTO
+    req.已发送 = 假
+    返回 req
+}
+
+函数 Request_clone(req) {
+    如果 (req == 0) { 返回 0 }
+    定义 新req = Request_创建(req.url, req.method)
+    新req.mode = req.mode; 新req.credentials = req.credentials
+    新req.cache = req.cache; 新req.redirect = req.redirect
+    新req.referrer = req.referrer; 新req.keepalive = req.keepalive
+    新req.signal = req.signal; 新req.priority = req.priority
+    // 复制headers
+    // 复制body(如果未消费)
+    返回 新req
+}

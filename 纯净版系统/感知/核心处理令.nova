@@ -1,0 +1,115 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./标记树构丙.nova")
+导入("./标记树构丁.nova")
+导入("./文档节点.nova")
+导入("./帧.nova")
+导入("./元素栈创建.nova")
+导入("./原子驻留.nova")
+导入("./树构建器.nova")
+导入("./文档接口属.nova")
+导入("./标记树构甲.nova")
+导入("./原生独创用.nova")
+导入("./文档创建.nova")
+
+// §2 核心: 处理令牌 
+// 根据当前插入模式分派令牌处理
+
+函数 HTMLTreeBuilder_处理令牌(tb, 令牌) {
+ // HTML规范 §13.2.6: Tree construction dispatcher
+ 如果 (tb.插入模式 == 插入模式_初始) {
+ HTMLTreeBuilder_初始模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_DOCTYPE前 || tb.插入模式 == 插入模式_html前) {
+ HTMLTreeBuilder_html前模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_head前) {
+ HTMLTreeBuilder_head前模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_head中) {
+ HTMLTreeBuilder_head中模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_head后) {
+ HTMLTreeBuilder_head后模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_body中) {
+ HTMLTreeBuilder_body中模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_文本) {
+ HTMLTreeBuilder_文本模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_body后) {
+ HTMLTreeBuilder_body后模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_html后) {
+ HTMLTreeBuilder_html后模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_table中) {
+ HTMLTreeBuilder_table中模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_行中) {
+ HTMLTreeBuilder_行中模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_单元格中) {
+ HTMLTreeBuilder_单元格中模式(tb, 令牌)
+ }
+ 否则 如果 (tb.插入模式 == 插入模式_select中) {
+ HTMLTreeBuilder_select中模式(tb, 令牌)
+ }
+}
+
+// §3 各插入模式处理 (HTML规范 §13.2.6.4.x)
+
+函数 HTMLTreeBuilder_初始模式(tb, 令牌) {
+ 如果 (令牌.类型 == 令牌类型_字符) {
+ // 忽略空白
+ 返回
+ }
+ 如果 (令牌.类型 == 令牌类型_注释) {
+ 定义 注释 = Comment_创建(令牌.数据)
+ 节点_appendChild(tb.文档, 注释)
+ 返回
+ }
+ 如果 (令牌.类型 == 令牌类型_DOCTYPE) {
+ 定义 doctype = DocumentType_创建(令牌.DOCTYPE名称, "", "")
+ 节点_appendChild(tb.文档, doctype)
+ // 判断兼容模式
+ 如果 (令牌.强制怪异模式) {
+ 定义 扩展 = Document_获取扩展(tb.文档)
+ 如果 (扩展 != 0) { 扩展.兼容模式 = 兼容模式_怪异 }
+ }
+ tb.插入模式 = 插入模式_html前
+ 返回
+ }
+ // 其他: 设置怪异模式,切换到html前,重新处理
+ 定义 扩展 = Document_获取扩展(tb.文档)
+ 如果 (扩展 != 0) { 扩展.兼容模式 = 兼容模式_怪异 }
+ tb.插入模式 = 插入模式_html前
+ HTMLTreeBuilder_处理令牌(tb, 令牌)
+}
+
+函数 HTMLTreeBuilder_html前模式(tb, 令牌) {
+ 如果 (令牌.类型 == 令牌类型_DOCTYPE) { 返回 }
+ 如果 (令牌.类型 == 令牌类型_注释) {
+ 定义 注释 = Comment_创建(令牌.数据)
+ 节点_appendChild(tb.文档, 注释)
+ 返回
+ }
+ 如果 (令牌.类型 == 令牌类型_开始标签) {
+ 定义 标签原子 = 原子_驻留(令牌.标签名)
+ 如果 (标签原子 == 原子_html) {
+ 定义 html = HTMLTreeBuilder_创建元素并插入(tb, 令牌, tb.文档)
+ 元素栈_压入(tb.开放元素栈, html)
+ Document_设置文档元素(tb.文档, html)
+ tb.插入模式 = 插入模式_head前
+ 返回
+ }
+ }
+ // 隐式创建<html>
+ 定义 html = Document_create元素(tb.文档, "html")
+ 节点_appendChild(tb.文档, html)
+ 元素栈_压入(tb.开放元素栈, html)
+ Document_设置文档元素(tb.文档, html)
+ tb.插入模式 = 插入模式_head前
+ HTMLTreeBuilder_处理令牌(tb, 令牌)
+}

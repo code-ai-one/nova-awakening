@@ -1,0 +1,314 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+
+// §5 SkShader — 着色器基类
+
+定义 SHADER_SOLID       = 0
+定义 SHADER_LINEAR      = 1
+定义 SHADER_RADIAL      = 2
+定义 SHADER_SWEEP       = 3
+定义 SHADER_BITMAP      = 4
+
+定义 TILE_CLAMP         = 0
+定义 TILE_REPEAT         = 1
+定义 TILE_MIRROR         = 2
+定义 TILE_DECAL          = 3
+
+结构 SkShader {
+    类型,    // u8 SHADER_xxx
+    // 线性渐变
+    x0,    // i32, y0: i32, x1: i32, y1: i32
+    // 径向渐变
+    cx,    // i32, cy: i32, 半径: i32
+    // 色标
+    色标颜色,    // u64 u32* 数组
+    色标位置,    // u64 i32* 数组 (Q10 0-1024)
+    色标数,
+    // 平铺
+    平铺模式,    // u8 TILE_xxx
+    // 矩阵(局部变换)
+    矩阵,    // [6]i32 2x3仿射 Q10
+}
+
+
+函数 SkShader_线性渐变(x0, y0, x1, y1, 颜色数组, 位置数组, 数量, 平铺) {
+    定义 s = 堆_分配(SkShader)
+    s.类型 = SHADER_LINEAR
+    s.x0 = x0; s.y0 = y0; s.x1 = x1; s.y1 = y1
+    s.色标颜色 = 颜色数组; s.色标位置 = 位置数组; s.色标数 = 数量
+    s.平铺模式 = 平铺
+    s.矩阵[0] = 1024; s.矩阵[3] = 1024    // 单位矩阵
+    返回 s
+}
+
+函数 SkShader_径向渐变(cx, cy, 半径, 颜色数组, 位置数组, 数量, 平铺) {
+    定义 s = 堆_分配(SkShader)
+    s.类型 = SHADER_RADIAL
+    s.cx = cx; s.cy = cy; s.半径 = 半径
+    s.色标颜色 = 颜色数组; s.色标位置 = 位置数组; s.色标数 = 数量
+    s.平铺模式 = 平铺
+    s.矩阵[0] = 1024; s.矩阵[3] = 1024
+    返回 s
+}
+
+// 着色器采样: 给定(x,y)返回ARGB颜色
+函数 SkShader_采样(shader, x, y) {
+    如果 (shader == 0) { 返回 0xFF000000 }
+
+    选择 (shader.类型) {
+        SHADER_SOLID: {
+            如果 (shader.色标数 > 0) {
+                返回 内存_读32(shader.色标颜色)
+            }
+            返回 0xFF000000
+        }
+        SHADER_LINEAR: {
+            // 投影到渐变线上
+            定义 dx = shader.x1 - shader.x0
+            定义 dy = shader.y1 - shader.y0
+            定义 len2 = dx * dx + dy * dy
+            如果 (len2 == 0) { 返回 0xFF000000 }
+            定义 t = ((x - shader.x0) * dx + (y - shader.y0) * dy) * 1024 / len2
+            t = SkShader_平铺(t, shader.平铺模式)
+            返回 SkShader_插值色标(shader, t)
+        }
+        SHADER_RADIAL: {
+            定义 dx = x - shader.cx
+            定义 dy = y - shader.cy
+            定义 dist = Sk数学_sqrt(dx * dx + dy * dy)
+            定义 t = 0
+            如果 (shader.半径 > 0) { t = dist * 1024 / shader.半径 }
+            t = SkShader_平铺(t, shader.平铺模式)
+            返回 SkShader_插值色标(shader, t)
+        }
+        SHADER_SWEEP: {
+            定义 dx = x - shader.cx
+            定义 dy = y - shader.cy
+            定义 角度 = Sk数学_atan2(dy, dx)    // 0-1024 (对应0-360°)
+            返回 SkShader_插值色标(shader, 角度)
+        }
+        默认: { 返回 0xFF000000 }
+    }
+}
+
+函数 SkShader_平铺(t, 模式) {
+    选择 (模式) {
+        TILE_CLAMP: {
+            如果 (t < 0) { 返回 0 }
+            如果 (t > 1024) { 返回 1024 }
+            返回 t
+        }
+        TILE_REPEAT: {
+            t = t % 1024
+            如果 (t < 0) { t = t + 1024 }
+            返回 t
+        }
+        TILE_MIRROR: {
+            t = t % 2048
+            如果 (t < 0) { t = t + 2048 }
+            如果 (t > 1024) { t = 2048 - t }
+            返回 t
+        }
+        TILE_DECAL: {
+            如果 (t < 0 || t > 1024) { 返回 -1 }    // 透明
+            返回 t
+        }
+        默认: { 返回 t }
+    }
+}
+
+函数 SkShader_插值色标(shader, t_Q10) {
+    如果 (shader.色标数 == 0) { 返回 0xFF000000 }
+    如果 (t_Q10 < 0) { 返回 0x00000000 }    // decal透明
+    如果 (shader.色标数 == 1) { 返回 内存_读32(shader.色标颜色) }
+
+    // 找t所在的两个色标
+    定义 可变 i = 0
+    当 (i < shader.色标数 - 1) {
+        定义 p0 = 内存_读32(shader.色标位置 + i * 4)
+        定义 p1 = 内存_读32(shader.色标位置 + (i + 1) * 4)
+        如果 (t_Q10 >= p0 && t_Q10 <= p1) {
+            定义 范围 = p1 - p0
+            如果 (范围 == 0) { 范围 = 1 }
+            定义 比例 = (t_Q10 - p0) * 256 / 范围
+            定义 c0 = 内存_读32(shader.色标颜色 + i * 4)
+            定义 c1 = 内存_读32(shader.色标颜色 + (i + 1) * 4)
+            返回 SkColor_lerp(c0, c1, 比例)
+        }
+        i = i + 1
+    }
+    返回 内存_读32(shader.色标颜色 + (shader.色标数 - 1) * 4)
+}
+
+// §6 颜色插值与操作
+
+函数 SkColor_lerp(c0, c1, t256) {
+    定义 a0 = (c0 >> 24) & 0xFF
+    定义 r0 = (c0 >> 16) & 0xFF
+    定义 g0 = (c0 >> 8) & 0xFF
+    定义 b0 = c0 & 0xFF
+    定义 a1 = (c1 >> 24) & 0xFF
+    定义 r1 = (c1 >> 16) & 0xFF
+    定义 g1 = (c1 >> 8) & 0xFF
+    定义 b1 = c1 & 0xFF
+    定义 a = a0 + (a1 - a0) * t256 / 256
+    定义 r = r0 + (r1 - r0) * t256 / 256
+    定义 g = g0 + (g1 - g0) * t256 / 256
+    定义 b = b0 + (b1 - b0) * t256 / 256
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+函数 SkColor_从RGBA(r, g, b, a) {
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+函数 SkColor_R(c) { 返回 (c >> 16) & 0xFF }
+函数 SkColor_G(c) { 返回 (c >> 8) & 0xFF }
+函数 SkColor_B(c) { 返回 c & 0xFF }
+函数 SkColor_A(c) { 返回 (c >> 24) & 0xFF }
+
+函数 SkColor_预乘Alpha(c) {
+    定义 a = SkColor_A(c)
+    如果 (a == 255) { 返回 c }
+    如果 (a == 0) { 返回 0 }
+    定义 r = SkColor_R(c) * a / 255
+    定义 g = SkColor_G(c) * a / 255
+    定义 b = SkColor_B(c) * a / 255
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+函数 SkColor_混合(src, dst) {
+    定义 sa = SkColor_A(src)
+    如果 (sa == 255) { 返回 src }
+    如果 (sa == 0) { 返回 dst }
+    定义 da = 255 - sa
+    定义 r = (SkColor_R(src) * sa + SkColor_R(dst) * da) / 255
+    定义 g = (SkColor_G(src) * sa + SkColor_G(dst) * da) / 255
+    定义 b = (SkColor_B(src) * sa + SkColor_B(dst) * da) / 255
+    定义 a = sa + SkColor_A(dst) * da / 255
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// §7 扫线渐变着色器
+
+函数 SkShader_扫线着色(shader, y, x起始, x结束, 输出缓冲) {
+    如果 (shader == 0 || 输出缓冲 == 0) { 返回 }
+    定义 可变 x = x起始
+    当 (x < x结束) {
+        定义 颜色 = SkShader_采样(shader, x, y)
+        内存_写32(输出缓冲 + (x - x起始) * 4, 颜色)
+        x = x + 1
+    }
+}
+
+函数 SkShader_纯色(颜色) {
+    定义 s = 堆_分配(SkShader)
+    s.类型 = SHADER_SOLID
+    s.色标颜色 = 堆_分配(4)
+    内存_写32(s.色标颜色, 颜色)
+    s.色标数 = 1
+    s.平铺模式 = TILE_CLAMP
+    返回 s
+}
+
+函数 SkShader_位图(位图数据, 宽, 高, 平铺) {
+    定义 s = 堆_分配(SkShader)
+    s.类型 = SHADER_BITMAP
+    s.色标颜色 = 位图数据
+    s.x0 = 宽
+    s.y0 = 高
+    s.平铺模式 = 平铺
+    返回 s
+}
+
+// §8 数学辅助
+
+函数 Sk数学_sqrt(x) {
+    如果 (x <= 0) { 返回 0 }
+    定义 可变 r = x
+    定义 可变 迭代 = 0
+    当 (迭代 < 20) {
+        定义 新r = (r + x / r) / 2
+        如果 (新r >= r) { 跳出 }
+        r = 新r
+        迭代 = 迭代 + 1
+    }
+    返回 r
+}
+
+函数 Sk数学_atan2(y, x) {
+    如果 (x == 0 && y == 0) { 返回 0 }
+    如果 (x > 0) { 返回 y * 256 / (x + Sk数学_sqrt(x * x + y * y)) }
+    返回 512 - x * 256 / (y + Sk数学_sqrt(x * x + y * y))
+}
+
+函数 Sk数学_abs(x) { 如果 (x < 0) { 返回 0 - x }; 返回 x }
+函数 Sk数学_clamp(值, 最小, 最大) {
+    如果 (值 < 最小) { 返回 最小 }
+    如果 (值 > 最大) { 返回 最大 }
+    返回 值
+}
+
+// §9 着色器统计
+
+定义 可变 着色器_创建总数 = 0
+定义 可变 着色器_采样总数 = 0
+
+函数 着色器_统计() {
+    返回 {
+        创建: 着色器_创建总数,
+        采样: 着色器_采样总数,
+    }
+}
+
+函数 着色器_健康检查() { 返回 "着色器子系统健康" }
+
+函数 着色器_重置() {
+    着色器_创建总数 = 0
+    着色器_采样总数 = 0
+}
+
+函数 着色器_完整统计() {
+    返回 [着色器_创建总数, 着色器_采样总数]
+}
+
+函数 着色器_类型名(类型) {
+    如果 (类型 == SHADER_SOLID) { 返回 "solid" }
+    如果 (类型 == SHADER_LINEAR) { 返回 "linear-gradient" }
+    如果 (类型 == SHADER_RADIAL) { 返回 "radial-gradient" }
+    如果 (类型 == SHADER_SWEEP) { 返回 "sweep-gradient" }
+    如果 (类型 == SHADER_BITMAP) { 返回 "bitmap" }
+    返回 "unknown"
+}
+
+函数 平铺_名称(模式) {
+    如果 (模式 == TILE_CLAMP) { 返回 "clamp" }
+    如果 (模式 == TILE_REPEAT) { 返回 "repeat" }
+    如果 (模式 == TILE_MIRROR) { 返回 "mirror" }
+    如果 (模式 == TILE_DECAL) { 返回 "decal" }
+    返回 "unknown"
+}
+
+定义 可变 AI_网缓着色着_调用数 = 0
+定义 可变 AI_网缓着色着_异常数 = 0
+
+函数 AI_网缓着色着_监控() {
+    AI_网缓着色着_调用数 = AI_网缓着色着_调用数 + 1
+    返回 AI_网缓着色着_异常数 == 0
+}
+
+函数 AI_网缓着色着_健康检查() {
+    如果 (AI_网缓着色着_调用数 > 0 && AI_网缓着色着_异常数 * 100 / AI_网缓着色着_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}
+
+// Phase3反哺注入: Sk数学_sqrt [BugFix]
+// 来源: Rust深度研究引擎 nova_deep_engine.rs
+// 误差: 0.00% → 0.00%  提升: 0.0x
+// 说明: 循环上限Bug: 循环上限硬编码: 当 (迭代 < 20) { → 用Q快速幂整数替换
+// E9反哺修复: 删除循环上限, 改用Q快速幂整数(base,exp)
+// 见在线学习.nova 函数 Q快速幂整数

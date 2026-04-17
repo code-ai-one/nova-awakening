@@ -1,0 +1,469 @@
+导入("../../../标准库/基础.nova")
+导入("../../../编译器/前端入口.nova")
+导入("../../../编译器/规划/核心/常量.nova")
+
+// Nova · 平台层 · ELF64构建器
+// 生成Linux ELF64 x86-64静态可执行文件
+
+函数 ELF_安全取列表项(列表, 索引) {
+ 如果 (是列表(列表) == 假 或 索引 < 0 或 索引 >= 计数(列表)) { 返回 0 }
+ 返回 列表[索引]
+}
+
+函数 构建ELF(入口偏移, 代码大小, linux_wrappers) {
+ 打印("构建 ELF64 文件 (Linux x86-64)...")
+
+ // Linux syscall wrapper偏移 (保守降级: 直接使用空偏移, 避免列表载荷异常)
+
+ // ELF布局: ELF头(64) + 4个程序头(4*56=224) = 288字节头
+ // PT_LOAD×2 + PT_INTERP + PT_DYNAMIC
+ 定义 elf_hdr_sz = 64
+ 定义 phdr_sz = 56
+ 定义 phnum = 4
+ // 当前阶段不内联额外 _start 字节码
+ 定义 可变 _start字节 = 空
+ 定义 可变 总代码含start = 代码大小
+ 定义 代码段文件偏移 = 0x1000 // 页对齐
+ 定义 基址 = 0x400000
+ 定义 代码段虚址 = 基址 + 代码段文件偏移
+ 定义 数据段文件偏移 = 代码段文件偏移 + ((总代码含start + 0xFFF) / 0x1000) * 0x1000
+ 定义 数据段虚址 = 基址 + 数据段文件偏移
+ 定义 数据段大小 = 0x1000 // 堆指针+全局变量指针+Linux参数保存
+ 定义 文件大小 = 数据段文件偏移 + 数据段大小
+
+ // 使用list而非raw buffer, 每个元素存一个字节值
+ 定义 可变 elf = []
+ 定义 可变 _ei = 0
+ 当 (_ei < 文件大小) { 追加(elf, 0) _ei = _ei + 1 }
+
+ // ELF头 (64字节)
+ _elf写(elf, x7F, 0) // magic
+ _elf写(elf, 1, 0x45) // 'E'
+ _elf写(elf, 2, 0x4C) // 'L'
+ _elf写(elf, 3, 0x46) // 'F'
+ _elf写(elf, 4, 2) // ELFCLASS64
+ _elf写(elf, 5, 1) // ELFDATA2LSB
+ _elf写(elf, 6, 1) // EV_CURRENT
+ _elf写(elf,  7, 0) // ELFOSABI_NONE (Linux)
+ _elf写16(elf, 16, 2) // ET_EXEC
+ _elf写16(elf, 18, 62) // EM_X86_64
+ _elf写32(elf, 20, 1) // EV_CURRENT
+ // e_entry: 如果有ELF入口存根则用它, 否则用原始入口
+ 定义 可变 elf入口 = 入口偏移
+ _elf写64(elf, 24, 代码段虚址 + elf入口) // e_entry
+ _elf写64(elf, 32, elf_hdr_sz) // e_phoff (程序头紧跟ELF头)
+ _elf写64(elf,  40, 0) // e_shoff (无节头)
+ _elf写32(elf,  48, 0) // e_flags
+ _elf写16(elf, 52, elf_hdr_sz) // e_ehsize
+ _elf写16(elf, 54, phdr_sz) // e_phentsize
+ _elf写16(elf, 56, phnum) // e_phnum
+ _elf写16(elf, 58, 64) // e_shentsize
+ _elf写16(elf,  60, 0) // e_shnum
+ _elf写16(elf,  62, 0) // e_shstrndx
+
+ // 程序头1: 代码段 (LOAD, R+X)
+ // 从偏移0开始, 包含ELF头+程序头+代码段 (动态链接器需要运行时访问PHDR)
+ 定义 ph1 = elf_hdr_sz
+ _elf写32(elf, ph1 + 0, 1) // PT_LOAD
+ _elf写32(elf, ph1 + 4, 7) // PF_R|PF_W|PF_X (运行时需rip-relative写)
+ _elf写64(elf,  ph1 + 8, 0) // p_offset = 0 (从文件头开始)
+ _elf写64(elf, ph1 + 16, 基址) // p_vaddr = 0x400000
+ _elf写64(elf, ph1 + 24, 基址) // p_paddr
+ _elf写64(elf, ph1 + 32, 代码段文件偏移 + 代码大小) // p_filesz (头+代码)
+ _elf写64(elf, ph1 + 40, 代码段文件偏移 + 代码大小) // p_memsz
+ _elf写64(elf, ph1 + 48, 0x1000) // p_align
+
+ // 程序头2: 数据段 (LOAD, R+W)
+ 定义 ph2 = elf_hdr_sz + phdr_sz
+ _elf写32(elf, ph2 + 0, 1) // PT_LOAD
+ _elf写32(elf, ph2 + 4, 6) // PF_R|PF_W
+ _elf写64(elf, ph2 + 8, 数据段文件偏移)
+ _elf写64(elf, ph2 + 16, 数据段虚址)
+ _elf写64(elf, ph2 + 24, 数据段虚址)
+ _elf写64(elf, ph2 + 32, 数据段大小)
+ _elf写64(elf, ph2 + 40, 数据段大小 + 0x10000000) // BSS: 256MB堆
+ _elf写64(elf, ph2 + 48, 0x1000)
+
+ // 动态链接结构 (在数据段偏移0x200处, 用于dlopen/dlsym)
+ 定义 dyn_base = 0x200
+ 定义 interp_off = dyn_base // 0x200: .interp
+ 定义 dynstr_off = dyn_base + 0x20 // 0x220: .dynstr
+ 定义 dynsym_off = dyn_base + 0x40 // 0x240: .dynsym (8-byte aligned)
+ 定义 hash_off = dyn_base + 0x88 // 0x288: .hash
+ 定义 rela_off = dyn_base + 0xA0 // 0x2A0: .rela.dyn (8-byte aligned)
+ 定义 got_off = dyn_base + 0xD0 // 0x2D0: .got
+ 定义 dynamic_off = dyn_base + 0xE0 // 0x2E0: .dynamic
+
+ // .interp: "/lib64/ld-linux-x86-64.so.2\0" (28 bytes)
+ 定义 interp_str = "/lib64/ld-linux-x86-64.so.2"
+ 定义 可变 si = 0
+ 当 (si < 计数(interp_str)) {
+ _elf写(elf, 数据段文件偏移 + interp_off + si, 编码(子串(interp_str, si, 1)))
+ si = si + 1
+ }
+ _elf写(elf,  数据段文件偏移 + interp_off + si, 0)
+
+ // .dynstr: "\0libc.so.6\0dlopen\0dlsym\0" (24 bytes)
+ 定义 ds = 数据段文件偏移 + dynstr_off
+ _elf写(elf,  ds +, 0) // \0
+ // "libc.so.6" at offset 1
+ 定义 libcstr = "libc.so.6"
+ 定义 可变 li = 0
+ 当 (li < 计数(libcstr)) {
+ _elf写(elf, ds + 1 + li, 编码(子串(libcstr, li, 1)))
+ li = li + 1
+ }
+ _elf写(elf,  ds + 10, 0) // \0
+ // "dlopen" at offset 11
+ _elf写(elf, ds + 11, 100) _elf写(elf, ds + 12, 108)
+ _elf写(elf, ds + 13, 111) _elf写(elf, ds + 14, 112)
+ _elf写(elf, ds + 15, 101) _elf写(elf, ds + 16, 110)
+ _elf写(elf,  ds + 17, 0) // \0
+ // "dlsym" at offset 18
+ _elf写(elf, ds + 18, 100) _elf写(elf, ds + 19, 108)
+ _elf写(elf, ds + 20, 115) _elf写(elf, ds + 21, 121)
+ _elf写(elf, ds + 22, 109)
+ _elf写(elf,  ds + 23, 0) // \0
+
+ // .dynsym: 3 × Elf64_Sym (24 bytes each = 72 bytes)
+ 定义 符号 = 数据段文件偏移 + dynsym_off
+ // 入口点0: NULL symbol (24 zeros, buffer already zero)
+ // 入口点1: dlopen (st_name=11, st_info=0x12=STB_GLOBAL|STT_FUNC)
+ _elf写32(elf, 符号 + 24, 11) // st_name = 11
+ _elf写(elf, 符号 + 28, 0x12) // st_info = STB_GLOBAL|STT_FUNC
+ // st_other=0, st_shndx=0(UNDEF), st_value=0, st_size=0 (already zero)
+ // 入口点2: dlsym (st_name=18, st_info=0x12)
+ _elf写32(elf, 符号 + 48, 18) // st_name = 18
+ _elf写(elf, 符号 + 52, 0x12) // st_info = STB_GLOBAL|STT_FUNC
+
+ // .hash: SYSV hash table (nbucket=1, nchain=3)
+ 定义 ht = 数据段文件偏移 + hash_off
+ _elf写32(elf, ht + 0, 1) // nbucket
+ _elf写32(elf, ht + 4, 3) // nchain
+ _elf写32(elf, ht + 8, 1) // bucket[0] = 1 (first non-NULL)
+ _elf写32(elf,  ht + 12, 0) // chain[0] = 0 (NULL, end)
+ _elf写32(elf, ht + 16, 2) // chain[1] = 2 (dlopen→dlsym)
+ _elf写32(elf,  ht + 20, 0) // chain[2] = 0 (end)
+
+ // .rela.dyn: 2 × Elf64_Rela (24 bytes each = 48 bytes)
+ 定义 got_dlopen_vaddr = 数据段虚址 + got_off
+ 定义 got_dlsym_vaddr = 数据段虚址 + got_off + 8
+ 定义 ra = 数据段文件偏移 + rela_off
+ // 入口点0: dlopen (符号=1, type=R_X86_64_GLOB_DAT=6)
+ _elf写64(elf, ra + 0, got_dlopen_vaddr) // r_offset
+ _elf写32(elf, ra + 8, 6) // r_info low = type 6
+ _elf写32(elf, ra + 12, 1) // r_info high = symbol 1
+ _elf写64(elf,  ra + 16, 0) // r_addend
+ // 入口点1: dlsym (符号=2, type=R_X86_64_GLOB_DAT=6)
+ _elf写64(elf, ra + 24, got_dlsym_vaddr) // r_offset
+ _elf写32(elf, ra + 32, 6) // r_info low = type 6
+ _elf写32(elf, ra + 36, 2) // r_info high = symbol 2
+ _elf写64(elf,  ra + 40, 0) // r_addend
+
+ // .got: 2 × uint64 (initially 0, filled by dynamic linker)
+ // Already zero from buffer init
+
+ // .dynamic: 10 × Elf64_Dyn (16 bytes each = 160 bytes)
+ 定义 dt = 数据段文件偏移 + dynamic_off
+ // DT_NEEDED (1): libc.so.6
+ _elf写64(elf, dt + 0, 1)
+ _elf写64(elf, dt + 8, 1)
+ // DT_HASH (4)
+ _elf写64(elf, dt + 16, 4)
+ _elf写64(elf, dt + 24, 数据段虚址 + hash_off)
+ // DT_STRTAB (5)
+ _elf写64(elf, dt + 32, 5)
+ _elf写64(elf, dt + 40, 数据段虚址 + dynstr_off)
+ // DT_SYMTAB (6)
+ _elf写64(elf, dt + 48, 6)
+ _elf写64(elf, dt + 56, 数据段虚址 + dynsym_off)
+ // DT_STRSZ (10)
+ _elf写64(elf, dt + 64, 10)
+ _elf写64(elf, dt + 72, 24)
+ // DT_SYMENT (11)
+ _elf写64(elf, dt + 80, 11)
+ _elf写64(elf, dt + 88, 24)
+ // DT_RELA (7)
+ _elf写64(elf, dt + 96, 7)
+ _elf写64(elf, dt + 104, 数据段虚址 + rela_off)
+ // DT_RELASZ (8)
+ _elf写64(elf, dt + 112, 8)
+ _elf写64(elf, dt + 120, 48)
+ // DT_RELAENT (9)
+ _elf写64(elf, dt + 128, 9)
+ _elf写64(elf, dt + 136, 24)
+ // DT_NULL ()
+ _elf写64(elf,  dt + 144, 0)
+ _elf写64(elf,  dt + 152, 0)
+
+ // 程序头3: PT_INTERP (动态链接器路径)
+ 定义 ph3 = elf_hdr_sz + phdr_sz * 2
+ _elf写32(elf, ph3 + 0, 3) // PT_INTERP
+ _elf写32(elf, ph3 + 4, 4) // PF_R
+ _elf写64(elf, ph3 + 8, 数据段文件偏移 + interp_off)
+ _elf写64(elf, ph3 + 16, 数据段虚址 + interp_off)
+ _elf写64(elf, ph3 + 24, 数据段虚址 + interp_off)
+ _elf写64(elf, ph3 + 32, 28) // filesz (interp string length + null)
+ _elf写64(elf, ph3 + 40, 28) // memsz
+ _elf写64(elf, ph3 + 48, 1) // align
+
+ // 程序头4: PT_DYNAMIC (动态段)
+ 定义 ph4 = elf_hdr_sz + phdr_sz * 3
+ _elf写32(elf, ph4 + 0, 2) // PT_DYNAMIC
+ _elf写32(elf, ph4 + 4, 6) // PF_R|PF_W
+ _elf写64(elf, ph4 + 8, 数据段文件偏移 + dynamic_off)
+ _elf写64(elf, ph4 + 16, 数据段虚址 + dynamic_off)
+ _elf写64(elf, ph4 + 24, 数据段虚址 + dynamic_off)
+ _elf写64(elf, ph4 + 32, 160) // filesz (10 × 16)
+ _elf写64(elf, ph4 + 40, 160) // memsz
+ _elf写64(elf, ph4 + 48, 8) // align
+
+ // 复制机器码到代码段
+ 定义 可变 ci = 0
+ 当 (ci < 代码大小) {
+ _elf写(elf, 代码段文件偏移 + ci, 代码[ci])
+ ci = ci + 1
+ }
+ // 追加_start字节码(直接写入ELF,绕过代码缓冲区heap overflow)
+ 如果 (_start字节 != 空) {
+  定义 可变 _si2 = 0
+  当 (_si2 < 计数(_start字节)) {
+   _elf写(elf, 代码段文件偏移 + 代码大小 + _si2, _start字节[_si2])
+   _si2 = _si2 + 1
+  }
+ }
+
+ // 修正表处理
+ // 对于call/str修正: 与PE相同 (相对偏移)
+ // 对于iat_*修正: 替换 ff 15 → e8 + nop, 目标指向Linux syscall wrapper
+ // 对于rt_heap/rt_globals: 指向数据段中的变量
+ 定义 rt_heap_addr = 数据段虚址 // 堆指针在数据段起始
+ 定义 rt_globals_addr = 数据段虚址 + 8 // 全局变量数组指针
+
+ 定义 可变 fi = 0
+ 当 (fi < 计数(修正表)) {
+  定义 修类 = 修正表_取类型(修正表, fi)
+  定义 修位 = 修正表_取位置(修正表, fi)
+  定义 修附 = 修正表_取附加(修正表, fi)
+  定义 步长 = 修正表_项步长(修正表, fi)
+
+  如果 (修类 != 空) {
+   如果 (修类 == "call" 且 修附 != 空) {
+    定义 目标名c = 修附
+    定义 目标偏移c = 字典取(函数表, 目标名c)
+    如果 (目标偏移c != 空) { 定义 可变 相对c = 目标偏移c - (修位 + 4)
+     _elf写32(elf, 代码段文件偏移 + 修位, 相对c)
+    }
+   }
+   否则 如果 (修类 == "str" 且 修附 != 空) {
+    定义 索引s = 修附
+    如果 (是整数(索引s) 且 索引s >= 0 且 索引s < 计数(字串偏移)) {
+     定义 字串位s = 字串偏移[索引s]
+     定义 相对s = 字串位s - (修位 + 4)
+     _elf写32(elf, 代码段文件偏移 + 修位, 相对s)
+    }
+   }
+   否则 如果 (修类 == "rt_heap") {
+    定义 下一指令指针 = 代码段虚址 + 修位 + 4
+    _elf写32(elf, 代码段文件偏移 + 修位, rt_heap_addr - 下一指令指针)
+   }
+   否则 如果 (修类 == "rt_globals") {
+    定义 下一指令指针 = 代码段虚址 + 修位 + 4
+    _elf写32(elf, 代码段文件偏移 + 修位, rt_globals_addr - 下一指令指针)
+   }
+   否则 如果 (修类 == "rt_saved_rsp") { 定义 下一指令指针 = 代码段虚址 + 修位 + 4
+    _elf写32(elf, 代码段文件偏移 + 修位, (数据段虚址 + 16) - 下一指令指针)
+   }
+   否则 如果 (修类 == "elf_entry_jmp") { 定义 重定位32 = 入口偏移 - (修位 + 4)
+    _elf写32(elf, 代码段文件偏移 + 修位, 重定位32)
+   }
+   否则 如果 (修类 == "got_dlopen") {
+    // GOT项指向dlopen, 动态链接器填充实际地址
+    定义 下一指令指针 = 代码段虚址 + 修位 + 4
+    _elf写32(elf, 代码段文件偏移 + 修位, got_dlopen_vaddr - 下一指令指针)
+   }
+   否则 如果 (修类 == "got_dlsym") {
+    // GOT项指向dlsym, 动态链接器填充实际地址
+    定义 下一指令指针 = 代码段虚址 + 修位 + 4
+    _elf写32(elf, 代码段文件偏移 + 修位, got_dlsym_vaddr - 下一指令指针)
+   }
+  }
+  fi = fi + 步长
+ }
+
+ 返回 [elf, 文件大小]
+}
+
+// Nova编译器 v4.1 — 内建优化 Pass 框架
+// 窥孔优化 / 死代码消除 / 强度削减 / 尾调用 / 内联 / 常量折叠 / CSE
+
+// 窥孔优化 (Peephole Optimization)
+// 指令级微优化: 冗余消除/指令合并/模式替换
+
+定义 指令_移动 = 1
+定义 ELF生成_指令_加 = 2
+定义 ELF生成_指令_减 = 3
+定义 ELF生成_指令_乘 = 4
+定义 ELF生成_指令_比较 = 5
+定义 ELF生成_指令_跳转 = 6
+定义 指令_条件等于跳 = 7
+定义 指令_条件不等跳 = 8
+定义 指令_压栈 = 9
+定义 指令_弹栈 = 10
+定义 ELF生成_指令_空操作 = 11
+定义 ELF生成_指令_返回 = 12
+定义 ELF生成_指令_调用 = 13
+定义 指令_异或 = 14
+定义 指令_取有效地址 = 15
+定义 ELF生成_指令_左移 = 16
+定义 指令_测试 = 17
+
+// ELF段管理
+
+函数 ELF_创建段(名称, 类型, 标志, 对齐) { 返回 [名称, 类型, 标志, 对齐, [],] // [名称,类型,标志,对齐,数据,虚拟地址,文件偏移]
+}
+
+函数 ELF_段_添加数据(段, 数据) { 定义 可变 i = 0
+ 当 (i < 计数(数据)) {
+ 追加(段[4], 数据[i])
+ i = i + 1
+ }
+}
+
+函数 ELF_段_大小(段) { 返回 计数(段[4]) }
+
+函数 ELF_段_设置地址(段, 地址) { 段[5] = 地址 }
+函数 ELF_段_设置偏移(段, 偏移) { 段[6] = 偏移 }
+
+// ELF头生成
+
+函数 ELF_写入头(缓冲, 入口, 段头偏移, 段数) {
+ // ELF魔数
+ 追加(缓冲, 0x7F)
+ 追加(缓冲, 0x45) // E
+ 追加(缓冲, 0x4C) // L
+ 追加(缓冲, 0x46) // F
+ 追加(缓冲, 2) // 64位
+ 追加(缓冲, 1) // 小端
+ 追加(缓冲, 1) // ELF版本
+ 追加(缓冲, 0) // OS/ABI
+ // 填充8字节
+ 定义 可变 i = 0
+ 当 (i < 8) { 追加(缓冲, 0) i = i + 1 }
+ // 类型: 可执行
+ 追加(缓冲, 2)
+ 追加(缓冲, 0)
+ // 机器: x86-64
+ 追加(缓冲, 0x3E)
+ 追加(缓冲, 0)
+ // 版本
+ ELF_写入u32(缓冲, 1)
+ // 入口点
+ ELF_写入u64(缓冲, 入口)
+ // 程序头偏移 (固定64)
+ ELF_写入u64(缓冲, 64)
+ // 段头偏移
+ ELF_写入u64(缓冲, 段头偏移)
+ // 标志
+ ELF_写入u32(缓冲, 0)
+ // ELF头大小
+ 追加(缓冲, 64)
+ 追加(缓冲, 0)
+ // 程序头条目大小
+ 追加(缓冲, 56)
+ 追加(缓冲, 0)
+ // 程序头数量
+ 追加(缓冲, 段数)
+ 追加(缓冲, 0)
+}
+
+函数 ELF_写入u32(缓冲, 值) {
+ 追加(缓冲, 值 & 0xFF)
+ 追加(缓冲, (值 >> 8) & 0xFF)
+ 追加(缓冲, (值 >> 16) & 0xFF)
+ 追加(缓冲, (值 >> 24) & 0xFF)
+}
+
+函数 ELF_写入u64(缓冲, 值) {
+ ELF_写入u32(缓冲, 值 & 0xFFFFFFFF)
+ ELF_写入u32(缓冲, (值 >> 32) & 0xFFFFFFFF)
+}
+
+// 程序头
+
+函数 ELF_写入程序头(缓冲, 类型, 标志, 偏移, 虚拟地址, 文件大小, 内存大小, 对齐) {
+ ELF_写入u32(缓冲, 类型)
+ ELF_写入u32(缓冲, 标志)
+ ELF_写入u64(缓冲, 偏移)
+ ELF_写入u64(缓冲, 虚拟地址)
+ ELF_写入u64(缓冲, 虚拟地址) // 物理地址=虚拟地址
+ ELF_写入u64(缓冲, 文件大小)
+ ELF_写入u64(缓冲, 内存大小)
+ ELF_写入u64(缓冲, 对齐)
+}
+
+// 重定位
+
+函数 ELF_计算跳转偏移(当前地址, 目标地址) { 返回 目标地址 - 当前地址 - 4
+}
+
+函数 ELF_对齐到(值, 对齐) {
+    如果 (对齐 == 0) { 返回 值
+}
+ 定义 余 = 值 % 对齐
+ 如果 (余 == 0) { 返回 值 }
+ 返回 值 + 对齐 - 余
+}
+
+定义 可变 _ELF_生成次数 = 0
+定义 可变 _ELF_总大小 = 0
+定义 可变 _ELF_段数 = 0
+
+函数 ELF_记录生成(大小) { _ELF_生成次数 = _ELF_生成次数 + 1
+ _ELF_总大小 = _ELF_总大小 + 大小
+}
+
+函数 ELF_记录段() { _ELF_段数 = _ELF_段数 + 1 }
+
+函数 ELF_质量评估() {
+    如果 (_ELF_总大小 > 10000000) { 返回 "二进制偏大(考虑strip)"
+}
+ 如果 (_ELF_段数 > 20) { 返回 "段过多(合并段)" }
+ 返回 "ELF生成正常"
+}
+
+函数 ELF_重置() { _ELF_生成次数 = 0 _ELF_总大小 = 0 _ELF_段数 = 0 }
+
+// 符号表
+
+定义 可变 _ELF_符号表 = []
+
+函数 ELF_添加符号(名称, 地址, 大小, 类型) {
+ 追加(_ELF_符号表, [名称, 地址, 大小, 类型])
+}
+
+函数 ELF_查找符号(名称) { 定义 可变 i = 0
+ 当 (i < 计数(_ELF_符号表)) { 如果 (_ELF_符号表[i][0] == 名称) { 返回 _ELF_符号表[i] }
+ i = i + 1
+ }
+ 返回 空
+}
+
+函数 ELF_符号数() { 返回 计数(_ELF_符号表) }
+
+// 字符串表
+
+函数 ELF_创建字符串表() { 返回 [[0], 1] }
+
+函数 ELF_添加字符串(表, 文本) { 定义 偏移 = 表[1]
+ 定义 可变 i = 0
+ 当 (i < 计数(文本)) {
+ 追加(表[0], 字符码(文本, i))
+ i = i + 1
+ }
+ 追加(表[0], 0)
+ 表[1] = 表[1] + 计数(文本) + 1
+ 返回 偏移
+}
+
+函数 ELF_清除符号表() { _ELF_符号表 = [] }

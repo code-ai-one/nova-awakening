@@ -1,0 +1,237 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+
+// NovaOS Nova公平调度 负载跟踪 (Nova负载追踪 - Per-Entity Load Tracking)
+// Nova负载追踪核心: 指数衰减平均负载
+//   load_avg = \Sum (runnable_time * decay^age)
+//   util_avg = \Sum (running_time * decay^age)
+//   decay = 0.5^(1/32) ≈ 0.978 (每32ms衰减一半)
+// 用途:
+//   1. 负载均衡: 根据load_avg在CPU间迁移任务
+//   2. CPU频率调节: 根据util_avg调整频率
+//   3. 唤醒放置: 选择负载最轻的CPU
+//   4. 过载检测: 识别过载CPU并触发均衡
+
+// Nova负载追踪常量 
+
+定义 Nova负载追踪_半衰期 = 32000        // 32ms (us)
+定义 Nova负载追踪_衰减因子 = 978        // 0.978 * 1000 (定点数)
+定义 Nova负载追踪_精度 = 1000           // 定点数精度
+定义 Nova负载追踪_最大周期 = 10         // 最多累积10个周期
+
+// 全局Nova负载追踪状态 (每个调度实体维护)
+
+// 任务描述符扩展字段 (需要在进程描述符.nova中添加):
+// T_load_avg      - 负载平均值 (runnable时间)
+// T_util_avg      - 利用率平均值 (running时间)
+// T_runnable_avg  - 可运行平均值
+// T_last_update   - 上次更新时间戳
+// T_period_contrib - 当前周期贡献
+
+// 衰减计算 
+
+函数 Nova负载追踪_衰减(值, 周期数) {
+    如果 (周期数 <= 0) { 返回 值 }
+    如果 (周期数 > Nova负载追踪_最大周期) { 周期数 = Nova负载追踪_最大周期 }
+    
+    // 计算 值 * (衰减因子 ^ 周期数)
+    定义 可变 结果 = 值
+    定义 可变 i = 0
+    当 (i < 周期数) {
+        结果 = 结果 * Nova负载追踪_衰减因子 / Nova负载追踪_精度
+        i = i + 1
+    }
+    返回 结果
+}
+
+// 累积负载 
+
+函数 Nova负载追踪_累积(当前值, delta_us, 权重) {
+    // 计算经过的周期数
+    定义 周期数 = delta_us / Nova负载追踪_半衰期
+    定义 余数 = delta_us % Nova负载追踪_半衰期
+    
+    // 衰减旧值
+    定义 衰减值 = Nova负载追踪_衰减(当前值, 周期数)
+    
+    // 添加新贡献: delta * weight
+    定义 新贡献 = delta_us * 权重 / Nova负载追踪_精度
+    
+    返回 衰减值 + 新贡献
+}
+
+// 更新实体负载 
+
+函数 Nova负载追踪_更新实体负载(任务, 当前时间, 是运行中) {
+    // 获取上次更新时间
+    定义 上次时间 = 任务[T_last_update]
+    如果 (上次时间 == 0) {
+        设置(任务, T_last_update, 当前时间)
+        设置(任务, T_load_avg, 0)
+        设置(任务, T_util_avg, 0)
+        设置(任务, T_runnable_avg, 0)
+        返回
+    }
+    
+    // 计算时间差
+    定义 delta_us = 当前时间 - 上次时间
+    如果 (delta_us <= 0) { 返回 }
+    
+    // 获取权重
+    定义 权重 = 任务[T_权重]
+    如果 (权重 <= 0) { 权重 = NICE_0_权重 }
+    
+    // 更新load_avg (runnable时间)
+    定义 旧load = 任务[T_load_avg]
+    定义 新load = Nova负载追踪_累积(旧load, delta_us, 权重)
+    设置(任务, T_load_avg, 新load)
+    
+    // 更新util_avg (running时间)
+    如果 (是运行中) {
+        定义 旧util = 任务[T_util_avg]
+        定义 新util = Nova负载追踪_累积(旧util, delta_us, Nova负载追踪_精度)
+        设置(任务, T_util_avg, 新util)
+    } 否则 {
+        // 不在运行: 只衰减
+        定义 周期数 = delta_us / Nova负载追踪_半衰期
+        定义 旧util = 任务[T_util_avg]
+        定义 新util = Nova负载追踪_衰减(旧util, 周期数)
+        设置(任务, T_util_avg, 新util)
+    }
+    
+    // 更新runnable_avg
+    定义 旧runnable = 任务[T_runnable_avg]
+    定义 新runnable = Nova负载追踪_累积(旧runnable, delta_us, Nova负载追踪_精度)
+    设置(任务, T_runnable_avg, 新runnable)
+    
+    // 更新时间戳
+    设置(任务, T_last_update, 当前时间)
+}
+
+// 更新Nova公平调度运行队列负载 
+
+定义 可变 Nova公平调度_rq_load_avg = 0      // 运行队列总负载
+定义 可变 Nova公平调度_rq_util_avg = 0      // 运行队列总利用率
+定义 可变 Nova公平调度_rq_runnable_avg = 0  // 运行队列总可运行
+定义 可变 Nova公平调度_rq_last_update = 0   // 上次更新时间
+
+函数 Nova负载追踪_更新运行队列负载(当前时间) {
+    定义 上次时间 = Nova公平调度_rq_last_update
+    如果 (上次时间 == 0) {
+        Nova公平调度_rq_last_update = 当前时间
+        返回
+    }
+    
+    定义 delta_us = 当前时间 - 上次时间
+    如果 (delta_us <= 0) { 返回 }
+    
+    // 衰减旧值
+    定义 周期数 = delta_us / Nova负载追踪_半衰期
+    Nova公平调度_rq_load_avg = Nova负载追踪_衰减(Nova公平调度_rq_load_avg, 周期数)
+    Nova公平调度_rq_util_avg = Nova负载追踪_衰减(Nova公平调度_rq_util_avg, 周期数)
+    Nova公平调度_rq_runnable_avg = Nova负载追踪_衰减(Nova公平调度_rq_runnable_avg, 周期数)
+    
+    Nova公平调度_rq_last_update = 当前时间
+}
+
+// 入队时更新负载 
+
+函数 Nova负载追踪_入队更新(任务, 当前时间) {
+    // 更新实体负载
+    Nova负载追踪_更新实体负载(任务, 当前时间, 假)
+    
+    // 更新运行队列负载
+    Nova负载追踪_更新运行队列负载(当前时间)
+    
+    // 累加到运行队列
+    Nova公平调度_rq_load_avg = Nova公平调度_rq_load_avg + 任务[T_load_avg]
+    Nova公平调度_rq_util_avg = Nova公平调度_rq_util_avg + 任务[T_util_avg]
+    Nova公平调度_rq_runnable_avg = Nova公平调度_rq_runnable_avg + 任务[T_runnable_avg]
+}
+
+// 出队时更新负载 
+
+函数 Nova负载追踪_出队更新(任务, 当前时间) {
+    // 更新实体负载
+    Nova负载追踪_更新实体负载(任务, 当前时间, 假)
+    
+    // 更新运行队列负载
+    Nova负载追踪_更新运行队列负载(当前时间)
+    
+    // 从运行队列减去
+    Nova公平调度_rq_load_avg = Nova公平调度_rq_load_avg - 任务[T_load_avg]
+    Nova公平调度_rq_util_avg = Nova公平调度_rq_util_avg - 任务[T_util_avg]
+    Nova公平调度_rq_runnable_avg = Nova公平调度_rq_runnable_avg - 任务[T_runnable_avg]
+    
+    // 防止负数
+    如果 (Nova公平调度_rq_load_avg < 0) { Nova公平调度_rq_load_avg = 0 }
+    如果 (Nova公平调度_rq_util_avg < 0) { Nova公平调度_rq_util_avg = 0 }
+    如果 (Nova公平调度_rq_runnable_avg < 0) { Nova公平调度_rq_runnable_avg = 0 }
+}
+
+// 获取CPU利用率 
+
+函数 Nova负载追踪_获取CPU利用率() {
+    // 返回百分比: util_avg / 1024 * 100
+    返回 Nova公平调度_rq_util_avg * 100 / Nova负载追踪_精度
+}
+
+函数 Nova负载追踪_获取CPU负载() {
+    返回 Nova公平调度_rq_load_avg
+}
+
+函数 Nova负载追踪_是否过载() {
+    // CPU利用率 > 80% 认为过载
+    返回 Nova负载追踪_获取CPU利用率() > 80
+}
+
+// 负载均衡辅助函数
+
+函数 Nova负载追踪_任务负载(任务) {
+    返回 任务[T_load_avg]
+}
+
+函数 Nova负载追踪_任务利用率(任务) {
+    返回 任务[T_util_avg]
+}
+
+函数 Nova负载追踪_任务可运行(任务) {
+    返回 任务[T_runnable_avg]
+}
+
+// 统计信息
+
+函数 Nova负载追踪_统计() {
+    返回 [
+        Nova公平调度_rq_load_avg,
+        Nova公平调度_rq_util_avg,
+        Nova公平调度_rq_runnable_avg,
+        Nova负载追踪_获取CPU利用率(),
+        Nova负载追踪_是否过载()
+    ]
+}
+
+// 初始化
+
+函数 Nova负载追踪_初始化() {
+    Nova公平调度_rq_load_avg = 0
+    Nova公平调度_rq_util_avg = 0
+    Nova公平调度_rq_runnable_avg = 0
+    Nova公平调度_rq_last_update = 0
+}
+
+定义 可变 AI_公平调度负_负载窗口 = []
+
+函数 AI_公平调度负_负载预测(当前负载) {
+    追加(AI_公平调度负_负载窗口, 当前负载)
+    如果 (计数(AI_公平调度负_负载窗口) > 20) { 列表_移除(AI_公平调度负_负载窗口, 0) }
+    如果 (计数(AI_公平调度负_负载窗口) < 3) { 返回 当前负载 }
+    定义 n = 计数(AI_公平调度负_负载窗口)
+    定义 趋势 = AI_公平调度负_负载窗口[n-1] - AI_公平调度负_负载窗口[n-3]
+    返回 当前负载 + 趋势
+}
+
+函数 AI_公平调度负_迁移建议(源CPU负载, 目标CPU负载) {
+    如果 (源CPU负载 > 目标CPU负载 * 2) { 返回 真 }
+    返回 假
+}

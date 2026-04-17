@@ -1,0 +1,97 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./绘制图层绘.nova")
+导入("./从布局树构.nova")
+
+    如果 (s.opacity < 100) {
+        绘制Layer_添加显示项(显示列表, 显示项 {
+            类型: 显示项_透明度开始,
+            透明度: s.opacity
+        })
+    }
+
+    如果 (层.标志 & 层标志_有溢出裁剪) {
+        绘制Layer_添加显示项(显示列表, 显示项 {
+            类型: 显示项_裁剪,
+            x: 绘制x, y: 绘制y, w: 绘制w, h: 绘制h
+        })
+    }
+
+    如果 (s.border_radius_tl > 0 || s.border_radius_tr > 0) {
+        绘制Layer_添加显示项(显示列表, 显示项 {
+            类型: 显示项_圆角裁剪,
+            x: 绘制x, y: 绘制y, w: 绘制w, h: 绘制h,
+            圆角半径: s.border_radius_tl
+        })
+    }
+
+    如果 (s.box_shadow != 0) {
+        绘制Layer_添加显示项(显示列表, 显示项 {
+            类型: 显示项_阴影,
+            x: 绘制x, y: 绘制y, w: 绘制w, h: 绘制h
+        })
+    }
+
+    如果 (s.background_color != 0x00000000) {
+        绘制Layer_添加显示项(显示列表, 显示项 {
+            类型: 显示项_背景,
+            x: 绘制x, y: 绘制y, w: 绘制w, h: 绘制h,
+            颜色: s.background_color
+        })
+    }
+
+    如果 (s.border_top_width > 0 || s.border_left_width > 0 ||
+        s.border_right_width > 0 || s.border_bottom_width > 0) {
+        // 上边框
+        如果 (s.border_top_width > 0) {
+            绘制Layer_添加显示项(显示列表, 显示项 {
+                类型: 显示项_背景,
+                x: 绘制x, y: 绘制y,
+                w: 绘制w, h: s.border_top_width,
+                颜色: s.border_top_color
+            })
+        }
+        // 下边框
+        如果 (s.border_bottom_width > 0) {
+            绘制Layer_添加显示项(显示列表, 显示项 {
+                类型: 显示项_背景,
+                x: 绘制x, y: 绘制y + 绘制h - s.border_bottom_width,
+                w: 绘制w, h: s.border_bottom_width,
+                颜色: s.border_bottom_color
+            })
+        }
+        // 左边框
+        如果 (s.border_left_width > 0) {
+            绘制Layer_添加显示项(显示列表, 显示项 {
+                类型: 显示项_背景,
+                x: 绘制x, y: 绘制y,
+                w: s.border_left_width, h: 绘制h,
+                颜色: s.border_left_color
+            })
+        }
+        // 右边框
+        如果 (s.border_right_width > 0) {
+            绘制Layer_添加显示项(显示列表, 显示项 {
+                类型: 显示项_背景,
+                x: 绘制x + 绘制w - s.border_right_width, y: 绘制y,
+                w: s.border_right_width, h: 绘制h,
+                颜色: s.border_right_color
+            })
+        }
+    }
+
+    定义 可变 i = 0
+    当 (i < 层.负z序数量) {
+        定义 子层 = 内存_读64(层.负z序列表 + i * 8)
+        绘制Layer_绘制(子层, 显示列表, 偏移x, 偏移y)
+        i = i + 1
+    }
+
+    绘制Layer_绘制内容(层, 显示列表, 偏移x, 偏移y)
+
+    i = 0
+    当 (i < 层.正z序数量) {
+        定义 子层 = 内存_读64(层.正z序列表 + i * 8)
+        绘制Layer_绘制(子层, 显示列表, 偏移x, 偏移y)
+        i = i + 1
+    }

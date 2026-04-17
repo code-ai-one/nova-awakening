@@ -1,0 +1,132 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../执行/底层内存操.nova")
+
+// 对应: nova/Nova渲染核心/css/properties/css_custom_property_declaration.cc
+//       nova/Nova渲染核心/css/css_variable_data.cc (~2000行)
+//       nova/Nova渲染核心/css/property_registration.cc (~800行)
+// CSS Custom Properties (Level 1, Nova标准):
+//   声明: --my-color: #ff0000;
+//   使用: color: var(--my-color);
+//   回退: color: var(--my-color, blue);
+//   继承: 自定义属性默认继承
+// CSS Properties & Values 接口 (Houdini Level 1):
+//   CSS.registerProperty({
+//     name: '--my-color', syntax: '<color>', inherits: false,
+//     initialValue: 'black'
+//   })
+//   @property --my-color { syntax: '<color>'; inherits: false; initial-value: black; }
+// 解析流程:
+//   1. 词法阶段: 识别--xxx为自定义属性名
+//   2. 值存储: 保存原始令牌列表(不立即解析)
+//   3. var()替换: 在计算值阶段递归展开var()引用
+//   4. 循环检测: 防止 --a: var(--b); --b: var(--a); 无限递归
+//   5. 已注册属性: 按syntax类型化解析(动画插值/初始值)
+
+// §1 自定义属性存储
+
+// 自定义属性值(保存原始令牌)
+结构 CSSVariableData {
+    名称,    // u64 "--my-color" 字符串
+    名称哈希,    // u32 快速查找
+    // 原始值(未解析的令牌列表)
+    原始值,    // u64 字符串 "#ff0000" / "var(--other)"
+    原始长度,
+    // 解析后的值(var()展开后)
+    计算值,
+    计算长度,
+    已计算,
+    // 是否包含var()引用
+    含var引用,
+    // 是否无效(循环引用等)
+    无效,
+}
+
+// 每个元素的自定义属性映射
+结构 CustomPropertyMap {
+    // 哈希表: 桶数组
+    桶,    // u64 CSSVariableData*[64]
+    桶数,
+    属性数,
+    // 链表(用于遍历)
+    头,
+}
+
+
+函数 CustomPropertyMap_创建() {
+    定义 map = 堆_分配(CustomPropertyMap)
+    map.桶数 = 64
+    map.桶 = 堆_分配(64 * 8)
+    内存_清零(map.桶, 64 * 8)
+    map.属性数 = 0; map.头 = 0
+    返回 map
+}
+
+函数 CustomProperty_哈希(名称) {
+    如果 (名称 == 0) { 返回 0 }
+    定义 可变 h = 5381
+    定义 len = 字节长度(名称)
+    定义 可变 i = 0
+    当 (i < len) {
+        h = ((h << 5) + h) + 字节取(名称, i)
+        i = i + 1
+    }
+    返回 h & 0xFFFFFFFF
+}
+
+函数 CustomPropertyMap_设置(map, 名称, 值, 值长度) {
+    如果 (map == 0 || 名称 == 0) { 返回 }
+    定义 hash = CustomProperty_哈希(名称)
+    定义 bucket = hash % map.桶数
+
+    // 查找是否已存在
+    定义 可变 entry = 内存_读64(map.桶 + bucket * 8)
+    当 (entry != 0) {
+        如果 (entry.名称哈希 == hash && 字符串_相等(entry.名称, 名称)) {
+            // 更新值
+            entry.原始值 = 值; entry.原始长度 = 值长度
+            entry.已计算 = 假; entry.无效 = 假
+            entry.含var引用 = CustomProperty_检查var引用(值, 值长度)
+            返回
+        }
+        entry = entry.下一个  // 假设CSSVariableData有下一个字段(链式哈希)
+    }
+
+    // 新增
+    定义 data = 堆_分配(CSSVariableData)
+    data.名称 = 名称; data.名称哈希 = hash
+    data.原始值 = 值; data.原始长度 = 值长度
+    data.计算值 = 0; data.计算长度 = 0; data.已计算 = 假; data.无效 = 假
+    data.含var引用 = CustomProperty_检查var引用(值, 值长度)
+    // 插入桶
+    // (哈希冲突时直接替换, 可扩展为链表)
+    内存_写64(map.桶 + bucket * 8, data)
+    map.属性数 = map.属性数 + 1
+}
+
+函数 CustomPropertyMap_获取(map, 名称) {
+    如果 (map == 0 || 名称 == 0) { 返回 0 }
+    定义 hash = CustomProperty_哈希(名称)
+    定义 bucket = hash % map.桶数
+    定义 entry = 内存_读64(map.桶 + bucket * 8)
+    如果 (entry != 0 && entry.名称哈希 == hash) {
+        返回 entry
+    }
+    返回 0
+}
+
+// 检查值是否包含var()引用
+函数 CustomProperty_检查var引用(值, 长度) {
+    如果 (值 == 0 || 长度 < 5) { 返回 假 }
+    定义 可变 i = 0
+    当 (i + 3 < 长度) {
+        如果 (字节取(值,i)==0x76 && 字节取(值,i+1)==0x61 &&
+            字节取(值,i+2)==0x72 && 字节取(值,i+3)==0x28) {   // "var("
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}

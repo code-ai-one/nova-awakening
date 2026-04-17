@@ -1,0 +1,110 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/创建甲.nova")
+
+// §5 查找最近snap点
+
+
+函数 ScrollSnap_查找最近(ssc, 目标x, 目标y) {
+    如果 (ssc == 0 || ssc.snap点数量 == 0) { 返回 [目标x, 目标y] }
+
+    定义 可变 最近距离 = 0x7FFFFFFF
+    定义 可变 最近x = 目标x
+    定义 可变 最近y = 目标y
+
+    定义 可变 i = 0
+    当 (i < ssc.snap点数量) {
+        定义 sp = 内存_读64(ssc.snap点列表 + i * 8)
+        如果 (sp == 0) { i = i + 1; 继续 }
+
+        定义 可变 dx = 0; 定义 可变 dy = 0
+
+        如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_BOTH || ssc.轴 == SNAP_AXIS_INLINE) {
+            dx = sp.x - 目标x
+            如果 (dx < 0) { dx = 0 - dx }
+        }
+        如果 (ssc.轴 == SNAP_AXIS_Y || ssc.轴 == SNAP_AXIS_BOTH || ssc.轴 == SNAP_AXIS_BLOCK) {
+            dy = sp.y - 目标y
+            如果 (dy < 0) { dy = 0 - dy }
+        }
+
+        定义 距离 = dx + dy    // 曼哈顿距离
+        如果 (距离 < 最近距离) {
+            最近距离 = 距离
+            如果 (ssc.轴 == SNAP_AXIS_X || ssc.轴 == SNAP_AXIS_BOTH) { 最近x = sp.x }
+            如果 (ssc.轴 == SNAP_AXIS_Y || ssc.轴 == SNAP_AXIS_BOTH) { 最近y = sp.y }
+        }
+        i = i + 1
+    }
+
+    // proximity模式: 只在足够近时才snap
+    如果 (ssc.严格度 == SNAP_STRICT_PROXIMITY) {
+        定义 阈值 = ssc.视口宽 / 4    // 视口1/4作为proximity阈值
+        如果 (最近距离 > 阈值) {
+            返回 [目标x, 目标y]    // 太远,不snap
+        }
+    }
+
+    // 范围限制
+    如果 (最近x < 0) { 最近x = 0 }
+    如果 (最近y < 0) { 最近y = 0 }
+    如果 (最近x > ssc.内容宽 - ssc.视口宽) { 最近x = ssc.内容宽 - ssc.视口宽 }
+    如果 (最近y > ssc.内容高 - ssc.视口高) { 最近y = ssc.内容高 - ssc.视口高 }
+
+    返回 [最近x, 最近y]
+}
+
+// §6 滚动结束时的snap处理
+
+函数 ScrollSnap_滚动结束(ssc) {
+    如果 (ssc == 0 || ssc.轴 == SNAP_AXIS_NONE) { 返回 }
+
+    // 查找最近snap点
+    定义 目标 = ScrollSnap_查找最近(ssc, ssc.滚动x, ssc.滚动y)
+    定义 snap_x = 目标[0]
+    定义 snap_y = 目标[1]
+
+    如果 (snap_x == ssc.滚动x && snap_y == ssc.滚动y) { 返回 }
+
+    // 启动平滑滚动到snap点
+    ScrollSnap_平滑滚动到(ssc, snap_x, snap_y)
+}
+
+// §7 平滑滚动(Smooth Scrolling)
+// 使用ease缓动函数
+
+函数 ScrollSnap_平滑滚动到(ssc, 目标x, 目标y) {
+    如果 (ssc == 0) { 返回 }
+    ssc.正在动画 = 真
+    ssc.动画起始x = ssc.滚动x
+    ssc.动画起始y = ssc.滚动y
+    ssc.动画目标x = 目标x
+    ssc.动画目标y = 目标y
+    ssc.动画起始时间 = 平台_获取高精度时间()
+}
+
+函数 ScrollSnap_动画tick(ssc, 当前时间) {
+    如果 (ssc == 0 || !ssc.正在动画) { 返回 }
+
+    定义 经过 = (当前时间 - ssc.动画起始时间) / 1000    // μs→ms
+    如果 (经过 >= ssc.动画持续时间) {
+        // 完成
+        ssc.滚动x = ssc.动画目标x
+        ssc.滚动y = ssc.动画目标y
+        ssc.正在动画 = 假
+        返回
+    }
+
+    // ease缓动: t = 经过/持续时间 → 0..1
+    定义 t = 经过 * 100 / ssc.动画持续时间    // ×100
+    定义 eased = ScrollSnap_ease(t)    // ×100
+
+    ssc.滚动x = ssc.动画起始x + (ssc.动画目标x - ssc.动画起始x) * eased / 100
+    ssc.滚动y = ssc.动画起始y + (ssc.动画目标y - ssc.动画起始y) * eased / 100
+}
+
+函数 ScrollSnap_ease(t) {
+    // CSS ease: Nova三次方-bezier(0.25, 0.1, 0.25, 1.0)
+    // Hermite插值 ease = 3t² - 2t³
+    返回 (3 * t * t - 2 * t * t * t / 100) / 100
+}

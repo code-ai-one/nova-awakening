@@ -1,0 +1,116 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./函数创建.nova")
+导入("./关键帧.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+
+// §6 CSS Transitions — 属性变化自动过渡
+// (对应 CSSTransitions::MaybeStaNova往返时间ransition)
+// 当元素的计算样式发生变化时:
+//   检查 transition-property 是否包含该属性
+//   → 创建Animation从旧值过渡到新值
+
+结构 TransitionSpec {
+    属性ID,    // u32 CSS属性ID (CSS属性_all = 所有)
+    持续时间,    // u32 毫秒
+    延迟,    // u32 毫秒
+    缓动,    // u64 TimingFunction*
+}
+
+
+函数 Transition_检查并启动(元素, 旧样式, 新样式) {
+    如果 (元素 == 0 || 旧样式 == 0 || 新样式 == 0) { 返回 }
+
+    // 检查transition属性
+    // 对有transition-duration > 0的变化属性创建CSS过渡动画
+    如果 (新样式.transition_duration <= 0) { 返回 }
+
+    定义 持续时间 = 新样式.transition_duration
+    定义 延迟 = 新样式.transition_delay
+    定义 缓动 = TimingFunction_创建(新样式.transition_timing)
+
+    // 检查哪些属性发生了变化
+    如果 (旧样式.opacity != 新样式.opacity) {
+        Transition_创建动画(元素, CSS属性_opacity, 0, 旧样式.opacity, 新样式.opacity, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.color != 新样式.color) {
+        Transition_创建动画(元素, CSS属性_color, 1, 旧样式.color, 新样式.color, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.background_color != 新样式.background_color) {
+        Transition_创建动画(元素, CSS属性_background_color, 1, 旧样式.background_color, 新样式.background_color, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.width != 新样式.width && 旧样式.width >= 0 && 新样式.width >= 0) {
+        Transition_创建动画(元素, CSS属性_width, 2, 旧样式.width, 新样式.width, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.height != 新样式.height && 旧样式.height >= 0 && 新样式.height >= 0) {
+        Transition_创建动画(元素, CSS属性_height, 2, 旧样式.height, 新样式.height, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.font_size != 新样式.font_size) {
+        Transition_创建动画(元素, CSS属性_font_size, 2, 旧样式.font_size, 新样式.font_size, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.top != 新样式.top && 旧样式.top >= 0 && 新样式.top >= 0) {
+        Transition_创建动画(元素, CSS属性_top, 2, 旧样式.top, 新样式.top, 持续时间, 延迟, 缓动)
+    }
+    如果 (旧样式.left != 新样式.left && 旧样式.left >= 0 && 新样式.left >= 0) {
+        Transition_创建动画(元素, CSS属性_left, 2, 旧样式.left, 新样式.left, 持续时间, 延迟, 缓动)
+    }
+}
+
+函数 Transition_创建动画(元素, 属性ID, 值类型, 旧值, 新值, 持续时间, 延迟, 缓动) {
+    定义 ke = KeyframeEffect_创建("transition", 元素, 持续时间)
+    ke.延迟 = 延迟
+    ke.迭代次数 = 100    // 1次
+    ke.填充模式 = 1      // forwards
+    ke.缓动 = 缓动
+
+    // 创建两个关键帧: 0% → 100%
+    定义 kf0 = KeyframeEffect_添加关键帧(ke, 0)
+    Keyframe_添加属性(kf0, 属性ID, 值类型, 旧值, 旧值)
+
+    定义 kf1 = KeyframeEffect_添加关键帧(ke, 10000)
+    Keyframe_添加属性(kf1, 属性ID, 值类型, 新值, 新值)
+
+    // 创建并播放动画
+    定义 anim = Animation_创建(ke)
+    Animation_play(anim)
+}
+
+// §7 @keyframes规则解析
+
+结构 KeyframesRule {
+    名称,    // u64 动画名称
+    关键帧规则,    // u64 [偏移, 声明列表] 数组
+    规则数量,
+    规则容量,
+}
+
+定义 可变 全局Keyframes表 = 0
+定义 可变 全局Keyframes数量 = 0
+定义 可变 全局Keyframes容量 = 0
+
+函数 Keyframes_注册(名称, 规则) {
+    如果 (全局Keyframes表 == 0) {
+        全局Keyframes容量 = 64
+        全局Keyframes表 = 堆_分配_数组(全局Keyframes容量 * 16)
+        全局Keyframes数量 = 0
+    }
+    如果 (全局Keyframes数量 >= 全局Keyframes容量) { 返回 }
+    定义 偏移 = 全局Keyframes表 + 全局Keyframes数量 * 16
+    内存_写64(偏移, 字符串_复制(名称))
+    内存_写64(偏移 + 8, 规则)
+    全局Keyframes数量 = 全局Keyframes数量 + 1
+}
+
+函数 Keyframes_查找(名称) {
+    如果 (全局Keyframes表 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < 全局Keyframes数量) {
+        定义 偏移 = 全局Keyframes表 + i * 16
+        如果 (字符串_相等(内存_读64(偏移), 名称)) {
+            返回 内存_读64(偏移 + 8)
+        }
+        i = i + 1
+    }
+    返回 0
+}

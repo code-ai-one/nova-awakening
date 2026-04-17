@@ -1,0 +1,111 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./解析电源表电.nova")
+导入("../执行/视窗打印.nova")
+导入("../中枢/字符串替换.nova")
+导入("../引导/端口输入.nova")
+导入("./散热管理.nova")
+导入("./中断处理.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §3 全局状态
+
+定义 可变 ACPI_RSDP地址 = 0
+定义 可变 ACPI_XSDT地址 = 0
+定义 可变 ACPI_表列表 = []        // [签名, 物理地址]
+定义 可变 ACPI_CPU列表 = []
+定义 可变 ACPI_IO接口C列表 = []
+定义 可变 ACPI_FADT = 空
+定义 可变 ACPI_散热列表 = []
+定义 可变 ACPI_已初始化 = 假
+
+// §4 初始化 — 查找和解析ACPI表
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 ACPI_初始化() {
+    内核信息("ACPI: 初始化...")
+
+    // 1. 查找RSDP
+    ACPI_RSDP地址 = ACPI_查找RSDP()
+    如果 (ACPI_RSDP地址 == 0) {
+        内核警告("ACPI: 未找到RSDP")
+        返回
+    }
+
+    // 2. 解析RSDP
+    定义 版本 = 内存读8(ACPI_RSDP地址 + 15)
+    定义 rsdt_addr = 内存读32(ACPI_RSDP地址 + 16)
+    定义 可变 xsdt_addr = 0
+    如果 (版本 >= 2) {
+        xsdt_addr = 内存读64(ACPI_RSDP地址 + 24)
+    }
+    定义 oem = 读取固定字符串(ACPI_RSDP地址 + 9, 6)
+    内核信息("ACPI: RSDP版本=" + 整数转字符串(版本) + " OEM=" + oem)
+
+    // 3. 解析XSDT(优先)或RSDT
+    如果 (xsdt_addr != 0) {
+        ACPI_XSDT地址 = xsdt_addr
+        ACPI_解析XSDT(xsdt_addr)
+    } 否则 {
+        ACPI_解析RSDT(rsdt_addr)
+    }
+
+    // 4. 解析关键子表
+    ACPI_解析MADT()
+    ACPI_解析FADT()
+    ACPI_解析HPET()
+    ACPI_解析MCFG()
+
+    // 5. 使能ACPI模式
+    如果 (ACPI_FADT != 空 && ACPI_FADT.SMI命令端口 != 0) {
+        端口写8(ACPI_FADT.SMI命令端口, ACPI_FADT.ACPI使能值)
+        延迟_ms(100)
+        内核信息("ACPI: ACPI模式已使能")
+    }
+
+    // 6. 初始化散热监控
+    ACPI_散热_初始化()
+
+    ACPI_已初始化 = 真
+    内核信息("ACPI: 初始化完成 CPU=" + 整数转字符串(计数(ACPI_CPU列表)) +
+             " IO接口C=" + 整数转字符串(计数(ACPI_IO接口C列表)) +
+             " 表=" + 整数转字符串(计数(ACPI_表列表)))
+}
+
+// §5 查找RSDP
+
+函数 ACPI_查找RSDP() {
+    // 搜索EBDA(Extended BIOS Data Area)
+    定义 ebda_seg = 内存读16(0x40E)
+    定义 ebda = ebda_seg << 4
+    定义 结果 = ACPI_扫描RSDP(ebda, ebda + 1024)
+    如果 (结果 != 0) { 返回 结果 }
+
+    // 搜索BIOS ROM区域 (0xE0000 - 0xFFFFF)
+    返回 ACPI_扫描RSDP(0xE0000, 0x100000)
+}
+
+函数 ACPI_扫描RSDP(起始, 结束) {
+    定义 可变 addr = 起始
+    当 (addr < 结束) {
+        // 检查签名 "RSD PTR "(8字节)
+        如果 (内存读8(addr) == 0x52 && 内存读8(addr + 1) == 0x53 &&
+            内存读8(addr + 2) == 0x44 && 内存读8(addr + 3) == 0x20 &&
+            内存读8(addr + 4) == 0x50 && 内存读8(addr + 5) == 0x54 &&
+            内存读8(addr + 6) == 0x52 && 内存读8(addr + 7) == 0x20) {
+            // 验证校验和(前20字节之和 mod 256 = 0)
+            定义 可变 sum = 0
+            定义 可变 i = 0
+            当 (i < 20) {
+                sum = sum + 内存读8(addr + i)
+                i = i + 1
+            }
+            如果 ((sum & 0xFF) == 0) {
+                内核信息("ACPI: RSDP @ " + 整数转十六进制(addr))
+                返回 addr
+            }
+        }
+        addr = addr + 16   // RSDP必须16字节对齐
+    }
+    返回 0
+}

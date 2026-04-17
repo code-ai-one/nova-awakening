@@ -1,0 +1,106 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档观察.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+
+// §5 Page域
+
+函数 DevTools_Page处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Page.enable")) {
+        session.page启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Page.reload")) {
+        // 重新加载页面
+    } 否则 如果 (字符串_相等(方法, "Page.navigate")) {
+        定义 url = DevTools_解析参数_str(msg.参数, "url")
+        // 导航到URL
+    } 否则 如果 (字符串_相等(方法, "Page.captureScreenshot")) {
+        // 截图 → 返回Base64 PNG
+        // 参数: format(jpeg/png/webp), quality, clip, fromSurface
+    } 否则 如果 (字符串_相等(方法, "Page.printToPDF")) {
+        // 打印PDF
+    } 否则 如果 (字符串_相等(方法, "Page.getFrameTree")) {
+        // 获取frame树
+    } 否则 如果 (字符串_相等(方法, "Page.setDocumentContent")) {
+        // 设置页面HTML内容
+    }
+}
+
+// §6 Network域
+
+结构 NetworkEntry {
+    requestId,
+    url,
+    method,
+    状态码,
+    // 时间
+    请求时间,
+    响应时间,
+    完成时间,
+    // 大小
+    请求大小,
+    响应大小,
+    // MIME
+    mimeType,
+    // 头
+    请求头,
+    响应头,
+    // 体
+    响应体,
+    响应体大小,
+    下一个,    // u64 NetworkEntry*
+}
+
+定义 可变 网络日志头 = 0
+定义 可变 网络日志数 = 0
+
+函数 DevTools_Network处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Network.enable")) {
+        session.network启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Network.disable")) {
+        session.network启用 = 假; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Network.getResponseBody")) {
+        定义 requestId = DevTools_解析参数_str(msg.参数, "requestId")
+        // 返回响应体
+    } 否则 如果 (字符串_相等(方法, "Network.set缓存Disabled")) {
+        // 禁用缓存
+    } 否则 如果 (字符串_相等(方法, "Network.setRequestInterception")) {
+        // 请求拦截
+    } 否则 如果 (字符串_相等(方法, "Network.emulateNetworkConditions")) {
+        // 模拟网络条件(延迟/带宽/离线)
+        定义 离线 = DevTools_解析参数_bool(msg.参数, "offline")
+        定义 延迟 = DevTools_解析参数_int(msg.参数, "latency")
+        定义 下载 = DevTools_解析参数_int(msg.参数, "downloadThroughput")
+        定义 上传 = DevTools_解析参数_int(msg.参数, "uploadThroughput")
+    } 否则 如果 (字符串_相等(方法, "Network.setCookie")) {
+        // 设置Cookie
+    } 否则 如果 (字符串_相等(方法, "Network.getCookies")) {
+        // 获取Cookies
+    } 否则 如果 (字符串_相等(方法, "Network.clearBrowserCookies")) {
+        // 清除Cookies
+    }
+}
+
+// 记录网络请求(由网络栈调用)
+函数 DevTools_Network_记录请求(url, method) {
+    如果 (全局DevTools == 0) { 返回 }
+    定义 entry = 堆_分配(NetworkEntry)
+    entry.url = url; entry.method = method
+    entry.请求时间 = 平台_获取高精度时间()
+    entry.下一个 = 网络日志头; 网络日志头 = entry
+    网络日志数 = 网络日志数 + 1
+    // 发送Network.requestWillBeSent事件
+}
+
+函数 DevTools_Network_记录响应(entry, 状态码, mimeType) {
+    如果 (entry == 0) { 返回 }
+    entry.状态码 = 状态码; entry.mimeType = mimeType
+    entry.响应时间 = 平台_获取高精度时间()
+    // 发送Network.responseReceived事件
+}

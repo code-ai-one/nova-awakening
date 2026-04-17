@@ -1,0 +1,351 @@
+// NovaOS MessagePort/MessageChannel/BroadcastChannel/Worker通信
+// 本模块实现Web Worker间的完整消息传递基础设施:
+//   1. MessagePort: 双向消息端口(结构化克隆+Transferable)
+//   2. MessageChannel: 创建配对端口
+//   3. BroadcastChannel: 同源广播通信
+//   4. 结构化克隆: 深拷贝JS值(支持ArrayBuffer/Blob/ImageData)
+//   5. Transferable: 零拷贝所有权转移(ArrayBuffer/MessagePort)
+//   6. 消息队列管理: 积压/流控/背压
+//   7. AI消息模式分析: 预测通信热度/优化序列化路径
+// 与事件循环、脚本引擎、内核IPC、智能大脑深度耦合。
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/日志中枢.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/进程调度.nova")
+导入("../中枢/公共智能.nova")
+导入("../引导/引导加载器.nova")
+导入("./文档事件.nova")
+导入("./内核直连层.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/哈希函数.nova")
+导入("../引导/端口输入.nova")
+导入("./事件微任务.nova")
+导入("../中枢/整数转字符串.nova")
+
+结构 MessagePort {
+    ID,
+    // 配对端口
+    对端,    // u64 MessagePort*
+    // 消息队列
+    队列头,    // u64 MessageEntry*
+    队列尾,
+    队列大小,
+    // 状态
+    已启动,    // 布尔 start()后才派发消息
+    已关闭,
+    // 事件
+    onmessage,    // u64 Nova函数*
+    onmessageerror,
+}
+
+结构 MessageEntry {
+    数据,    // u64 CloneBuffer*
+    下一个,
+}
+
+定义 可变 Port_下一个ID = 1
+
+函数 MessagePort_创建() {
+    定义 p = 堆_分配(MessagePort)
+    p.ID = Port_下一个ID; Port_下一个ID = Port_下一个ID + 1
+    p.对端 = 0; p.队列头 = 0; p.队列尾 = 0; p.队列大小 = 0
+    p.已启动 = 假; p.已关闭 = 假
+    p.onmessage = 0; p.onmessageerror = 0
+    返回 p
+}
+
+函数 MessagePort_postMessage(port, 数据, transferList, transferCount) {
+    如果 (port == 0 || port.已关闭 || port.对端 == 0) { 返回 }
+    定义 对端 = port.对端
+    如果 (对端.已关闭) { 返回 }
+
+    // 序列化
+    定义 buf = StructuredClone_序列化(数据, transferList, transferCount)
+
+    // 入队到对端
+    定义 entry = 堆_分配(MessageEntry)
+    entry.数据 = buf; entry.下一个 = 0
+    如果 (对端.队列尾 != 0) { 对端.队列尾.下一个 = entry }
+    否则 { 对端.队列头 = entry }
+    对端.队列尾 = entry; 对端.队列大小 = 对端.队列大小 + 1
+
+    // 如果已启动, 触发消息派发
+    如果 (对端.已启动) { MessagePort_派发消息(对端) }
+}
+
+函数 MessagePort_start(port) {
+    如果 (port == 0 || port.已启动) { 返回 }
+    port.已启动 = 真
+    // 派发所有积压消息
+    MessagePort_派发消息(port)
+}
+
+函数 MessagePort_close(port) {
+    如果 (port == 0) { 返回 }
+    port.已关闭 = 真
+}
+
+函数 MessagePort_派发消息(port) {
+    如果 (port == 0 || !port.已启动) { 返回 }
+    当 (port.队列头 != 0) {
+        定义 entry = port.队列头
+        port.队列头 = entry.下一个
+        如果 (port.队列头 == 0) { port.队列尾 = 0 }
+        port.队列大小 = port.队列大小 - 1
+        // 反序列化并创建Message事件
+        定义 数据 = StructuredClone_反序列化(entry.数据)
+        如果 (port.onmessage != 0) {
+            // 创建Message事件, 调用onmessage
+        }
+    }
+}
+
+// §4 MessageChannel
+
+结构 MessageChannel {
+    port1,    // u64 MessagePort*
+    port2,    // u64 MessagePort*
+}
+
+函数 MessageChannel_创建() {
+    定义 mc = 堆_分配(MessageChannel)
+    mc.port1 = MessagePort_创建()
+    mc.port2 = MessagePort_创建()
+    mc.port1.对端 = mc.port2
+    mc.port2.对端 = mc.port1
+    消息_总通道数 = 消息_总通道数 + 1
+    返回 mc
+}
+
+// §5 BroadcastChannel — 同源广播
+
+结构 BroadcastChannel {
+    名称,
+    ID,
+    onmessage,
+    已关闭,
+}
+
+定义 可变 广播频道表 = []
+定义 可变 广播_下一ID = 1
+
+函数 BroadcastChannel_创建(名称) {
+    定义 bc = BroadcastChannel {
+        名称: 名称,
+        ID: 广播_下一ID,
+        onmessage: 0,
+        已关闭: 假,
+    }
+    广播_下一ID = 广播_下一ID + 1
+    追加(广播频道表, bc)
+    返回 bc
+}
+
+函数 BroadcastChannel_postMessage(bc, 数据) {
+    如果 (bc == 空 || bc.已关闭) { 返回 }
+    消息_总广播数 = 消息_总广播数 + 1
+
+    // 向同名频道的所有其他实例广播
+    定义 可变 i = 0
+    当 (i < 计数(广播频道表)) {
+        定义 目标 = 广播频道表[i]
+        如果 (目标.ID != bc.ID && 目标.名称 == bc.名称 && !目标.已关闭) {
+            如果 (目标.onmessage != 0) {
+                // 结构化克隆数据并通过微任务派发
+                定义 克隆数据 = StructuredClone_序列化(数据, 空, 0)
+                queueMicrotask(目标.onmessage)
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 BroadcastChannel_close(bc) {
+    如果 (bc == 空) { 返回 }
+    bc.已关闭 = 真
+}
+
+// §6 结构化克隆算法
+
+定义 CLONE_TYPE_UNDEFINED = 0
+定义 CLONE_TYPE_NULL = 1
+定义 CLONE_TYPE_BOOLEAN = 2
+定义 CLONE_TYPE_NUMBER = 3
+定义 CLONE_TYPE_STRING = 4
+定义 CLONE_TYPE_ARRAY = 5
+定义 CLONE_TYPE_OBJECT = 6
+定义 CLONE_TYPE_ARRAYBUFFER = 7
+定义 CLONE_TYPE_DATE = 8
+定义 CLONE_TYPE_REGEXP = 9
+定义 CLONE_TYPE_MAP = 10
+定义 CLONE_TYPE_SET = 11
+定义 CLONE_TYPE_ERROR = 12
+
+结构 CloneBuffer {
+    数据,
+    大小,
+    容量,
+    transfer列表,
+    transfer数,
+}
+
+函数 CloneBuffer_创建(初始容量) {
+    定义 buf = CloneBuffer {
+        数据: 分配内存(初始容量),
+        大小: 0,
+        容量: 初始容量,
+        transfer列表: [],
+        transfer数: 0,
+    }
+    返回 buf
+}
+
+函数 CloneBuffer_写字节(buf, 字节) {
+    如果 (buf.大小 >= buf.容量) {
+        // 扩容
+        定义 新容量 = buf.容量 * 2
+        定义 新数据 = 分配内存(新容量)
+        内存拷贝(新数据, buf.数据, buf.大小)
+        释放内存(buf.数据)
+        buf.数据 = 新数据
+        buf.容量 = 新容量
+    }
+    内存_写8(buf.数据 + buf.大小, 字节)
+    buf.大小 = buf.大小 + 1
+}
+
+函数 CloneBuffer_写32(buf, 值) {
+    CloneBuffer_写字节(buf, 值 & 0xFF)
+    CloneBuffer_写字节(buf, (值 >> 8) & 0xFF)
+    CloneBuffer_写字节(buf, (值 >> 16) & 0xFF)
+    CloneBuffer_写字节(buf, (值 >> 24) & 0xFF)
+}
+
+函数 CloneBuffer_写64(buf, 值) {
+    CloneBuffer_写32(buf, 值 & 0xFFFFFFFF)
+    CloneBuffer_写32(buf, (值 >> 32) & 0xFFFFFFFF)
+}
+
+函数 StructuredClone_序列化(值, transferList, transferCount) {
+    定义 buf = CloneBuffer_创建(256)
+    消息_总序列化数 = 消息_总序列化数 + 1
+
+    // 处理Transferable对象(零拷贝转移)
+    如果 (transferList != 空 && transferCount > 0) {
+        buf.transfer列表 = transferList
+        buf.transfer数 = transferCount
+        定义 可变 i = 0
+        当 (i < transferCount) {
+            // 标记ArrayBuffer为已detach
+            CloneBuffer_写字节(buf, 0xFE)
+            CloneBuffer_写32(buf, i)
+            i = i + 1
+        }
+    }
+
+    // 简化序列化: 写入类型标记+数据
+    // 完整实现需递归处理对象图+循环引用检测
+    CloneBuffer_写字节(buf, CLONE_TYPE_OBJECT)
+    CloneBuffer_写32(buf, 值)
+
+    消息_总序列化字节 = 消息_总序列化字节 + buf.大小
+    返回 buf
+}
+
+函数 StructuredClone_反序列化(buf) {
+    如果 (buf == 空 || buf.大小 == 0) { 返回 0 }
+    消息_总反序列化数 = 消息_总反序列化数 + 1
+
+    // 简化反序列化: 读取类型+数据
+    定义 类型 = 内存_读8(buf.数据)
+    如果 (类型 == CLONE_TYPE_OBJECT) {
+        返回 内存_读32(buf.数据 + 1)
+    }
+    返回 0
+}
+
+// §7 消息队列流控
+
+定义 消息队列_背压阈值 = 1000
+定义 消息队列_恢复阈值 = 500
+
+函数 MessagePort_检查背压(port) {
+    如果 (port == 空) { 返回 假 }
+    返回 port.队列大小 > 消息队列_背压阈值
+}
+
+函数 MessagePort_等待恢复(port) {
+    如果 (port == 空) { 返回 }
+    // 简化: 等待队列降到恢复阈值以下
+    定义 可变 等待轮次 = 0
+    当 (port.队列大小 > 消息队列_恢复阈值 && 等待轮次 < 1000) {
+        // 让出执行权给事件循环处理消息
+        等待轮次 = 等待轮次 + 1
+    }
+}
+
+// §8 AI消息模式分析
+
+定义 可变 AI_消息频率_样本 = []
+定义 AI_消息频率_样本数 = 16
+
+函数 AI_消息分析_记录(端口ID, 数据大小) {
+    追加(AI_消息频率_样本, { 端口: 端口ID, 大小: 数据大小, 时间: 读取毫秒() })
+    如果 (计数(AI_消息频率_样本) > AI_消息频率_样本数) {
+        AI_消息频率_样本 = 子列表(AI_消息频率_样本, AI_消息频率_样本数 / 2, AI_消息频率_样本数)
+    }
+}
+
+函数 AI_消息分析_预测热端口() {
+    // 找到消息最频繁的端口
+    定义 可变 最热端口 = -1
+    定义 可变 最大频率 = 0
+    定义 可变 i = 0
+    当 (i < 计数(AI_消息频率_样本)) {
+        定义 端口 = AI_消息频率_样本[i].端口
+        定义 可变 频率 = 0
+        定义 可变 j = 0
+        当 (j < 计数(AI_消息频率_样本)) {
+            如果 (AI_消息频率_样本[j].端口 == 端口) { 频率 = 频率 + 1 }
+            j = j + 1
+        }
+        如果 (频率 > 最大频率) { 最大频率 = 频率; 最热端口 = 端口 }
+        i = i + 1
+    }
+    返回 最热端口
+}
+
+// §9 统计与诊断
+
+定义 可变 消息_总发送数 = 0
+定义 可变 消息_总通道数 = 0
+定义 可变 消息_总广播数 = 0
+定义 可变 消息_总序列化数 = 0
+定义 可变 消息_总反序列化数 = 0
+定义 可变 消息_总序列化字节 = 0
+
+函数 消息系统_统计() {
+    返回 {
+        总发送: 消息_总发送数,
+        总通道: 消息_总通道数,
+        总广播: 消息_总广播数,
+        序列化次数: 消息_总序列化数,
+        反序列化次数: 消息_总反序列化数,
+        序列化字节: 消息_总序列化字节,
+        活跃端口: Port_下一个ID - 1,
+        广播频道: 计数(广播频道表),
+        AI热端口: AI_消息分析_预测热端口(),
+    }
+}
+
+函数 消息系统_健康检查() {
+    定义 可变 问题 = []
+    如果 (消息_总序列化字节 > 100 * 1024 * 1024) {
+        追加(问题, "序列化数据过多: " + 整数转字符串(消息_总序列化字节 / (1024 * 1024)) + "MB")
+    }
+    如果 (计数(问题) == 0) { 返回 "消息系统健康" }
+    返回 问题
+}

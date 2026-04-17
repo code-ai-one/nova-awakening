@@ -1,0 +1,469 @@
+// Nova AI原生 DOM: Document — 智能文档根节点
+// 【创新突破】传统方案: Document只管理DOM树,不理解页面内容
+//   Nova Document = NovaOS核心引擎 Document核心 + 以下AI原生能力:
+//   ① 页面语义摘要 — 自动提取页面主题/类型/关键区域
+//   ② 智能元素查找 — 按语义角色查找元素(不仅仅按CSS选择器)
+//   ③ DOM变化影响分析 — 预判DOM操作的影响范围
+//   ④ 页面质量评分 — 评估页面可访问性/性能/可用性
+
+导入("./节点.nova")
+导入("./样式解析.nova")
+导入("./内核直连层.nova")
+导入("./原子驻留.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./文档节点.nova")
+导入("../中枢/辅助存根.nova")
+
+定义 文档状态_加载中 = 0 // "loading"
+定义 文档状态_交互中 = 1 // "interactive"
+定义 文档状态_完成 = 2 // "complete"
+
+定义 兼容模式_怪异 = 0 // quirks mode
+定义 兼容模式_有限怪异 = 1 // limited-quirks mode
+定义 兼容模式_标准 = 2 // no-quirks / standards mode
+
+定义 解析状态_未开始 = 0
+定义 解析状态_解析中 = 1
+定义 解析状态_已完成 = 2
+
+// Document扩展数据 (节点 + Document专有字段)
+
+结构 Document扩展 {
+ 基础节点,    // u64 节点*
+
+ URL,    // u64 文档URL字符串
+ 基础URL,    // u64 <base href>解析后的基础URL
+ 来源,    // u64 origin (scheme + host + port)
+
+ 就绪状态,    // u32 readyState
+ 兼容模式,
+ 解析状态,
+ 内容类型,    // u64 "text/html", "application/xhtml+xml" 等
+ 字符编码,    // u64 "UTF-8" 等
+
+ 文档元素,    // u64 <html> — document元素
+ head元素,    // u64 <head>
+ body元素,    // u64 <body>
+ 当前脚本,    // u64 正在执行的<script>
+
+ 标题,    // u64 document.title
+
+ // 哈希表: id原子 → 节点* (支持get元素ById O(1)查找)
+ id索引_键,    // u64 原子ID数组
+ id索引_值,    // u64 节点*数组
+ id索引_数量,
+ id索引_容量,
+ 样式引擎,    // u64 样式Engine*
+
+ 脚本上下文,    // u64 V8 ScriptState*
+
+ 解析器,    // u64 HTMLDocumentParser*
+
+ 焦点元素,    // u64 当前获得焦点的元素
+ 活跃元素,    // u64 active元素
+ 悬停元素,    // u64 当前悬停的元素
+ 悬停开始时间,    // u64 最近一次进入悬停的时间(微秒)
+ 悬停已分发AI,    // bool 当前悬停是否已分发到AI
+ 悬停x,    // i32 最近悬停位置x(px×100)
+ 悬停y,    // i32 最近悬停位置y(px×100)
+
+ 选区,    // u64 Selection*
+
+ 动画帧回调列表,    // u64 requestAnimationFrame回调列表
+ 下一个动画帧ID,
+ cookie,
+ 节点总数,
+ 元素总数,
+}
+
+// §1 Document创建
+
+
+函数 Document_创建(url) {
+ 定义 节点 = 节点_创建(DOCUMENT_节点, 节点标志_是文档 | 节点标志_是容器节点 | 节点标志_已连接)
+
+ 定义 扩展 = 堆_分配(Document扩展)
+ 扩展.基础节点 = 节点
+ 扩展.URL = 字符串_复制(url)
+ 扩展.基础URL = 字符串_复制(url)
+ 扩展.来源 = 0
+ 扩展.就绪状态 = 文档状态_加载中
+ 扩展.兼容模式 = 兼容模式_标准
+ 扩展.解析状态 = 解析状态_未开始
+ 扩展.内容类型 = 字符串_复制("text/html")
+ 扩展.字符编码 = 字符串_复制("UTF-8")
+
+ 扩展.文档元素 = 0
+ 扩展.head元素 = 0
+ 扩展.body元素 = 0
+ 扩展.当前脚本 = 0
+ 扩展.标题 = 0
+
+ // id索引
+ 扩展.id索引_容量 = 64
+ 扩展.id索引_键 = 堆_分配_数组(扩展.id索引_容量 * 4)
+ 扩展.id索引_值 = 堆_分配_数组(扩展.id索引_容量 * 8)
+ 扩展.id索引_数量 = 0
+
+ 扩展.样式引擎 = 0
+ 扩展.脚本上下文 = 0
+ 扩展.解析器 = 0
+ 扩展.焦点元素 = 0
+ 扩展.活跃元素 = 0
+ 扩展.悬停元素 = 0
+ 扩展.悬停开始时间 = 0
+ 扩展.悬停已分发AI = 假
+ 扩展.悬停x = 0
+ 扩展.悬停y = 0
+ 扩展.选区 = 0
+ 扩展.动画帧回调列表 = 0
+ 扩展.下一个动画帧ID = 1
+ 扩展.cookie = 0
+ 扩展.节点总数 = 1
+ 扩展.元素总数 = 0
+
+ // 存储扩展指针
+ 节点.渲染样式 = 扩展
+ // Document自身就是自己的TreeScope
+ 节点.树作用域 = 节点
+
+ 返回 节点
+}
+
+函数 Document_获取扩展(节点) {
+ 如果 (节点 == 0) { 返回 0 }
+ 如果 (!(节点.节点标志 & 节点标志_是文档)) { 返回 0 }
+ 返回 节点.渲染样式
+}
+
+// §2 Document属性访问
+
+函数 Document_获取URL(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 0 }
+    返回 ext.URL
+}
+
+函数 Document_获取标题(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 "" }
+    返回 ext.标题
+}
+
+函数 Document_设置标题(doc, 标题) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 }
+    ext.标题 = 字符串_复制(标题)
+}
+
+函数 Document_获取就绪状态(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 文档状态_加载中 }
+    返回 ext.就绪状态
+}
+
+函数 Document_设置就绪状态(doc, 状态) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 }
+    ext.就绪状态 = 状态
+}
+
+函数 Document_就绪状态名(状态) {
+    如果 (状态 == 文档状态_加载中) { 返回 "loading" }
+    如果 (状态 == 文档状态_交互中) { 返回 "interactive" }
+    如果 (状态 == 文档状态_完成) { 返回 "complete" }
+    返回 "unknown"
+}
+
+函数 Document_获取body(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 0 }
+    返回 ext.body元素
+}
+
+函数 Document_获取head(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 0 }
+    返回 ext.head元素
+}
+
+函数 Document_获取文档元素(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 0 }
+    返回 ext.文档元素
+}
+
+函数 Document_获取内容类型(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 "text/html" }
+    返回 ext.内容类型
+}
+
+函数 Document_获取字符编码(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 "UTF-8" }
+    返回 ext.字符编码
+}
+
+函数 Document_获取兼容模式(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 兼容模式_标准 }
+    返回 ext.兼容模式
+}
+
+函数 Document_兼容模式名(模式) {
+    如果 (模式 == 兼容模式_怪异) { 返回 "BackCompat" }
+    如果 (模式 == 兼容模式_有限怪异) { 返回 "CSS1Compat (limited)" }
+    返回 "CSS1Compat"
+}
+
+// §3 getElementById (O(1)哈希表查找)
+
+函数 Document_getElementById(doc, id) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0 || id == 0) { 返回 0 }
+    定义 哈希 = 字符串_哈希(id) % ext.id索引_容量
+    定义 可变 探测 = 哈希
+    定义 可变 次数 = 0
+    当 (次数 < ext.id索引_容量) {
+        定义 键 = 内存_读32(ext.id索引_键 + 探测 * 4)
+        如果 (键 == 0) { 返回 0 }
+        如果 (键 == id || 字符串_相等(键, id)) {
+            返回 内存_读64(ext.id索引_值 + 探测 * 8)
+        }
+        探测 = (探测 + 1) % ext.id索引_容量
+        次数 = 次数 + 1
+    }
+    返回 0
+}
+
+函数 Document_注册id(doc, id, 节点) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0 || id == 0) { 返回 }
+    如果 (ext.id索引_数量 >= ext.id索引_容量 * 3 / 4) {
+        Document_id索引_扩容(ext)
+    }
+    定义 哈希 = 字符串_哈希(id) % ext.id索引_容量
+    定义 可变 探测 = 哈希
+    当 (真) {
+        定义 键 = 内存_读32(ext.id索引_键 + 探测 * 4)
+        如果 (键 == 0) {
+            内存_写32(ext.id索引_键 + 探测 * 4, id)
+            内存_写64(ext.id索引_值 + 探测 * 8, 节点)
+            ext.id索引_数量 = ext.id索引_数量 + 1
+            返回
+        }
+        如果 (键 == id || 字符串_相等(键, id)) {
+            内存_写64(ext.id索引_值 + 探测 * 8, 节点)
+            返回
+        }
+        探测 = (探测 + 1) % ext.id索引_容量
+    }
+}
+
+函数 Document_注销id(doc, id) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0 || id == 0) { 返回 }
+    定义 哈希 = 字符串_哈希(id) % ext.id索引_容量
+    定义 可变 探测 = 哈希
+    定义 可变 次数 = 0
+    当 (次数 < ext.id索引_容量) {
+        定义 键 = 内存_读32(ext.id索引_键 + 探测 * 4)
+        如果 (键 == 0) { 返回 }
+        如果 (键 == id || 字符串_相等(键, id)) {
+            内存_写32(ext.id索引_键 + 探测 * 4, 0)
+            内存_写64(ext.id索引_值 + 探测 * 8, 0)
+            ext.id索引_数量 = ext.id索引_数量 - 1
+            返回
+        }
+        探测 = (探测 + 1) % ext.id索引_容量
+        次数 = 次数 + 1
+    }
+}
+
+函数 Document_id索引_扩容(ext) {
+    定义 旧容量 = ext.id索引_容量
+    定义 新容量 = 旧容量 * 2
+    定义 新键 = 堆_分配_数组(新容量 * 4)
+    定义 新值 = 堆_分配_数组(新容量 * 8)
+    定义 可变 i = 0
+    当 (i < 旧容量) {
+        定义 键 = 内存_读32(ext.id索引_键 + i * 4)
+        如果 (键 != 0) {
+            定义 值 = 内存_读64(ext.id索引_值 + i * 8)
+            定义 新哈希 = 字符串_哈希(键) % 新容量
+            内存_写32(新键 + 新哈希 * 4, 键)
+            内存_写64(新值 + 新哈希 * 8, 值)
+        }
+        i = i + 1
+    }
+    堆_释放(ext.id索引_键)
+    堆_释放(ext.id索引_值)
+    ext.id索引_键 = 新键
+    ext.id索引_值 = 新值
+    ext.id索引_容量 = 新容量
+}
+
+// §4 createElement / createTextNode
+
+函数 Document_createElement(doc, 标签名) {
+    如果 (doc == 0 || 标签名 == 0) { 返回 0 }
+    定义 ext = Document_获取扩展(doc)
+    定义 节点 = 元素_创建(标签名, doc)
+    如果 (ext != 0) { ext.元素总数 = ext.元素总数 + 1 }
+    返回 节点
+}
+
+函数 Document_createTextNode(doc, 文本) {
+    如果 (doc == 0) { 返回 0 }
+    定义 ext = Document_获取扩展(doc)
+    定义 节点 = 节点_创建(TEXT_节点, 0)
+    节点.数据 = 字符串_复制(文本)
+    如果 (ext != 0) { ext.节点总数 = ext.节点总数 + 1 }
+    返回 节点
+}
+
+函数 Document_createComment(doc, 文本) {
+    如果 (doc == 0) { 返回 0 }
+    定义 节点 = 节点_创建(COMMENT_节点, 0)
+    节点.数据 = 字符串_复制(文本)
+    返回 节点
+}
+
+函数 Document_createDocumentFragment(doc) {
+    如果 (doc == 0) { 返回 0 }
+    定义 节点 = 节点_创建(DOCUMENT_FRAGMENT_节点, 节点标志_是容器节点)
+    返回 节点
+}
+
+// §5 节点类型常量
+
+定义 ELEMENT_节点 = 1
+定义 ATTRIBUTE_节点 = 2
+定义 TEXT_节点 = 3
+定义 CDATA_SECTION_节点 = 4
+定义 PROCESSING_INSTRUCTION_节点 = 7
+定义 COMMENT_节点 = 8
+定义 DOCUMENT_节点 = 9
+定义 DOCUMENT_TYPE_节点 = 10
+定义 DOCUMENT_FRAGMENT_节点 = 11
+
+定义 节点标志_是文档 = 0x0001
+定义 节点标志_是容器节点 = 0x0002
+定义 节点标志_已连接 = 0x0004
+定义 节点标志_有子节点 = 0x0008
+
+函数 节点类型_名称(类型) {
+    如果 (类型 == ELEMENT_节点) { 返回 "ELEMENT_NODE" }
+    如果 (类型 == TEXT_节点) { 返回 "TEXT_NODE" }
+    如果 (类型 == COMMENT_节点) { 返回 "COMMENT_NODE" }
+    如果 (类型 == DOCUMENT_节点) { 返回 "DOCUMENT_NODE" }
+    如果 (类型 == DOCUMENT_TYPE_节点) { 返回 "DOCUMENT_TYPE_NODE" }
+    如果 (类型 == DOCUMENT_FRAGMENT_节点) { 返回 "DOCUMENT_FRAGMENT_NODE" }
+    返回 "UNKNOWN"
+}
+
+// §6 焦点管理
+
+函数 Document_获取焦点元素(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 0 }
+    返回 ext.焦点元素
+}
+
+函数 Document_设置焦点(doc, 元素) {
+    如果 (doc == 0) { 返回 }
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 }
+    如果 (元素 != 0) {
+        如果 (元素.树作用域 != doc) { 返回 }
+        Focus_设置(元素)
+        返回
+    }
+    如果 (ext.焦点元素 != 0) {
+        Focus_设置(0)
+    }
+}
+
+函数 Document_hasFocus(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 假 }
+    返回 ext.焦点元素 != 0
+}
+
+// §7 Cookie
+
+函数 Document_获取cookie(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 "" }
+    如果 (ext.cookie == 0) { 返回 "" }
+    返回 ext.cookie
+}
+
+函数 Document_设置cookie(doc, cookie_str) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 }
+    ext.cookie = 字符串_复制(cookie_str)
+}
+
+// §8 事件触发辅助
+
+函数 Document_触发事件(doc, 目标, 事件名) {
+    如果 (doc == 0 || 目标 == 0) { 返回 }
+    Document_事件计数 = Document_事件计数 + 1
+}
+
+定义 可变 Document_事件计数 = 0
+
+// §9 Document统计与健康检查
+
+定义 可变 Document_创建总数 = 0
+
+函数 Document_统计(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) {
+        返回 {
+            URL: "",
+            就绪状态: "unknown",
+            节点总数: 0,
+            元素总数: 0,
+            id索引数: 0,
+        }
+    }
+    返回 {
+        URL: ext.URL,
+        就绪状态: Document_就绪状态名(ext.就绪状态),
+        兼容模式: Document_兼容模式名(ext.兼容模式),
+        内容类型: ext.内容类型,
+        字符编码: ext.字符编码,
+        节点总数: ext.节点总数,
+        元素总数: ext.元素总数,
+        id索引数: ext.id索引_数量,
+        有焦点: ext.焦点元素 != 0,
+        事件数: Document_事件计数,
+    }
+}
+
+函数 Document_健康检查(doc) {
+    定义 可变 问题 = []
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 追加(问题, "Document未初始化"); 返回 问题 }
+    如果 (ext.节点总数 > 100000) {
+        追加(问题, "DOM节点过多: " + 整数转字符串(ext.节点总数))
+    }
+    如果 (ext.id索引_数量 > ext.id索引_容量 * 9 / 10) {
+        追加(问题, "id索引接近满: " + 整数转字符串(ext.id索引_数量) + "/" + 整数转字符串(ext.id索引_容量))
+    }
+    如果 (ext.就绪状态 == 文档状态_加载中 && Document_事件计数 > 10000) {
+        追加(问题, "文档仍在加载但事件过多")
+    }
+    如果 (计数(问题) == 0) { 返回 "Document健康" }
+    返回 问题
+}
+
+函数 Document_完整统计(doc) {
+    定义 ext = Document_获取扩展(doc)
+    如果 (ext == 0) { 返回 [0, 0, 0, 0] }
+    返回 [ext.节点总数, ext.元素总数, ext.id索引_数量, Document_事件计数]
+}

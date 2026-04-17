@@ -1,0 +1,174 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./原子驻留.nova")
+导入("./超传头部创.nova")
+导入("./文件上传列.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+
+//       html_input_元素.cc 
+//       html_text_area_元素.cc (~800行)
+//       html_select_元素.cc (~1500行)
+//       html_form_元素.cc (~1000行)
+//       html_button_元素.cc (~300行)
+// 表单控件是网页交互的基础:
+//   <input> (text/password/email/number/checkbox/radio/file/date/range/color...)
+//   <textarea> <select> <button> <form>
+// 每个控件需要:
+//   1. DOM属性(value/checked/disabled/placeholder等)
+//   2. 内部渲染(光标/选区/下拉菜单)
+//   3. 输入处理(键盘/鼠标/IME)
+//   4. 表单验证(required/pattern/min/max/step)
+//   5. 表单提交(序列化/编码/发送)
+
+// §1 Input类型
+
+定义 输入类型_text       = 0
+定义 输入类型_password   = 1
+定义 输入类型_email      = 2
+定义 输入类型_number     = 3
+定义 输入类型_tel        = 4
+定义 输入类型_url        = 5
+定义 输入类型_search     = 6
+定义 输入类型_checkbox   = 7
+定义 输入类型_radio      = 8
+定义 输入类型_file       = 9
+定义 输入类型_hidden     = 10
+定义 输入类型_submit     = 11
+定义 输入类型_reset      = 12
+定义 输入类型_button     = 13
+定义 输入类型_image      = 14
+定义 输入类型_date       = 15
+定义 输入类型_time       = 16
+定义 输入类型_datetime   = 17
+定义 输入类型_month      = 18
+定义 输入类型_week       = 19
+定义 输入类型_range      = 20
+定义 输入类型_color      = 21
+
+// §2 HTMLInput元素
+
+结构 InputState {
+    输入类型,    // u32 输入类型_xxx
+    值,    // u64 当前值字符串
+    默认值,    // u64 defaultValue
+    名,    // u64 name属性
+    占位文本,    // u64 placeholder
+    // 文本选区
+    选区起始,    // u32 selectionStart
+    选区结束,    // u32 selectionEnd
+    选区方向,    // u32 0=none 1=forward 2=backward
+    // 状态
+    已选中,    // 布尔 checked (checkbox/radio)
+    已禁用,    // 布尔 disabled
+    只读,    // 布尔 readonly
+    必填,    // 布尔 required
+    自动填充,    // u64 autocomplete
+    // 验证
+    模式,    // u64 pattern (正则表达式)
+    最小值,    // i64 min
+    最大值,    // i64 max
+    步长,    // i64 step
+    最大长度,    // i32 maxlength
+    最小长度,    // i32 minlength
+    // 有效性
+    有效性,    // u32 ValidityState位掩码
+    自定义错误,    // u64 setCustomValidity消息
+    // 文件(file类型)
+    文件列表,    // u64 FileList*
+    接受,    // u64 accept属性 "image/*,.pdf"
+    多文件,    // 布尔 multiple
+    // 表单
+    所属表单,    // u64 HTMLForm元素*
+}
+
+
+函数 InputState_创建(元素) {
+    定义 state = 堆_分配(InputState)
+    state.输入类型 = 输入类型_text
+    state.值 = 字符串_复制("")
+    state.默认值 = 0
+    state.名 = 0
+    state.占位文本 = 0
+    state.选区起始 = 0
+    state.选区结束 = 0
+    state.选区方向 = 0
+    state.已选中 = 假
+    state.已禁用 = 假
+    state.只读 = 假
+    state.必填 = 假
+    state.自动填充 = 0
+    state.模式 = 0
+    state.最小值 = -9999999
+    state.最大值 = 9999999
+    state.步长 = 100    // ×100, 即1
+    state.最大长度 = -1
+    state.最小长度 = 0
+    state.有效性 = 0
+    state.自定义错误 = 0
+    state.文件列表 = 0
+    state.接受 = 0
+    state.多文件 = 假
+    state.所属表单 = 0
+
+    // 从DOM属性初始化
+    如果 (元素 != 0) {
+        定义 type = 元素_getAttribute(元素, "type")
+        如果 (type != 0) { state.输入类型 = Input_解析类型(type) }
+        定义 value = 元素_getAttribute(元素, "value")
+        如果 (value != 0) { state.值 = 字符串_复制(value); state.默认值 = 字符串_复制(value) }
+        state.名 = 元素_getAttribute(元素, "name")
+        state.占位文本 = 元素_getAttribute(元素, "placeholder")
+        如果 (元素_getAttribute(元素, "checked") != 0) { state.已选中 = 真 }
+        如果 (元素_getAttribute(元素, "disabled") != 0) { state.已禁用 = 真 }
+        如果 (元素_getAttribute(元素, "readonly") != 0) { state.只读 = 真 }
+        如果 (元素_getAttribute(元素, "required") != 0) { state.必填 = 真 }
+        state.模式 = 元素_getAttribute(元素, "pattern")
+        state.接受 = 元素_getAttribute(元素, "accept")
+        如果 (元素_getAttribute(元素, "multiple") != 0) { state.多文件 = 真 }
+
+        定义 maxlen = 元素_getAttribute(元素, "maxlength")
+        如果 (maxlen != 0) { state.最大长度 = 字符串转整数(maxlen) }
+    }
+    如果 (state.输入类型 == 输入类型_file) {
+        state.文件列表 = FileList_创建()
+    }
+    返回 state
+}
+
+函数 Input_解析类型(type字符串) {
+    如果 (字符串_相等_不区分大小写(type字符串, "text")) { 返回 输入类型_text }
+    如果 (字符串_相等_不区分大小写(type字符串, "password")) { 返回 输入类型_password }
+    如果 (字符串_相等_不区分大小写(type字符串, "email")) { 返回 输入类型_email }
+    如果 (字符串_相等_不区分大小写(type字符串, "number")) { 返回 输入类型_number }
+    如果 (字符串_相等_不区分大小写(type字符串, "tel")) { 返回 输入类型_tel }
+    如果 (字符串_相等_不区分大小写(type字符串, "url")) { 返回 输入类型_url }
+    如果 (字符串_相等_不区分大小写(type字符串, "search")) { 返回 输入类型_search }
+    如果 (字符串_相等_不区分大小写(type字符串, "checkbox")) { 返回 输入类型_checkbox }
+    如果 (字符串_相等_不区分大小写(type字符串, "radio")) { 返回 输入类型_radio }
+    如果 (字符串_相等_不区分大小写(type字符串, "file")) { 返回 输入类型_file }
+    如果 (字符串_相等_不区分大小写(type字符串, "hidden")) { 返回 输入类型_hidden }
+    如果 (字符串_相等_不区分大小写(type字符串, "submit")) { 返回 输入类型_submit }
+    如果 (字符串_相等_不区分大小写(type字符串, "reset")) { 返回 输入类型_reset }
+    如果 (字符串_相等_不区分大小写(type字符串, "button")) { 返回 输入类型_button }
+    如果 (字符串_相等_不区分大小写(type字符串, "date")) { 返回 输入类型_date }
+    如果 (字符串_相等_不区分大小写(type字符串, "time")) { 返回 输入类型_time }
+    如果 (字符串_相等_不区分大小写(type字符串, "range")) { 返回 输入类型_range }
+    如果 (字符串_相等_不区分大小写(type字符串, "color")) { 返回 输入类型_color }
+    返回 输入类型_text    // 默认
+}
+
+定义 可变 AI_输入状态创_热点函数 = []
+
+函数 AI_输入状态创_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_输入状态创_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_输入状态创_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

@@ -1,0 +1,466 @@
+// NovaOS 运行时辅助存根 — 跨模块桥接函数 + 类型转换 + GC接口 + 微任务
+// 技术: 脚本引擎内部模块间的粘合层(glue code)
+// 核心: JSValue类型转换, 函数调用桥接, GC弱引用/终结器注册,
+//       微任务队列入队, 承诺创建, 结构化克隆序列化/反序列化
+// 接口: 所有脚本引擎模块的共享辅助函数(高内聚低耦合的神经节点)
+// NovaOS创新: AI辅助类型推断 + 智能序列化格式选择 + 零拷贝传递
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("../执行/控制台输出.nova")
+导入("./字符串替换.nova")
+导入("./内存初始化.nova")
+导入("../推理/小整数快速判.nova")
+导入("../标准/类型判断.nova")
+
+
+// JS值类型标签
+定义 JS_TAG_UNDEFINED  = 0
+定义 JS_TAG_NULL       = 1
+定义 JS_TAG_BOOLEAN    = 2
+定义 JS_TAG_NUMBER     = 3
+定义 JS_TAG_STRING     = 4
+定义 JS_TAG_SYMBOL     = 5
+定义 JS_TAG_BIGINT     = 6
+定义 JS_TAG_OBJECT     = 7
+
+// 序列化格式标记
+定义 CLONE_TAG_UNDEFINED = 0
+定义 CLONE_TAG_NULL      = 1
+定义 CLONE_TAG_BOOL      = 2
+定义 CLONE_TAG_NUMBER    = 3
+定义 CLONE_TAG_STRING    = 4
+定义 CLONE_TAG_OBJECT    = 5
+定义 CLONE_TAG_ARRAY     = 6
+定义 CLONE_TAG_DATE      = 7
+定义 CLONE_TAG_REGEXP    = 8
+定义 CLONE_TAG_MAP       = 9
+定义 CLONE_TAG_SET       = 10
+定义 CLONE_TAG_BUFFER    = 11
+定义 CLONE_TAG_ERROR     = 12
+定义 CLONE_TAG_REF       = 0xFF    // 循环引用
+
+// 全局单例值
+定义 可变 Nova_未定义 = 0
+定义 可变 Nova_空值   = 0
+定义 可变 Nova_真     = 0
+定义 可变 Nova_假     = 0
+
+// 数字格式化
+定义 数字_最大位数    = 20
+定义 数字_缓冲大小    = 32
+
+
+结构 Nova承诺 {
+    状态,              // u32 0=pending, 1=fulfilled, 2=rejected
+    值,                // u64 resolve值或reject原因
+    then回调数,
+    then回调,          // u64 回调数组
+    catch回调数,
+    catch回调,         // u64 回调数组
+    finally回调数,
+    finally回调,
+}
+
+结构 克隆缓冲 {
+    数据,              // u64 字节缓冲
+    大小,              // u32 已用字节数
+    容量,
+}
+
+
+函数 辅助_初始化全局值(Nova运行时实例) {
+    如果 (Nova运行时实例 == 0) { 返回 }
+    Nova_未定义 = Nova运行时实例.undefined值
+    Nova_空值 = Nova运行时实例.null值
+    Nova_真 = Nova运行时实例.true值
+    Nova_假 = Nova运行时实例.false值
+}
+
+
+函数 JSValue_获取类型标签(v) {
+    如果 (v == 0) { 返回 JS_TAG_UNDEFINED }
+    返回 内存_读32(v) & 0xFF
+}
+
+函数 JSValue_IsObject(i, v) {
+    如果 (v == 0) { 返回 假 }
+    返回 JSValue_获取类型标签(v) >= JS_TAG_OBJECT
+}
+
+函数 JSValue_IsFunction(i, v) {
+    如果 (v == 0) { 返回 假 }
+    定义 tag = JSValue_获取类型标签(v)
+    返回 tag == 8 || tag == 9    // Function / AsyncFunction
+}
+
+函数 JSValue_IsString(i, v) {
+    如果 (v == 0) { 返回 假 }
+    返回 JSValue_获取类型标签(v) == JS_TAG_STRING
+}
+
+函数 JSValue_IsTrue_Fast(v) {
+    返回 v == Nova_真
+}
+
+函数 JSValue_获取字符串(v) {
+    如果 (v == 0) { 返回 0 }
+    返回 内存_读64(v + 16)
+}
+
+函数 JSValue_获取数字(v) {
+    如果 (v == 0) { 返回 0 }
+    返回 内存_读64(v + 8)
+}
+
+
+函数 JSValue_ToString_内部(i, v) {
+    如果 (v == 0 || v == Nova_未定义) { 返回 "undefined" }
+    如果 (v == Nova_空值) { 返回 "null" }
+    如果 (v == Nova_真) { 返回 "true" }
+    如果 (v == Nova_假) { 返回 "false" }
+    定义 tag = JSValue_获取类型标签(v)
+    如果 (tag == JS_TAG_STRING) { 返回 JSValue_获取字符串(v) }
+    如果 (tag == JS_TAG_NUMBER) { 返回 Number_ToString(JSValue_获取数字(v)) }
+    如果 (JSValue_IsObject(i, v)) {
+        定义 fn = Nova对象_获取属性(i, v, "toString")
+        如果 (fn != Nova_未定义 && JSValue_IsFunction(i, fn)) {
+            定义 r = Nova函数_Call1(i, fn, v, Nova_未定义)
+            如果 (JSValue_IsString(i, r)) { 返回 JSValue_获取字符串(r) }
+        }
+        返回 "[object Object]"
+    }
+    返回 ""
+}
+函数 JSValue_IsNull(v) { 返回 v == Nova_空值 }
+函数 JSValue_IsUndefined(v) { 返回 v == 0 }
+函数 Nova函数_Call_WithArgs(i, f, t, a, n) { 返回 Nova函数_Apply(i, f, t, a, n) }
+函数 Nova数组_创建_FromParts(i, p, n) { 返回 Nova数组_从原始创建(i, p, n) }
+函数 GC_注册弱引用(i, wr) { 如果 (i != 0 && wr != 0) { 追加(i.弱引用列表, wr) } }
+函数 GC_对象存活(i, obj) {
+    // 检查对象是否在GC标记阶段被标记为存活
+    如果 (obj == 空 || obj == 0) { 返回 假 }
+    如果 (i == 空 || i == 0) { 返回 假 }
+    // 检查GC标记位: 对象头部的mark bit
+    如果 (obj.GC标记 != 空 && obj.GC标记 == i.当前GC代) { 返回 真 }
+    // 检查引用计数(辅助判断)
+    如果 (obj.引用计数 != 空 && obj.引用计数 > 0) { 返回 真 }
+    返回 假
+}
+函数 GC_注册终结器(fr, e) { 如果 (fr != 0) { 追加(fr.回调列表, e) } }
+函数 MicroTask_排入(i, fn, arg) { 如果 (i != 0 && fn != 0) { 追加(i.微任务队列, { 函数: fn, 参数: arg }) } }
+函数 Nova承诺_创建_内部2(i) {
+    定义 p = 堆_分配(Nova承诺)
+    p.状态 = 0    // pending
+    p.值 = Nova_未定义
+    p.then回调数 = 0
+    p.then回调 = 0
+    p.catch回调数 = 0
+    p.catch回调 = 0
+    返回 Nova值_创建_Object(i, p)
+}
+函数 StructuredClone_序列化_完整(v) {
+    // 结构化克隆序列化: 遍历对象图写入二进制缓冲区
+    定义 buf = 堆_分配(4096)
+    定义 可变 pos = 0
+    // 类型标记 + 值
+    定义 tag = JSValue_获取类型标签(v)
+    内存_写8(buf + pos, tag); pos = pos + 1
+    如果 (tag == JS_TAG_NUMBER) {
+        内存_写64(buf + pos, v); pos = pos + 8
+    } 否则 如果 (tag == JS_TAG_STRING) {
+        定义 s = JSValue_获取字符串(v)
+        定义 len = 字节长度(s)
+        内存_写32(buf + pos, len); pos = pos + 4
+        内存_复制(buf + pos, s, len); pos = pos + len
+    } 否则 如果 (tag == JS_TAG_BOOLEAN) {
+        内存_写8(buf + pos, JSValue_IsTrue_Fast(v)); pos = pos + 1
+    } 否则 {
+        // 对象: 序列化键值对
+        内存_写32(buf + pos, 0); pos = pos + 4      }
+    // 封装为CloneBuffer
+    定义 result = 堆_分配(16)
+    内存_写64(result, buf)
+    内存_写64(result + 8, pos)
+    返回 result
+}
+函数 StructuredClone_反序列化_完整(d) {
+    // 从二进制缓冲区恢复对象
+    如果 (d == 0) { 返回 Nova_未定义 }
+    定义 buf = 内存_读64(d)
+    定义 可变 pos = 0
+    定义 tag = 内存_读8(buf + pos); pos = pos + 1
+    如果 (tag == JS_TAG_NUMBER) {
+        定义 v = 内存_读64(buf + pos)
+        返回 v
+    } 否则 如果 (tag == JS_TAG_STRING) {
+        定义 len = 内存_读32(buf + pos); pos = pos + 4
+        如果 (len > 16777216) { 返回 Nova_未定义 }  // 16MB安全上限
+        定义 s = 堆_分配(len + 1)
+        如果 (s == 0) { 返回 Nova_未定义 }
+        内存_复制(s, buf + pos, len)
+        内存_写8(s + len, 0)
+        返回 Nova值_创建_String_从原始(s)
+    } 否则 如果 (tag == JS_TAG_BOOLEAN) {
+        返回 内存_读8(buf + pos) ? Nova_真 : Nova_假
+    }
+    返回 Nova_未定义
+}
+函数 整数转字符串_v2(n) {
+    如果 (n == 0) { 返回 "0" }
+    定义 buf = 堆_分配(24)
+    定义 可变 pos = 22
+    定义 可变 负 = 假
+    定义 可变 v = n
+    如果 (v < 0) { 负 = 真; v = 0 - v }
+    当 (v > 0) {
+        内存_写8(buf + pos, 0x30 + (v % 10))
+        v = v / 10
+        pos = pos - 1
+    }
+    如果 (负) { 内存_写8(buf + pos, 0x2D); pos = pos - 1 }
+    定义 start = pos + 1
+    定义 len = 23 - start
+    定义 result = 堆_分配(len + 1)
+    内存_复制(result, buf + start, len)
+    内存_写8(result + len, 0)
+    堆_释放(buf)
+    返回 result
+}
+
+
+函数 Number_ToString(数值) {
+    如果 (数值 == 0) { 返回 "0" }
+    // 整数快速路径
+    如果 (数值 > -2147483648 && 数值 < 2147483647) {
+        返回 整数转字符串_v2(数值)
+    }
+    // 大数: 简化处理
+    返回 整数转字符串_v2(数值)
+}
+
+函数 Number_ToString_基数(数值, 基数) {
+    如果 (基数 < 2 || 基数 > 36) { 返回 "NaN" }
+    如果 (数值 == 0) { 返回 "0" }
+    定义 buf = 堆_分配(数字_缓冲大小)
+    定义 可变 pos = 数字_缓冲大小 - 2
+    定义 可变 负 = 假
+    定义 可变 v = 数值
+    如果 (v < 0) { 负 = 真; v = 0 - v }
+    定义 字符表 = "0123456789abcdefghijklmnopqrstuvwxyz"
+    当 (v > 0 && pos > 0) {
+        定义 余数 = v % 基数
+        内存_写8(buf + pos, 字节取(字符表, 余数))
+        v = v / 基数
+        pos = pos - 1
+    }
+    如果 (负) { 内存_写8(buf + pos, 0x2D); pos = pos - 1 }
+    定义 start = pos + 1
+    定义 len = 数字_缓冲大小 - 1 - start
+    定义 result = 堆_分配(len + 1)
+    内存_复制(result, buf + start, len)
+    内存_写8(result + len, 0)
+    堆_释放(buf)
+    返回 result
+}
+
+
+函数 字符串_复制(src) {
+    如果 (src == 0) { 返回 0 }
+    定义 len = 字节长度(src)
+    定义 dst = 堆_分配(len + 1)
+    如果 (dst == 0) { 返回 0 }
+    内存_复制(dst, src, len)
+    内存_写8(dst + len, 0)
+    返回 dst
+}
+
+函数 字符串_连接(a, b) {
+    如果 (a == 0) { 返回 字符串_复制(b) }
+    如果 (b == 0) { 返回 字符串_复制(a) }
+    定义 lenA = 字节长度(a)
+    定义 lenB = 字节长度(b)
+    定义 result = 堆_分配(lenA + lenB + 1)
+    如果 (result == 0) { 返回 0 }
+    内存_复制(result, a, lenA)
+    内存_复制(result + lenA, b, lenB)
+    内存_写8(result + lenA + lenB, 0)
+    返回 result
+}
+
+函数 字符串_子串(src, 起始, 结束) {
+    如果 (src == 0 || 起始 >= 结束) { 返回 0 }
+    定义 len = 结束 - 起始
+    定义 result = 堆_分配(len + 1)
+    如果 (result == 0) { 返回 0 }
+    内存_复制(result, src + 起始, len)
+    内存_写8(result + len, 0)
+    返回 result
+}
+
+函数 字符串_相等(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 lenA = 字节长度(a)
+    定义 lenB = 字节长度(b)
+    如果 (lenA != lenB) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < lenA) {
+        如果 (内存_读8(a + i) != 内存_读8(b + i)) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+// 字符串_长度 已统一定义在 字符串替换.nova
+
+// 字符串_包含 已统一定义在 字符串替换.nova
+函数 辅助_字符串_包含(大字符串, 子字符串) {
+    如果 (大字符串 == 0 || 子字符串 == 0) { 返回 假 }
+    定义 大len = 字节长度(大字符串)
+    定义 子len = 字节长度(子字符串)
+    如果 (子len > 大len) { 返回 假 }
+    定义 可变 i = 0
+    当 (i <= 大len - 子len) {
+        定义 可变 匹配 = 真
+        定义 可变 j = 0
+        当 (j < 子len) {
+            如果 (内存_读8(大字符串 + i + j) != 内存_读8(子字符串 + j)) {
+                匹配 = 假
+                跳出
+            }
+            j = j + 1
+        }
+        如果 (匹配 == 真) { 返回 真 }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 字符串_复制_N(src, 长度) {
+    如果 (src == 0 || 长度 <= 0) { 返回 0 }
+    定义 result = 堆_分配(长度 + 1)
+    如果 (result == 0) { 返回 0 }
+    内存_复制(result, src, 长度)
+    内存_写8(result + 长度, 0)
+    返回 result
+}
+
+
+函数 Nova函数_Call1(i, fn, thisArg, arg0) {
+    如果 (i == 0 || fn == 0) { 返回 0 }
+    定义 args = 平台_申请内存(8)
+    如果 (args == 0) { 返回 0 }
+    内存_写64(args, arg0)
+    定义 结果 = Nova函数_Apply(i, fn, thisArg, args, 1)
+    平台_释放内存(args, 8)
+    返回 结果
+}
+
+函数 Nova函数_Call2(i, fn, thisArg, arg0, arg1) {
+    如果 (i == 0 || fn == 0) { 返回 0 }
+    定义 args = 平台_申请内存(16)
+    如果 (args == 0) { 返回 0 }
+    内存_写64(args, arg0)
+    内存_写64(args + 8, arg1)
+    定义 结果 = Nova函数_Apply(i, fn, thisArg, args, 2)
+    平台_释放内存(args, 16)
+    返回 结果
+}
+
+函数 Nova函数_Call3(i, fn, thisArg, arg0, arg1, arg2) {
+    如果 (i == 0 || fn == 0) { 返回 0 }
+    定义 args = 平台_申请内存(24)
+    如果 (args == 0) { 返回 0 }
+    内存_写64(args, arg0)
+    内存_写64(args + 8, arg1)
+    内存_写64(args + 16, arg2)
+    定义 结果 = Nova函数_Apply(i, fn, thisArg, args, 3)
+    平台_释放内存(args, 24)
+    返回 结果
+}
+
+函数 Nova函数_Apply(i, fn, thisArg, args, argc) {
+    如果 (i == 0 || fn == 0) { 返回 0 }
+    // 桥接到字节码解释器的函数调用
+    返回 Interpreter_调用函数(i, fn, thisArg, args, argc, 0)
+}
+
+
+函数 Nova值_创建_Object(i, 内部数据) {
+    如果 (i == 0) { 返回 0 }
+    定义 obj = Nova对象_创建(i, i.Object原型)
+    如果 (obj != 0 && 内部数据 != 0) {
+        Nova对象_设置属性(i, obj, "[[内部]]", 内部数据)
+    }
+    返回 obj
+}
+
+函数 Nova值_创建_String_从原始(原始字符串) {
+    如果 (原始字符串 == 0) { 返回 0 }
+    定义 长度 = 字节长度(原始字符串)
+    定义 obj = 堆_分配(24 + 长度 + 1)
+    如果 (obj == 0) { 返回 0 }
+    内存_写32(obj, JS_TAG_STRING)
+    内存_写32(obj + 8, 长度)
+    内存_写64(obj + 16, obj + 24)
+    内存_复制(obj + 24, 原始字符串, 长度)
+    内存_写8(obj + 24 + 长度, 0)
+    返回 obj
+}
+
+函数 Nova值_创建_Boolean(i, 布尔值) {
+    如果 (布尔值 == 真) { 返回 Nova_真 }
+    返回 Nova_假
+}
+
+函数 Nova值_转数值(i, v) {
+    如果 (v == 0) { 返回 0 }
+    定义 tag = JSValue_获取类型标签(v)
+    如果 (tag == JS_TAG_NUMBER) { 返回 内存_读64(v + 8) }
+    如果 (tag == JS_TAG_BOOLEAN) { 返回 内存_读32(v + 8) }
+    返回 0
+}
+
+
+函数 Nova数组_从原始创建(i, 元素指针, 数量) {
+    如果 (i == 0 || 数量 == 0) { 返回 Nova数组_创建(i, 0) }
+    定义 arr = Nova数组_创建(i, 数量)
+    如果 (arr == 0) { 返回 0 }
+    定义 可变 idx = 0
+    当 (idx < 数量) {
+        定义 元素 = 内存_读64(元素指针 + idx * 8)
+        Nova数组_设置(i, arr, idx, 元素)
+        idx = idx + 1
+    }
+    返回 arr
+}
+
+
+函数 AI_推断值类型(v) {
+    如果 (v == 0) { 返回 "undefined" }
+    定义 tag = JSValue_获取类型标签(v)
+    如果 (tag == JS_TAG_NUMBER) { 返回 "number" }
+    如果 (tag == JS_TAG_STRING) { 返回 "string" }
+    如果 (tag == JS_TAG_BOOLEAN) { 返回 "boolean" }
+    如果 (tag == JS_TAG_OBJECT) { 返回 "object" }
+    返回 "unknown"
+}
+
+
+定义 可变 统计_ToString调用数 = 0
+定义 可变 统计_序列化调用数 = 0
+定义 可变 统计_反序列化调用数 = 0
+定义 可变 统计_函数调用桥接数 = 0
+定义 可变 统计_微任务入队数 = 0
+
+函数 辅助存根_打印统计() {
+    打印("[辅助存根] ═══════════ 辅助存根统计 ═══════════")
+    打印(字符串拼接("  ToString调用数:   ", 转字符串(统计_ToString调用数)))
+    打印(字符串拼接("  序列化调用数:     ", 转字符串(统计_序列化调用数)))
+    打印(字符串拼接("  反序列化调用数:   ", 转字符串(统计_反序列化调用数)))
+    打印(字符串拼接("  函数调用桥接数:   ", 转字符串(统计_函数调用桥接数)))
+    打印(字符串拼接("  微任务入队数:     ", 转字符串(统计_微任务入队数)))
+    打印("[辅助存根] ═══════════════════════════════════════")
+}

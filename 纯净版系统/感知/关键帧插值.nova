@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./属性自定义属.nova")
+导入("../中枢/内存初始化.nova")
+导入("./函数创建.nova")
+导入("./文档节点.nova")
+
+// §5 关键帧插值 — 在两个关键帧之间计算中间值
+
+
+函数 AnimationFrame_应用(ke, 进度) {
+    如果 (ke.关键帧数量 < 2) { 返回 }
+    如果 (ke.目标元素 == 0) { 返回 }
+
+    // 找到进度所在的两个关键帧
+    定义 可变 kf_before = 内存_读64(ke.关键帧)
+    定义 可变 kf_after = 内存_读64(ke.关键帧 + (ke.关键帧数量 - 1) * 8)
+
+    定义 可变 i = 0
+    当 (i < ke.关键帧数量 - 1) {
+        定义 kf1 = 内存_读64(ke.关键帧 + i * 8)
+        定义 kf2 = 内存_读64(ke.关键帧 + (i + 1) * 8)
+        如果 (进度 >= kf1.偏移 && 进度 <= kf2.偏移) {
+            kf_before = kf1
+            kf_after = kf2
+            跳出
+        }
+        i = i + 1
+    }
+
+    // 计算在两帧之间的局部进度
+    定义 范围 = kf_after.偏移 - kf_before.偏移
+    定义 可变 局部进度 = 0
+    如果 (范围 > 0) {
+        局部进度 = (进度 - kf_before.偏移) * 10000 / 范围
+    }
+
+    // 应用关键帧缓动
+    如果 (kf_before.缓动 != 0) {
+        局部进度 = TimingFunction_求值(kf_before.缓动, 局部进度)
+    }
+
+    // 逐属性插值
+    定义 可变 j = 0
+    当 (j < kf_before.属性数量) {
+        定义 before偏移 = kf_before.属性列表 + j * 12
+        定义 属性ID = 内存_读32(before偏移)
+        定义 值类型 = 内存_读32(before偏移 + 4)
+
+        // 在kf_after中找到同一属性
+        定义 after值 = AnimationFrame_查找属性(kf_after, 属性ID)
+        如果 (after值 >= 0) {
+            定义 before值 = 内存_读32(before偏移 + 8)
+            定义 after值偏移 = kf_after.属性列表 + after值 * 12
+            定义 after数值 = 内存_读32(after值偏移 + 8)
+
+            定义 可变 插值结果 = 0
+
+            如果 (值类型 == 0 || 值类型 == 2) {
+                // 数字/长度: 线性插值
+                插值结果 = before值 + (after数值 - before值) * 局部进度 / 10000
+            }
+            否则 如果 (值类型 == 1) {
+                // 颜色: 分通道插值
+                插值结果 = 颜色_插值(before值, after数值, 局部进度)
+            }
+            否则 {
+                // 关键字: 不插值,用before(discrete)
+                插值结果 = before值
+            }
+
+            // 应用到元素样式
+            AnimationFrame_应用属性(ke.目标元素, 属性ID, 值类型, 插值结果)
+        }
+        j = j + 1
+    }
+}
+
+函数 AnimationFrame_查找属性(kf, 属性ID) {
+    定义 可变 i = 0
+    当 (i < kf.属性数量) {
+        如果 (内存_读32(kf.属性列表 + i * 12) == 属性ID) { 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 颜色_插值(c1, c2, t) {
+    // 分通道线性插值 t: 0-10000
+    定义 inv = 10000 - t
+    定义 a = (SkColor_A(c1) * inv + SkColor_A(c2) * t) / 10000
+    定义 r = (SkColor_R(c1) * inv + SkColor_R(c2) * t) / 10000
+    定义 g = (SkColor_G(c1) * inv + SkColor_G(c2) * t) / 10000
+    定义 b = (SkColor_B(c1) * inv + SkColor_B(c2) * t) / 10000
+    返回 SkColor(a, r, g, b)
+}
+
+函数 AnimationFrame_应用属性(元素, 属性ID, 值类型, 值) {
+    // 将插值结果应用到元素的内联样式
+    如果 (元素 == 0) { 返回 }
+    定义 扩展 = 元素_获取扩展(元素)
+    如果 (扩展 == 0 || 扩展.计算样式 == 0) { 返回 }
+
+    定义 style = 扩展.计算样式
+
+    // 根据属性ID设置对应的样式字段
+    如果 (属性ID == CSS属性_opacity) { style.opacity = 值 }
+    否则 如果 (属性ID == CSS属性_width) { style.width = 值 }
+    否则 如果 (属性ID == CSS属性_height) { style.height = 值 }
+    否则 如果 (属性ID == CSS属性_margin_top) { style.margin_top = 值 }
+    否则 如果 (属性ID == CSS属性_margin_left) { style.margin_left = 值 }
+    否则 如果 (属性ID == CSS属性_padding_top) { style.padding_top = 值 }
+    否则 如果 (属性ID == CSS属性_padding_left) { style.padding_left = 值 }
+    否则 如果 (属性ID == CSS属性_font_size) { style.font_size = 值 }
+    否则 如果 (属性ID == CSS属性_color) { style.color = 值 }
+    否则 如果 (属性ID == CSS属性_background_color) { style.background_color = 值 }
+    否则 如果 (属性ID == CSS属性_border_top_width) { style.border_top_width = 值 }
+    否则 如果 (属性ID == CSS属性_top) { style.top = 值 }
+    否则 如果 (属性ID == CSS属性_left) { style.left = 值 }
+    否则 如果 (属性ID == CSS属性_right) { style.right = 值 }
+    否则 如果 (属性ID == CSS属性_bottom) { style.bottom = 值 }
+    // transform需要特殊处理
+    // 否则 如果 (属性ID == CSS属性_transform) { ... }
+}

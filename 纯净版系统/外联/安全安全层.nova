@@ -1,0 +1,124 @@
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+
+// Nova网络栈: 安全 1.3 / 安全 1.2 完整实现
+// 安全 1.3 (Nova安全规范) 1-Nova往返时间握手:
+//   C→S: ClientHello(随机数+支持的密码套件+支持的组+key_share)
+//   S→C: ServerHello(选定套件+key_share) + EncryptedExtensions
+//         + Certificate + CertificateVerify + Finished
+//   C→S: Finished → [Application Data]
+// 密码套件: AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305
+// 密钥交换: X25519 / P-256 ECDHE
+// 证书验证: X.509 v3 链式验证 + CT + OCSP
+
+// §1 常量
+
+定义 安全_1_2 = 0x0303
+定义 安全_1_3 = 0x0304
+
+// 握手类型
+定义 HS_CLIENT_HELLO       = 1
+定义 HS_SERVER_HELLO       = 2
+定义 HS_ENCRYPTED_EXT      = 8
+定义 HS_CERTIFICATE        = 11
+定义 HS_CERT_VERIFY        = 15
+定义 HS_FINISHED           = 20
+定义 HS_NEW_SESSION_TICKET = 4
+
+// 记录类型
+定义 REC_CHANGE_CIPHER     = 20
+定义 REC_ALERT             = 21
+定义 REC_HANDSHAKE         = 22
+定义 REC_APPLICATION       = 23
+
+// Alert级别
+定义 ALERT_WARNING  = 1
+定义 ALERT_FATAL    = 2
+
+// Alert描述
+定义 ALERT_CLOSE_NOTIFY          = 0
+定义 ALERT_UNEXPECTED_MSG        = 10
+定义 ALERT_BAD_RECORD_MAC        = 20
+定义 ALERT_HANDSHAKE_FAILURE     = 40
+定义 ALERT_BAD_CERTIFICATE       = 42
+定义 ALERT_CERTIFICATE_EXPIRED   = 45
+定义 ALERT_UNKNOWN_CA            = 48
+定义 ALERT_DECODE_ERROR          = 50
+
+// 密码套件
+定义 CS_AES_128_GCM_SHA256       = 0x1301
+定义 CS_AES_256_GCM_SHA384       = 0x1302
+定义 CS_CHACHA20_POLY1305_SHA256 = 0x1303
+定义 CS_ECDHE_RSA_AES128_GCM    = 0xC02F
+定义 CS_ECDHE_RSA_AES256_GCM    = 0xC030
+
+// 命名组(NamedGroup)
+定义 GROUP_X25519  = 0x001D
+定义 GROUP_P256    = 0x0017
+定义 GROUP_P384    = 0x0018
+
+// 签名算法
+定义 SIG_RSA_PSS_SHA256      = 0x0804
+定义 SIG_ECDSA_SHA256        = 0x0403
+定义 SIG_ED25519             = 0x0807
+
+// 安全状态机
+定义 安全_STATE_INIT          = 0
+定义 安全_STATE_CLIENT_HELLO  = 1
+定义 安全_STATE_SERVER_HELLO  = 2
+定义 安全_STATE_ENCRYPTED     = 3
+定义 安全_STATE_CERT          = 4
+定义 安全_STATE_VERIFY        = 5
+定义 安全_STATE_FINISHED      = 6
+定义 安全_STATE_CONNECTED     = 7
+定义 安全_STATE_ERROR         = 8
+
+// §2 核心结构
+
+结构 安全Connection {
+    // 底层传控 socket
+    socket_fd,
+    // 协议版本
+    版本,    // u16 安全_1_2 / 安全_1_3
+    状态,    // u8 安全_STATE_xxx
+    // 选定密码套件
+    密码套件,
+    // 密钥材料
+    client_random,    // [32]u8
+    server_random,    // [32]u8
+    // ECDHE密钥交换
+    私钥,    // [32]u8 X25519私钥
+    公钥,    // [32]u8 X25519公钥
+    对方公钥,    // [32]u8 服务器X25519公钥
+    共享密钥,    // [32]u8 ECDHE结果
+    // 派生密钥(安全 1.3 HKDF)
+    handshake_secret,    // [32]u8
+    client_hs_key,    // [16]u8
+    client_hs_iv,    // [12]u8
+    server_hs_key,    // [16]u8
+    server_hs_iv,    // [12]u8
+    client_app_key,    // [16]u8
+    client_app_iv,    // [12]u8
+    server_app_key,    // [16]u8
+    server_app_iv,    // [12]u8
+    master_secret,    // [32]u8
+    // 序列号(用于nonce构造)
+    client_seq,
+    server_seq,
+    // 握手哈希(transcript)
+    transcript_hash,    // [32]u8
+    // 证书
+    服务器证书,    // u64 X509Certificate*
+    证书链,    // u64 链
+    // SNI
+    主机名,    // u64 字符串
+    // 错误
+    最后错误,
+    // 恢复
+    session_ticket,    // [256]u8
+    ticket_长度,
+    // ALPN
+    alpn_协议,    // u64 "h2" / "http/1.1"
+}

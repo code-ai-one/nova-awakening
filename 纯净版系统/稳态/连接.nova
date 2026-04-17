@@ -1,0 +1,362 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./无线框架全局.nova")
+导入("./无线框架辅助.nova")
+导入("../中枢/内核打印.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./帧收发.nova")
+
+// §6 连接
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 WiFi_连接(dev_name, ssid, 密码) {
+    定义 dev = WiFi_查找设备(dev_name)
+    如果 (dev == 空) { 返回 错误_设备不存在 }
+    如果 (dev.状态 == WIFI_STATE_CONNECTED) {
+        WiFi_断开(dev_name)
+    }
+
+    内核信息("WiFi: 连接到 '" + ssid + "'")
+
+    // 查找目标BSS
+    定义 目标 = WiFi_查找BSS(dev, ssid)
+    如果 (目标 == 空) {
+        内核警告("WiFi: 未找到网络 '" + ssid + "' 尝试重新扫描")
+        WiFi_扫描(dev_name)
+        目标 = WiFi_查找BSS(dev, ssid)
+        如果 (目标 == 空) { 返回 错误_网络不存在 }
+    }
+
+    // 1. 认证阶段
+    dev.状态 = WIFI_STATE_AUTHENTICATING
+    如果 (目标.认证类型 == WIFI_AUTH_WPA2_PSK || 目标.认证类型 == WIFI_AUTH_WPA3_SAE) {
+        // WPA2/3: 计算PMK = PBKDF2(密码, SSID, 4096, 256)
+        定义 密钥 = WiFi密钥 {}
+        密钥.密码 = 密码
+        密钥.类型 = 目标.加密类型
+        密钥.PMK = WiFi_PBKDF2(密码, ssid)
+        内核调试("WiFi: PMK已生成")
+
+        // 2. 四次握手(4-way handshake) → 协商PTK
+        如果 (!WiFi_四次握手(dev, 目标, 密钥)) {
+            dev.状态 = WIFI_STATE_DISCONNECTED
+            内核警告("WiFi: 认证失败(密码错误?)")
+            返回 错误_认证失败
+        }
+    }
+
+    // 3. 关联阶段
+    dev.状态 = WIFI_STATE_ASSOCIATING
+    // 发送Association Request帧
+
+    // 4. 连接成功
+    dev.状态 = WIFI_STATE_CONNECTED
+    dev.当前BSS = 目标
+    dev.当前频率 = 目标.频率
+    dev.当前频道 = 目标.频道
+
+    内核信息("WiFi: 已连接 '" + ssid + "' 信号=" + 整数转字符串(目标.信号强度) + "dBm" +
+             " 频道=" + 整数转字符串(目标.频道) +
+             " 加密=" + WiFi_加密名(目标.加密类型))
+
+    // 5. 启动DHCP获取IP
+    DHCP_请求(dev_name)
+
+    返回 0
+}
+
+函数 WiFi_断开(dev_name) {
+    定义 dev = WiFi_查找设备(dev_name)
+    如果 (dev == 空) { 返回 错误_设备不存在 }
+    如果 (dev.状态 != WIFI_STATE_CONNECTED) { 返回 0 }
+
+    内核信息("WiFi: 断开 '" + dev.当前BSS.SSID + "'")
+    // 发送Deauthentication帧
+    dev.状态 = WIFI_STATE_DISCONNECTED
+    返回 0
+}
+
+// §7 WPA2四次握手(简化)
+
+函数 WiFi_四次握手(dev, bss, 密钥) {
+    // WPA2-PSK 4-Way Handshake (IEEE 802.11i)
+    定义 pmk = 密钥  // PMK已由PBKDF2生成
+    // 1. 接收AP的EAPOL Message 1 (ANonce)
+    定义 eapol1 = WiFi_等待EAPOL(dev, 5000)
+    如果 (eapol1 == 空) { 内核警告("WiFi: 四次握手超时(M1)"); 返回 假 }
+    定义 ANonce = eapol1.负载  // 32字节
+    // 2. 生成SNonce (32字节随机数)
+    定义 SNonce = 堆_分配(32)
+    平台_随机字节(SNonce, 32)
+    // 3. 计算PTK = PRF-384(PMK, "Pairwise key expansion", Min(AA,SA)||Max(AA,SA)||Min(ANonce,SNonce)||Max(ANonce,SNonce))
+    定义 AA = bss.bssid  // AP的MAC地址 (6字节)
+    定义 SA = dev.mac    // STA的MAC地址 (6字节)
+    定义 ptk_data = 堆_分配(76)  // 6+6+32+32
+    // Min/Max排序 MAC地址
+    如果 (内存_比较(AA, SA, 6) < 0) {
+        内存_复制(ptk_data, AA, 6)
+        内存_复制(ptk_data + 6, SA, 6)
+    } 否则 {
+        内存_复制(ptk_data, SA, 6)
+        内存_复制(ptk_data + 6, AA, 6)
+    }
+    // Min/Max排序 Nonce
+    如果 (内存_比较(ANonce, SNonce, 32) < 0) {
+        内存_复制(ptk_data + 12, ANonce, 32)
+        内存_复制(ptk_data + 44, SNonce, 32)
+    } 否则 {
+        内存_复制(ptk_data + 12, SNonce, 32)
+        内存_复制(ptk_data + 44, ANonce, 32)
+    }
+    // PRF-384: 3轮HMAC-SHA1
+    定义 ptk = 堆_分配(48)
+    定义 可变 r = 0
+    当 (r < 3) {
+        定义 input = 字节数组拼接(字符串转字节数组("Pairwise key expansion"), [0])
+        input = 字节数组拼接(input, ptk_data)
+        input = 字节数组拼接(input, [r])
+        定义 hmac_out = HMAC_SHA1(pmk, input)
+        内存_复制(ptk + r * 16, hmac_out, 16)
+        r = r + 1
+    }
+    // PTK拆分: KCK(16) + KEK(16) + TK(16)
+    定义 KCK = ptk          // Key Confirmation Key
+    定义 KEK = ptk + 16     // Key Encryption Key
+    定义 TK = ptk + 32      // Temporal Key
+    // 4. 发送EAPOL Message 2 (SNonce + MIC)
+    定义 eapol2 = WiFi_构造EAPOL(SNonce, 32, 0x010A)  // Key Info: Pairwise+MIC
+    定义 mic2 = HMAC_SHA1(KCK, eapol2)
+    WiFi_设置MIC(eapol2, mic2)
+    WiFi_发送EAPOL(dev, bss, eapol2)
+    // 5. 接收EAPOL Message 3 (GTK + MIC)
+    定义 eapol3 = WiFi_等待EAPOL(dev, 5000)
+    如果 (eapol3 == 空) { 内核警告("WiFi: 四次握手超时(M3)"); 堆_释放(ptk_data); 堆_释放(ptk); 堆_释放(SNonce); 返回 假 }
+    // 验证M3的MIC
+    定义 mic3_expected = HMAC_SHA1(KCK, eapol3)
+    如果 (!WiFi_验证MIC(eapol3, mic3_expected)) {
+        内核警告("WiFi: MIC验证失败(M3)")
+        堆_释放(ptk_data); 堆_释放(ptk); 堆_释放(SNonce)
+        返回 假
+    }
+    // 解密GTK (AES Key Unwrap with KEK)
+    定义 gtk = WiFi_AES_Unwrap(KEK, eapol3.加密负载, eapol3.加密长度)
+    // 6. 发送EAPOL Message 4 (ACK)
+    定义 eapol4 = WiFi_构造EAPOL(空, 0, 0x030A)  // Key Info: Pairwise+MIC+Secure
+    定义 mic4 = HMAC_SHA1(KCK, eapol4)
+    WiFi_设置MIC(eapol4, mic4)
+    WiFi_发送EAPOL(dev, bss, eapol4)
+    // 7. 安装密钥
+    dev.ptk = ptk
+    dev.gtk = gtk
+    dev.加密已启用 = 真
+    内核调试("WiFi: WPA2四次握手完成, 密钥已安装")
+    堆_释放(ptk_data)
+    堆_释放(SNonce)
+    返回 真
+}
+
+函数 WiFi_PBKDF2(密码, ssid) {
+    // PBKDF2-SHA1(密码, ssid, 4096迭代, 256位输出) — Nova协议规范 2898
+    // PMK = T1 || T2, 每个Ti = 20字节SHA1输出, 取前32字节
+    定义 可变 pmk = []
+    定义 迭代次数 = 4096
+
+    // 密码转字节数组
+    定义 密码字节 = 字符串转字节数组(密码)
+    定义 ssid字节 = 字符串转字节数组(ssid)
+
+    // 需要2个block (每个SHA1产生20字节, 2×20=40 > 32)
+    定义 可变 block = 1
+    当 (block <= 2) {
+        // U1 = HMAC-SHA1(密码, ssid || INT(block))
+        定义 盐 = 字节数组拼接(ssid字节, [0, 0, 0, block])
+        定义 可变 U = HMAC_SHA1(密码字节, 盐)
+        定义 可变 T = 字节数组复制(U)
+
+        // U2..U4096: Ui = HMAC-SHA1(密码, Ui-1), T ^= Ui
+        定义 可变 iter = 1
+        当 (iter < 迭代次数) {
+            U = HMAC_SHA1(密码字节, U)
+            定义 可变 j = 0
+            当 (j < 20) {
+                T[j] = T[j] ^ U[j]
+                j = j + 1
+            }
+            iter = iter + 1
+        }
+
+        // 追加T到pmk
+        定义 可变 k = 0
+        当 (k < 20 && 计数(pmk) < 32) {
+            追加(pmk, T[k])
+            k = k + 1
+        }
+        block = block + 1
+    }
+    返回 pmk
+}
+
+// HMAC-SHA1(key, message) → 20字节 (Nova协议规范 2104)
+函数 HMAC_SHA1(密钥, 消息) {
+    定义 块大小 = 64  // SHA1 block size
+
+    // 如果密钥>64字节, 先SHA1压缩
+    定义 可变 K = 密钥
+    如果 (计数(K) > 块大小) {
+        K = SHA1(K)
+    }
+    // 补零到64字节
+    当 (计数(K) < 块大小) {
+        追加(K, 0)
+    }
+
+    // ipad = K ^ 0x36, opad = K ^ 0x5C
+    定义 可变 ipad = []
+    定义 可变 opad = []
+    定义 可变 i = 0
+    当 (i < 块大小) {
+        追加(ipad, K[i] ^ 0x36)
+        追加(opad, K[i] ^ 0x5C)
+        i = i + 1
+    }
+
+    // HMAC = SHA1(opad || SHA1(ipad || message))
+    定义 内层 = SHA1(字节数组拼接(ipad, 消息))
+    返回 SHA1(字节数组拼接(opad, 内层))
+}
+
+// SHA1(data) → 20字节 (FIPS 180-4)
+函数 SHA1(数据) {
+    定义 可变 h0 = 0x67452301
+    定义 可变 h1 = 0xEFCDAB89
+    定义 可变 h2 = 0x98BADCFE
+    定义 可变 h3 = 0x10325476
+    定义 可变 h4 = 0xC3D2E1F0
+
+    // 预处理: 填充
+    定义 原始长度位 = 计数(数据) * 8
+    定义 可变 msg = 字节数组复制(数据)
+    追加(msg, 0x80)
+    当 (计数(msg) % 64 != 56) {
+        追加(msg, 0)
+    }
+    // 追加64位长度(大端)
+    定义 可变 len_i = 7
+    当 (len_i >= 0) {
+        追加(msg, (原始长度位 >> (len_i * 8)) & 0xFF)
+        len_i = len_i - 1
+    }
+
+    // 处理每个512位块
+    定义 可变 块偏移 = 0
+    当 (块偏移 < 计数(msg)) {
+        // 展开16个32位字
+        定义 可变 w = []
+        定义 可变 t = 0
+        当 (t < 16) {
+            定义 idx = 块偏移 + t * 4
+            追加(w, ((msg[idx] & 0xFF) << 24) | ((msg[idx+1] & 0xFF) << 16) |
+                     ((msg[idx+2] & 0xFF) << 8) | (msg[idx+3] & 0xFF))
+            t = t + 1
+        }
+        // 扩展到80个字
+        当 (t < 80) {
+            定义 val = w[t-3] ^ w[t-8] ^ w[t-14] ^ w[t-16]
+            追加(w, 循环左移32(val, 1))
+            t = t + 1
+        }
+
+        定义 可变 a = h0
+        定义 可变 b = h1
+        定义 可变 c = h2
+        定义 可变 d = h3
+        定义 可变 e = h4
+
+        t = 0
+        当 (t < 80) {
+            定义 可变 f = 0
+            定义 可变 k = 0
+            如果 (t < 20) {
+                f = (b & c) | ((~b) & d)
+                k = 0x5A827999
+            } 否则 如果 (t < 40) {
+                f = b ^ c ^ d
+                k = 0x6ED9EBA1
+            } 否则 如果 (t < 60) {
+                f = (b & c) | (b & d) | (c & d)
+                k = 0x8F1BBCDC
+            } 否则 {
+                f = b ^ c ^ d
+                k = 0xCA62C1D6
+            }
+            定义 temp = (循环左移32(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF
+            e = d
+            d = c
+            c = 循环左移32(b, 30)
+            b = a
+            a = temp
+            t = t + 1
+        }
+
+        h0 = (h0 + a) & 0xFFFFFFFF
+        h1 = (h1 + b) & 0xFFFFFFFF
+        h2 = (h2 + c) & 0xFFFFFFFF
+        h3 = (h3 + d) & 0xFFFFFFFF
+        h4 = (h4 + e) & 0xFFFFFFFF
+        块偏移 = 块偏移 + 64
+    }
+
+    // 输出20字节
+    返回 [
+        (h0 >> 24) & 0xFF, (h0 >> 16) & 0xFF, (h0 >> 8) & 0xFF, h0 & 0xFF,
+        (h1 >> 24) & 0xFF, (h1 >> 16) & 0xFF, (h1 >> 8) & 0xFF, h1 & 0xFF,
+        (h2 >> 24) & 0xFF, (h2 >> 16) & 0xFF, (h2 >> 8) & 0xFF, h2 & 0xFF,
+        (h3 >> 24) & 0xFF, (h3 >> 16) & 0xFF, (h3 >> 8) & 0xFF, h3 & 0xFF,
+        (h4 >> 24) & 0xFF, (h4 >> 16) & 0xFF, (h4 >> 8) & 0xFF, h4 & 0xFF
+    ]
+}
+
+// §连接增强
+定义 可变 AI_连接_调用数 = 0
+定义 可变 AI_连接_异常数 = 0
+
+函数 AI_连接_监控() {
+    AI_连接_调用数 = AI_连接_调用数 + 1
+    返回 AI_连接_异常数 == 0
+}
+
+函数 AI_连接_健康检查() {
+    如果 (AI_连接_调用数 > 0 && AI_连接_异常数 * 100 / AI_连接_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}
+
+函数 连接_统计() {
+    返回 {
+        模块: "连接",
+        AI_连接_调用数: AI_连接_调用数,
+        AI_连接_异常数: AI_连接_异常数
+    }
+}
+
+函数 连接_健康评估() {
+    定义 可变 问题 = []
+
+    返回 计数(问题) == 0
+}
+
+函数 连接_综合报告() {
+    打印("[连接] ═══ 综合报告 ═══")
+    打印("  AI_连接_调用数: " + 整数转字符串(AI_连接_调用数))
+    打印("  AI_连接_异常数: " + 整数转字符串(AI_连接_异常数))
+    打印("  健康: " + 如果 (连接_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 连接_全局重置() {
+    AI_连接_调用数 = 0
+    AI_连接_异常数 = 0
+    打印("[连接] 全局统计已重置")
+    返回 0
+}

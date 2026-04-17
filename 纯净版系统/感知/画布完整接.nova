@@ -1,0 +1,100 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// 对应: nova/renderer/modules/canvas/canvas2d/ (
+// nova/renderer/platform/graphics/ (
+// 画布渲染ingContext2D 完整接口:
+// 路径: beginPath/moveTo/lineTo/arc/arcTo/bezierCurveTo/quadraticCurveTo
+// rect/ellipse/closePath/fill/stroke/clip/isPointInPath
+// Path2D: 独立路径对象, addPath, SVG路径字符串
+// 渐变: createLinearGradient/createRadialGradient/createConicGradient
+// 图案: createPattern (repeat/repeat-x/repeat-y/no-repeat)
+// 阴影: shadowColor/shadowBlur/shadowOffsetX/shadowOffsetY
+// 文本: fillText/strokeText/measureText/font/textAlign/textBaseline
+// 像素: get图像Data/put图像Data/create图像Data
+// 合成: globalCompositeOperation (source-over/multiply/screen/...)
+// 变换: transform/setTransform/getTransform/resetTransform
+// 离屏: Offscreen画布/transferTo图像Bitmap
+// 滤镜: filter属性 (blur/brightness/contrast/grayscale/...)
+// 【Nova特色】AI 画布优化:
+// ① AI检测绘图模式, 自动图处加速(图绘后端)
+// ② AI图像识别辅助(captureStream → 实时分析)
+
+// §1 常量
+
+// 填充规则
+定义 FILL_NONZERO = 0
+定义 FILL_EVENODD = 1
+
+// lineCap
+定义 CAP_BUTT = 0
+定义 CAP_ROUND = 1
+定义 CAP_SQUARE = 2
+
+// lineJoin
+定义 JOIN_MITER = 0
+定义 JOIN_ROUND = 1
+定义 JOIN_BEVEL = 2
+
+// textAlign
+定义 TEXT_ALIGN_START = 0
+定义 TEXT_ALIGN_END = 1
+定义 TEXT_ALIGN_LEFT = 2
+定义 TEXT_ALIGN_RIGHT = 3
+定义 TEXT_ALIGN_CENTER = 4
+
+// textBaseline
+定义 TEXT_BASE_TOP = 0
+定义 TEXT_BASE_HANGING = 1
+定义 TEXT_BASE_MIDDLE = 2
+定义 TEXT_BASE_ALPHABETIC = 3
+定义 TEXT_BASE_IDEOGRAPHIC = 4
+定义 TEXT_BASE_BOTTOM = 5
+
+// direction
+定义 TEXT_DIR_LTR = 0
+定义 TEXT_DIR_RTL = 1
+定义 TEXT_DIR_INHERIT = 2
+
+// globalCompositeOperation
+定义 COMP_SOURCE_OVER = 0
+定义 COMP_SOURCE_IN = 1
+定义 COMP_SOURCE_OUT = 2
+定义 COMP_SOURCE_ATOP = 3
+定义 COMP_DESTINATION_OVER = 4
+定义 COMP_DESTINATION_IN = 5
+定义 COMP_DESTINATION_OUT = 6
+定义 COMP_DESTINATION_ATOP = 7
+定义 COMP_LIGHTER = 8
+定义 COMP_COPY = 9
+定义 COMP_XOR = 10
+定义 COMP_MULTIPLY = 11
+定义 COMP_SCREEN = 12
+定义 COMP_OVERLAY = 13
+定义 COMP_DARKEN = 14
+定义 COMP_LIGHTEN = 15
+定义 COMP_COLOR_DODGE = 16
+定义 COMP_COLOR_BURN = 17
+定义 COMP_HARD_LIGHT = 18
+定义 COMP_SOFT_LIGHT = 19
+定义 COMP_DIFFERENCE = 20
+定义 COMP_EXCLUSION = 21
+定义 COMP_HUE = 22
+定义 COMP_SATURATION = 23
+定义 COMP_COLOR = 24
+定义 COMP_LUMINOSITY = 25
+
+// imageSmoothingQuality
+定义 SMOOTH_LOW = 0
+定义 SMOOTH_MEDIUM = 1
+定义 SMOOTH_HIGH = 2
+
+// Path命令
+定义 PATH_MOVE = 0
+定义 PATH_LINE = 1
+定义 PATH_QUAD = 2 // quadratic bezier
+定义 PATH_Nova三次方 = 3 // Nova三次方 bezier
+定义 PATH_ARC = 4
+定义 PATH_CLOSE = 5
+定义 PATH_ELLIPSE = 6
+定义 PATH_RECT = 7

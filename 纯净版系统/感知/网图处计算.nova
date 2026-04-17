@@ -1,0 +1,240 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// NovaOS Web图处 — 下一代图处图形与计算接口
+// 标准: Nova标准 Web图处 Specification (2024)
+//       WGSL (Web图处 Shading Language)
+// 核心: 替代图绘, 直接映射到Vulkan/Metal/D3D12
+//   - 显式图处资源管理(非OpenGL隐式状态机)
+//   - 计算着色器(GP图处通用计算)
+//   - 渲染管线与计算管线分离
+//   - 绑定组(Bind Group)资源布局
+//   - 命令编码器批量提交
+
+
+定义 图处_FORMAT_RGBA8_UNORM  = 0x01
+定义 图处_FORMAT_BGRA8_UNORM  = 0x02
+定义 图处_FORMAT_RGBA16_FLOAT = 0x03
+定义 图处_FORMAT_DEPTH24_S8   = 0x04
+定义 图处_FORMAT_R32_FLOAT    = 0x05
+
+// 缓冲区用途
+定义 图处_BUFFER_VERTEX   = 0x0020
+定义 图处_BUFFER_INDEX    = 0x0010
+定义 图处_BUFFER_UNIFORM  = 0x0040
+定义 图处_BUFFER_STORAGE  = 0x0080
+定义 图处_BUFFER_COPY_SRC = 0x0004
+定义 图处_BUFFER_COPY_DST = 0x0008
+定义 图处_BUFFER_MAP_READ = 0x0001
+定义 图处_BUFFER_MAP_WRITE = 0x0002
+
+// 着色器阶段
+定义 图处_STAGE_VERTEX   = 0x01
+定义 图处_STAGE_FRAGMENT = 0x02
+定义 图处_STAGE_COMPUTE  = 0x04
+
+
+结构 图处Device {
+    原生句柄,    // u64 Vulkan VkDevice / Metal MTLDevice
+    队列,    // u64 图处队列
+    特性,    // u64 支持的特性集
+    限制,    // u64 设备限制(最大纹理大小等)
+    已丢失,
+}
+
+
+函数 图处_请求适配器(电源偏好) {
+    // 枚举物理图处设备
+    定义 设备列表 = Vulkan_枚举物理设备()
+    如果 (计数(设备列表) == 0) { 返回 空 }
+
+    // 按偏好选择: 高性能=独显, 低功耗=集显
+    定义 可变 最佳 = 设备列表[0]
+    定义 可变 i = 0
+    当 (i < 计数(设备列表)) {
+        定义 dev = 设备列表[i]
+        如果 (电源偏好 == "high-performance" && dev.类型 == 图处_类型_独立) {
+            最佳 = dev
+        }
+        如果 (电源偏好 == "low-power" && dev.类型 == 图处_类型_集成) {
+            最佳 = dev
+        }
+        i = i + 1
+    }
+    返回 最佳
+}
+
+函数 图处_请求设备(适配器, 需要特性, 限制) {
+    定义 可变 device = 图处Device {}
+    device.原生句柄 = Vulkan_创建逻辑设备(适配器, 需要特性)
+    device.队列 = Vulkan_获取队列(device.原生句柄, 0)
+    device.已丢失 = 假
+    返回 device
+}
+
+
+结构 图处Buffer {
+    句柄,
+    大小,
+    用途,
+    映射态,    // u32 0=未映射, 1=映射中, 2=已映射
+}
+
+函数 图处_创建缓冲区(device, 大小, 用途, 映射创建) {
+    定义 可变 buf = 图处Buffer {}
+    buf.大小 = 大小
+    buf.用途 = 用途
+    buf.句柄 = Vulkan_创建缓冲(device.原生句柄, 大小, 用途)
+    如果 (映射创建) { buf.映射态 = 2 }
+    返回 buf
+}
+
+函数 图处_写缓冲区(device, 缓冲, 偏移, 数据, 大小) {
+    Vulkan_更新缓冲(device.队列, 缓冲.句柄, 偏移, 数据, 大小)
+}
+
+
+结构 图处Shader模块 {
+    句柄,
+    代码,    // u64 WGSL源码
+}
+
+函数 图处_创建着色器(device, WGSL代码) {
+    // 编译WGSL → SPIR-V (Vulkan后端)
+    定义 SPIRV = WGSL_编译到SPIRV(WGSL代码)
+    如果 (SPIRV == 空) { 返回 空 }
+
+    定义 可变 shader = 图处Shader模块 {}
+    shader.句柄 = Vulkan_创建着色器模块(device.原生句柄, SPIRV)
+    shader.代码 = WGSL代码
+    返回 shader
+}
+
+
+结构 图处BindGroup布局 {
+    句柄,
+    项数,
+}
+
+函数 图处_创建绑定组布局(device, 项列表) {
+    // 项: [(绑定号, 可见性, 类型), ...]
+    定义 可变 layout = 图处BindGroup布局 {}
+    layout.项数 = 计数(项列表)
+    layout.句柄 = Vulkan_创建描述符集布局(device.原生句柄, 项列表)
+    返回 layout
+}
+
+函数 图处_创建绑定组(device, 布局, 绑定列表) {
+    // 绑定: [(绑定号, 资源), ...]
+    返回 Vulkan_分配描述符集(device.原生句柄, 布局.句柄, 绑定列表)
+}
+
+
+结构 图处ComputePipeline {
+    句柄,
+    布局,
+    工作组大小,    // [u32, u32, u32]
+}
+
+函数 图处_创建计算管线(device, 着色器, 入口点, 绑定组布局列表) {
+    定义 管线布局 = Vulkan_创建管线布局(device.原生句柄, 绑定组布局列表)
+
+    定义 可变 pipeline = 图处ComputePipeline {}
+    pipeline.句柄 = Vulkan_创建计算管线(device.原生句柄, 着色器.句柄, 入口点, 管线布局)
+    pipeline.布局 = 管线布局
+    返回 pipeline
+}
+
+
+结构 图处渲染Pipeline {
+    句柄,
+    顶点着色器,
+    片段着色器,
+    顶点布局,
+    基元拓扑,    // u32 点/线/三角形
+    深度模板,
+    多重采样,
+}
+
+函数 图处_创建渲染管线(device, 描述) {
+    定义 可变 pipeline = 图处渲染Pipeline {}
+    pipeline.顶点着色器 = 描述.顶点.着色器
+    pipeline.片段着色器 = 描述.片段.着色器
+    pipeline.基元拓扑 = 描述.基元.拓扑
+    pipeline.多重采样 = 描述.多重采样.计数
+
+    pipeline.句柄 = Vulkan_创建图形管线(device.原生句柄, 描述)
+    返回 pipeline
+}
+
+
+结构 图处CommandEncoder {
+    命令列表,
+}
+
+函数 图处_创建命令编码器(device) {
+    定义 可变 enc = 图处CommandEncoder {}
+    enc.命令列表 = Vulkan_创建命令缓冲(device.原生句柄)
+    返回 enc
+}
+
+// 计算通道
+函数 图处_开始计算通道(编码器) {
+    返回 Vulkan_开始计算(编码器.命令列表)
+}
+
+函数 图处_计算通道_设管线(通道, 管线) {
+    Vulkan_绑定计算管线(通道, 管线.句柄)
+}
+
+函数 图处_计算通道_设绑定组(通道, 索引, 绑定组) {
+    Vulkan_绑定描述符集(通道, 索引, 绑定组)
+}
+
+函数 图处_计算通道_分发(通道, x, y, z) {
+    Vulkan_分发计算(通道, x, y, z)
+}
+
+函数 图处_计算通道_结束(通道) {
+    Vulkan_结束计算(通道)
+}
+
+// 渲染通道
+函数 图处_开始渲染通道(编码器, 颜色附件, 深度附件) {
+    返回 Vulkan_开始渲染(编码器.命令列表, 颜色附件, 深度附件)
+}
+
+函数 图处_渲染通道_设管线(通道, 管线) {
+    Vulkan_绑定图形管线(通道, 管线.句柄)
+}
+
+函数 图处_渲染通道_设顶点缓冲(通道, 槽, 缓冲, 偏移) {
+    Vulkan_绑定顶点缓冲(通道, 槽, 缓冲.句柄, 偏移)
+}
+
+函数 图处_渲染通道_绘制(通道, 顶点数, 实例数, 起始顶点, 起始实例) {
+    Vulkan_绘制(通道, 顶点数, 实例数, 起始顶点, 起始实例)
+}
+
+函数 图处_渲染通道_结束(通道) {
+    Vulkan_结束渲染(通道)
+}
+
+// 提交
+函数 图处_提交(device, 编码器) {
+    定义 命令缓冲 = Vulkan_结束命令缓冲(编码器.命令列表)
+    Vulkan_队列提交(device.队列, 命令缓冲)
+}
+
+定义 可变 AI_网图处计算_样式缓存命中 = 0
+
+函数 AI_网图处计算_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_网图处计算_布局缓存(元素哈希) {
+    AI_网图处计算_样式缓存命中 = AI_网图处计算_样式缓存命中 + 1
+    返回 元素哈希
+}

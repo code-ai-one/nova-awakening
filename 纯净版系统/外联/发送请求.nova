@@ -1,0 +1,238 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./处理超传.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("./帧编码.nova")
+导入("../感知/内核直连层.nova")
+
+// §5 发送请求(创建新流)
+
+函数 H2Session_发送请求(s, 方法, 路径, 头部, 体, 体长度) {
+    如果 (s == 0 || s.已关闭) { 返回 0 }
+
+    // 分配流ID
+    定义 流ID = s.下一个流ID
+    s.下一个流ID = s.下一个流ID + 2    // 客户端奇数
+
+    // 创建流
+    定义 stream = 堆_分配(H2Stream)
+    stream.流ID = 流ID
+    stream.状态 = H2_STREAM_OPEN
+    stream.方法 = 方法; stream.路径 = 路径
+    stream.本地窗口 = s.远端设置.initial_window_size
+    stream.远端窗口 = s.本地设置.initial_window_size
+    stream.依赖流 = 0; stream.权重 = 16
+    stream.响应体容量 = 65536
+    stream.响应体 = 堆_分配(65536)
+    stream.响应体长度 = 0
+
+    // 注册流
+    如果 (s.流数量 < s.流容量) {
+        内存_写64(s.流列表 + s.流数量 * 8, stream)
+        s.流数量 = s.流数量 + 1
+    }
+
+    // HPACK编码请求头
+    定义 编码头 = HPACK_编码(s.编码器, 方法, 路径, 头部)
+
+    // 发送HEADERS帧
+    定义 帧 = H2Frame {}
+    帧.类型 = H2_FRAME_HEADERS
+    帧.流ID = 流ID
+    帧.有效载荷 = 编码头.数据
+    帧.长度 = 编码头.长度
+
+    如果 (体 == 0 || 体长度 == 0) {
+        帧.标志 = H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM
+        H2Session_发送帧(s, 帧)
+    } 否则 {
+        帧.标志 = H2_FLAG_END_HEADERS
+        H2Session_发送帧(s, 帧)
+
+        // 发送DATA帧(可能需要分片)
+        H2Session_发送DATA(s, stream, 体, 体长度)
+    }
+
+    返回 stream
+}
+
+函数 H2Session_发送DATA(s, stream, 数据, 长度) {
+    如果 (s == 0 || stream == 0) { 返回 }
+    定义 最大帧 = s.远端设置.max_frame_size
+    定义 可变 已发 = 0
+
+    当 (已发 < 长度) {
+        // 检查流量控制窗口
+        定义 可发 = stream.远端窗口
+        如果 (可发 <= 0) { 返回 }    // 需要等待WINDOW_UPDATE
+        如果 (s.连接窗口_远端 <= 0) { 返回 }
+
+        定义 本次 = 长度 - 已发
+        如果 (本次 > 最大帧) { 本次 = 最大帧 }
+        如果 (本次 > 可发) { 本次 = 可发 }
+        如果 (本次 > s.连接窗口_远端) { 本次 = s.连接窗口_远端 }
+
+        定义 帧 = H2Frame {}
+        帧.类型 = H2_FRAME_DATA; 帧.流ID = stream.流ID
+        帧.有效载荷 = 数据 + 已发; 帧.长度 = 本次
+        如果 (已发 + 本次 >= 长度) {
+            帧.标志 = H2_FLAG_END_STREAM
+            stream.状态 = H2_STREAM_HALF_CLOSED_L
+        } 否则 { 帧.标志 = 0 }
+
+        H2Session_发送帧(s, 帧)
+        已发 = 已发 + 本次
+        stream.远端窗口 = stream.远端窗口 - 本次
+        s.连接窗口_远端 = s.连接窗口_远端 - 本次
+    }
+}
+
+// §6 接收帧处理
+
+函数 H2Session_处理接收(s) {
+    如果 (s == 0 || s.已关闭) { 返回 }
+
+    // 读取数据
+    定义 读取量 = 安全_接收(s.安全上下文, s.接收缓冲 + s.接收长度, s.接收容量 - s.接收长度)
+    如果 (读取量 <= 0) { 返回 }
+    s.接收长度 = s.接收长度 + 读取量
+
+    // 解析帧
+    定义 可变 偏移 = 0
+    当 (偏移 + 9 <= s.接收长度) {
+        定义 帧 = H2Frame_解码(s.接收缓冲 + 偏移, s.接收长度 - 偏移)
+        如果 (帧 == 0) { 跳出 }
+        如果 (偏移 + 9 + 帧.长度 > s.接收长度) { 跳出 }    // 不完整
+
+        H2Session_处理帧(s, 帧)
+        偏移 = 偏移 + 9 + 帧.长度
+    }
+
+    // 移动剩余数据
+    如果 (偏移 > 0) {
+        内存_复制(s.接收缓冲, s.接收缓冲 + 偏移, s.接收长度 - 偏移)
+        s.接收长度 = s.接收长度 - 偏移
+    }
+}
+
+函数 H2Session_处理帧(s, 帧) {
+    如果 (帧.类型 == H2_FRAME_DATA) { H2_处理DATA(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_HEADERS) { H2_处理HEADERS(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_SETTINGS) { H2_处理SETTINGS(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_WINDOW_UPDATE) { H2_处理WINDOW_UPDATE(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_RST_STREAM) { H2_处理RST(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_GOAWAY) { H2_处理GOAWAY(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_PING) { H2_处理PING(s, 帧) }
+    否则 如果 (帧.类型 == H2_FRAME_PUSH_PROMISE) { H2_处理PUSH_PROMISE(s, 帧) }
+}
+
+函数 H2_处理DATA(s, 帧) {
+    定义 stream = H2Session_查找流(s, 帧.流ID)
+    如果 (stream == 0) { 返回 }
+
+    // 追加数据到响应体
+    如果 (帧.有效载荷 != 0 && 帧.长度 > 0) {
+        如果 (stream.响应体长度 + 帧.长度 <= stream.响应体容量) {
+            内存_复制(stream.响应体 + stream.响应体长度, 帧.有效载荷, 帧.长度)
+            stream.响应体长度 = stream.响应体长度 + 帧.长度
+        }
+    }
+
+    // 更新流量控制窗口
+    s.连接窗口_本地 = s.连接窗口_本地 - 帧.长度
+    stream.本地窗口 = stream.本地窗口 - 帧.长度
+
+    // 发送WINDOW_UPDATE(补充窗口)
+    如果 (s.连接窗口_本地 < 32768) {
+        H2_发送WINDOW_UPDATE(s, 0, 65535)
+        s.连接窗口_本地 = s.连接窗口_本地 + 65535
+    }
+    如果 (stream.本地窗口 < 32768) {
+        H2_发送WINDOW_UPDATE(s, stream.流ID, 65535)
+        stream.本地窗口 = stream.本地窗口 + 65535
+    }
+
+    // END_STREAM
+    如果 (帧.标志 & H2_FLAG_END_STREAM) {
+        stream.状态 = H2_STREAM_HALF_CLOSED_R
+        // 触发完成回调
+    }
+}
+
+函数 H2_处理HEADERS(s, 帧) {
+    定义 stream = H2Session_查找流(s, 帧.流ID)
+    如果 (stream == 0) { 返回 }
+    // HPACK解码头部
+    如果 (帧.有效载荷 != 0) {
+        HPACK_解码(s.解码器, 帧.有效载荷, 帧.长度, stream)
+    }
+    如果 (帧.标志 & H2_FLAG_END_STREAM) {
+        stream.状态 = H2_STREAM_HALF_CLOSED_R
+    }
+}
+
+函数 H2_处理SETTINGS(s, 帧) {
+    如果 (帧.标志 & H2_FLAG_ACK) { 返回 }    // 应答
+    // 解析设置
+    定义 可变 i = 0
+    当 (i + 6 <= 帧.长度) {
+        定义 id = 内存_读16_大端(帧.有效载荷 + i)
+        定义 val = 内存_读32_大端(帧.有效载荷 + i + 2)
+        如果 (id == 1) { s.远端设置.header_table_size = val }
+        否则 如果 (id == 3) { s.远端设置.max_concurrent_streams = val }
+        否则 如果 (id == 4) { s.远端设置.initial_window_size = val }
+        否则 如果 (id == 5) { s.远端设置.max_frame_size = val }
+        i = i + 6
+    }
+    // 发送ACK
+    定义 ack = H2Frame {}
+    ack.类型 = H2_FRAME_SETTINGS; ack.标志 = H2_FLAG_ACK; ack.流ID = 0; ack.长度 = 0
+    H2Session_发送帧(s, ack)
+}
+
+函数 H2_处理WINDOW_UPDATE(s, 帧) {
+    定义 增量 = 内存_读32_大端(帧.有效载荷) & 0x7FFFFFFF
+    如果 (帧.流ID == 0) {
+        s.连接窗口_远端 = s.连接窗口_远端 + 增量
+    } 否则 {
+        定义 stream = H2Session_查找流(s, 帧.流ID)
+        如果 (stream != 0) { stream.远端窗口 = stream.远端窗口 + 增量 }
+    }
+}
+
+函数 H2_处理RST(s, 帧) {
+    定义 stream = H2Session_查找流(s, 帧.流ID)
+    如果 (stream != 0) { stream.状态 = H2_STREAM_CLOSED }
+}
+
+函数 H2_处理GOAWAY(s, 帧) {
+    s.最后流ID = 内存_读32_大端(帧.有效载荷) & 0x7FFFFFFF
+    s.已关闭 = 真
+}
+
+函数 H2_处理PING(s, 帧) {
+    如果 (帧.标志 & H2_FLAG_ACK) { 返回 }
+    // 发送PING ACK
+    定义 pong = H2Frame {}
+    pong.类型 = H2_FRAME_PING; pong.标志 = H2_FLAG_ACK; pong.流ID = 0
+    pong.长度 = 8; pong.有效载荷 = 帧.有效载荷
+    H2Session_发送帧(s, pong)
+}
+
+定义 可变 AI_发送请求_带宽估计 = 0
+定义 可变 AI_发送请求_丢包窗口 = []
+
+函数 AI_发送请求_带宽预测(发送字节, 耗时毫秒) {
+    如果 (耗时毫秒 == 0) { 返回 AI_发送请求_带宽估计 }
+    定义 当前 = 发送字节 * 1000 / 耗时毫秒
+    AI_发送请求_带宽估计 = AI_发送请求_带宽估计 * 700 / 1000 + 当前 * 300 / 1000
+    返回 AI_发送请求_带宽估计
+}
+
+函数 AI_发送请求_拥塞建议(丢包率) {
+    追加(AI_发送请求_丢包窗口, 丢包率)
+    如果 (计数(AI_发送请求_丢包窗口) > 10) { 列表_移除(AI_发送请求_丢包窗口, 0) }
+    如果 (丢包率 > 50) { 返回 "减半窗口" }
+    如果 (丢包率 < 5) { 返回 "增大窗口" }
+    返回 "保持"
+}

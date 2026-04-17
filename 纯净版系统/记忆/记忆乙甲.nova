@@ -1,0 +1,203 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/每处理器.nova")
+导入("../中枢/中断请求管理.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. /proc/stat: 系统级CPU和中断统计
+//   2. 供top/htop/mpstat等工具解析
+//   3. CPU行: user/nice/system/idle/iowait/irq/softirq/steal
+//   4. 中断行: 每个IRQ的触发次数
+//   5. 上下文切换/进程创建/运行进程数
+
+外部 获取总内存KB
+外部 获取空闲内存KB
+外部 获取缓冲区KB
+外部 获取缓存KB
+外部 获取交换总量KB
+外部 获取交换空闲KB
+
+定义 可变 cpu_user    = 0    // 用户态时间
+定义 可变 cpu_nice    = 0    // nice用户态
+定义 可变 cpu_system  = 0    // 内核态时间
+定义 可变 cpu_idle    = 0    // 空闲时间
+定义 可变 cpu_iowait  = 0    // IO等待
+定义 可变 cpu_irq     = 0    // 硬中断
+定义 可变 cpu_softirq = 0    // 软中断
+定义 可变 cpu_steal   = 0    // 虚拟化偷取
+
+定义 可变 stat_上下文切换 = 0
+定义 可变 stat_进程创建 = 0
+定义 可变 stat_运行进程 = 0
+定义 可变 stat_阻塞进程 = 0
+定义 可变 stat_启动时间 = 0    // 启动时间(秒, 自epoch)
+
+// 更新CPU统计 (由调度器tick调用)
+
+函数 stat_记录用户态()   { cpu_user = cpu_user + 1 }
+函数 stat_记录nice()     { cpu_nice = cpu_nice + 1 }
+函数 stat_记录内核态()   { cpu_system = cpu_system + 1 }
+函数 stat_记录空闲()     { cpu_idle = cpu_idle + 1 }
+函数 stat_记录iowait()   { cpu_iowait = cpu_iowait + 1 }
+函数 stat_记录硬中断()   { cpu_irq = cpu_irq + 1 }
+函数 stat_记录软中断()   { cpu_softirq = cpu_softirq + 1 }
+
+函数 stat_记录上下文切换() { stat_上下文切换 = stat_上下文切换 + 1 }
+函数 stat_记录进程创建()   { stat_进程创建 = stat_进程创建 + 1 }
+
+// 生成/proc/stat内容 
+
+函数 proc_stat_读取() {
+    定义 可变 输出 = ""
+
+    // cpu行: 所有CPU汇总
+    输出 = 输出 + "cpu  " +
+           整数转字符串(cpu_user) + " " +
+           整数转字符串(cpu_nice) + " " +
+           整数转字符串(cpu_system) + " " +
+           整数转字符串(cpu_idle) + " " +
+           整数转字符串(cpu_iowait) + " " +
+           整数转字符串(cpu_irq) + " " +
+           整数转字符串(cpu_softirq) + " " +
+           整数转字符串(cpu_steal) + "\n"
+
+    // per-CPU行
+    定义 可变 cpu = 0
+    当 (cpu < 获取CPU数量()) {
+        输出 = 输出 + "cpu" + 整数转字符串(cpu) + " " +
+               整数转字符串(cpu_user) + " " +
+               整数转字符串(cpu_nice) + " " +
+               整数转字符串(cpu_system) + " " +
+               整数转字符串(cpu_idle) + " " +
+               整数转字符串(cpu_iowait) + " " +
+               整数转字符串(cpu_irq) + " " +
+               整数转字符串(cpu_softirq) + " " +
+               整数转字符串(cpu_steal) + "\n"
+        cpu = cpu + 1
+    }
+
+    // 中断统计
+    // 中断统计: 总数 + 每个IRQ的计数
+    定义 总中断 = IRQ_获取总计数()
+    输出 = 输出 + "intr " + 整数转字符串(总中断) + "\n"
+
+    // 上下文切换
+    输出 = 输出 + "ctxt " + 整数转字符串(stat_上下文切换) + "\n"
+
+    // 启动时间
+    输出 = 输出 + "btime " + 整数转字符串(stat_启动时间) + "\n"
+
+    // 进程统计
+    输出 = 输出 + "processes " + 整数转字符串(stat_进程创建) + "\n"
+    输出 = 输出 + "procs_running " + 整数转字符串(stat_运行进程) + "\n"
+    输出 = 输出 + "procs_blocked " + 整数转字符串(stat_阻塞进程) + "\n"
+
+    // softirq统计
+    输出 = 输出 + "softirq 0 0 0 0 0 0 0 0 0 0 0\n"
+
+    返回 输出
+}
+
+// /proc/uptime
+
+函数 proc_uptime_读取() {
+    定义 运行秒 = 读取秒()
+    定义 空闲秒 = cpu_idle / 100   // jiffies→秒 (HZ=100)
+    返回 整数转字符串(运行秒) + "." + "00" + " " +
+           整数转字符串(空闲秒) + "." + "00" + "\n"
+}
+
+// /proc/Nova负载均值
+
+函数 proc_Nova负载均值_读取() {
+    定义 la = 获取Nova负载均值()
+    定义 la1 = la[0] / 100
+    定义 la1f = la[0] % 100
+    定义 la5 = la[1] / 100
+    定义 la5f = la[1] % 100
+    定义 la15 = la[2] / 100
+    定义 la15f = la[2] % 100
+    返回 整数转字符串(la1) + "." + 字符串左填充(整数转字符串(la1f), 2, "0") + " " +
+           整数转字符串(la5) + "." + 字符串左填充(整数转字符串(la5f), 2, "0") + " " +
+           整数转字符串(la15) + "." + 字符串左填充(整数转字符串(la15f), 2, "0") + " " +
+           整数转字符串(stat_运行进程) + "/" + 整数转字符串(stat_进程创建) + " " +
+           整数转字符串(stat_进程创建) + "\n"
+}
+
+// /proc/meminfo 
+
+函数 proc_meminfo_读取() {
+
+    定义 总内存 = 获取总内存KB()
+    定义 空闲 = 获取空闲内存KB()
+    定义 可变 输出 = ""
+    输出 = 输出 + "MemTotal:       " + 整数转字符串(总内存) + " kB\n"
+    输出 = 输出 + "MemFree:        " + 整数转字符串(空闲) + " kB\n"
+    输出 = 输出 + "MemAvailable:   " + 整数转字符串(空闲 + 获取缓存KB()) + " kB\n"
+    输出 = 输出 + "Buffers:        " + 整数转字符串(获取缓冲区KB()) + " kB\n"
+    输出 = 输出 + "缓存d:         " + 整数转字符串(获取缓存KB()) + " kB\n"
+    输出 = 输出 + "SwapTotal:      " + 整数转字符串(获取交换总量KB()) + " kB\n"
+    输出 = 输出 + "SwapFree:       " + 整数转字符串(获取交换空闲KB()) + " kB\n"
+    返回 输出
+}
+
+// /proc/version
+
+函数 proc_version_读取() {
+    返回 "NovaOS version 1.0.0 (nova@novaos) (龙编译器 1.0) #1 SMP\n"
+}
+
+// CPU利用率计算 (供top/htop使用)
+
+函数 cpu利用率() {
+    定义 总时间 = cpu_user + cpu_nice + cpu_system + cpu_idle + cpu_iowait + cpu_irq + cpu_softirq + cpu_steal
+    如果 (总时间 == 0) { 返回 0 }
+    定义 忙时间 = 总时间 - cpu_idle - cpu_iowait
+    返回 忙时间 * 100 / 总时间
+}
+
+函数 cpu用户利用率() {
+    定义 总时间 = cpu_user + cpu_nice + cpu_system + cpu_idle + cpu_iowait + cpu_irq + cpu_softirq
+    如果 (总时间 == 0) { 返回 0 }
+    返回 (cpu_user + cpu_nice) * 100 / 总时间
+}
+
+函数 cpu内核利用率() {
+    定义 总时间 = cpu_user + cpu_nice + cpu_system + cpu_idle + cpu_iowait + cpu_irq + cpu_softirq
+    如果 (总时间 == 0) { 返回 0 }
+    返回 cpu_system * 100 / 总时间
+}
+
+// 初始化
+
+函数 proc_stat_初始化() {
+    stat_启动时间 = 读取秒()
+    stat_运行进程 = 1   // init进程
+    内核信息("proc/stat: CPU统计+内存信息+负载+版本 就绪")
+}
+
+// 完整统计
+
+函数 proc_stat_完整统计() {
+    返回 [cpu_user, cpu_system, cpu_idle, cpu_iowait, cpu_irq, cpu_softirq,
+           cpu用户利用率(), cpu内核利用率(), stat_运行进程]
+}
+
+定义 可变 AI_记忆乙甲_风暴阈值 = 10000
+定义 可变 AI_记忆乙甲_预测IRQ = 0
+
+函数 AI_记忆乙甲_风暴检测(触发频率) {
+    如果 (触发频率 > AI_记忆乙甲_风暴阈值) {
+        AI_记忆乙甲_风暴阈值 = AI_记忆乙甲_风暴阈值 * 3 / 2
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_记忆乙甲_自适应合并(当前延迟) {
+    如果 (当前延迟 < 100) { 返回 16 }
+    如果 (当前延迟 < 500) { 返回 8 }
+    返回 1
+}

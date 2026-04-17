@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./解码器.nova")
+导入("./文档事件.nova")
+导入("./媒体播控.nova")
+导入("./字幕.nova")
+
+// §7 播放循环 (requestAnimationFrame驱动)
+
+
+函数 媒体元素_开始播放循环(me) {
+    如果 (me == 0 || me.paused) { 返回 }
+    // 每帧调用: 解码+渲染
+    媒体元素_播放帧(me)
+}
+
+函数 媒体元素_播放帧(me) {
+    如果 (me == 0 || me.paused || me.ended) { 返回 }
+
+    // 1. 时间推进
+    定义 帧时间 = 1000 * 1024 / 60 / me.playbackRate    // ~16.67ms @ 1x
+    me.currentTime = me.currentTime + 帧时间 / 1024
+
+    // 2. 检查结束
+    如果 (me.duration > 0 && me.currentTime >= me.duration) {
+        如果 (me.loop) {
+            me.currentTime = 0
+        } 否则 {
+            me.ended = 真
+            me.paused = 真
+            媒体元素_触发事件(me, "ended")
+            返回
+        }
+    }
+
+    // 3. 解码音频帧
+    如果 (me.demuxer != 0 && me.audioDecoder != 0) {
+        定义 packet = Demuxer_读取音频包(me.demuxer)
+        如果 (packet != 0) {
+            定义 frame = 音频Decoder_解码(me.audioDecoder, packet)
+            如果 (frame != 0 && me.audio渲染er != 0) {
+                定义 有效音量 = 如果(me.muted, 0, me.volume)
+                音频渲染er_渲染(me.audio渲染er, frame, 有效音量)
+            }
+        }
+    }
+
+    // 4. 解码视频帧
+    如果 (me.demuxer != 0 && me.videoDecoder != 0) {
+        定义 packet = Demuxer_读取视频包(me.demuxer)
+        如果 (packet != 0) {
+            定义 frame = 视频Decoder_解码(me.videoDecoder, packet)
+            如果 (frame != 0 && me.video渲染er != 0) {
+                视频渲染er_渲染(me.video渲染er, frame)
+            }
+        }
+    }
+
+    // 5. 更新字幕
+    媒体元素_更新字幕(me)
+
+    // 6. 更新缓冲范围
+    TimeRanges_添加(me.played, 0, me.currentTime)
+
+    // 7. 触发timeupdate(每250ms一次)
+    媒体元素_触发事件(me, "timeupdate")
+
+    // 8. 触发进度
+    媒体元素_触发事件(me, "progress")
+}
+
+函数 媒体元素_停止播放(me) {
+    如果 (me == 0) { 返回 }
+    me.paused = 真
+}
+
+// §8 解复用器 (Demuxer)
+
+结构 媒体Packet {
+    数据,
+    大小,
+    时间戳,    // i64 PTS (毫秒)
+    解码时间,    // i64 DTS
+    是关键帧,
+    轨道类型,    // u8 TRACK_xxx
+    下一个,    // u64 媒体Packet*
+}
+
+结构 Demuxer {
+    源URL,
+    格式,    // u8 CONTAINER_xxx
+    // 缓冲
+    数据缓冲,
+    缓冲大小,
+    已读位置,
+    // 轨道信息
+    有音频,
+    有视频,
+    时长,    // i64 毫秒
+    // 包队列
+    音频队列头,    // u64 媒体Packet*
+    视频队列头,
+}
+
+函数 Demuxer_创建(url) {
+    定义 d = 堆_分配(Demuxer)
+    d.源URL = url; d.格式 = 0
+    d.数据缓冲 = 0; d.缓冲大小 = 0; d.已读位置 = 0
+    d.有音频 = 假; d.有视频 = 假; d.时长 = -1
+    d.音频队列头 = 0; d.视频队列头 = 0
+    返回 d
+}
+
+函数 Demuxer_探测格式(d) {
+    如果 (d == 0) { 返回 0 }
+    // 读取前几个字节判断格式
+    // MP4: ftyp box
+    // WEBM: 0x1A45DFA3 (EBML header)
+    // OGG: OggS
+    // MP3: 0xFFFB / ID3
+    返回 CONTAINER_MP4    // 默认容器格式
+}
+
+函数 Demuxer_解析轨道(d, me) {
+    如果 (d == 0 || me == 0) { 返回 }
+    d.格式 = CONTAINER_MP4
+    d.有视频 = 真; d.有音频 = 真
+    d.时长 = 0
+    me.duration = d.时长
+    // 添加默认轨道(实际解析容器header)
+    如果 (d.有音频) {
+        me.音频轨道[0].编解码器 = CODEC_AAC
+        me.音频轨道[0].采样率 = 44100
+        me.音频轨道[0].声道数 = 2
+        me.音频轨道[0].位深度 = 16
+        me.音频轨道[0].enabled = 真
+        me.音频轨道数 = 1
+    }
+    如果 (d.有视频) {
+        me.视频轨道[0].编解码器 = CODEC_H264
+        me.视频轨道[0].宽度 = 1920; me.视频轨道[0].高度 = 1080
+        me.视频轨道[0].帧率 = 30 * 1024
+        me.视频轨道[0].selected = 真
+        me.视频轨道数 = 1
+    }
+}
+
+函数 Demuxer_seek(d, 时间) {
+    如果 (d == 0) { 返回 }
+    // 找到目标时间最近的关键帧, 重置读取位置
+}
+
+函数 Demuxer_读取音频包(d) {
+    // 从容器格式中读取下一个音频包
+    如果 (d == 0 || d.音频流 == 0) { 返回 0 }
+    如果 (d.音频位置 >= d.音频流.大小) { 返回 0 }  // EOF
+    定义 pkt = 堆_分配(媒体Packet)
+    pkt.流类型 = STREAM_AUDIO
+    pkt.时间戳 = Demuxer_读取时间戳(d, d.音频位置)
+    pkt.数据 = d.音频流.数据 + d.音频位置
+    pkt.大小 = Demuxer_计算帧大小(d, d.音频位置)
+    d.音频位置 = d.音频位置 + pkt.大小
+    返回 pkt
+}
+函数 Demuxer_读取视频包(d) {
+    如果 (d == 0 || d.视频流 == 0) { 返回 0 }
+    如果 (d.视频位置 >= d.视频流.大小) { 返回 0 }
+    定义 pkt = 堆_分配(媒体Packet)
+    pkt.流类型 = STREAM_VIDEO
+    pkt.时间戳 = Demuxer_读取时间戳(d, d.视频位置)
+    pkt.数据 = d.视频流.数据 + d.视频位置
+    pkt.大小 = Demuxer_计算帧大小(d, d.视频位置)
+    d.视频位置 = d.视频位置 + pkt.大小
+    返回 pkt
+}

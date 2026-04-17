@@ -1,0 +1,174 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("./内核直连层.nova")
+导入("./接口基.nova")
+
+// §10 选区管理
+
+// 适用于input[type=text/search/url/tel/password]和textarea
+
+
+函数 Input_setSelectionRange(input, start, end, direction) {
+    如果 (input == 0) { 返回 }
+    // 更新selectionStart/selectionEnd/selectionDirection
+    // 移动光标, 更新渲染
+}
+
+函数 Input_select(input) {
+    如果 (input == 0) { 返回 }
+    // 全选文本
+    // 触发select事件
+}
+
+函数 Input_setRangeText(input, 替换文本, start, end, selectMode) {
+    如果 (input == 0 || 替换文本 == 0) { 返回 }
+    // selectMode: "select"/"start"/"end"/"preserve"
+    // 替换[start,end)范围内的文本
+    // 触发input事件
+}
+
+// §11 Input事件处理
+
+// 键盘输入处理(所有文本类input)
+函数 Input_键盘输入(input, keyCode, charCode, 是IME) {
+    如果 (input == 0 || input.disabled || input.readonly) { 返回 }
+
+    // IME处理
+    如果 (是IME) { 返回 }    // IME由compositionstart/update/end处理
+
+    如果 (charCode > 0) {
+        // 普通字符输入
+        // 1. 检查maxlength
+        // 2. 在selectionStart处插入字符(替换选区)
+        // 3. 触发input事件
+        // 4. 如果有datalist, 更新建议列表
+    }
+
+    // 特殊键
+    如果 (keyCode == 8) {    // Backspace
+        // 删除光标前字符或选区
+    }
+    如果 (keyCode == 46) {   // Delete
+        // 删除光标后字符或选区
+    }
+    如果 (keyCode == 13) {   // Enter
+        // text: 提交表单
+        // textarea: 插入换行
+    }
+}
+
+// §12 表单序列化
+
+结构 FormDataPair {
+    名称,
+    值,
+    是文件,
+    文件,    // u64 File*
+    下一个,
+}
+
+函数 Form_序列化(form) {
+    如果 (form == 0) { 返回 0 }
+    定义 可变 头 = 0
+    定义 可变 尾 = 0
+    // 遍历所有表单控件:
+    //   input[type=text/email/...]: name=value
+    //   input[type=checkbox/radio]: name=value(仅选中时)
+    //   input[type=file]: name=文件列表
+    //   select: name=选中option的value
+    //   textarea: name=value
+    //   output: 不提交
+    //   fieldset内disabled的控件: 不提交
+    //   disabled控件: 不提交
+    //   无name的控件: 不提交
+    返回 头
+}
+
+// URL编码序列化: name=value&name2=value2
+函数 Form_URL编码序列化(pairs) {
+    如果 (pairs == 0) { 返回 "" }
+    定义 buf = 堆_分配(4096)
+    定义 可变 pos = 0
+    定义 可变 first = 真
+    定义 可变 pair = pairs
+    当 (pair != 0) {
+        如果 (!first) { 字节写(buf, pos, 38); pos = pos + 1 }    // '&'
+        // URL编码name
+        定义 encName = URL_encodeComponent(pair.名称)
+        定义 nlen = 字节长度(encName)
+        内存_复制(buf + pos, encName, nlen); pos = pos + nlen
+        字节写(buf, pos, 61); pos = pos + 1    // '='
+        // URL编码value
+        定义 encVal = URL_encodeComponent(pair.值)
+        定义 vlen = 字节长度(encVal)
+        内存_复制(buf + pos, encVal, vlen); pos = pos + vlen
+        first = 假; pair = pair.下一个
+    }
+    字节写(buf, pos, 0)
+    返回 buf
+}
+
+// multipart/form-data序列化(用于文件上传)
+函数 Form_Multipart序列化(pairs, boundary) {
+    如果 (pairs == 0 || boundary == 0) { 返回 0 }
+    定义 buf = 堆_分配(65536)
+    定义 可变 pos = 0
+    定义 可变 pair = pairs
+    当 (pair != 0) {
+        // --boundary\r\n
+        字节写(buf, pos, 45); 字节写(buf, pos+1, 45); pos = pos + 2
+        定义 blen = 字节长度(boundary)
+        内存_复制(buf + pos, boundary, blen); pos = pos + blen
+        字节写(buf, pos, 13); 字节写(buf, pos+1, 10); pos = pos + 2    // \r\n
+
+        // Content-Disposition
+        定义 cd = "Content-Disposition: form-data; name=\""
+        定义 cdlen = 字节长度(cd)
+        内存_复制(buf + pos, cd, cdlen); pos = pos + cdlen
+        定义 nlen = 字节长度(pair.名称)
+        内存_复制(buf + pos, pair.名称, nlen); pos = pos + nlen
+        字节写(buf, pos, 34); pos = pos + 1    // '"'
+
+        如果 (pair.是文件 && pair.文件 != 0) {
+            定义 fn = "; filename=\""
+            定义 fnlen = 字节长度(fn)
+            内存_复制(buf + pos, fn, fnlen); pos = pos + fnlen
+            // 文件名
+            字节写(buf, pos, 34); pos = pos + 1    // '"'
+        }
+        字节写(buf, pos, 13); 字节写(buf, pos+1, 10); pos = pos + 2
+        字节写(buf, pos, 13); 字节写(buf, pos+1, 10); pos = pos + 2    // 空行
+
+        // 值
+        如果 (!pair.是文件 && pair.值 != 0) {
+            定义 vlen = 字节长度(pair.值)
+            内存_复制(buf + pos, pair.值, vlen); pos = pos + vlen
+        }
+        字节写(buf, pos, 13); 字节写(buf, pos+1, 10); pos = pos + 2
+        pair = pair.下一个
+    }
+    // 结束: --boundary--\r\n
+    字节写(buf, pos, 45); 字节写(buf, pos+1, 45); pos = pos + 2
+    定义 blen2 = 字节长度(boundary)
+    内存_复制(buf + pos, boundary, blen2); pos = pos + blen2
+    字节写(buf, pos, 45); 字节写(buf, pos+1, 45); pos = pos + 2
+    字节写(buf, pos, 13); 字节写(buf, pos+1, 10); pos = pos + 2
+    字节写(buf, pos, 0)
+    返回 buf
+}
+
+定义 可变 AI_选区管理_调用数 = 0
+定义 可变 AI_选区管理_异常数 = 0
+
+函数 AI_选区管理_监控() {
+    AI_选区管理_调用数 = AI_选区管理_调用数 + 1
+    返回 AI_选区管理_异常数 == 0
+}
+
+函数 AI_选区管理_健康检查() {
+    如果 (AI_选区管理_调用数 > 0 && AI_选区管理_异常数 * 100 / AI_选区管理_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

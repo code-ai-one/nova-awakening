@@ -1,0 +1,217 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./子进程主循.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("./沙箱默认能力.nova")
+
+// §3 沙箱创建与应用
+
+函数 Sandbox_创建策略(进程类型) {
+    定义 policy = 堆_分配(SandboxPolicy)
+    policy.进程类型 = 进程类型
+    policy.能力 = Sandbox_默认能力(进程类型)
+
+    如果 (进程类型 == PROC_RENDERER) {
+        // 渲染er: 最严格沙箱
+        policy.新PID空间 = 真; policy.新网络空间 = 真
+        policy.新用户空间 = 真; policy.新挂载空间 = 真; policy.新IPC空间 = 真
+        policy.启用seccomp = 真
+        policy.seccomp过滤器 = Seccomp_渲染er过滤器()
+        policy.只读挂载 = 真
+        policy.内存上限MB = 512; policy.CPU份额 = 256
+        policy.文件描述符上限 = 64
+    } 否则 如果 (进程类型 == PROC_图处) {
+        policy.新PID空间 = 真; policy.新网络空间 = 真
+        policy.新用户空间 = 假; policy.新挂载空间 = 真; policy.新IPC空间 = 真
+        policy.启用seccomp = 真
+        policy.seccomp过滤器 = Seccomp_图处过滤器()
+        policy.内存上限MB = 1024; policy.CPU份额 = 512
+        policy.文件描述符上限 = 128
+    } 否则 如果 (进程类型 == PROC_NETWORK) {
+        policy.新PID空间 = 真; policy.新网络空间 = 假    // 需要网络
+        policy.新用户空间 = 真; policy.新挂载空间 = 真; policy.新IPC空间 = 真
+        policy.启用seccomp = 真
+        policy.seccomp过滤器 = Seccomp_Network过滤器()
+        policy.内存上限MB = 256; policy.CPU份额 = 256
+        policy.文件描述符上限 = 1024
+    } 否则 {
+        // Browser: 无沙箱(特权进程)
+        policy.新PID空间 = 假; policy.新网络空间 = 假
+        policy.启用seccomp = 假
+        policy.内存上限MB = 0; policy.文件描述符上限 = 0
+    }
+    返回 policy
+}
+
+函数 Sandbox_应用(policy) {
+    如果 (policy == 0) { 返回 -1 }
+    // 1. 创建命名空间(clone flags)
+    定义 可变 flags = 0
+    如果 (policy.新PID空间) { flags = flags | 0x20000000 }      // CLONE_NEWPID
+    如果 (policy.新网络空间) { flags = flags | 0x40000000 }     // CLONE_NEWNET
+    如果 (policy.新用户空间) { flags = flags | 0x10000000 }     // CLONE_NEWUSER
+    如果 (policy.新挂载空间) { flags = flags | 0x00020000 }     // CLONE_NEWNS
+    如果 (policy.新IPC空间) { flags = flags | 0x08000000 }      // CLONE_NEWIPC
+    // 系统调用: unshare(flags)
+    平台_unshare(flags)
+
+    // 2. 剥离能力(capabilities)
+    如果 (policy.进程类型 != PROC_BROWSER) {
+        // prctl(PR_SET_NO_NEW_PRIVS, 1): 禁止提升权限
+        平台_prctl_no_new_privs()
+        // capset: 清除所有能力
+        平台_drop_capabilities()
+    }
+
+    // 3. 文件系统隔离
+    如果 (policy.新挂载空间 && policy.只读挂载) {
+        // pivot_root到只读tmpfs
+        // mount("none", "/", "", MS_REMOUNT|MS_RDONLY, NULL)
+        平台_remount_readonly()
+    }
+
+    // 4. seccomp-BPF
+    如果 (policy.启用seccomp && policy.seccomp过滤器 != 0) {
+        // prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
+        平台_seccomp_install(policy.seccomp过滤器)
+    }
+
+    // 5. 资源限制(rlimit / cgroup)
+    如果 (policy.内存上限MB > 0) {
+        平台_setrlimit_memory(policy.内存上限MB * 1024 * 1024)
+    }
+    如果 (policy.文件描述符上限 > 0) {
+        平台_setrlimit_nofile(policy.文件描述符上限)
+    }
+    返回 0
+}
+
+// §4 seccomp-BPF过滤器
+
+// BPF指令
+结构 BPF_Insn {
+    code,
+    jt,
+    jf,
+    k,
+}
+
+// 渲染er允许的系统调用白名单
+函数 Seccomp_渲染er过滤器() {
+    // 允许: read/write/close/Nova内存映射/munmap/mprotect/brk
+    //       Nova快速锁/clock_gettime/nanosleep/Nova事件轮询*
+    //       Nova设备控制(仅timerfd)/事件fd/pipe2
+    // 禁止: open/openat/connect/bind/listen/accept
+    //       fork/exec/kill/ptrace/mount/...
+    定义 允许表 = 堆_分配(64 * 4)    // 最多64个系统调用号
+    定义 可变 n = 0
+    内存_写32(允许表 + n*4, 0); n=n+1    // read
+    内存_写32(允许表 + n*4, 1); n=n+1    // write
+    内存_写32(允许表 + n*4, 3); n=n+1    // close
+    内存_写32(允许表 + n*4, 9); n=n+1    // Nova内存映射
+    内存_写32(允许表 + n*4, 10); n=n+1   // mprotect
+    内存_写32(允许表 + n*4, 11); n=n+1   // munmap
+    内存_写32(允许表 + n*4, 12); n=n+1   // brk
+    内存_写32(允许表 + n*4, 202); n=n+1  // Nova快速锁
+    内存_写32(允许表 + n*4, 228); n=n+1  // clock_gettime
+    内存_写32(允许表 + n*4, 35); n=n+1   // nanosleep
+    内存_写32(允许表 + n*4, 232); n=n+1  // Nova事件轮询_wait
+    内存_写32(允许表 + n*4, 233); n=n+1  // Nova事件轮询_ctl
+    内存_写32(允许表 + n*4, 291); n=n+1  // Nova事件轮询_创建1
+    内存_写32(允许表 + n*4, 293); n=n+1  // pipe2
+    内存_写32(允许表 + n*4, 284); n=n+1  // 事件fd2
+    内存_写32(允许表 + n*4, 60); n=n+1   // exit
+    内存_写32(允许表 + n*4, 231); n=n+1  // exit_group
+    返回 Seccomp_构建BPF白名单(允许表, n)
+}
+
+函数 Seccomp_图处过滤器() {
+    // 图处进程: 额外允许Nova设备控制(DRM设备)
+    定义 允许表 = 堆_分配(64 * 4)
+    定义 可变 n = 0
+    // 基础Nova系统调用s + Nova设备控制 + Nova内存映射
+    内存_写32(允许表+n*4, 0); n=n+1     // read
+    内存_写32(允许表+n*4, 1); n=n+1     // write
+    内存_写32(允许表+n*4, 3); n=n+1     // close
+    内存_写32(允许表+n*4, 9); n=n+1     // Nova内存映射
+    内存_写32(允许表+n*4, 10); n=n+1    // mprotect
+    内存_写32(允许表+n*4, 11); n=n+1    // munmap
+    内存_写32(允许表+n*4, 16); n=n+1    // Nova设备控制 (DRM)
+    内存_写32(允许表+n*4, 202); n=n+1   // Nova快速锁
+    内存_写32(允许表+n*4, 60); n=n+1    // exit
+    内存_写32(允许表+n*4, 231); n=n+1   // exit_group
+    返回 Seccomp_构建BPF白名单(允许表, n)
+}
+
+函数 Seccomp_Network过滤器() {
+    // Network进程: 允许socket/connect/send/recv
+    定义 允许表 = 堆_分配(64 * 4)
+    定义 可变 n = 0
+    内存_写32(允许表+n*4, 0); n=n+1     // read
+    内存_写32(允许表+n*4, 1); n=n+1     // write
+    内存_写32(允许表+n*4, 3); n=n+1     // close
+    内存_写32(允许表+n*4, 41); n=n+1    // socket
+    内存_写32(允许表+n*4, 42); n=n+1    // connect
+    内存_写32(允许表+n*4, 44); n=n+1    // sendto
+    内存_写32(允许表+n*4, 45); n=n+1    // recvfrom
+    内存_写32(允许表+n*4, 46); n=n+1    // sendmsg
+    内存_写32(允许表+n*4, 47); n=n+1    // recvmsg
+    内存_写32(允许表+n*4, 232); n=n+1   // Nova事件轮询_wait
+    内存_写32(允许表+n*4, 9); n=n+1     // Nova内存映射
+    内存_写32(允许表+n*4, 202); n=n+1   // Nova快速锁
+    内存_写32(允许表+n*4, 60); n=n+1    // exit
+    返回 Seccomp_构建BPF白名单(允许表, n)
+}
+
+函数 Seccomp_构建BPF白名单(允许表, 数量) {
+    // 构建BPF程序:
+    // BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)  → 加载Nova系统调用号
+    // 对每个允许的Nova系统调用: BPF_JMP | BPF_JEQ, Nova系统调用_nr → ALLOW
+    // 最后: BPF_RET | SECCOMP_RET_KILL_PROCESS
+    定义 程序大小 = (数量 + 2) * 8    // 每条BPF指令8字节
+    定义 prog = 堆_分配(程序大小)
+    // 第一条: 加载Nova系统调用号
+    // LD [0] (offsetof seccomp_data.nr = 0)
+    定义 可变 pos = 0
+    内存_写16(prog+pos, 0x0020); 内存_写16(prog+pos+2, 0); 内存_写32(prog+pos+4, 0)
+    pos = pos + 8
+    // 每个允许的Nova系统调用
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 nr = 内存_读32(允许表 + i * 4)
+        // JEQ nr, 0, 1 → 如果匹配跳到ALLOW(0步), 否则下一条(1步)
+        内存_写16(prog+pos, 0x0015)    // JMP|JEQ
+        字节写(prog, pos+2, 数量 - i)  // jt: 跳到ALLOW
+        字节写(prog, pos+3, 0)         // jf: 继续
+        内存_写32(prog+pos+4, nr)
+        pos = pos + 8
+        i = i + 1
+    }
+    // KILL
+    内存_写16(prog+pos, 0x0006); 内存_写32(prog+pos+4, 0x80000000)  // SECCOMP_RET_KILL_PROCESS
+    pos = pos + 8
+    // ALLOW (跳转目标)
+    内存_写16(prog+pos, 0x0006); 内存_写32(prog+pos+4, 0x7FFF0000)  // SECCOMP_RET_ALLOW
+    返回 prog
+}
+
+定义 可变 AI_沙箱创建与_帧率窗口 = []
+
+函数 AI_沙箱创建与_帧率预测(当前帧耗时) {
+    追加(AI_沙箱创建与_帧率窗口, 当前帧耗时)
+    如果 (计数(AI_沙箱创建与_帧率窗口) > 30) { 列表_移除(AI_沙箱创建与_帧率窗口, 0) }
+    如果 (计数(AI_沙箱创建与_帧率窗口) < 3) { 返回 60 }
+    定义 可变 总 = 0
+    定义 可变 i = 0
+    当 (i < 计数(AI_沙箱创建与_帧率窗口)) { 总 = 总 + AI_沙箱创建与_帧率窗口[i]; i = i + 1 }
+    定义 平均帧耗时 = 总 / 计数(AI_沙箱创建与_帧率窗口)
+    如果 (平均帧耗时 == 0) { 返回 60 }
+    返回 1000 / 平均帧耗时
+}
+
+函数 AI_沙箱创建与_质量降级建议(帧率) {
+    如果 (帧率 < 30) { 返回 "降低分辨率" }
+    如果 (帧率 < 45) { 返回 "跳过阴影" }
+    返回 "全质量"
+}

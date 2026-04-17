@@ -1,0 +1,409 @@
+// §3 @property — 自定义属性注册
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../中枢/字符串替换.nova")
+
+定义 PROP_SYNTAX_ANY         = 0     // *
+定义 PROP_SYNTAX_LENGTH      = 1     // <length>
+定义 PROP_SYNTAX_NUMBER      = 2     // <number>
+定义 PROP_SYNTAX_PERCENTAGE  = 3     // <percentage>
+定义 PROP_SYNTAX_COLOR       = 4     // <color>
+定义 PROP_SYNTAX_IMAGE       = 5     // <image>
+定义 PROP_SYNTAX_URL         = 6     // <url>
+定义 PROP_SYNTAX_INTEGER     = 7     // <integer>
+定义 PROP_SYNTAX_ANGLE       = 8     // <angle>
+定义 PROP_SYNTAX_TIME        = 9     // <time>
+定义 PROP_SYNTAX_RESOLUTION  = 10    // <resolution>
+定义 PROP_SYNTAX_TRANSFORM   = 11    // <transform-function>
+定义 PROP_SYNTAX_CUSTOM_IDENT = 12   // <custom-ident>
+定义 PROP_SYNTAX_LENGTH_PERCENTAGE = 13  // <length-percentage>
+
+结构 RegisteredProperty {
+    名称,    // u64 --property-name
+    语法,    // u32 PROP_SYNTAX_xxx
+    语法字符串,    // u64 原始syntax字符串
+    继承,    // 布尔 inherits
+    初始值,    // u64 initial-value
+    // 用于动画插值
+    可动画,
+}
+
+结构 PropertyRegistry {
+    属性列表,    // u64 RegisteredProperty*数组
+    属性数量,
+    属性容量,
+}
+
+定义 可变 全局属性注册表 = 0
+
+
+函数 PropertyRegistry_获取() {
+    如果 (全局属性注册表 == 0) {
+        全局属性注册表 = 堆_分配(PropertyRegistry)
+        全局属性注册表.属性容量 = 128
+        全局属性注册表.属性列表 = 堆_分配_数组(128 * 8)
+        全局属性注册表.属性数量 = 0
+    }
+    返回 全局属性注册表
+}
+
+函数 Property_注册(名称, 语法字符串, 继承, 初始值) {
+    定义 reg = PropertyRegistry_获取()
+    如果 (reg.属性数量 >= reg.属性容量) { 返回 }
+
+    // 检查是否已注册(不允许重复)
+    如果 (Property_查找(名称) != 0) { 返回 }
+
+    定义 prop = 堆_分配(RegisteredProperty)
+    prop.名称 = 字符串_复制(名称)
+    prop.语法字符串 = 语法字符串 != 0 ? 字符串_复制(语法字符串) : "*"
+    prop.语法 = Property_解析语法(prop.语法字符串)
+    prop.继承 = 继承
+    prop.初始值 = 初始值 != 0 ? 字符串_复制(初始值) : 0
+    prop.可动画 = prop.语法 != PROP_SYNTAX_ANY    // 有类型才能动画
+
+    内存_写64(reg.属性列表 + reg.属性数量 * 8, prop)
+    reg.属性数量 = reg.属性数量 + 1
+}
+
+函数 Property_查找(名称) {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0 && 字符串_相等(prop.名称, 名称)) { 返回 prop }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 Property_解析语法(语法字符串) {
+    如果 (语法字符串 == 0 || 字符串_相等(语法字符串, "*")) { 返回 PROP_SYNTAX_ANY }
+    如果 (字符串_相等(语法字符串, "<length>")) { 返回 PROP_SYNTAX_LENGTH }
+    如果 (字符串_相等(语法字符串, "<number>")) { 返回 PROP_SYNTAX_NUMBER }
+    如果 (字符串_相等(语法字符串, "<percentage>")) { 返回 PROP_SYNTAX_PERCENTAGE }
+    如果 (字符串_相等(语法字符串, "<color>")) { 返回 PROP_SYNTAX_COLOR }
+    如果 (字符串_相等(语法字符串, "<image>")) { 返回 PROP_SYNTAX_IMAGE }
+    如果 (字符串_相等(语法字符串, "<url>")) { 返回 PROP_SYNTAX_URL }
+    如果 (字符串_相等(语法字符串, "<integer>")) { 返回 PROP_SYNTAX_INTEGER }
+    如果 (字符串_相等(语法字符串, "<angle>")) { 返回 PROP_SYNTAX_ANGLE }
+    如果 (字符串_相等(语法字符串, "<time>")) { 返回 PROP_SYNTAX_TIME }
+    如果 (字符串_相等(语法字符串, "<transform-function>")) { 返回 PROP_SYNTAX_TRANSFORM }
+    如果 (字符串_相等(语法字符串, "<length-percentage>")) { 返回 PROP_SYNTAX_LENGTH_PERCENTAGE }
+    返回 PROP_SYNTAX_ANY
+}
+
+// 已注册属性的动画插值
+函数 Property_插值(属性, 从值, 到值, t) {
+    如果 (属性 == 0 || !属性.可动画) { 返回 到值 }
+
+    如果 (属性.语法 == PROP_SYNTAX_LENGTH || 属性.语法 == PROP_SYNTAX_NUMBER || 属性.语法 == PROP_SYNTAX_PERCENTAGE || 属性.语法 == PROP_SYNTAX_LENGTH_PERCENTAGE) {
+        // 数值插值
+        定义 从 = CSS解析_数字(从值)
+        定义 到 = CSS解析_数字(到值)
+        定义 结果 = 从 + (到 - 从) * t / 10000
+        返回 整数转字符串(结果)
+    }
+
+    如果 (属性.语法 == PROP_SYNTAX_COLOR) {
+        // 颜色插值(在sRGB空间)
+        // 在sRGB空间逐通道插值
+        定义 从c = CSS解析_颜色(从值)
+        定义 到c = CSS解析_颜色(到值)
+        定义 rr = SkColor_R(从c) + (SkColor_R(到c) - SkColor_R(从c)) * t / 10000
+        定义 gg = SkColor_G(从c) + (SkColor_G(到c) - SkColor_G(从c)) * t / 10000
+        定义 bb = SkColor_B(从c) + (SkColor_B(到c) - SkColor_B(从c)) * t / 10000
+        定义 aa = SkColor_A(从c) + (SkColor_A(到c) - SkColor_A(从c)) * t / 10000
+        返回 CSS颜色_到字符串(SkColor(aa, rr, gg, bb))
+    }
+
+    如果 (属性.语法 == PROP_SYNTAX_ANGLE) {
+        定义 从 = CSS解析_数字(从值)
+        定义 到 = CSS解析_数字(到值)
+        定义 结果 = 从 + (到 - 从) * t / 10000
+        返回 整数转字符串(结果)
+    }
+
+    // 不支持插值: 在50%时切换
+    如果 (t >= 5000) { 返回 到值 }
+    返回 从值
+}
+
+// CSS.registerProperty() JavaScript 接口
+函数 CSS_registerProperty(Nova运行时实例, 选项) {
+    如果 (选项 == 0) { 返回 }
+    定义 名称 = Nova对象_获取属性(Nova运行时实例, 选项, "name")
+    定义 语法 = Nova对象_获取属性(Nova运行时实例, 选项, "syntax")
+    定义 继承 = Nova对象_获取属性(Nova运行时实例, 选项, "inherits")
+    定义 初始 = Nova对象_获取属性(Nova运行时实例, 选项, "initialValue")
+
+    如果 (名称 == 0) { 返回 }
+    Property_注册(
+        JSValue_获取字符串(名称),
+        语法 != 0 ? JSValue_获取字符串(语法) : "*",
+        继承 != 0 ? JSValue_ToBoolean(Nova运行时实例, 继承) : 假,
+        初始 != 0 ? JSValue_获取字符串(初始) : 0
+    )
+}
+
+// §4 @property规则解析
+
+函数 Property_从AtRule解析(规则文本) {
+    如果 (规则文本 == 0) { 返回 }
+    定义 可变 名称 = 0
+    定义 可变 语法 = "*"
+    定义 可变 继承 = 假
+    定义 可变 初始值 = 0
+    定义 长度 = 字节长度(规则文本)
+    定义 可变 位置 = 0
+    当 (位置 < 长度) {
+        当 (位置 < 长度 && 字节取(规则文本, 位置) == 32) { 位置 = 位置 + 1 }
+        定义 行开始 = 位置
+        当 (位置 < 长度 && 字节取(规则文本, 位置) != 59 && 字节取(规则文本, 位置) != 125) {
+            位置 = 位置 + 1
+        }
+        定义 行 = 字符串_子串(规则文本, 行开始, 位置 - 行开始)
+        如果 (字符串_以开头(行, "syntax:")) {
+            语法 = 字符串_去空白(字符串_子串(行, 7, 字符串_长度(行) - 7))
+        } 否则 如果 (字符串_以开头(行, "inherits:")) {
+            定义 值 = 字符串_去空白(字符串_子串(行, 9, 字符串_长度(行) - 9))
+            继承 = 字符串_相等(值, "true")
+        } 否则 如果 (字符串_以开头(行, "initial-value:")) {
+            初始值 = 字符串_去空白(字符串_子串(行, 14, 字符串_长度(行) - 14))
+        }
+        如果 (位置 < 长度) { 位置 = 位置 + 1 }
+    }
+    如果 (名称 != 0) {
+        Property_注册(名称, 语法, 继承, 初始值)
+    }
+}
+
+// §5 属性语法类型辅助
+
+函数 Property_语法名(语法) {
+    如果 (语法 == PROP_SYNTAX_ANY) { 返回 "*" }
+    如果 (语法 == PROP_SYNTAX_LENGTH) { 返回 "<length>" }
+    如果 (语法 == PROP_SYNTAX_NUMBER) { 返回 "<number>" }
+    如果 (语法 == PROP_SYNTAX_PERCENTAGE) { 返回 "<percentage>" }
+    如果 (语法 == PROP_SYNTAX_COLOR) { 返回 "<color>" }
+    如果 (语法 == PROP_SYNTAX_IMAGE) { 返回 "<image>" }
+    如果 (语法 == PROP_SYNTAX_URL) { 返回 "<url>" }
+    如果 (语法 == PROP_SYNTAX_INTEGER) { 返回 "<integer>" }
+    如果 (语法 == PROP_SYNTAX_ANGLE) { 返回 "<angle>" }
+    如果 (语法 == PROP_SYNTAX_TIME) { 返回 "<time>" }
+    如果 (语法 == PROP_SYNTAX_RESOLUTION) { 返回 "<resolution>" }
+    如果 (语法 == PROP_SYNTAX_TRANSFORM) { 返回 "<transform-function>" }
+    如果 (语法 == PROP_SYNTAX_CUSTOM_IDENT) { 返回 "<custom-ident>" }
+    如果 (语法 == PROP_SYNTAX_LENGTH_PERCENTAGE) { 返回 "<length-percentage>" }
+    返回 "unknown"
+}
+
+函数 Property_是数值语法(语法) {
+    返回 语法 == PROP_SYNTAX_LENGTH || 语法 == PROP_SYNTAX_NUMBER ||
+           语法 == PROP_SYNTAX_PERCENTAGE || 语法 == PROP_SYNTAX_INTEGER ||
+           语法 == PROP_SYNTAX_ANGLE || 语法 == PROP_SYNTAX_TIME ||
+           语法 == PROP_SYNTAX_LENGTH_PERCENTAGE
+}
+
+函数 Property_可插值(语法) {
+    返回 语法 != PROP_SYNTAX_ANY && 语法 != PROP_SYNTAX_URL &&
+           语法 != PROP_SYNTAX_IMAGE && 语法 != PROP_SYNTAX_CUSTOM_IDENT
+}
+
+函数 Property_是有效自定义属性名(名称) {
+    如果 (名称 == 0) { 返回 假 }
+    定义 长度 = 字符串_长度(名称)
+    如果 (长度 < 3) { 返回 假 }
+    返回 字节取(名称, 0) == 45 && 字节取(名称, 1) == 45
+}
+
+// §6 注册表操作扩展
+
+函数 PropertyRegistry_数量() {
+    定义 reg = PropertyRegistry_获取()
+    返回 reg.属性数量
+}
+
+函数 PropertyRegistry_获取按索引(索引) {
+    定义 reg = PropertyRegistry_获取()
+    如果 (索引 >= reg.属性数量) { 返回 0 }
+    返回 内存_读64(reg.属性列表 + 索引 * 8)
+}
+
+函数 PropertyRegistry_删除(名称) {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0 && 字符串_相等(prop.名称, 名称)) {
+            定义 最后 = reg.属性数量 - 1
+            如果 (i < 最后) {
+                内存_写64(reg.属性列表 + i * 8, 内存_读64(reg.属性列表 + 最后 * 8))
+            }
+            reg.属性数量 = reg.属性数量 - 1
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 PropertyRegistry_清空() {
+    定义 reg = PropertyRegistry_获取()
+    reg.属性数量 = 0
+}
+
+函数 PropertyRegistry_列出所有() {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0) { 追加(结果, prop) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 PropertyRegistry_按语法过滤(语法) {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0 && prop.语法 == 语法) { 追加(结果, prop) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 PropertyRegistry_可继承属性() {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0 && prop.继承) { 追加(结果, prop) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 PropertyRegistry_可动画属性() {
+    定义 reg = PropertyRegistry_获取()
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < reg.属性数量) {
+        定义 prop = 内存_读64(reg.属性列表 + i * 8)
+        如果 (prop != 0 && prop.可动画) { 追加(结果, prop) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+// §7 CSS值解析辅助
+
+函数 CSS解析_数字(文本) {
+    如果 (文本 == 0) { 返回 0 }
+    返回 转整数(文本)
+}
+
+函数 CSS解析_颜色(文本) {
+    如果 (文本 == 0) { 返回 0 }
+    如果 (字节取(文本, 0) == 35) {
+        返回 CSS解析_十六进制颜色(文本)
+    }
+    返回 0
+}
+
+函数 CSS解析_十六进制颜色(文本) {
+    如果 (文本 == 0) { 返回 0 }
+    定义 长度 = 字符串_长度(文本)
+    如果 (长度 == 4) {
+        定义 r = CSS_十六进制字符(字节取(文本, 1)) * 17
+        定义 g = CSS_十六进制字符(字节取(文本, 2)) * 17
+        定义 b = CSS_十六进制字符(字节取(文本, 3)) * 17
+        返回 (255 << 24) | (r << 16) | (g << 8) | b
+    }
+    如果 (长度 == 7) {
+        定义 r = CSS_十六进制字符(字节取(文本, 1)) * 16 + CSS_十六进制字符(字节取(文本, 2))
+        定义 g = CSS_十六进制字符(字节取(文本, 3)) * 16 + CSS_十六进制字符(字节取(文本, 4))
+        定义 b = CSS_十六进制字符(字节取(文本, 5)) * 16 + CSS_十六进制字符(字节取(文本, 6))
+        返回 (255 << 24) | (r << 16) | (g << 8) | b
+    }
+    返回 0
+}
+
+函数 CSS_十六进制字符(ch) {
+    如果 (ch >= 48 && ch <= 57) { 返回 ch - 48 }
+    如果 (ch >= 65 && ch <= 70) { 返回 ch - 55 }
+    如果 (ch >= 97 && ch <= 102) { 返回 ch - 87 }
+    返回 0
+}
+
+函数 SkColor(a, r, g, b) {
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+函数 SkColor_R(c) { 返回 (c >> 16) & 0xFF }
+函数 SkColor_G(c) { 返回 (c >> 8) & 0xFF }
+函数 SkColor_B(c) { 返回 c & 0xFF }
+函数 SkColor_A(c) { 返回 (c >> 24) & 0xFF }
+
+函数 CSS颜色_到字符串(颜色) {
+    返回 "#" + 十六进制(SkColor_R(颜色)) + 十六进制(SkColor_G(颜色)) + 十六进制(SkColor_B(颜色))
+}
+
+// §8 统计与健康检查
+
+定义 可变 Property_注册总数 = 0
+定义 可变 Property_查找总数 = 0
+定义 可变 Property_插值总数 = 0
+
+函数 Property_统计() {
+    返回 {
+        注册数: PropertyRegistry_数量(),
+        注册总数: Property_注册总数,
+        查找总数: Property_查找总数,
+        插值总数: Property_插值总数,
+        可动画数: 计数(PropertyRegistry_可动画属性()),
+        可继承数: 计数(PropertyRegistry_可继承属性()),
+    }
+}
+
+函数 Property_健康检查() {
+    定义 可变 问题 = []
+    如果 (PropertyRegistry_数量() > 500) {
+        追加(问题, "注册属性过多: " + 整数转字符串(PropertyRegistry_数量()))
+    }
+    如果 (计数(问题) == 0) { 返回 "自定义属性注册表健康" }
+    返回 问题
+}
+
+函数 Property_重置统计() {
+    Property_注册总数 = 0
+    Property_查找总数 = 0
+    Property_插值总数 = 0
+}
+
+函数 Property_完整统计() {
+    返回 [PropertyRegistry_数量(), Property_注册总数, Property_查找总数, Property_插值总数]
+}
+
+函数 Property_诊断(名称) {
+    定义 prop = Property_查找(名称)
+    如果 (prop == 0) { 返回 "属性未注册: " + 名称 }
+    返回 {
+        名称: prop.名称,
+        语法: Property_语法名(prop.语法),
+        继承: prop.继承,
+        初始值: prop.初始值,
+        可动画: prop.可动画,
+    }
+}

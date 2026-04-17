@@ -1,0 +1,112 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./全局软件管.nova")
+导入("../中枢/创建甲.nova")
+
+// §8 SW更新
+
+函数 SW_更新(reg, 新脚本URL) {
+    如果 (reg == 0 || reg.更新中) { 返回 }
+    reg.更新中 = 真
+
+    // 1. 下载新脚本
+    // 2. 与当前脚本byte比较
+    // 3. 如果不同: 创建新SW, 走install流程
+    定义 新sw = SW_创建(新脚本URL, reg.作用域)
+    reg.installing = 新sw
+    SW_开始安装(reg)
+    reg.更新中 = 假
+    reg.最后更新检查 = 平台_获取高精度时间()
+}
+
+// 24小时自动更新检查
+函数 SW_检查更新(reg) {
+    如果 (reg == 0) { 返回 }
+    定义 现在 = 平台_获取高精度时间()
+    定义 间隔 = 24 * 60 * 60 * 1000    // 24小时(毫秒)
+    如果 (现在 - reg.最后更新检查 > 间隔) {
+        如果 (reg.active != 0) {
+            SW_更新(reg, reg.active.脚本URL)
+        }
+    }
+}
+
+// §9 客户端通信 (postMessage)
+
+结构 Client {
+    ID,
+    类型,    // u8 0=window 1=worker 2=sharedworker
+    URL,
+    // 通信通道
+    消息端口,
+}
+
+函数 SW_postMessage(sw, 消息, 客户端ID) {
+    如果 (sw == 0 || sw.message处理器 == 0) { 返回 }
+    // 序列化消息(Structured Clone)
+    // 传递到SW线程
+    // 触发message事件
+}
+
+函数 Client_postMessage(client, 消息) {
+    如果 (client == 0) { 返回 }
+    // 从SW向页面发送消息
+    // 页面的navigator.service工线.onmessage
+}
+
+// SW中的clients.matchAll()
+函数 SW_matchAllClients(sw, 类型) {
+    如果 (sw == 0) { 返回 0 }
+    // 返回所有匹配的client
+    返回 0
+}
+
+// SW中的clients.claim()
+函数 SW_claim(sw) {
+    如果 (sw == 0 || sw.状态 != SW_STATE_ACTIVATED) { 返回 }
+    // 立即接管所有scope内的页面
+    定义 容器 = SW_获取容器()
+    如果 (容器 != 0) {
+        容器.controller = sw
+    }
+}
+
+// §10 推送通知 (Push 接口)
+
+结构 PushSubscription {
+    enNova直接偏好优化int,    // u64 推送服务URL
+    p256dh,    // u64 公钥(Base64)
+    auth,    // u64 认证密钥(Base64)
+    过期时间,    // u64 0=不过期
+}
+
+结构 Push事件 {
+    基类,    // 事件
+    数据,    // u64 推送数据
+    数据长度,
+}
+
+函数 SW_触发push(sw, 数据, 长度) {
+    如果 (sw == 0 || sw.push处理器 == 0) { 返回 }
+    // 创建Push事件, 调用处理器
+    // 处理器中通常: self.registration.showNotification(title, options)
+}
+
+// §11 后台同步 (Background Sync)
+
+结构 Sync事件 {
+    基类,    // 事件
+    tag,    // u64 同步标识
+    lastChance,    // 布尔 最后一次尝试
+}
+
+函数 SW_registerSync(reg, tag) {
+    如果 (reg == 0) { 返回 }
+    // 注册后台同步
+    // 当网络恢复时触发sync事件
+}
+
+函数 SW_触发sync(sw, tag) {
+    如果 (sw == 0 || sw.sync处理器 == 0) { 返回 }
+    // 创建Sync事件, 调用处理器
+}

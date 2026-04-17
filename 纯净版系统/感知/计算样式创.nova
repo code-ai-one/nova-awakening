@@ -1,0 +1,245 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./应用样式声明.nova")
+导入("./计算长度零.nova")
+
+    align_self:         u32,       // auto/flex-start/flex-end/center/baseline/stretch
+    order:              i32,       // 默认0
+    column_gap:         i32,       // px×100
+    row_gap:            i32,       // px×100
+
+    grid_template_columns: u64,    // 模板字符串
+    grid_template_rows:    u64,
+    grid_column_start:  i32,
+    grid_column_end:    i32,
+    grid_row_start:     i32,
+    grid_row_end:       i32,
+    grid_auto_flow:     u32,       // 0=row 1=column 2=dense
+
+    transform_origin_x: i32,       // px×100 (默认50%)
+    transform_origin_y: i32,
+
+    transition_property: u64,      // 属性名字符串
+    transition_duration: i32,      // ms×100
+    transition_timing:  u32,       // 0=ease 1=linear 2=ease-in 3=ease-out 4=ease-in-out
+    transition_delay:   i32,       // ms×100
+    animation_name:     u64,       // 关键帧名
+    animation_duration: i32,       // ms×100
+    animation_timing:   u32,
+    animation_delay:    i32,       // ms×100
+    animation_count:    i32,       // 次数×100 (-100=infinite)
+    animation_direction: u32,      // 0=normal 1=reverse 2=alternate 3=alternate-reverse
+    animation_fill:     u32,       // 0=none 1=forwards 2=backwards 3=both
+    animation_state:    u32,       // 0=running 1=paused
+
+    filter:             u64,       // 滤镜函数链
+    backdrop_filter:    u64,
+    mix_blend_mode:     u32,       // 0=normal 1=multiply 2=screen 3=overlay ...
+
+    object_fit:         u32,       // 0=fill 1=contain 2=cover 3=none 4=scale-down
+    object_position_x:  i32,       // px×100 (默认50%)
+    object_position_y:  i32,
+
+    cursor:             u32,
+    pointer_事件s:     u32,       // 0=auto 1=none
+    user_select:        u32,       // 0=auto 1=none 2=text 3=all
+    content:            u64,
+    list_style:         u32,
+    outline:            u64,
+    will_change:        u32,       // 0=auto 1=transform 2=opacity 3=scroll-position
+    contain:            u32,       // bit: 1=size 2=layout 4=style 8=paint
+    resize:             u32,       // 0=none 1=both 2=horizontal 3=vertical
+    table_layout:       u32,       // 0=auto 1=fixed
+    direction:          u32,       // 0=ltr 1=rtl
+    writing_mode:       u32,       // 0=horizontal-tb 1=vertical-rl 2=vertical-lr
+    hyphens:            u32,       // 0=none 1=manual 2=auto
+    tab_size:           i32,       // 默认8
+    appearance:         u32,       // 0=none 1=auto
+    scroll_behavior:    u32,       // 0=auto 1=smooth
+    aspect_ratio:       i32,       // 宽×10000/高 (0=auto)
+    accent_color:       u32,       // RGBA
+    clip_path:          u64,
+
+    是继承的:           布尔       // 某些属性从父继承
+}
+
+// §1 创建默认Computed样式 
+
+函数 Computed样式_创建() {
+ 定义 style = 堆_分配(Computed样式)
+
+ // 默认值(CSS初始值)
+ style.display = Display_inline // 大多数元素初始值
+ style.position = Position_static
+ style.float_val = 浮动_none
+ style.clear = 0
+ style.box_sizing = BoxSizing_content
+
+ style.width = 计算长度_auto()
+ style.height = 计算长度_auto()
+ style.min_width = 计算长度_零()
+ style.min_height = 计算长度_零()
+ style.max_width = 计算长度_none()
+ style.max_height = 计算长度_none()
+
+ style.margin_top = 计算长度_零()
+ style.margin_right = 计算长度_零()
+ style.margin_bottom = 计算长度_零()
+ style.margin_left = 计算长度_零()
+
+ style.padding_top = 计算长度_零()
+ style.padding_right = 计算长度_零()
+ style.padding_bottom = 计算长度_零()
+ style.padding_left = 计算长度_零()
+
+ style.border_top_width = 0
+ style.border_right_width = 0
+ style.border_bottom_width = 0
+ style.border_left_width = 0
+ style.border_top_color = 0x000000FF
+ style.border_right_color = 0x000000FF
+ style.border_bottom_color = 0x000000FF
+ style.border_left_color = 0x000000FF
+ style.border_radius_tl = 0
+ style.border_radius_tr = 0
+ style.border_radius_bl = 0
+ style.border_radius_br = 0
+
+ style.top = 计算长度_auto()
+ style.right_pos = 计算长度_auto()
+ style.bottom = 计算长度_auto()
+ style.left_pos = 计算长度_auto()
+ style.z_index = 0
+ style.z_index_auto = 真
+
+ style.color = 0x000000FF // 黑色
+ style.background_color = 0x00000000 // 透明
+ style.background_image = 0
+
+ style.font_size = 1600 // 16px (×100)
+ style.font_weight = 400
+ style.font_family = 0
+ style.font_style = 0
+ style.line_height = 0 // normal
+ style.text_align = TextAlign_left
+ style.text_decoration = 0
+ style.white_space = 0
+ style.word_break = 0
+ style.vertical_align = 0
+
+ style.overflow_x = Overflow_visible
+ style.overflow_y = Overflow_visible
+
+ style.opacity = 100 // 1.0 (×100)
+ style.visibility = Visibility_visible
+
+ style.flex_direction = 弹性Dir_row
+ style.flex_wrap = 0
+ style.justify_content = JC_flex_start
+ style.align_items = JC_stretch
+ style.align_content = JC_stretch
+ style.flex_grow = 0
+ style.flex_shrink = 100 // 1.0 (×100)
+ style.flex_basis = 计算长度_auto()
+ style.gap = 0
+
+ style.transform = 0
+ style.transition = 0
+ style.box_shadow = 0
+ style.text_shadow = 0
+ style.cursor = 0
+ style.pointer_事件s = 0
+ style.user_select = 0
+ style.content = 0
+ style.list_style = 0
+ style.outline = 0
+
+ style.text_transform = 0
+ style.text_indent = 0
+ style.text_overflow = 0
+ style.letter_spacing = 0
+ style.word_spacing = 0
+ style.overflow_wrap = 0
+
+ style.border_top_style = 0
+ style.border_right_style = 0
+ style.border_bottom_style = 0
+ style.border_left_style = 0
+ style.border_collapse = 0
+ style.border_spacing = 0
+
+ style.background_repeat = 0
+ style.background_size = 0
+ style.background_position_x = 0
+ style.background_position_y = 0
+ style.background_attachment = 0
+ style.background_clip = 0
+ style.background_origin = 0
+
+ style.align_self = 0
+ style.order = 0
+ style.column_gap = 0
+ style.row_gap = 0
+
+ style.grid_template_columns = 0
+ style.grid_template_rows = 0
+ style.grid_column_start = 0
+ style.grid_column_end = 0
+ style.grid_row_start = 0
+ style.grid_row_end = 0
+ style.grid_auto_flow = 0
+
+ style.transform_origin_x = 5000 // 50%
+ style.transform_origin_y = 5000
+
+ style.transition_property = 0
+ style.transition_duration = 0
+ style.transition_timing = 0
+ style.transition_delay = 0
+ style.animation_name = 0
+ style.animation_duration = 0
+ style.animation_timing = 0
+ style.animation_delay = 0
+ style.animation_count = 100 // 1×100
+ style.animation_direction = 0
+ style.animation_fill = 0
+ style.animation_state = 0
+
+ style.filter = 0
+ style.backdrop_filter = 0
+ style.mix_blend_mode = 0
+
+ style.object_fit = 0
+ style.object_position_x = 5000 // 50%
+ style.object_position_y = 5000
+
+ style.will_change = 0
+ style.contain = 0
+ style.resize = 0
+ style.table_layout = 0
+ style.direction = 0
+ style.writing_mode = 0
+ style.hyphens = 0
+ style.tab_size = 800 // 8×100
+ style.appearance = 0
+ style.scroll_behavior = 0
+ style.aspect_ratio = 0
+ style.accent_color = 0
+ style.clip_path = 0
+
+ style.是继承的 = 假
+
+ 返回 style
+
+定义 可变 AI_计算样式创_样式缓存命中 = 0
+
+函数 AI_计算样式创_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_计算样式创_布局缓存(元素哈希) {
+    AI_计算样式创_样式缓存命中 = AI_计算样式创_样式缓存命中 + 1
+    返回 元素哈希
+}

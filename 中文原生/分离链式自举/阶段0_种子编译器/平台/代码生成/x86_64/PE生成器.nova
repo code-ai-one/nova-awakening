@@ -1,0 +1,277 @@
+// Nova · 平台层 · PE可执行文件构建器
+// 生成Windows PE32+ x86-64可执行文件
+
+导入("../../../标准库/基础.nova")
+导入("../../../编译器/规划/核心/常量.nova")
+导入("../../../自举兼容桥.nova")
+
+函数 写pe字符串(buf, pos, s) {
+    定义 可变 i = 0
+    当 (i < 字节长度(s)) {
+        缓冲写(buf, pos + i, 字节取(s, i))
+        i = i + 1
+    }
+}
+
+函数 构建PE_处理__call_(修位, 目标名) {
+    定义 目标偏移 = 字典取(函数表, 目标名)
+    如果 (目标偏移 != 空) {
+        定义 可变 相对 = 目标偏移 - (修位 + 4)
+        缓冲写32(pe, 文件对齐 + 修位, 相对)
+    } 否则 {
+        打印文本(字符串拼接("错误: 未定义函数 ", 目标名))
+    }
+}
+
+函数 构建PE_处理__str_(修位, 索引) {
+    定义 字串位 = 字串偏移[索引]
+    定义 相对 = 字串位 - (修位 + 4)
+    缓冲写32(pe, 文件对齐 + 修位, 相对)
+}
+
+函数 构建PE(入口偏移, 代码大小) {
+    定义 可变 ii = 0
+    打印("构建 PE 文件...")
+    定义 文件对齐 = 0x200
+    定义 段对齐 = 0x1000
+    定义 代码段RVA = 0x1000
+    定义 代码段虚大 = ((代码大小 + 段对齐 - 1) / 段对齐) * 段对齐
+    定义 导入段RVA = 代码段RVA + 代码段虚大
+    定义 代码段原大 = ((代码大小 + 文件对齐 - 1) / 文件对齐) * 文件对齐
+    定义 文件大小 = 文件对齐 + 代码段原大 + 文件对齐
+    定义 映像大小 = 导入段RVA + 段对齐
+    定义 可变 pe = 缓冲区(文件大小)
+    缓冲写16(pe, 0x00, 0x5A4D)
+    缓冲写32(pe, 0x3C, 0x40)
+    缓冲写32(pe, 0x40, 0x4550)
+    缓冲写16(pe, 0x44, 0x8664)
+    缓冲写16(pe, 0x46, 2)
+    缓冲写16(pe, 0x54, 0xF0)
+    缓冲写16(pe, 0x56, 0x22)
+    缓冲写16(pe, 0x58, 0x020B)
+    缓冲写(pe, 0x5A, 14)
+    缓冲写32(pe, 0x5C, 代码段原大)
+    缓冲写32(pe, 0x60, 文件对齐)
+    缓冲写32(pe, 0x68, 代码段RVA + 入口偏移)
+    缓冲写32(pe, 0x6C, 代码段RVA)
+    缓冲写32(pe, 0x70, 0x400000)
+    缓冲写32(pe, 0x78, 段对齐)
+    缓冲写32(pe, 0x7C, 文件对齐)
+    缓冲写16(pe, 0x80, 6)
+    缓冲写16(pe, 0x88, 6)
+    缓冲写32(pe, 0x90, 映像大小)
+    缓冲写32(pe, 0x94, 文件对齐)
+    缓冲写16(pe, 0x9C, 3)
+    缓冲写32(pe, 0xA0, 0x800000)
+    缓冲写32(pe, 0xA8, 0x10000)
+    缓冲写32(pe, 0xB0, 0x800000) // 8MB栈
+    缓冲写32(pe, 0xB8, 0x1000)
+    缓冲写32(pe, 0xC4, 16)
+    缓冲写32(pe, 0xD0, 导入段RVA)
+    缓冲写32(pe, 0xD4, 40)
+    缓冲写32(pe, 0x128, 导入段RVA + 0xA0)
+    缓冲写32(pe, 0x12C, 120)
+
+    写pe字符串(pe, 0x148, ".text")
+    缓冲写32(pe, 0x150, 代码大小)
+    缓冲写32(pe, 0x154, 代码段RVA)
+    缓冲写32(pe, 0x158, 代码段原大)
+    缓冲写32(pe, 0x15C, 文件对齐)
+    缓冲写32(pe, 0x16C, 0x60000020)
+
+    写pe字符串(pe, 0x170, ".idata")
+    缓冲写32(pe, 0x178, 0x200)
+    缓冲写32(pe, 0x17C, 导入段RVA)
+    缓冲写32(pe, 0x180, 文件对齐)
+    缓冲写32(pe, 0x184, 文件对齐 + 代码段原大)
+    缓冲写32(pe, 0x194, 0xC0000040)
+
+    // 复制机器码到 .text 段
+    定义 可变 ci = 0
+    当 (ci < 代码大小) {
+        缓冲写(pe, 文件对齐 + ci, 缓冲读(代码, ci))
+        ci = ci + 1
+    }
+    // .idata 段 — 14 个 API 法 (kernel32.dll)
+    定义 导入基 = 文件对齐 + 代码段原大
+    定义 IDT = 0
+    定义 ILT = 0x28
+    定义 IAT = 0xA0
+    定义 HNT = 0x118
+    定义 DLL名 = 0x1D8
+
+    缓冲写32(pe, 导入基 + IDT + 0, 导入段RVA + ILT)
+    缓冲写32(pe, 导入基 + IDT + 12, 导入段RVA + DLL名)
+    缓冲写32(pe, 导入基 + IDT + 16, 导入段RVA + IAT)
+
+    // ILT (11 entries + null terminator)
+    当 (ii < 14) {
+        定义 可变 hnt偏移 = 0
+        如果 (ii == 0) { hnt偏移 = 0 }
+        否则 如果 (ii == 1) { hnt偏移 = 16 }
+        否则 如果 (ii == 2) { hnt偏移 = 32 }
+        否则 如果 (ii == 3) { hnt偏移 = 46 }
+        否则 如果 (ii == 4) { hnt偏移 = 60 }
+        否则 如果 (ii == 5) { hnt偏移 = 72 }
+        否则 如果 (ii == 6) { hnt偏移 = 86 }
+        否则 如果 (ii == 7) { hnt偏移 = 102 }
+        否则 如果 (ii == 8) { hnt偏移 = 114 }
+        否则 如果 (ii == 9) { hnt偏移 = 132 }
+        否则 如果 (ii == 10) { hnt偏移 = 148 }
+        否则 如果 (ii == 11) { hnt偏移 = 166 }
+        否则 如果 (ii == 12) { hnt偏移 = 180 }
+        否则 如果 (ii == 13) { hnt偏移 = 194 }
+        缓冲写64(pe, 导入基 + ILT + ii * 8, 导入段RVA + HNT + hnt偏移)
+        缓冲写64(pe, 导入基 + IAT + ii * 8, 导入段RVA + HNT + hnt偏移)
+        ii = ii + 1
+    }
+
+    // HNT (Hint/Name Table)
+    // 0: GetStdHandle (16 bytes)
+    缓冲写16(pe,  导入基 + HNT, 0)
+    写pe字符串(pe, 导入基 + HNT + 2, "GetStdHandle")
+    // 1: WriteConsoleA (16 bytes) @ +16
+    缓冲写16(pe,  导入基 + HNT + 16, 0)
+    写pe字符串(pe, 导入基 + HNT + 18, "WriteConsoleA")
+    // 2: ExitProcess (14 bytes) @ +32
+    缓冲写16(pe,  导入基 + HNT + 32, 0)
+    写pe字符串(pe, 导入基 + HNT + 34, "ExitProcess")
+    // 3: CreateFileA (14 bytes) @ +46
+    缓冲写16(pe,  导入基 + HNT + 46, 0)
+    写pe字符串(pe, 导入基 + HNT + 48, "CreateFileA")
+    // 4: WriteFile (12 bytes) @ +60
+    缓冲写16(pe,  导入基 + HNT + 60, 0)
+    写pe字符串(pe, 导入基 + HNT + 62, "WriteFile")
+    // 5: CloseHandle (14 bytes) @ +72
+    缓冲写16(pe,  导入基 + HNT + 72, 0)
+    写pe字符串(pe, 导入基 + HNT + 74, "CloseHandle")
+    // 6: VirtualAlloc (16 bytes) @ +86
+    缓冲写16(pe,  导入基 + HNT + 86, 0)
+    写pe字符串(pe, 导入基 + HNT + 88, "VirtualAlloc")
+    // 7: ReadFile (12 bytes) @ +102
+    缓冲写16(pe,  导入基 + HNT + 102, 0)
+    写pe字符串(pe, 导入基 + HNT + 104, "ReadFile")
+    // 8: GetCommandLineA (18 bytes) @ +114
+    缓冲写16(pe,  导入基 + HNT + 114, 0)
+    写pe字符串(pe, 导入基 + HNT + 116, "GetCommandLineA")
+    // 9: LoadLibraryA (16 bytes) @ +132
+    缓冲写16(pe,  导入基 + HNT + 132, 0)
+    写pe字符串(pe, 导入基 + HNT + 134, "LoadLibraryA")
+    // 10: GetProcAddress (18 bytes) @ +148
+    缓冲写16(pe,  导入基 + HNT + 148, 0)
+    写pe字符串(pe, 导入基 + HNT + 150, "GetProcAddress")
+    // 11: GetFileSize (14 bytes) @ +166
+    缓冲写16(pe,  导入基 + HNT + 166, 0)
+    写pe字符串(pe, 导入基 + HNT + 168, "GetFileSize")
+    // 12: CreateFileW (14 bytes) @ +180
+    缓冲写16(pe,  导入基 + HNT + 180, 0)
+    写pe字符串(pe, 导入基 + HNT + 182, "CreateFileW")
+    // 13: MultiByteToWideChar (22 bytes) @ +194
+    缓冲写16(pe,  导入基 + HNT + 194, 0)
+    写pe字符串(pe, 导入基 + HNT + 196, "MultiByteToWideChar")
+
+    写pe字符串(pe, 导入基 + DLL名, "kernel32.dll")
+
+    // 修正 IAT 用 (RIP-relative)
+    定义 IAT_GetStdHandle = 导入段RVA + IAT
+    定义 IAT_WriteConsoleA = 导入段RVA + IAT + 8
+    定义 IAT_ExitProcess = 导入段RVA + IAT + 16
+    定义 IAT_CreateFileA = 导入段RVA + IAT + 24
+    定义 IAT_WriteFile = 导入段RVA + IAT + 32
+    定义 IAT_CloseHandle = 导入段RVA + IAT + 40
+    定义 IAT_VirtualAlloc = 导入段RVA + IAT + 48
+    定义 IAT_ReadFile = 导入段RVA + IAT + 56
+    定义 IAT_GetCommandLineA = 导入段RVA + IAT + 64
+    定义 IAT_LoadLibraryA = 导入段RVA + IAT + 72
+    定义 IAT_GetProcAddress = 导入段RVA + IAT + 80
+    定义 IAT_GetFileSize = 导入段RVA + IAT + 88
+    定义 IAT_CreateFileW = 导入段RVA + IAT + 96
+    定义 IAT_MultiByteToWideChar = 导入段RVA + IAT + 104
+
+    定义 可变 fi = 0
+    当 (fi < 计数(修正表)) {
+        定义 修类 = 修正表_取类型(修正表, fi)
+        定义 修位 = 修正表_取位置(修正表, fi)
+        定义 修附 = 修正表_取附加(修正表, fi)
+        定义 步长 = 修正表_项步长(修正表, fi)
+        如果 (修类 == "call") {
+            构建PE_处理__call_(修位, 修附)
+        }
+        否则 如果 (修类 == "iat_exit") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_ExitProcess - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_gethandle") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_GetStdHandle - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_writeconsole") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_WriteConsoleA - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_createfile") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_CreateFileA - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_writefile") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_WriteFile - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_closehandle") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_CloseHandle - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_virtualalloc") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_VirtualAlloc - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_readfile") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_ReadFile - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_getcmdline") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_GetCommandLineA - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_loadlibrary") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_LoadLibraryA - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_getprocaddr") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_GetProcAddress - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_getfilesize") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_GetFileSize - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_createfilew") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_CreateFileW - 下一指令指针)
+        }
+        否则 如果 (修类 == "iat_multibytetowidechar") {
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, IAT_MultiByteToWideChar - 下一指令指针)
+        }
+        否则 如果 (修类 == "rt_heap") {
+            定义 rt_rva = 导入段RVA + 0x1F0
+            定义 可变 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, rt_rva - 下一指令指针)
+        }
+        否则 如果 (修类 == "rt_globals") {
+            定义 rg_rva = 导入段RVA + 0x1F8
+            定义 下一指令指针 = 代码段RVA + 修位 + 4
+            缓冲写32(pe, 文件对齐 + 修位, rg_rva - 下一指令指针)
+        }
+        否则 如果 (修类 == "str") {
+            构建PE_处理__str_(修位, 修附)
+        }
+        fi = fi + 步长
+    }
+
+    返回 [pe, 文件大小]
+}
+
+// ELF64 构建器 (Linux x86-64 静态可执行文件)
+// 与构建PE平行, 复用相同机器码, 用Linux syscall替换Windows IAT
+

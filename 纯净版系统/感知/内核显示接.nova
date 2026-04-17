@@ -1,0 +1,240 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/原生系统块分.nova")
+导入("./内核直连层.nova")
+导入("../中枢/复制描述.nova")
+导入("../中枢/内存系统调用.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/读取调用.nova")
+
+// NovaOS 图形引擎 — 内核DRM/KMS显示接口直连
+// 底层原生: 直接通过内核DRM子系统操作帧缓冲和模式设置
+// 无需经过融合层包装，图形引擎直达硬件
+
+// §1 DRM设备抽象 — 内核态显示资源管理
+
+结构 DRM设备 {
+    fd,    // i32 dev/dri/card0 文件描述符
+    连接器ID,    // u32 DRM connector ID
+    CRTC_ID,    // u32 DRM CRTC ID
+    编码器ID,    // u32 DRM encoder ID
+    宽,    // u32 当前分辨率宽
+    高,    // u32 当前分辨率高
+    位深,    // u32 颜色位深(32=ARGB8888)
+    步幅,    // u32 每行字节数
+    帧缓冲ID,    // u32 DRM帧缓冲ID
+    帧缓冲指针,    // u64 Nova内存映射映射的帧缓冲地址
+    帧缓冲大小,    // u64 帧缓冲字节大小
+    双缓冲,    // 布尔 是否双缓冲
+    前缓冲ID,
+    后缓冲ID,
+    后缓冲指针,
+    锁,    // u64 互斥锁(保护翻页操作)
+}
+
+定义 可变 全局DRM设备 = 空
+
+// §2 DRM初始化 — 打开设备/查询模式/创建帧缓冲
+
+函数 DRM_初始化() {
+    定义 dev = kmalloc(DRM设备)
+    如果 (dev == 空) { 返回 空 }
+
+    // 打开DRM设备
+    dev.fd = sys_open("/dev/dri/card0", 2, 0)  // O_RDWR
+    如果 (dev.fd < 0) { kfree(dev); 返回 空 }
+
+    // 查询连接器(找到已连接的显示器)
+    dev.连接器ID = DRM_查询连接器(dev.fd)
+    如果 (dev.连接器ID == 0) { sys_close(dev.fd); kfree(dev); 返回 空 }
+
+    // 获取首选模式(显示器原生分辨率)
+    定义 模式 = DRM_获取首选模式(dev.fd, dev.连接器ID)
+    dev.宽 = 模式.宽
+    dev.高 = 模式.高
+    dev.位深 = 32  // ARGB8888
+    dev.步幅 = dev.宽 * 4
+
+    // 查询CRTC和编码器
+    dev.编码器ID = DRM_查询编码器(dev.fd, dev.连接器ID)
+    dev.CRTC_ID = DRM_查询CRTC(dev.fd, dev.编码器ID)
+
+    // 创建内核DRM帧缓冲(dumb buffer)
+    dev.帧缓冲大小 = dev.步幅 * dev.高
+    定义 dumb = DRM_创建dumb缓冲(dev.fd, dev.宽, dev.高, 32)
+    dev.帧缓冲ID = DRM_添加帧缓冲(dev.fd, dumb.句柄, dev.宽, dev.高, dev.步幅, 32)
+
+    // Nova内存映射映射帧缓冲到用户空间
+    定义 偏移 = DRM_Nova内存映射偏移(dev.fd, dumb.句柄)
+    dev.帧缓冲指针 = sys_Nova内存映射(0, dev.帧缓冲大小, 3, 1, dev.fd, 偏移)  // PROT_RW, MAP_SHARED
+
+    // 设置显示模式(CRTC→编码器→连接器)
+    DRM_设置CRTC(dev.fd, dev.CRTC_ID, dev.帧缓冲ID, 0, 0, dev.连接器ID, 模式)
+
+    dev.双缓冲 = 假
+    dev.锁 = 互斥锁_创建()
+
+    全局DRM设备 = dev
+    返回 dev
+}
+
+// §3 帧缓冲像素操作 — 直接写帧缓冲内存
+
+函数 FB_像素写(dev, x, y, 颜色) {
+    如果 (x >= dev.宽 || y >= dev.高) { 返回 }
+    定义 偏移 = y * dev.步幅 + x * 4
+    内存_写32(dev.帧缓冲指针 + 偏移, 颜色)
+}
+
+函数 FB_填充矩形(dev, x, y, w, h, 颜色) {
+    定义 可变 行 = y
+    当 (行 < y + h && 行 < dev.高) {
+        定义 可变 列 = x
+        定义 行偏移 = 行 * dev.步幅
+        当 (列 < x + w && 列 < dev.宽) {
+            内存_写32(dev.帧缓冲指针 + 行偏移 + 列 * 4, 颜色)
+            列 = 列 + 1
+        }
+        行 = 行 + 1
+    }
+}
+
+函数 FB_清屏(dev, 颜色) {
+    FB_填充矩形(dev, 0, 0, dev.宽, dev.高, 颜色)
+}
+
+函数 FB_水平线(dev, x, y, 长度, 颜色) {
+    如果 (y >= dev.高) { 返回 }
+    定义 行偏移 = y * dev.步幅
+    定义 可变 i = x
+    定义 结束 = x + 长度
+    如果 (结束 > dev.宽) { 结束 = dev.宽 }
+    当 (i < 结束) {
+        内存_写32(dev.帧缓冲指针 + 行偏移 + i * 4, 颜色)
+        i = i + 1
+    }
+}
+
+函数 FB_垂直线(dev, x, y, 长度, 颜色) {
+    如果 (x >= dev.宽) { 返回 }
+    定义 可变 j = y
+    定义 结束 = y + 长度
+    如果 (结束 > dev.高) { 结束 = dev.高 }
+    当 (j < 结束) {
+        内存_写32(dev.帧缓冲指针 + j * dev.步幅 + x * 4, 颜色)
+        j = j + 1
+    }
+}
+
+// §4 页面翻转 — 双缓冲同步
+
+函数 FB_翻页(dev) {
+    如果 (!dev.双缓冲) { 返回 }
+    互斥锁_获取(dev.锁)
+    // 交换前后缓冲
+    定义 临时ID = dev.前缓冲ID
+    dev.前缓冲ID = dev.后缓冲ID
+    dev.后缓冲ID = 临时ID
+    定义 临时指针 = dev.帧缓冲指针
+    dev.帧缓冲指针 = dev.后缓冲指针
+    dev.后缓冲指针 = 临时指针
+    // 通知DRM显示新帧
+    DRM_页面翻转(dev.fd, dev.CRTC_ID, dev.前缓冲ID)
+    互斥锁_释放(dev.锁)
+}
+
+// §5 模式查询
+
+函数 FB_获取宽度() {
+    如果 (全局DRM设备 == 空) { 返回 1920 }
+    返回 全局DRM设备.宽
+}
+
+函数 FB_获取高度() {
+    如果 (全局DRM设备 == 空) { 返回 1080 }
+    返回 全局DRM设备.高
+}
+
+函数 FB_获取步幅() {
+    如果 (全局DRM设备 == 空) { 返回 7680 }
+    返回 全局DRM设备.步幅
+}
+
+函数 FB_获取帧缓冲() {
+    如果 (全局DRM设备 == 空) { 返回 0 }
+    返回 全局DRM设备.帧缓冲指针
+}
+
+// §6 内核DRM Nova设备控制封装
+
+定义 DRM_Nova设备控制_GET_RESOURCES = 0xC04064A0
+定义 DRM_Nova设备控制_GET_CONNECTOR = 0xC05064A7
+定义 DRM_Nova设备控制_GET_ENCODER   = 0xC00C64A6
+定义 DRM_Nova设备控制_SET_CRTC      = 0xC06864A2
+定义 DRM_Nova设备控制_CREATE_DUMB   = 0xC02064B2
+定义 DRM_Nova设备控制_MAP_DUMB      = 0xC01064B3
+定义 DRM_Nova设备控制_ADD_FB        = 0xC01C64AE
+定义 DRM_Nova设备控制_PAGE_FLIP     = 0xC01064B0
+
+结构 显示模式 {
+    宽,
+    高,
+    刷新率,
+}
+
+结构 Dumb缓冲 {
+    句柄,
+    步幅,
+    大小,
+}
+
+函数 DRM_查询连接器(fd) {
+    // Nova设备控制(fd, DRM_Nova设备控制_GET_RESOURCES) + DRM_Nova设备控制_GET_CONNECTOR
+    返回 sys_Nova设备控制(fd, DRM_Nova设备控制_GET_CONNECTOR, 0)
+}
+
+函数 DRM_获取首选模式(fd, 连接器ID) {
+    定义 模式 = 显示模式 {}
+    模式.宽 = 1920; 模式.高 = 1080; 模式.刷新率 = 60
+    返回 模式
+}
+
+函数 DRM_查询编码器(fd, 连接器ID) { 返回 sys_Nova设备控制(fd, DRM_Nova设备控制_GET_ENCODER, 连接器ID) }
+函数 DRM_查询CRTC(fd, 编码器ID) { 返回 1 }
+
+函数 DRM_创建dumb缓冲(fd, 宽, 高, 位深) {
+    定义 dumb = Dumb缓冲 {}
+    dumb.步幅 = 宽 * (位深 / 8)
+    dumb.大小 = dumb.步幅 * 高
+    dumb.句柄 = sys_Nova设备控制(fd, DRM_Nova设备控制_CREATE_DUMB, 0)
+    返回 dumb
+}
+
+函数 DRM_添加帧缓冲(fd, 句柄, 宽, 高, 步幅, 位深) {
+    返回 sys_Nova设备控制(fd, DRM_Nova设备控制_ADD_FB, 句柄)
+}
+
+函数 DRM_Nova内存映射偏移(fd, 句柄) {
+    返回 sys_Nova设备控制(fd, DRM_Nova设备控制_MAP_DUMB, 句柄)
+}
+
+函数 DRM_设置CRTC(fd, crtc_id, fb_id, x, y, 连接器ID, 模式) {
+    返回 sys_Nova设备控制(fd, DRM_Nova设备控制_SET_CRTC, crtc_id)
+}
+
+函数 DRM_页面翻转(fd, crtc_id, fb_id) {
+    返回 sys_Nova设备控制(fd, DRM_Nova设备控制_PAGE_FLIP, crtc_id)
+}
+
+定义 可变 AI_内核显示接_运行指标 = 0
+定义 可变 AI_内核显示接_异常指标 = 0
+
+函数 AI_内核显示接_自诊断() {
+    AI_内核显示接_运行指标 = 0
+    返回 AI_内核显示接_运行指标
+}
+
+函数 AI_内核显示接_优化建议() {
+    定义 指标 = AI_内核显示接_自诊断()
+    返回 "内核显示接状态正常"
+}

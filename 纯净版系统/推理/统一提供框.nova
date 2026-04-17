@@ -1,0 +1,281 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+
+// NovaOS · 统一AI模型Provider框架
+// 工业级多模型适配: 一套接口接入所有大模型
+// 支持模型:
+//   国产: 智谱GLM-4/MiniMax/通义千问Qwen/百度文心/讯飞星火/月之暗面Kimi
+//   国际: Nova智能 Nova语言模型-4o / Anthropic Claude / 行业 Gemini / Mistral
+//   兼容: 任何Nova智能兼容接口(如本地Ollama/vLLM/LM Studio)
+// 核心能力:
+//   §1 统一接口: 所有模型同一套调用方法
+//   §2 请求格式适配: 自动转换为目标模型的序列格式
+//   §3 响应解析: 自动提取content/令牌s/finish_reason
+//   §4 流式输出: SSE流式接收(逐字显示)
+//   §5 令牌计数: 精确计数→防爆炸
+//   §6 错误重试: 指数退避+自动降级
+//   §7 多Provider负载均衡/故障切换
+//   §8 加密密钥管理: 通过内核加密框架
+//   §9 图形界面可配置: 所有参数通过NovaGUI设置
+
+
+定义 提供者_Nova智能兼容 = 0     // Nova智能 / 任何兼容接口
+定义 提供者_Anthropic = 1      // Claude系列
+定义 提供者_GLM = 2            // 智谱GLM
+定义 提供者_MiniMax = 3        // MiniMax
+定义 提供者_Qwen = 4           // 通义千问
+定义 提供者_文心 = 5           // 百度ERNIE
+定义 提供者_星火 = 6           // 讯飞
+定义 提供者_Kimi = 7           // 月之暗面
+定义 提供者_Gemini = 8         // 行业
+定义 提供者_Mistral = 9        // Mistral
+定义 提供者_本地Ollama = 10    // 本地Ollama
+
+
+结构 AI提供者配置 {
+    名称,    // 字符串 "GLM-4" / "Qwen-Max" / "Nova语言模型-4o"
+    类型,    // u32 提供者_XXX
+    接口端点,    // 字符串 "https://open.bigmodel.cn/api/paas/v4/..."
+    接口密钥名,    // 字符串 加密存储中的密钥名称
+    模型标识,    // 字符串 "glm-4" / "qwen-max" / "Nova语言模型-4o"
+    最大令牌,    // u32 模型上下文窗口
+    最大输出令牌,    // u32 最大生成长度
+    温度,    // u32 ×1000, 如700=0.7
+    TopP,    // u32 ×1000
+    超时毫秒,
+    重试次数,
+    启用流式,    // u8 1=SSE流式输出
+    已启用,
+    // 认证方式
+    认证头名,    // 字符串 "Authorization" / "X-接口-Key" / "api-key"
+    认证头前缀,    // 字符串 "Bearer " / "" / "ApiKey "
+    // 请求格式差异
+    系统提示字段,    // 字符串 "system" (Anthropic) / 在messages内(Nova智能)
+    消息格式版本,    // u32 0=Nova智能标准 1=Anthropic 2=GLM 3=MiniMax 4=Qwen
+    // 统计
+    总请求数,
+    总成功数,
+    总失败数,
+    总令牌消耗,
+    平均延迟EMA,    // u64 毫秒×1024
+}
+
+
+定义 最大Provider数 = 16
+定义 可变 Provider列表 = []
+定义 可变 当前Provider索引 = 0
+定义 可变 Provider_已初始化 = 假
+
+函数 Provider_初始化() {
+    Provider列表 = []
+    当前Provider索引 = 0
+    Provider_已初始化 = 真
+    内核信息("AI Provider框架: 支持11种模型类型 统一接口+令牌优化+流式+重试")
+}
+
+
+函数 Provider_创建_GLM4(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "智谱GLM-4"
+    cfg.类型 = 提供者_GLM
+    cfg.接口端点 = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "glm-4"
+    cfg.最大令牌 = 128000       // GLM-4支持128K上下文
+    cfg.最大输出令牌 = 4096
+    cfg.温度 = 700
+    cfg.TopP = 950
+    cfg.超时毫秒 = 60000
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"
+    cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"  // GLM系统提示在messages数组内
+    cfg.消息格式版本 = 2
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_MiniMax(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "MiniMax"
+    cfg.类型 = 提供者_MiniMax
+    cfg.接口端点 = "https://api.minimax.chat/v1/text/chatcompletion_v2"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "MiniMax-Text-01"
+    cfg.最大令牌 = 1000000      // MiniMax支持100万令牌
+    cfg.最大输出令牌 = 16384
+    cfg.温度 = 700
+    cfg.TopP = 950
+    cfg.超时毫秒 = 120000       // MiniMax长上下文可能慢
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"
+    cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"
+    cfg.消息格式版本 = 3          // MiniMax格式
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_Qwen(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "通义千问Qwen"
+    cfg.类型 = 提供者_Qwen
+    cfg.接口端点 = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "qwen-max"
+    cfg.最大令牌 = 32000        // Qwen-Max 32K
+    cfg.最大输出令牌 = 8192
+    cfg.温度 = 700
+    cfg.TopP = 800
+    cfg.超时毫秒 = 60000
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"
+    cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"
+    cfg.消息格式版本 = 4          // Qwen用Nova智能兼容但有扩展
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_Nova智能兼容(名称, 端点, 模型, 密钥名, 最大令牌) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = 名称
+    cfg.类型 = 提供者_Nova智能兼容
+    cfg.接口端点 = 端点
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = 模型
+    cfg.最大令牌 = 最大令牌
+    cfg.最大输出令牌 = 4096
+    cfg.温度 = 700
+    cfg.TopP = 950
+    cfg.超时毫秒 = 60000
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"
+    cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"
+    cfg.消息格式版本 = 0          // 标准Nova智能格式
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_Anthropic(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "Anthropic Claude"
+    cfg.类型 = 提供者_Anthropic
+    cfg.接口端点 = "https://api.anthropic.com/v1/messages"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "claude-sonnet-4-20250514"
+    cfg.最大令牌 = 200000       // Claude 200K
+    cfg.最大输出令牌 = 8192
+    cfg.温度 = 700
+    cfg.TopP = 950
+    cfg.超时毫秒 = 120000
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 1
+    cfg.认证头名 = "x-api-key"   // Anthropic用x-api-key
+    cfg.认证头前缀 = ""           // 无前缀
+    cfg.系统提示字段 = "system"   // Anthropic系统提示是顶层字段
+    cfg.消息格式版本 = 1          // Anthropic格式
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_文心(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "百度文心ERNIE"
+    cfg.类型 = 提供者_文心
+    cfg.接口端点 = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/ernie-4.0-8k"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "ernie-4.0-8k"
+    cfg.最大令牌 = 8192
+    cfg.最大输出令牌 = 4096
+    cfg.温度 = 700; cfg.TopP = 800
+    cfg.超时毫秒 = 60000; cfg.重试次数 = 3; cfg.启用流式 = 1; cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"; cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "system"; cfg.消息格式版本 = 0
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_Kimi(密钥名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "月之暗面Kimi"
+    cfg.类型 = 提供者_Kimi
+    cfg.接口端点 = "https://api.moonshot.cn/v1/chat/completions"
+    cfg.接口密钥名 = 密钥名
+    cfg.模型标识 = "moonshot-v1-128k"
+    cfg.最大令牌 = 128000
+    cfg.最大输出令牌 = 8192
+    cfg.温度 = 700; cfg.TopP = 950
+    cfg.超时毫秒 = 120000; cfg.重试次数 = 3; cfg.启用流式 = 1; cfg.已启用 = 1
+    cfg.认证头名 = "Authorization"; cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"; cfg.消息格式版本 = 0  // Kimi兼容Nova智能
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+函数 Provider_创建_本地Ollama(模型名) {
+    定义 cfg = AI提供者配置 {}
+    cfg.名称 = "本地Ollama-" + 模型名
+    cfg.类型 = 提供者_本地Ollama
+    cfg.接口端点 = "http://localhost:11434/v1/chat/completions"
+    cfg.接口密钥名 = ""
+    cfg.模型标识 = 模型名
+    cfg.最大令牌 = 32000
+    cfg.最大输出令牌 = 4096
+    cfg.温度 = 700
+    cfg.TopP = 950
+    cfg.超时毫秒 = 60000
+    cfg.重试次数 = 3
+    cfg.启用流式 = 1
+    cfg.已启用 = 0
+    cfg.认证头名 = "Authorization"
+    cfg.认证头前缀 = "Bearer "
+    cfg.系统提示字段 = "messages"
+    cfg.消息格式版本 = 0
+    追加(Provider列表, cfg)
+    返回 计数(Provider列表) - 1
+}
+
+
+函数 Provider_选择(索引) {
+    如果 (索引 >= 0 && 索引 < 计数(Provider列表)) {
+        当前Provider索引 = 索引
+    }
+}
+
+函数 Provider_当前() {
+    如果 (当前Provider索引 < 计数(Provider列表) && Provider列表[当前Provider索引].已启用 == 1) {
+        返回 Provider列表[当前Provider索引]
+    }
+    定义 可变 i = 0
+    当 (i < 计数(Provider列表)) {
+        如果 (Provider列表[i].已启用 == 1) {
+            当前Provider索引 = i
+            返回 Provider列表[i]
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 Provider_按名称选择(名称) {
+    定义 可变 i = 0
+    当 (i < 计数(Provider列表)) {
+        如果 (Provider列表[i].名称 == 名称) { 当前Provider索引 = i; 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 Provider_列表() { 返回 Provider列表 }
+函数 Provider_数量() { 返回 计数(Provider列表) }

@@ -1,0 +1,291 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/日志缓冲区.nova")
+导入("../中枢/字符设备分配.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. /dev/null: 写入丢弃, 读取返回EOF
+//   2. /dev/zero: 写入丢弃, 读取返回全零
+//   3. /dev/full: 写入返回ENOSPC
+//   4. 用于: 丢弃输出/清零内存/测试
+
+// /dev/null
+
+外部 devtmpfs_创建节点
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 null_read(缓冲, 长度) {
+    返回 0   // EOF
+}
+
+函数 null_write(数据, 长度) {
+    返回 长度   // 成功丢弃
+}
+
+// /dev/zero
+
+函数 zero_read(缓冲, 长度) {
+    内存清零(缓冲, 长度)
+    返回 长度
+}
+
+函数 zero_write(数据, 长度) {
+    返回 长度   // 丢弃
+}
+
+// /dev/full
+
+函数 full_read(缓冲, 长度) {
+    内存清零(缓冲, 长度)
+    返回 长度
+}
+
+函数 full_write(数据, 长度) {
+    返回 -28   // ENOSPC
+}
+
+// /dev/kmsg (内核日志)
+
+函数 kmsg_read(缓冲, 长度) {
+    返回 dmesg_读取()
+}
+
+函数 kmsg_write(数据, 长度) {
+    日志_写入(6, 数据)   // LOG_INFO
+    返回 长度
+}
+
+// /dev/urandom (伪随机数 —
+
+定义 可变 urandom_种子 = 0x5DEECE66D
+定义 可变 urandom_熵池 = []
+定义 可变 urandom_熵计数 = 0
+定义 ENTROPY_POOL_SIZE = 128
+
+函数 urandom_初始化() {
+    urandom_种子 = 读取纳秒() ^ 内联汇编_返回值("rdtsc")
+    urandom_熵池 = []
+    定义 可变 i = 0
+    当 (i < ENTROPY_POOL_SIZE) {
+        追加(urandom_熵池, urandom_种子 ^ (i * 0x9E3779B9))
+        urandom_种子 = urandom_xorshift64(urandom_种子)
+        i = i + 1
+    }
+    urandom_熵计数 = 0
+}
+
+函数 urandom_xorshift64(s) {
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    返回 s
+}
+
+函数 urandom_mix_entropy(值) {
+    定义 idx = urandom_熵计数 % ENTROPY_POOL_SIZE
+    urandom_熵池[idx] = urandom_熵池[idx] ^ 值
+    urandom_熵计数 = urandom_熵计数 + 1
+    // Diffuse: 扩散到相邻槽位
+    定义 下一个 = (idx + 1) % ENTROPY_POOL_SIZE
+    urandom_熵池[下一个] = urandom_熵池[下一个] ^ urandom_xorshift64(值)
+}
+
+函数 urandom_extract() {
+    // 从熵池提取一个伪随机数(ChaCha20风格简化)
+    定义 idx = urandom_熵计数 % ENTROPY_POOL_SIZE
+    定义 a = urandom_熵池[idx]
+    定义 b = urandom_熵池[(idx + 37) % ENTROPY_POOL_SIZE]
+    定义 c = urandom_熵池[(idx + 79) % ENTROPY_POOL_SIZE]
+    urandom_种子 = urandom_xorshift64(urandom_种子 ^ a ^ b)
+    urandom_熵池[idx] = urandom_种子
+    urandom_熵计数 = urandom_熵计数 + 1
+    返回 urandom_种子 ^ c
+}
+
+函数 urandom_read(缓冲, 长度) {
+    如果 (长度 <= 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 r = urandom_extract()
+        内存写8(缓冲 + i, r & 0xFF)
+        如果 (i + 1 < 长度) { 内存写8(缓冲 + i + 1, (r >> 8) & 0xFF) }
+        如果 (i + 2 < 长度) { 内存写8(缓冲 + i + 2, (r >> 16) & 0xFF) }
+        如果 (i + 3 < 长度) { 内存写8(缓冲 + i + 3, (r >> 24) & 0xFF) }
+        如果 (i + 4 < 长度) { 内存写8(缓冲 + i + 4, (r >> 32) & 0xFF) }
+        如果 (i + 5 < 长度) { 内存写8(缓冲 + i + 5, (r >> 40) & 0xFF) }
+        如果 (i + 6 < 长度) { 内存写8(缓冲 + i + 6, (r >> 48) & 0xFF) }
+        如果 (i + 7 < 长度) { 内存写8(缓冲 + i + 7, (r >> 56) & 0xFF) }
+        i = i + 8
+    }
+    返回 长度
+}
+
+函数 urandom_write(数据, 长度) {
+    // 写入数据作为额外熵源
+    定义 可变 i = 0
+    当 (i < 长度) {
+        urandom_mix_entropy(内存读8(数据 + i))
+        i = i + 1
+    }
+    返回 长度
+}
+
+函数 urandom_Nova设备控制(命令, 参数) {
+    如果 (命令 == 0x5401) {  // RNDGETENTCNT
+        返回 urandom_熵计数
+    }
+    如果 (命令 == 0x5402) {  // RNDADDENTROPY
+        urandom_mix_entropy(参数)
+        返回 成功
+    }
+    返回 错误_无效参数
+}
+
+// 文件操作表注册 
+
+定义 可变 null_fops = 空
+定义 可变 zero_fops = 空
+定义 可变 full_fops = 空
+定义 可变 kmsg_fops = 空
+定义 可变 urandom_fops = 空
+
+定义 可变 char_dev_统计 = [0, 0, 0, 0, 0]  // null/zero/full/kmsg/urandom读次数
+
+函数 chardev_初始化() {
+    urandom_初始化()
+
+    null_fops = [null_read, null_write, 空, 空, 空]
+    zero_fops = [zero_read, zero_write, 空, 空, 空]
+    full_fops = [full_read, full_write, 空, 空, 空]
+    kmsg_fops = [kmsg_read, kmsg_write, 空, 空, 空]
+    urandom_fops = [urandom_read, urandom_write, urandom_Nova设备控制, 空, 空]
+
+    // 注册到devtmpfs
+    chardev_注册("/dev/null", 1, 3, null_fops)
+    chardev_注册("/dev/zero", 1, 5, zero_fops)
+    chardev_注册("/dev/full", 1, 7, full_fops)
+    chardev_注册("/dev/kmsg", 1, 11, kmsg_fops)
+    chardev_注册("/dev/urandom", 1, 9, urandom_fops)
+    chardev_注册("/dev/random", 1, 8, urandom_fops)  // 现代Linux random==urandom
+
+    内核信息("字符设备: null/zero/full/kmsg/urandom 已注册")
+}
+
+函数 chardev_注册(路径, 主设备号, 次设备号, fops) {
+    // 在devtmpfs中创建设备节点
+    devtmpfs_创建节点(路径, 主设备号, 次设备号, fops)
+}
+
+函数 chardev_统计() {
+    返回 [char_dev_统计[0], char_dev_统计[1], char_dev_统计[2],
+           char_dev_统计[3], char_dev_统计[4]]
+}
+
+// /dev/mem 和 /dev/port (物理内存/IO端口直接访问)
+
+函数 mem_read(缓冲, 长度, 偏移) {
+    // 直接读取物理内存(需要root权限)
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存写8(缓冲 + i, 内存读8(偏移 + i))
+        i = i + 1
+    }
+    返回 长度
+}
+
+函数 mem_write(数据, 长度, 偏移) {
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存写8(偏移 + i, 内存读8(数据 + i))
+        i = i + 1
+    }
+    返回 长度
+}
+
+函数 port_read(缓冲, 长度, 偏移) {
+    // 读取IO端口
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存写8(缓冲 + i, inb(偏移 + i))
+        i = i + 1
+    }
+    返回 长度
+}
+
+函数 port_write(数据, 长度, 偏移) {
+    定义 可变 i = 0
+    当 (i < 长度) {
+        outb(偏移 + i, 内存读8(数据 + i))
+        i = i + 1
+    }
+    返回 长度
+}
+
+// 设备名称 + 熵统计
+
+函数 chardev_设备名(次设备号) {
+    如果 (次设备号 == 3) { 返回 "null" }
+    如果 (次设备号 == 5) { 返回 "zero" }
+    如果 (次设备号 == 7) { 返回 "full" }
+    如果 (次设备号 == 8) { 返回 "random" }
+    如果 (次设备号 == 9) { 返回 "urandom" }
+    如果 (次设备号 == 11) { 返回 "kmsg" }
+    返回 "unknown"
+}
+
+函数 urandom_熵统计() {
+    返回 [urandom_熵计数, ENTROPY_POOL_SIZE]
+}
+
+
+函数 null_zero_完整统计() {
+    返回 [urandom_熵计数, ENTROPY_POOL_SIZE]
+}
+
+// null/zero/urandom辅助
+
+定义 可变 null_写入字节数 = 0
+定义 可变 zero_读取字节数 = 0
+定义 可变 urandom_读取字节数 = 0
+
+函数 null_zero_健康检查() {
+    定义 可变 问题 = []
+    如果 (urandom_熵计数 < 128) {
+        追加(问题, "熵池不足: " + 整数转字符串(urandom_熵计数))
+    }
+    如果 (计数(问题) == 0) { 返回 "null/zero/urandom健康" }
+    返回 问题
+}
+
+函数 null_zero_IO统计() {
+    返回 {
+        null写入: null_写入字节数,
+        zero读取: zero_读取字节数,
+        urandom读取: urandom_读取字节数,
+        熵池: urandom_熵计数,
+    }
+}
+
+函数 null_zero_熵充足() {
+    返回 urandom_熵计数 >= ENTROPY_POOL_SIZE / 2
+}
+
+函数 null_zero_重置统计() {
+    null_写入字节数 = 0
+    zero_读取字节数 = 0
+    urandom_读取字节数 = 0
+}
+
+函数 null_zero_总IO() {
+    返回 null_写入字节数 + zero_读取字节数 + urandom_读取字节数
+}
+
+定义 可变 AI_稳态甲_调用数 = 0
+
+函数 AI_稳态甲_风险评分(异常数, 总操作) {
+    AI_稳态甲_调用数 = AI_稳态甲_调用数 + 1
+    如果 (总操作 == 0) { 返回 0 }
+    返回 异常数 * 1000 / 总操作
+}

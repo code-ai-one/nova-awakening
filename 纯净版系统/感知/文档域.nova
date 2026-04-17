@@ -1,0 +1,121 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档观察.nova")
+导入("../标准/原生字符串.nova")
+导入("./内核直连层.nova")
+导入("../执行/节点操作.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../外联/双解析证书.nova")
+
+// §3 DOM域
+
+// DOM节点的CDP表示
+
+结构 CDP节点 {
+    节点Id,
+    backend节点Id,
+    节点Type,
+    节点Name,
+    localName,
+    节点Value,
+    child节点Count,
+    children,    // u64 CDP节点*数组
+    attributes,    // u64 [name, value, name, value, ...]
+    // 关联的真实节点
+    真实节点,    // u64 节点*
+}
+
+定义 可变 CDP_下一个节点Id = 1
+
+函数 DevTools_DOM处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "DOM.enable")) {
+        session.dom启用 = 真
+        msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "DOM.disable")) {
+        session.dom启用 = 假
+        msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "DOM.getDocument")) {
+        // 返回document节点及其子树(默认深度2)
+        msg.结果 = DevTools_序列化DOM根()
+    } 否则 如果 (字符串_相等(方法, "DOM.requestChild节点s")) {
+        // 请求子节点(异步返回setChild节点s事件)
+        定义 节点Id = DevTools_解析参数_int(msg.参数, "节点Id")
+        DevTools_发送子节点(session, 节点Id)
+    } 否则 如果 (字符串_相等(方法, "DOM.querySelector")) {
+        定义 节点Id = DevTools_解析参数_int(msg.参数, "节点Id")
+        定义 选择器 = DevTools_解析参数_str(msg.参数, "selector")
+        // 执行CSS选择器查询
+    } 否则 如果 (字符串_相等(方法, "DOM.querySelectorAll")) {
+        // 返回所有匹配节点
+    } 否则 如果 (字符串_相等(方法, "DOM.setAttributeValue")) {
+        // 修改属性
+    } 否则 如果 (字符串_相等(方法, "DOM.removeAttribute")) {
+        // 删除属性
+    } 否则 如果 (字符串_相等(方法, "DOM.setOuterHTML")) {
+        // 修改outerHTML
+    } 否则 如果 (字符串_相等(方法, "DOM.highlight节点")) {
+        // 高亮节点(覆盖层)
+    } 否则 如果 (字符串_相等(方法, "DOM.hideHighlight")) {
+        // 隐藏高亮
+    } 否则 如果 (字符串_相等(方法, "DOM.getBoxModel")) {
+        // 返回盒模型信息(margin/border/padding/content)
+    }
+}
+
+函数 DevTools_序列化DOM根() {
+    返回 "{\"root\":{\"节点Id\":1,\"节点Type\":9,\"节点Name\":\"#document\"}}"
+}
+
+函数 DevTools_发送子节点(session, 节点Id) {
+    // 异步事件: DOM.setChild节点s
+    如果 (session == 0) { 返回 }
+    定义 节点 = DOM_查找节点(节点Id)
+    如果 (节点 == 0) { 返回 }
+    // 构建子节点列表序列
+    定义 buf = 堆_分配(8192)
+    定义 可变 pos = 0
+    pos = 字符串_追加(buf, pos, "{\"method\":\"DOM.setChild节点s\",\"params\":{\"parentId\":")
+    pos = pos + 整数_写入(buf + pos, 节点Id)
+    pos = 字符串_追加(buf, pos, ",\"节点s\":[")
+    定义 可变 child = 节点.第一子节点
+    定义 可变 first = 真
+    当 (child != 0) {
+        如果 (!first) { pos = 字符串_追加(buf, pos, ",") }
+        pos = DevTools_序列化节点(buf, pos, child)
+        first = 假
+        child = child.下一兄弟
+    }
+    pos = 字符串_追加(buf, pos, "]}}")
+    内存_写8(buf + pos, 0)
+    DevTools_发送消息(session, buf, pos)
+    堆_释放(buf)
+}
+
+// §4 CSS域
+
+函数 DevTools_CSS处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "CSS.enable")) {
+        session.css启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "CSS.getMatched样式sFor节点")) {
+        // 返回匹配的CSS规则
+        定义 节点Id = DevTools_解析参数_int(msg.参数, "节点Id")
+        // 查找所有匹配此节点的规则
+    } 否则 如果 (字符串_相等(方法, "CSS.getComputed样式For节点")) {
+        // 返回计算后样式
+        定义 节点Id = DevTools_解析参数_int(msg.参数, "节点Id")
+    } 否则 如果 (字符串_相等(方法, "CSS.getInline样式sFor节点")) {
+        // 返回内联样式
+    } 否则 如果 (字符串_相等(方法, "CSS.set样式Texts")) {
+        // 批量修改样式
+    } 否则 如果 (字符串_相等(方法, "CSS.forcePseudoState")) {
+        // 强制伪类状态(:hover, :active, :focus, :visited)
+    } 否则 如果 (字符串_相等(方法, "CSS.get样式SheetText")) {
+        // 获取样式表文本
+    }
+}

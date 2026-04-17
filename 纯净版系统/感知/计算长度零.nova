@@ -1,0 +1,110 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+
+函数 计算长度_零() {
+    定义 l = 计算长度 {}
+    l.值 = 0; l.是auto = 假; l.单位 = 单位_px
+    返回 l
+}
+
+函数 计算长度_auto() {
+    定义 l = 计算长度 {}
+    l.值 = 0; l.是auto = 真; l.单位 = 单位_auto
+    返回 l
+}
+
+函数 计算长度_none() {
+    // max-width/max-height的初始值: none (无限制)
+    定义 l = 计算长度 {}
+    l.值 = 99999900; l.是auto = 假; l.单位 = 单位_px
+    返回 l
+}
+
+函数 计算长度_px(像素值_x100) {
+    定义 l = 计算长度 {}
+    l.值 = 像素值_x100; l.是auto = 假; l.单位 = 单位_px
+    返回 l
+}
+
+// §2 设置HTML元素默认display (User 智能体 样式Sheet)
+// (对应 nova 的 html.css)
+
+函数 Computed样式_应用UA默认(style, 标签名原子) {
+    // 块级元素
+    如果 (标签名原子 == 原子_html || 标签名原子 == 原子_body ||
+        标签名原子 == 原子_div || 标签名原子 == 原子_p ||
+        标签名原子 == 原子_h1 || 标签名原子 == 原子_h2 || 标签名原子 == 原子_h3 ||
+        标签名原子 == 原子_ul || 标签名原子 == 原子_ol || 标签名原子 == 原子_li ||
+        标签名原子 == 原子_header || 标签名原子 == 原子_footer ||
+        标签名原子 == 原子_nav || 标签名原子 == 原子_section ||
+        标签名原子 == 原子_article || 标签名原子 == 原子_aside ||
+        标签名原子 == 原子_main || 标签名原子 == 原子_form ||
+        标签名原子 == 原子_hr || 标签名原子 == 原子_canvas) {
+        style.display = Display_block
+    }
+
+    // 标题字号
+    如果 (标签名原子 == 原子_h1) {
+        style.font_size = 3200; style.font_weight = 700
+        style.margin_top = 计算长度_px(2133); style.margin_bottom = 计算长度_px(2133)
+    }
+    如果 (标签名原子 == 原子_h2) {
+        style.font_size = 2400; style.font_weight = 700
+        style.margin_top = 计算长度_px(1866); style.margin_bottom = 计算长度_px(1866)
+    }
+    如果 (标签名原子 == 原子_h3) {
+        style.font_size = 1866; style.font_weight = 700
+        style.margin_top = 计算长度_px(1600); style.margin_bottom = 计算长度_px(1600)
+    }
+
+    // <p> 默认margin
+    如果 (标签名原子 == 原子_p) {
+        style.margin_top = 计算长度_px(1600)
+        style.margin_bottom = 计算长度_px(1600)
+    }
+
+    // <body> 默认margin 8px
+    如果 (标签名原子 == 原子_body) {
+        style.margin_top = 计算长度_px(800)
+        style.margin_right = 计算长度_px(800)
+        style.margin_bottom = 计算长度_px(800)
+        style.margin_left = 计算长度_px(800)
+    }
+
+    // <a> 默认蓝色下划线
+    如果 (标签名原子 == 原子_a) {
+        style.color = 0x0000EEFF
+        style.text_decoration = 1    // underline
+        style.cursor = 30           // pointer
+    }
+
+    // 表格元素
+    如果 (标签名原子 == 原子_table) { style.display = Display_table }
+    如果 (标签名原子 == 原子_tr) { style.display = Display_table_row }
+    如果 (标签名原子 == 原子_td || 标签名原子 == 原子_th) { style.display = Display_table_cell }
+
+    // 隐藏元素
+    如果 (标签名原子 == 原子_head || 标签名原子 == 原子_script || 标签名原子 == 原子_style || 标签名原子 == 原子_meta || 标签名原子 == 原子_link) {
+        style.display = Display_none
+    }
+
+    // <ul>/<ol> 默认padding-left
+    如果 (标签名原子 == 原子_ul || 标签名原子 == 原子_ol) {
+        style.padding_left = 计算长度_px(4000)
+        style.margin_top = 计算长度_px(1600)
+        style.margin_bottom = 计算长度_px(1600)
+    }
+    如果 (标签名原子 == 原子_li) { style.display = Display_list_item }
+
+    // <textarea> / <select> / <input>
+    如果 (标签名原子 == 原子_textarea) { style.display = Display_inline_block }
+    如果 (标签名原子 == 原子_select) { style.display = Display_inline_block }
+    如果 (标签名原子 == 原子_input) { style.display = Display_inline_block }
+    如果 (标签名原子 == 原子_button) { style.display = Display_inline_block }
+
+    // <img> / <video> / <iframe>
+    如果 (标签名原子 == 原子_img || 标签名原子 == 原子_video || 标签名原子 == 原子_iframe) {
+        style.display = Display_inline_block
+    }
+}

@@ -1,0 +1,123 @@
+//       shadow_root.cc (~800行)
+//       元素_shadow.cc (~300行)
+//       flat_tree_traversal.cc 
+//       slot_assignment.cc (~600行)
+//       custom_元素_registry.cc (~1000行)
+//       custom_元素.cc 
+//       custom_元素_definition.cc (~400行)
+// Web Components三大接口:
+//   1. Shadow DOM: 封装的DOM子树(样式隔离/事件边界)
+//   2. Custom 元素s: 自定义HTML标签 (<my-component>)
+//   3. HTML Templates: <template> + <slot>
+// Shadow DOM核心概念:
+//   host: 宿主元素(附加shadow的元素)
+//   shadow root: 影子根(替代host的子树进行渲染)
+//   slot: 插槽(将host的子节点"分配"到shadow中)
+//   flat tree: 扁平树(合并light DOM和shadow DOM后的最终渲染树)
+
+导入("./节点.nova")
+导入("./元素.nova")
+导入("./内核直连层.nova")
+导入("./文档节点.nova")
+导入("../中枢/字符串替换.nova")
+
+// §1 ShadowRoot — 影子根节点
+// (对应 ShadowRoot)
+
+定义 ShadowMode_Open = 0 // 元素.shadowRoot可访问
+定义 ShadowMode_Closed = 1 // 元素.shadowRoot返回null
+
+结构 ShadowRoot {
+ // 基础节点属性(ShadowRoot是DocumentFragment的子类)
+ 节点,    // u64 节点* (ShadowRoot本身是个节点)
+ 模式,    // u32 open/closed
+ 宿主,    // u64 元素* (host)
+ 委托焦点,    // 布尔 delegatesFocus
+ // slot管理
+ slot列表,    // u64 SlotAssignment*
+ slot数量,
+ // 样式隔离
+ 样式表列表,    // u64 CSS样式Sheet*数组(shadow内的<style>)
+ 样式表数量,
+ 采用样式表,    // u64 adopted样式Sheets
+ 采用样式表数量,
+ // 内部标记
+ 需要slot分配,
+}
+
+
+函数 ShadowRoot_创建(宿主元素, 模式) {
+ 定义 sr = 堆_分配(ShadowRoot)
+
+ // 创建底层节点(类型=DOCUMENT_FRAGMENT_节点=11)
+ sr.节点 = 节点_创建(11, 节点标志_是容器节点)
+ sr.模式 = 模式
+ sr.宿主 = 宿主元素
+ sr.委托焦点 = 假
+
+ sr.slot列表 = 堆_分配_数组(16 * 16)
+ sr.slot数量 = 0
+
+ sr.样式表列表 = 堆_分配_数组(16 * 8)
+ sr.样式表数量 = 0
+ sr.采用样式表 = 堆_分配_数组(8 * 8)
+ sr.采用样式表数量 = 0
+
+ sr.需要slot分配 = 真
+
+ // 将ShadowRoot存储在宿主元素上
+ 如果 (宿主元素 != 0) {
+ 定义 扩展 = 元素_获取扩展(宿主元素)
+ 如果 (扩展 != 0) {
+ 扩展.shadowRoot = sr
+ }
+ }
+
+ 返回 sr
+}
+
+函数 元素_attachShadow(元素, 模式) {
+ 如果 (元素 == 0) { 返回 0 }
+
+ // 检查是否已有shadow root
+ 定义 扩展 = 元素_获取扩展(元素)
+ 如果 (扩展 != 0 && 扩展.shadowRoot != 0) {
+ // 已有shadow root: 抛错
+ 返回 0
+ }
+
+ // 检查元素是否允许attachShadow
+ // 允许的元素: article/aside/blockquote/body/div/footer/h1-h6/header/main/nav/p/section/span
+ // + 自定义元素(含-)
+ 如果 (!元素_允许Shadow(元素)) { 返回 0 }
+
+ 返回 ShadowRoot_创建(元素, 模式)
+}
+
+函数 元素_允许Shadow(元素) {
+ 定义 扩展 = 元素_获取扩展(元素)
+ 如果 (扩展 == 0) { 返回 假 }
+
+ // 自定义元素(名称含-)
+ 定义 标签 = 扩展.标签名
+ 如果 (标签 != 0) {
+ 定义 长度 = 字符串_长度(标签)
+ 定义 可变 i = 0
+ 当 (i < 长度) {
+ 如果 (内存_读8(标签 + i) == 0x2D) { 返回 真 } // 含-: 自定义元素
+ i = i + 1
+ }
+ }
+
+ // 标准允许的元素
+ 定义 原子 = 扩展.标签名原子
+ 如果 (原子 == 原子_div || 原子 == 原子_span || 原子 == 原子_p ||
+ 原子 == 原子_section || 原子 == 原子_article || 原子 == 原子_aside ||
+ 原子 == 原子_header || 原子 == 原子_footer || 原子 == 原子_nav ||
+ 原子 == 原子_main || 原子 == 原子_body ||
+ 原子 == 原子_h1 || 原子 == 原子_h2 || 原子 == 原子_h3) {
+ 返回 真
+ }
+
+ 返回 假
+}

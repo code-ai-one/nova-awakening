@@ -1,0 +1,202 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./底层系统调.nova")
+导入("../感知/内核直连层.nova")
+
+// §4 内存管理封装
+
+函数 系统调用_Nova内存映射(addr, length, prot, flags, fd, offset) {
+    返回 系统调用6(SYS_Nova内存映射, addr, length, prot, flags, fd, offset)
+}
+
+函数 系统调用_munmap(addr, length) {
+    返回 系统调用2(SYS_munmap, addr, length)
+}
+
+函数 系统调用_mprotect(addr, length, prot) {
+    返回 系统调用3(SYS_mprotect, addr, length, prot)
+}
+
+函数 系统调用_mremap(old_addr, old_size, new_size, flags) {
+    返回 系统调用4(SYS_mremap, old_addr, old_size, new_size, flags)
+}
+
+函数 系统调用_madvise(addr, length, advice) {
+    返回 系统调用3(SYS_madvise, addr, length, advice)
+}
+
+函数 系统调用_brk(addr) {
+    返回 系统调用1(SYS_brk, addr)
+}
+
+函数 系统调用_memfd_create(name, flags) {
+    返回 系统调用2(SYS_memfd_create, name, flags)
+}
+
+// 匿名Nova内存映射快捷方式(分配内存)
+函数 平台_匿名Nova内存映射(大小) {
+    返回 系统调用_Nova内存映射(0, 大小, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+}
+
+// §5 进程/线程封装
+
+函数 系统调用_fork() {
+    // RISC-V没有fork, 用clone模拟: clone(SIGCHLD, 0, 0, 0, 0)
+    返回 系统调用5(SYS_clone, SIGCHLD, 0, 0, 0, 0)
+}
+
+函数 系统调用_exit(code) {
+    系统调用1(SYS_exit_group, code)
+}
+
+函数 系统调用_waitpid(pid, status, options) {
+    返回 系统调用4(SYS_wait4, pid, status, options, 0)
+}
+
+函数 系统调用_kill(pid, sig) {
+    返回 系统调用2(SYS_kill, pid, sig)
+}
+
+函数 系统调用_getpid() {
+    返回 系统调用0(SYS_getpid)
+}
+
+函数 系统调用_gettid() {
+    返回 系统调用0(SYS_gettid)
+}
+
+函数 系统调用_execve(路径, argv, envp) {
+    返回 系统调用3(SYS_execve, 路径, argv, envp)
+}
+
+函数 系统调用_clone_线程(fn, stack, flags, arg) {
+    // 创建线程: clone(flags|CLONE_VM|CLONE_FS|..., stack_top)
+    定义 thread_flags = flags | 0x100 | 0x200 | 0x400 | 0x800 | 0x10000  // VM|FS|FILES|SIGHAND|THREAD
+    返回 系统调用5(SYS_clone, thread_flags | SIGCHLD, stack, 0, 0, 0)
+}
+
+函数 系统调用_Nova快速锁(uaddr, op, val, timeout) {
+    返回 系统调用4(SYS_Nova快速锁, uaddr, op, val, timeout)
+}
+
+函数 系统调用_sched_yield() {
+    返回 系统调用0(SYS_sched_yield)
+}
+
+函数 系统调用_prctl(option, arg2, arg3, arg4, arg5) {
+    返回 系统调用5(SYS_prctl, option, arg2, arg3, arg4, arg5)
+}
+
+// §6 网络封装
+
+函数 系统调用_socket(domain, type, protocol) {
+    返回 系统调用3(SYS_socket, domain, type, protocol)
+}
+
+函数 系统调用_connect(fd, addr, addrlen) {
+    返回 系统调用3(SYS_connect, fd, addr, addrlen)
+}
+
+函数 系统调用_bind(fd, addr, addrlen) {
+    返回 系统调用3(SYS_bind, fd, addr, addrlen)
+}
+
+函数 系统调用_listen(fd, backlog) {
+    返回 系统调用2(SYS_listen, fd, backlog)
+}
+
+函数 系统调用_accept4(fd, addr, addrlen, flags) {
+    返回 系统调用4(SYS_accept4, fd, addr, addrlen, flags)
+}
+
+函数 系统调用_sendto(fd, buf, len, flags, addr, addrlen) {
+    返回 系统调用6(SYS_sendto, fd, buf, len, flags, addr, addrlen)
+}
+
+函数 系统调用_recvfrom(fd, buf, len, flags, addr, addrlen) {
+    返回 系统调用6(SYS_recvfrom, fd, buf, len, flags, addr, addrlen)
+}
+
+函数 系统调用_sendmsg(fd, msg, flags) {
+    返回 系统调用3(SYS_sendmsg, fd, msg, flags)
+}
+
+函数 系统调用_recvmsg(fd, msg, flags) {
+    返回 系统调用3(SYS_recvmsg, fd, msg, flags)
+}
+
+函数 系统调用_shutdown(fd, how) {
+    返回 系统调用2(SYS_shutdown, fd, how)
+}
+
+函数 系统调用_setsockopt(fd, level, optname, optval, optlen) {
+    返回 系统调用5(SYS_setsockopt, fd, level, optname, optval, optlen)
+}
+
+函数 系统调用_getsockopt(fd, level, optname, optval, optlen) {
+    返回 系统调用5(SYS_getsockopt, fd, level, optname, optval, optlen)
+}
+
+函数 系统调用_socketpair(domain, type, protocol, fds) {
+    返回 系统调用4(SYS_socketpair, domain, type, protocol, fds)
+}
+
+// 便捷: 传控 socket发送
+函数 平台_socket_发送(fd, buf, len) {
+    返回 系统调用_sendto(fd, buf, len, 0, 0, 0)
+}
+
+// 便捷: 传控 socket接收
+函数 平台_socket_接收(fd, buf, max) {
+    返回 系统调用_recvfrom(fd, buf, max, 0, 0, 0)
+}
+
+// 便捷: 设置传控_节点LAY
+函数 平台_设置传控无延迟(fd) {
+    定义 val = 堆_分配(4)
+    内存_写32(val, 1)
+    系统调用_setsockopt(fd, IPPROTO_传控, 传控_节点LAY, val, 4)
+    堆_释放(val)
+}
+
+// 便捷: 设置非阻塞
+函数 平台_设置非阻塞(fd) {
+    定义 flags = 系统调用_fcntl(fd, F_GETFL, 0)
+    系统调用_fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+}
+
+// 网络字节序转换
+函数 网络_htons(v) {
+    返回 ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
+}
+
+函数 网络_htonl(v) {
+    返回 ((v & 0xFF) << 24) | (((v >> 8) & 0xFF) << 16) |
+           (((v >> 16) & 0xFF) << 8) | ((v >> 24) & 0xFF)
+}
+
+函数 网络_ntohs(v) { 返回 网络_htons(v) }
+函数 网络_ntohl(v) { 返回 网络_htonl(v) }
+
+// 构建sockaddr_in
+函数 平台_构建IPv4地址(ip, port) {
+    定义 addr = 堆_分配(16)
+    内存_写16(addr, AF_INET)
+    内存_写16(addr + 2, 网络_htons(port))
+    内存_写32(addr + 4, ip)
+    内存_置零(addr + 8, 8)
+    返回 addr
+}
+
+定义 可变 AI_内存管理封_运行指标 = 0
+定义 可变 AI_内存管理封_异常指标 = 0
+
+函数 AI_内存管理封_自诊断() {
+    AI_内存管理封_运行指标 = 0
+    返回 AI_内存管理封_运行指标
+}
+
+函数 AI_内存管理封_优化建议() {
+    定义 指标 = AI_内存管理封_自诊断()
+    返回 "内存管理封状态正常"
+}

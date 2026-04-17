@@ -1,0 +1,210 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./布局未知计算.nova")
+导入("./样式值解析.nova")
+导入("../执行/配置获取.nova")
+导入("./弹性布局深度.nova")
+
+
+函数 布局块级Flow_折叠margin(margin_a, margin_b) {
+    如果 (margin_a >= 0 && margin_b >= 0) {
+        // 两个正: 取大者
+        如果 (margin_a > margin_b) { 返回 margin_a }
+        返回 margin_b
+    }
+    如果 (margin_a < 0 && margin_b < 0) {
+        // 两个负: 取绝对值大者
+        如果 (margin_a < margin_b) { 返回 margin_a }
+        返回 margin_b
+    }
+    // 一正一负: 求和
+    返回 margin_a + margin_b
+}
+
+// §4 BFC判断 — 哪些元素建立新的块格式化上下文
+// CSS2.1 §9.4.1: 以下元素建立新BFC:
+//   - 根元素
+//   - float != none
+//   - position: absolute/fixed
+//   - display: inline-block / table-cell / table-caption / flex / grid
+//   - overflow != visible (最常用的触发方式)
+
+函数 布局块级Flow_建立BFC(layout) {
+    定义 style = layout.样式
+    如果 (style == 0) { 返回 假 }
+    如果 (layout.父布局 == 0) { 返回 真 }    // 根元素
+    如果 (style.float_type != 0) { 返回 真 }
+    如果 (style.position == 定位_绝对 || style.position == 定位_固定) { 返回 真 }
+    如果 (style.display == 显示_行内块 || style.display == 显示_flex ||
+        style.display == 显示_grid || style.display == 显示_表格单元) { 返回 真 }
+    如果 (style.overflow != 0) { 返回 真 }    // overflow非visible
+    返回 假
+}
+
+// §5 浮动布局 (浮动 Placement)
+// float:left 放在当前行的左侧
+// float:right 放在当前行的右侧
+// 后续内容环绕浮动元素
+
+函数 布局块级Flow_布局浮动(layout, 浮动子, 包含块宽,
+                              左浮动边界, 右浮动边界, 左浮动底部, 右浮动底部, 当前Y) {
+    定义 子style = 浮动子.样式
+    定义 子总宽 = 浮动子.宽度 + 浮动子.padding_left + 浮动子.padding_right
+                 + 浮动子.border_left + 浮动子.border_right
+                 + 浮动子.margin_left + 浮动子.margin_right
+
+    // 递归布局浮动元素内容
+    布局块级Flow_布局(浮动子)
+
+    定义 子总高 = 浮动子.高度 + 浮动子.padding_top + 浮动子.padding_bottom
+                 + 浮动子.border_top + 浮动子.border_bottom
+
+    如果 (子style.float_type == 1) {
+        // float:left
+        定义 可变 x = 左浮动边界 + 浮动子.margin_left
+        定义 可变 y = 当前Y + 浮动子.margin_top
+
+        // 检查是否有空间: 如果当前行放不下,下移到浮动下方
+        如果 (x + 子总宽 > 右浮动边界 && 当前Y < 左浮动底部) {
+            y = 左浮动底部 + 浮动子.margin_top
+            x = 浮动子.margin_left
+        }
+
+        浮动子.x = x + layout.padding_left + layout.border_left
+        浮动子.y = y
+    }
+    否则 如果 (子style.float_type == 2) {
+        // float:right
+        定义 可变 x = 右浮动边界 - 子总宽 + 浮动子.margin_left
+        定义 可变 y = 当前Y + 浮动子.margin_top
+
+        如果 (x < 左浮动边界 && 当前Y < 右浮动底部) {
+            y = 右浮动底部 + 浮动子.margin_top
+            x = 包含块宽 - 子总宽 + 浮动子.margin_left
+        }
+
+        浮动子.x = x + layout.padding_left + layout.border_left
+        浮动子.y = y
+    }
+}
+
+// §6 定位元素布局 (position:absolute/fixed/relative)
+
+函数 布局块级Flow_布局定位子元素(layout, 包含块宽, 包含块高) {
+    定义 可变 子 = layout.第一子
+    当 (子 != 0) {
+        定义 子style = 子.样式
+        如果 (子style == 0) { 子 = 子.后一兄弟布局; 继续 }
+
+        // relative: 相对自身正常位置偏移
+        如果 (子style.position == 定位_相对) {
+            如果 (子style.left != -1 && 子style.left != 0) {
+                子.x = 子.x + CSS值_解析为像素(子style.left, 包含块宽)
+            } 否则 如果 (子style.right != -1 && 子style.right != 0) {
+                子.x = 子.x - CSS值_解析为像素(子style.right, 包含块宽)
+            }
+            如果 (子style.top != -1 && 子style.top != 0) {
+                子.y = 子.y + CSS值_解析为像素(子style.top, 包含块高)
+            } 否则 如果 (子style.bottom != -1 && 子style.bottom != 0) {
+                子.y = 子.y - CSS值_解析为像素(子style.bottom, 包含块高)
+            }
+        }
+
+        // absolute: 相对最近定位祖先
+        如果 (子style.position == 定位_绝对) {
+            布局Box_计算盒模型(子, 包含块宽, 包含块高)
+            布局块级Flow_布局(子)
+
+            // left/right/top/bottom
+            定义 可变 x = 0; 定义 可变 y = 0
+            定义 可变 x已设 = 假; 定义 可变 y已设 = 假
+
+            如果 (子style.left != -1) {
+                x = CSS值_解析为像素(子style.left, 包含块宽) + 子.margin_left
+                x已设 = 真
+            }
+            如果 (子style.right != -1 && !x已设) {
+                定义 right_val = CSS值_解析为像素(子style.right, 包含块宽)
+                定义 子外宽 = 子.宽度 + 子.padding_left + 子.padding_right
+                            + 子.border_left + 子.border_right + 子.margin_right
+                x = 包含块宽 - right_val - 子外宽
+                x已设 = 真
+            }
+            如果 (!x已设) { x = 子.margin_left }
+
+            如果 (子style.top != -1) {
+                y = CSS值_解析为像素(子style.top, 包含块高) + 子.margin_top
+                y已设 = 真
+            }
+            如果 (子style.bottom != -1 && !y已设) {
+                定义 bottom_val = CSS值_解析为像素(子style.bottom, 包含块高)
+                定义 子外高 = 子.高度 + 子.padding_top + 子.padding_bottom
+                            + 子.border_top + 子.border_bottom + 子.margin_bottom
+                y = 包含块高 - bottom_val - 子外高
+                y已设 = 真
+            }
+            如果 (!y已设) { y = 子.margin_top }
+
+            // 如果left和right都设了且没有width: 拉伸
+            如果 (子style.left != -1 && 子style.right != -1 && 子style.width == -1) {
+                定义 l = CSS值_解析为像素(子style.left, 包含块宽)
+                定义 r = CSS值_解析为像素(子style.right, 包含块宽)
+                子.宽度 = 包含块宽 - l - r - 子.margin_left - 子.margin_right
+                         - 子.padding_left - 子.padding_right
+                         - 子.border_left - 子.border_right
+                如果 (子.宽度 < 0) { 子.宽度 = 0 }
+            }
+
+            // 同理top+bottom拉伸height
+            如果 (子style.top != -1 && 子style.bottom != -1 && 子style.height == -1) {
+                定义 t = CSS值_解析为像素(子style.top, 包含块高)
+                定义 b = CSS值_解析为像素(子style.bottom, 包含块高)
+                子.高度 = 包含块高 - t - b - 子.margin_top - 子.margin_bottom
+                         - 子.padding_top - 子.padding_bottom
+                         - 子.border_top - 子.border_bottom
+                如果 (子.高度 < 0) { 子.高度 = 0 }
+            }
+
+            // auto margin居中(绝对定位)
+            如果 (子style.margin_left == -1 && 子style.margin_right == -1 &&
+                子style.left != -1 && 子style.right != -1) {
+                定义 l = CSS值_解析为像素(子style.left, 包含块宽)
+                定义 r = CSS值_解析为像素(子style.right, 包含块宽)
+                定义 子外宽 = 子.宽度 + 子.padding_left + 子.padding_right
+                            + 子.border_left + 子.border_right
+                定义 剩余 = 包含块宽 - l - r - 子外宽
+                如果 (剩余 > 0) {
+                    子.margin_left = 剩余 / 2
+                    子.margin_right = 剩余 - 子.margin_left
+                    x = l + 子.margin_left
+                }
+            }
+
+            子.x = x + layout.padding_left + layout.border_left
+            子.y = y + layout.padding_top + layout.border_top
+        }
+
+        // fixed: 相对viewport定位
+        如果 (子style.position == 定位_固定) {
+            // 参照块是viewport(而非offset parent)
+            定义 vp_宽 = Config_视口宽() * 100    // 像素×100
+            定义 vp_高 = Config_视口高() * 100
+            布局Box_计算盒模型(子, vp_宽, vp_高)
+            定义 可变 x = 0; 定义 可变 y = 0
+            // left/right/top/bottom相对viewport
+            如果 (子style.left != -1) {
+                x = CSS值_解析为像素(子style.left, vp_宽)
+            } 否则 如果 (子style.right != -1) {
+                x = vp_宽 - CSS值_解析为像素(子style.right, vp_宽) - 子.宽度
+            }
+            如果 (子style.top != -1) {
+                y = CSS值_解析为像素(子style.top, vp_高)
+            } 否则 如果 (子style.bottom != -1) {
+                y = vp_高 - CSS值_解析为像素(子style.bottom, vp_高) - 子.高度
+            }
+            子.x = x; 子.y = y
+        }
+
+        子 = 子.后一兄弟布局
+    }
+}

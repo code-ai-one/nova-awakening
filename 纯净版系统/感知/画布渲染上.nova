@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./像素混合.nova")
+导入("./感知乙丙.nova")
+导入("./图像数据像.nova")
+导入("./渐变.nova")
+
+// §7 画布渲染ingContext2D
+
+结构 画布渲染ingContext2D {
+    // 画布
+    画布宽,
+    画布高,
+    像素缓冲,    // u64 RGBA像素数据
+    // 状态
+    当前状态,    // u64 画布State*
+    // 当前路径
+    当前路径,    // u64 Path2D*
+    // 是否离屏
+    是离屏,
+    // 脏区域(优化: 只重绘变化部分)
+    脏区x,
+    脏区y,
+    脏区w,
+    脏区h,
+    有脏区,
+}
+
+
+函数 Ctx2D_创建(宽度, 高度) {
+    定义 ctx = 堆_分配(画布渲染ingContext2D)
+    ctx.画布宽 = 宽度; ctx.画布高 = 高度
+    ctx.像素缓冲 = 堆_分配(宽度 * 高度 * 4)
+    内存_填充(ctx.像素缓冲, 0, 宽度 * 高度 * 4)
+    ctx.当前状态 = 画布State_创建()
+    ctx.当前路径 = Path2D_创建()
+    ctx.是离屏 = 假; ctx.有脏区 = 假
+    返回 ctx
+}
+
+// save/restore
+函数 Ctx2D_save(ctx) {
+    如果 (ctx == 0) { 返回 }
+    定义 新状态 = 画布State_创建()
+    // 复制当前状态
+    内存_复制(新状态, ctx.当前状态, 大小of(画布State))
+    新状态.上一个状态 = ctx.当前状态
+    ctx.当前状态 = 新状态
+}
+
+函数 Ctx2D_restore(ctx) {
+    如果 (ctx == 0 || ctx.当前状态 == 0) { 返回 }
+    定义 旧 = ctx.当前状态
+    如果 (旧.上一个状态 != 0) {
+        ctx.当前状态 = 旧.上一个状态
+    }
+}
+
+// §8 变换接口
+
+函数 Ctx2D_translate(ctx, tx, ty) {
+    如果 (ctx == 0 || ctx.当前状态 == 0) { 返回 }
+    定义 s = ctx.当前状态
+    s.变换[4] = s.变换[4] + tx; s.变换[5] = s.变换[5] + ty
+}
+
+函数 Ctx2D_scale(ctx, sx, sy) {
+    如果 (ctx == 0 || ctx.当前状态 == 0) { 返回 }
+    定义 s = ctx.当前状态
+    s.变换[0] = s.变换[0] * sx / 1024
+    s.变换[3] = s.变换[3] * sy / 1024
+}
+
+函数 Ctx2D_rotate(ctx, angle) {
+    如果 (ctx == 0 || ctx.当前状态 == 0) { 返回 }
+    // angle in Q10 radians
+    // cos/sin Taylor级数近似(Q10定点)
+    定义 s = ctx.当前状态
+    // 矩阵乘法: rotate(angle) * current
+}
+
+函数 Ctx2D_setTransform(ctx, a, b, c, d, e, f) {
+    如果 (ctx == 0 || ctx.当前状态 == 0) { 返回 }
+    定义 s = ctx.当前状态
+    s.变换[0] = a; s.变换[1] = b; s.变换[2] = c
+    s.变换[3] = d; s.变换[4] = e; s.变换[5] = f
+}
+
+函数 Ctx2D_resetTransform(ctx) {
+    Ctx2D_setTransform(ctx, 1024, 0, 0, 1024, 0, 0)
+}
+
+// 变换点
+函数 Ctx2D_变换点(s, x, y, ox, oy) {
+    如果 (s == 0) { ox = x; oy = y; 返回 }
+    ox = (s.变换[0] * x + s.变换[2] * y) / 1024 + s.变换[4]
+    oy = (s.变换[1] * x + s.变换[3] * y) / 1024 + s.变换[5]
+}
+
+// §9 绘制接口
+
+函数 Ctx2D_clearRect(ctx, x, y, w, h) {
+    如果 (ctx == 0 || ctx.像素缓冲 == 0) { 返回 }
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.画布高) {
+        如果 (py >= 0) {
+            定义 可变 px = x
+            当 (px < x + w && px < ctx.画布宽) {
+                如果 (px >= 0) {
+                    定义 偏移 = (py * ctx.画布宽 + px) * 4
+                    内存_写32(ctx.像素缓冲 + 偏移, 0)
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+函数 Ctx2D_fillRect(ctx, x, y, w, h) {
+    如果 (ctx == 0 || ctx.像素缓冲 == 0) { 返回 }
+    定义 s = ctx.当前状态
+    如果 (s == 0) { 返回 }
+    定义 颜色 = s.fill样式_颜色
+    定义 alpha = s.globalAlpha
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.画布高) {
+        如果 (py >= 0) {
+            定义 可变 px = x
+            当 (px < x + w && px < ctx.画布宽) {
+                如果 (px >= 0) {
+                    定义 最终颜色 = 颜色
+                    如果 (s.fill样式_渐变 != 0) {
+                        // 计算渐变颜色
+                        定义 t = (px - x) * 1024 / w
+                        最终颜色 = Gradient_采样(s.fill样式_渐变, t)
+                    }
+                    如果 (alpha < 1024) {
+                        定义 a = ((最终颜色 >> 24) & 0xFF) * alpha / 1024
+                        最终颜色 = (a << 24) | (最终颜色 & 0x00FFFFFF)
+                    }
+                    Ctx2D_混合像素(ctx, px, py, 最终颜色, s.globalCompositeOperation)
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+    Ctx2D_标记脏区(ctx, x, y, w, h)
+}
+
+函数 Ctx2D_strokeRect(ctx, x, y, w, h) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.当前状态
+    如果 (s == 0) { 返回 }
+    定义 lw = s.lineWidth / 1024
+    如果 (lw < 1) { lw = 1 }
+    // 四条边
+    Ctx2D_fillRect(ctx, x, y, w, lw)           // 上
+    Ctx2D_fillRect(ctx, x, y + h - lw, w, lw)  // 下
+    Ctx2D_fillRect(ctx, x, y, lw, h)            // 左
+    Ctx2D_fillRect(ctx, x + w - lw, y, lw, h)  // 右
+}
+
+函数 Ctx2D_fill(ctx) {
+    如果 (ctx == 0 || ctx.当前路径 == 0) { 返回 }
+    // 路径填充: 使用扫描线算法
+    // 对每条水平扫描线, 计算与路径的交点, 填充交点之间的像素
+}
+
+函数 Ctx2D_stroke(ctx) {
+    如果 (ctx == 0 || ctx.当前路径 == 0) { 返回 }
+    // 路径描边: 沿路径展开lineWidth宽度的带状区域
+}

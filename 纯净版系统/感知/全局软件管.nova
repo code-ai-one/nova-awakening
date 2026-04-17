@@ -1,0 +1,205 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./软件更新.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+导入("./服务工作线.nova")
+
+// §3 全局SW管理器
+
+定义 可变 全局SW容器 = 0
+
+函数 SW_获取容器() {
+    如果 (全局SW容器 == 0) {
+        全局SW容器 = 堆_分配(Service工线Container)
+        全局SW容器.注册容量 = 32
+        全局SW容器.注册表 = 堆_分配_数组(32 * 8)
+        全局SW容器.注册数 = 0
+        全局SW容器.controller = 0
+        全局SW容器.ready = 假
+    }
+    返回 全局SW容器
+}
+
+// §4 注册 — navigator.service工线.register(url, options)
+
+定义 可变 SW_下一个ID = 1
+
+函数 SW_register(脚本URL, 作用域) {
+    定义 容器 = SW_获取容器()
+    如果 (容器 == 0) { 返回 0 }
+
+    // 检查是否已注册相同作用域
+    定义 可变 i = 0
+    当 (i < 容器.注册数) {
+        定义 reg = 内存_读64(容器.注册表 + i * 8)
+        如果 (reg != 0 && 字符串_相等(reg.作用域, 作用域)) {
+            // 已有注册: 触发更新流程
+            SW_更新(reg, 脚本URL)
+            返回 reg
+        }
+        i = i + 1
+    }
+
+    // 新注册
+    定义 reg = 堆_分配(Service工线Registration)
+    reg.ID = SW_下一个ID; SW_下一个ID = SW_下一个ID + 1
+    reg.作用域 = 字符串_复制(作用域)
+    reg.installing = 0; reg.waiting = 0; reg.active = 0
+    reg.更新中 = 假; reg.最后更新检查 = 平台_获取高精度时间()
+
+    // 创建SW
+    定义 sw = SW_创建(脚本URL, 作用域)
+    如果 (sw == 0) { 返回 0 }
+
+    reg.installing = sw
+    如果 (容器.注册数 < 容器.注册容量) {
+        内存_写64(容器.注册表 + 容器.注册数 * 8, reg)
+        容器.注册数 = 容器.注册数 + 1
+    }
+
+    // 启动安装
+    SW_开始安装(reg)
+    返回 reg
+}
+
+函数 SW_创建(脚本URL, 作用域) {
+    定义 sw = 堆_分配(Service工线)
+    sw.脚本URL = 字符串_复制(脚本URL)
+    sw.作用域 = 字符串_复制(作用域)
+    sw.状态 = SW_STATE_PARSED
+    sw.ID = SW_下一个ID; SW_下一个ID = SW_下一个ID + 1
+    sw.脚本 = 0; sw.脚本长度 = 0
+    sw.install处理器 = 0; sw.activate处理器 = 0
+    sw.fetch处理器 = 0; sw.push处理器 = 0
+    sw.sync处理器 = 0; sw.message处理器 = 0
+    sw.客户端 = 0; sw.客户端数 = 0
+    sw.版本哈希 = 0; sw.跳过等待 = 假
+    返回 sw
+}
+
+// §5 安装/激活生命周期
+
+函数 SW_开始安装(reg) {
+    如果 (reg == 0 || reg.installing == 0) { 返回 }
+    定义 sw = reg.installing
+    sw.状态 = SW_STATE_INSTALLING
+
+    // 1. 获取脚本
+    // 网络下载SW脚本
+
+    // 2. 执行脚本(注册事件监听器)
+    // 在工线线程中执行脚本
+    // 脚本中的self.add事件Listener('install', ...)等会设置处理器
+
+    // 3. 触发install事件
+    定义 成功 = SW_触发install(sw)
+    如果 (成功) {
+        sw.状态 = SW_STATE_INSTALLED
+        // 从installing移到waiting
+        reg.waiting = sw
+        reg.installing = 0
+
+        // 如果skipWaiting或无active worker
+        如果 (sw.跳过等待 || reg.active == 0) {
+            SW_开始激活(reg)
+        }
+    } 否则 {
+        sw.状态 = SW_STATE_REDUNDANT
+        reg.installing = 0
+    }
+}
+
+函数 SW_开始激活(reg) {
+    如果 (reg == 0 || reg.waiting == 0) { 返回 }
+    定义 sw = reg.waiting
+    sw.状态 = SW_STATE_ACTIVATING
+
+    // 旧active变redundant
+    如果 (reg.active != 0) {
+        reg.active.状态 = SW_STATE_REDUNDANT
+    }
+
+    reg.active = sw
+    reg.waiting = 0
+
+    // 触发activate事件
+    定义 成功 = SW_触发activate(sw)
+    如果 (成功) {
+        sw.状态 = SW_STATE_ACTIVATED
+        // 设为controller
+        定义 容器 = SW_获取容器()
+        如果 (容器 != 0) {
+            容器.controller = sw
+            容器.ready = 真
+        }
+    } 否则 {
+        sw.状态 = SW_STATE_REDUNDANT
+        reg.active = 0
+    }
+}
+
+函数 SW_触发install(sw) {
+    如果 (sw == 0 || sw.install处理器 == 0) { 返回 真 }
+    // 创建Install事件, 调用处理器
+    // 事件.waitUntil(promise) 等待承诺完成
+    返回 真
+}
+
+函数 SW_触发activate(sw) {
+    如果 (sw == 0 || sw.activate处理器 == 0) { 返回 真 }
+    // 创建Activate事件
+    // 事件.waitUntil()中通常做缓存清理
+    返回 真
+}
+
+函数 全局软件管_容器摘要() {
+    返回 服务工作线_容器摘要(全局SW容器)
+}
+
+函数 全局软件管_统计() {
+    定义 摘要 = 全局软件管_容器摘要()
+    返回 {
+        模块: "全局软件管",
+        全局SW容器: 全局SW容器,
+        SW_下一个ID: SW_下一个ID,
+        注册数: 摘要.注册数,
+        installing数: 摘要.installing数,
+        waiting数: 摘要.waiting数,
+        active数: 摘要.active数,
+        controller状态: 摘要.controller状态,
+        ready: 摘要.ready,
+        服务工作线统计: 服务工作线_统计()
+    }
+}
+
+函数 全局软件管_健康评估() {
+    定义 可变 问题 = []
+    如果 (!服务工作线_健康评估()) { 追加(问题, "服务工作线基础契约异常") }
+    如果 (!服务工作线_容器健康评估(全局SW容器)) { 追加(问题, "全局SW容器状态异常") }
+
+    返回 计数(问题) == 0
+}
+
+函数 全局软件管_综合报告() {
+    定义 摘要 = 全局软件管_容器摘要()
+    打印("[全局软件管] ═══ 综合报告 ═══")
+    打印("  全局SW容器: " + 整数转字符串(全局SW容器))
+    打印("  SW_下一个ID: " + 整数转字符串(SW_下一个ID))
+    打印("  注册数: " + 整数转字符串(摘要.注册数))
+    打印("  installing数: " + 整数转字符串(摘要.installing数))
+    打印("  waiting数: " + 整数转字符串(摘要.waiting数))
+    打印("  active数: " + 整数转字符串(摘要.active数))
+    打印("  controller状态: " + 摘要.controller状态)
+    打印("  ready: " + 如果 (摘要.ready) { "真" } 否则 { "假" })
+    打印("  健康: " + 如果 (全局软件管_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 全局软件管_全局重置() {
+    全局SW容器 = 0
+    SW_下一个ID = 1
+    服务工作线_全局重置()
+    打印("[全局软件管] 全局统计已重置")
+    返回 0
+}

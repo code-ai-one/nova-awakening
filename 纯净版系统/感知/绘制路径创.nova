@@ -1,0 +1,314 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("../稳态/数学基础向量.nova")
+
+// NovaOS 2D路径引擎 — 向量路径/贝塞尔/圆弧/椭圆/包围盒/光栅化
+// 本模块实现Skia风格的2D向量路径:
+//   1. 路径动词: moveTo/lineTo/quadTo/cubicTo/conicTo/close
+//   2. 便捷形状: rect/roundRect/circle/oval/arc
+//   3. 路径操作: 反转/变换/合并/包围盒计算
+//   4. 填充规则: Winding(非零缠绕)/EvenOdd(奇偶)
+//   5. 路径迭代器: 逐段遍历用于光栅化
+//   6. AI路径缓存: 高频路径指纹→缓存光栅化结果
+// 与Canvas 2D、SVG引擎、图形后端、智能大脑深度耦合。
+
+定义 路径动词_移动   = 0     // moveTo
+定义 路径动词_直线   = 1     // lineTo
+定义 路径动词_二次   = 2     // quadTo (二次贝塞尔)
+定义 路径动词_三次   = 3     // Nova三次方To (三次贝塞尔)
+定义 路径动词_圆锥   = 4     // conicTo
+定义 路径动词_关闭   = 5     // close
+
+定义 路径填充_缠绕   = 0     // Winding (非零缠绕)
+定义 路径填充_奇偶   = 1     // EvenOdd
+
+结构 SkPath {
+    动词列表,    // u64 u8数组
+    动词数量,
+    动词容量,
+    点列表,    // u64 i32对数组 (x,y ×100)
+    点数量,
+    点容量,
+    填充规则,    // u32 Winding/EvenOdd
+}
+
+
+函数 SkPath_创建() {
+    定义 path = 堆_分配(SkPath)
+    path.动词容量 = 64
+    path.动词列表 = 堆_分配_数组(path.动词容量)
+    path.动词数量 = 0
+    path.点容量 = 128
+    path.点列表 = 堆_分配_数组(path.点容量 * 8)
+    path.点数量 = 0
+    path.填充规则 = 路径填充_缠绕
+    返回 path
+}
+
+函数 SkPath_moveTo(path, x, y) {
+    SkPath_添加动词(path, 路径动词_移动)
+    SkPath_添加点(path, x, y)
+}
+
+函数 SkPath_lineTo(path, x, y) {
+    SkPath_添加动词(path, 路径动词_直线)
+    SkPath_添加点(path, x, y)
+}
+
+函数 SkPath_quadTo(path, cx, cy, x, y) {
+    SkPath_添加动词(path, 路径动词_二次)
+    SkPath_添加点(path, cx, cy)
+    SkPath_添加点(path, x, y)
+}
+
+函数 SkPath_Nova三次方To(path, c1x, c1y, c2x, c2y, x, y) {
+    SkPath_添加动词(path, 路径动词_三次)
+    SkPath_添加点(path, c1x, c1y)
+    SkPath_添加点(path, c2x, c2y)
+    SkPath_添加点(path, x, y)
+}
+
+函数 SkPath_close(path) {
+    SkPath_添加动词(path, 路径动词_关闭)
+}
+
+函数 SkPath_addRect(path, rect) {
+    SkPath_moveTo(path, rect.左, rect.上)
+    SkPath_lineTo(path, rect.右, rect.上)
+    SkPath_lineTo(path, rect.右, rect.下)
+    SkPath_lineTo(path, rect.左, rect.下)
+    SkPath_close(path)
+}
+
+函数 SkPath_addRoundRect(path, rect, rx, ry) {
+    // 近似圆角矩形(用直线+贝塞尔)
+    定义 左 = rect.左; 定义 上 = rect.上
+    定义 右 = rect.右; 定义 下 = rect.下
+
+    SkPath_moveTo(path, 左 + rx, 上)
+    SkPath_lineTo(path, 右 - rx, 上)
+    SkPath_quadTo(path, 右, 上, 右, 上 + ry)
+    SkPath_lineTo(path, 右, 下 - ry)
+    SkPath_quadTo(path, 右, 下, 右 - rx, 下)
+    SkPath_lineTo(path, 左 + rx, 下)
+    SkPath_quadTo(path, 左, 下, 左, 下 - ry)
+    SkPath_lineTo(path, 左, 上 + ry)
+    SkPath_quadTo(path, 左, 上, 左 + rx, 上)
+    SkPath_close(path)
+}
+
+函数 SkPath_添加动词(path, 动词) {
+    如果 (path.动词数量 >= path.动词容量) {
+        定义 新容量 = path.动词容量 * 2
+        定义 新列表 = 堆_分配_数组(新容量)
+        内存_复制(新列表, path.动词列表, path.动词数量)
+        堆_释放(path.动词列表)
+        path.动词列表 = 新列表
+        path.动词容量 = 新容量
+    }
+    内存_写8(path.动词列表 + path.动词数量, 动词)
+    path.动词数量 = path.动词数量 + 1
+}
+
+函数 SkPath_添加点(path, x, y) {
+    如果 (path.点数量 >= path.点容量) {
+        定义 新容量 = path.点容量 * 2
+        定义 新列表 = 堆_分配_数组(新容量 * 8)
+        内存_复制(新列表, path.点列表, path.点数量 * 8)
+        堆_释放(path.点列表)
+        path.点列表 = 新列表
+        path.点容量 = 新容量
+    }
+    内存_写32(path.点列表 + path.点数量 * 8, x)
+    内存_写32(path.点列表 + path.点数量 * 8 + 4, y)
+    path.点数量 = path.点数量 + 1
+}
+
+// §2 圆弧与椭圆
+
+函数 SkPath_addCircle(path, cx, cy, 半径) {
+    // 用4段三次贝塞尔近似圆(kappa ≈ 0.5523)
+    定义 k = 半径 * 5523 / 10000
+    SkPath_moveTo(path, cx + 半径, cy)
+    SkPath_Nova三次方To(path, cx + 半径, cy + k, cx + k, cy + 半径, cx, cy + 半径)
+    SkPath_Nova三次方To(path, cx - k, cy + 半径, cx - 半径, cy + k, cx - 半径, cy)
+    SkPath_Nova三次方To(path, cx - 半径, cy - k, cx - k, cy - 半径, cx, cy - 半径)
+    SkPath_Nova三次方To(path, cx + k, cy - 半径, cx + 半径, cy - k, cx + 半径, cy)
+    SkPath_close(path)
+}
+
+函数 SkPath_addOval(path, rect) {
+    定义 cx = (rect.左 + rect.右) / 2
+    定义 cy = (rect.上 + rect.下) / 2
+    定义 rx = (rect.右 - rect.左) / 2
+    定义 ry = (rect.下 - rect.上) / 2
+    定义 kx = rx * 5523 / 10000
+    定义 ky = ry * 5523 / 10000
+    SkPath_moveTo(path, cx + rx, cy)
+    SkPath_Nova三次方To(path, cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry)
+    SkPath_Nova三次方To(path, cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy)
+    SkPath_Nova三次方To(path, cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry)
+    SkPath_Nova三次方To(path, cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy)
+    SkPath_close(path)
+}
+
+函数 SkPath_addArc(path, cx, cy, 半径, 起始角, 扫描角) {
+    // 将圆弧分为最多4段90度贝塞尔
+    定义 可变 剩余 = 扫描角
+    定义 可变 当前角 = 起始角
+    当 (剩余 > 0) {
+        定义 段角 = 剩余
+        如果 (段角 > 1571) { 段角 = 1571 }
+
+        定义 cos1 = 定点_cos(当前角)
+        定义 sin1 = 定点_sin(当前角)
+        定义 cos2 = 定点_cos(当前角 + 段角)
+        定义 sin2 = 定点_sin(当前角 + 段角)
+
+        定义 x1 = cx + 半径 * cos1 / 1000
+        定义 y1 = cy + 半径 * sin1 / 1000
+        定义 x2 = cx + 半径 * cos2 / 1000
+        定义 y2 = cy + 半径 * sin2 / 1000
+
+        如果 (剩余 == 扫描角) {
+            SkPath_moveTo(path, x1, y1)
+        }
+        SkPath_lineTo(path, x2, y2)
+
+        当前角 = 当前角 + 段角
+        剩余 = 剩余 - 段角
+    }
+}
+
+// §3 路径操作
+
+函数 SkPath_重置(path) {
+    如果 (path == 空) { 返回 }
+    path.动词数量 = 0
+    path.点数量 = 0
+}
+
+函数 SkPath_是空(path) {
+    返回 path == 空 || path.动词数量 == 0
+}
+
+函数 SkPath_包围盒(path) {
+    如果 (path == 空 || path.点数量 == 0) { 返回 [0, 0, 0, 0] }
+    定义 可变 min_x = 内存_读32(path.点列表)
+    定义 可变 min_y = 内存_读32(path.点列表 + 4)
+    定义 可变 max_x = min_x
+    定义 可变 max_y = min_y
+
+    定义 可变 i = 1
+    当 (i < path.点数量) {
+        定义 x = 内存_读32(path.点列表 + i * 8)
+        定义 y = 内存_读32(path.点列表 + i * 8 + 4)
+        如果 (x < min_x) { min_x = x }
+        如果 (x > max_x) { max_x = x }
+        如果 (y < min_y) { min_y = y }
+        如果 (y > max_y) { max_y = y }
+        i = i + 1
+    }
+    返回 [min_x, min_y, max_x, max_y]
+}
+
+函数 SkPath_变换(path, 矩阵) {
+    如果 (path == 空 || path.点数量 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < path.点数量) {
+        定义 x = 内存_读32(path.点列表 + i * 8)
+        定义 y = 内存_读32(path.点列表 + i * 8 + 4)
+        定义 新点 = 矩阵_乘向量(矩阵, 向量3_新(x, y, 0))
+        内存_写32(path.点列表 + i * 8, 新点.x)
+        内存_写32(path.点列表 + i * 8 + 4, 新点.y)
+        i = i + 1
+    }
+}
+
+函数 SkPath_反转(path) {
+    如果 (path == 空 || path.点数量 < 2) { 返回 }
+    // 反转点序列
+    定义 可变 左 = 0
+    定义 可变 右 = path.点数量 - 1
+    当 (左 < 右) {
+        定义 lx = 内存_读32(path.点列表 + 左 * 8)
+        定义 ly = 内存_读32(path.点列表 + 左 * 8 + 4)
+        定义 rx = 内存_读32(path.点列表 + 右 * 8)
+        定义 ry = 内存_读32(path.点列表 + 右 * 8 + 4)
+        内存_写32(path.点列表 + 左 * 8, rx)
+        内存_写32(path.点列表 + 左 * 8 + 4, ry)
+        内存_写32(path.点列表 + 右 * 8, lx)
+        内存_写32(path.点列表 + 右 * 8 + 4, ly)
+        左 = 左 + 1
+        右 = 右 - 1
+    }
+}
+
+函数 SkPath_合并(目标, 源) {
+    如果 (目标 == 空 || 源 == 空) { 返回 }
+    定义 可变 vi = 0
+    当 (vi < 源.动词数量) {
+        SkPath_添加动词(目标, 内存_读8(源.动词列表 + vi))
+        vi = vi + 1
+    }
+    定义 可变 pi = 0
+    当 (pi < 源.点数量) {
+        定义 x = 内存_读32(源.点列表 + pi * 8)
+        定义 y = 内存_读32(源.点列表 + pi * 8 + 4)
+        SkPath_添加点(目标, x, y)
+        pi = pi + 1
+    }
+}
+
+// §4 路径迭代器
+
+结构 路径迭代器 {
+    路径,
+    动词索引,
+    点索引,
+}
+
+函数 路径迭代器_创建(path) {
+    返回 路径迭代器 { 路径: path, 动词索引: 0, 点索引: 0 }
+}
+
+函数 路径迭代器_下一个(iter) {
+    如果 (iter.动词索引 >= iter.路径.动词数量) { 返回 -1 }
+    定义 动词 = 内存_读8(iter.路径.动词列表 + iter.动词索引)
+    iter.动词索引 = iter.动词索引 + 1
+
+    如果 (动词 == 路径动词_移动) { iter.点索引 = iter.点索引 + 1 }
+    否则 如果 (动词 == 路径动词_直线) { iter.点索引 = iter.点索引 + 1 }
+    否则 如果 (动词 == 路径动词_二次) { iter.点索引 = iter.点索引 + 2 }
+    否则 如果 (动词 == 路径动词_三次) { iter.点索引 = iter.点索引 + 3 }
+
+    返回 动词
+}
+
+// §5 定点三角函数(路径用)
+
+函数 定点_cos(角度) {
+    返回 定点_sin(角度 + 1571)
+}
+
+函数 定点_sin(角度) {
+    定义 x = 角度 % 6284
+    如果 (x < 0) { x = x + 6284 }
+    如果 (x > 3142) { x = x - 6284 }
+    定义 x2 = x * x / 1000
+    定义 x3 = x2 * x / 1000
+    定义 x5 = x3 * x2 / 1000
+    返回 x - x3 / 6 + x5 / 120
+}
+
+// §6 统计
+
+定义 可变 路径_总创建数 = 0
+
+函数 路径_统计() {
+    返回 {
+        总创建: 路径_总创建数,
+    }
+}

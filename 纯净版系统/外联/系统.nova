@@ -1,0 +1,194 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./系统甲.nova")
+导入("../中枢/列表加头加尾.nova")
+导入("../中枢/链表后继.nova")
+导入("../记忆/文件描述符.nova")
+导入("./传控核心.nova")
+导入("../中枢/释放文件表.nova")
+导入("../中枢/每处理器.nova")
+导入("../中枢/同步原语.nova")
+
+// NovaOS Socket层 (BSD Socket 接口)
+// 职责: socket/bind/listen/accept/connect/send/recv系统调用
+
+定义 AF_UNSPEC = 0
+定义 AF_UNIX = 1         // Unix域
+定义 AF_INET = 2         // IPv4
+定义 AF_INET6 = 10       // IPv6
+定义 AF_NETLINK = 16     // Netlink
+
+定义 SOCK_STREAM = 1     // 传控
+定义 SOCK_DGRAM = 2      // 数报
+定义 SOCK_RAW = 3        // 原始
+
+定义 SS_未连接 = 0       // SS_UNCONNECTED
+定义 SS_正在连接 = 1     // SS_CONNECTING
+定义 SS_已连接 = 2       // SS_CONNECTED
+定义 SS_正在断开 = 3     // SS_DISCONNECTING
+定义 SS_监听 = 4
+
+定义 SOL_SOCKET = 1
+定义 SOL_传控 = 6
+定义 SOL_数报 = 17
+
+定义 SO_REUSEADDR = 2
+定义 SO_KEEPALIVE = 9
+定义 SO_RCVBUF = 8
+定义 SO_SNDBUF = 7
+定义 SO_RCVTIMEO = 20
+定义 SO_SNDTIMEO = 21
+定义 SO_LINGER = 13
+定义 SO_ERROR = 4
+
+定义 MSG_PEEK = 0x02       // 不移除数据
+定义 MSG_WAITALL = 0x100   // 等待所有数据
+定义 MSG_DONTWAIT = 0x40   // 非阻塞
+定义 MSG_NOSIGNAL = 0x4000 // 不产生SIGPIPE
+
+定义 SOCK_类型 = 0        // SOCK_STREAM/SOCK_DGRAM
+定义 SOCK_域 = 1          // AF_INET等
+定义 SOCK_协议 = 2        // IPPROTO_传控等
+定义 SOCK_状态 = 3        // SS_*
+定义 SOCK_本地IP = 4
+定义 SOCK_本地端口 = 5
+定义 SOCK_远端IP = 6
+定义 SOCK_远端端口 = 7
+定义 SOCK_发送缓冲 = 8   // 发送缓冲队列
+定义 SOCK_接收缓冲 = 9   // 接收缓冲队列
+定义 SOCK_错误 = 10       // 待处理错误
+定义 SOCK_标志 = 11       // 选项标志
+定义 SOCK_等待队列 = 12   // 等待数据的进程
+定义 SOCK_积压队列 = 13   // accept积压队列
+定义 SOCK_积压最大 = 14   // 积压队列最大长度
+定义 SOCK_操作 = 15       // proto_ops
+定义 SOCK_TCB = 16        // 传控控制块 (传控专用)
+定义 SOCK_引用计数 = 17
+定义 SOCK_发送缓冲大小 = 18
+定义 SOCK_接收缓冲大小 = 19
+定义 SOCK_字段数 = 20
+
+定义 默认发送缓冲 = 212992    // 208KB
+定义 默认接收缓冲 = 212992
+
+定义 可变 Socket_创建数 = 0
+定义 可变 Socket_关闭数 = 0
+定义 可变 Socket_发送字节 = 0
+定义 可变 Socket_接收字节 = 0
+
+// socket(): 创建Socket
+
+函数 系统_socket(域, 类型, 协议) {
+    如果 (域 != AF_INET && 域 != AF_UNIX) { 返回 错误_不支持 }
+    如果 (类型 != SOCK_STREAM && 类型 != SOCK_DGRAM && 类型 != SOCK_RAW) {
+        返回 错误_不支持
+    }
+
+    // 创建Socket结构
+    定义 可变 sock = []
+    定义 可变 i = 0
+    当 (i < SOCK_字段数) { 追加(sock, 0)  i = i + 1 }
+
+    设置(sock, SOCK_类型, 类型)
+    设置(sock, SOCK_域, 域)
+    设置(sock, SOCK_协议, 协议)
+    设置(sock, SOCK_状态, SS_未连接)
+    设置(sock, SOCK_发送缓冲, 链表_创建())
+    设置(sock, SOCK_接收缓冲, 链表_创建())
+    设置(sock, SOCK_等待队列, 等待队列_创建())
+    设置(sock, SOCK_积压队列, 链表_创建())
+    设置(sock, SOCK_引用计数, 1)
+    设置(sock, SOCK_发送缓冲大小, 默认发送缓冲)
+    设置(sock, SOCK_接收缓冲大小, 默认接收缓冲)
+
+    // 根据域和类型设置操作表
+    如果 (域 == AF_INET) {
+        如果 (类型 == SOCK_STREAM) {
+            设置(sock, SOCK_操作, 传控_协议操作)
+            // 创建传控控制块
+            设置(sock, SOCK_TCB, 传控_创建TCB(0, 0, 0))
+        } 否则 如果 (类型 == SOCK_DGRAM) {
+            设置(sock, SOCK_操作, 数报_协议操作)
+        }
+    }
+
+    // 分配fd并关联
+    定义 当前 = 获取当前进程()
+    定义 fd = 文件表_分配(当前[T_文件表])
+    如果 (fd < 0) { 返回 fd }
+
+    // 创建文件对象, 关联socket
+    定义 文件 = Socket_创建文件(sock)
+    文件表_设置(当前[T_文件表], fd, 文件)
+
+    Socket_创建数 = Socket_创建数 + 1
+    返回 fd
+}
+
+// bind(): 绑定地址
+
+函数 系统_bind(fd, IP地址, 端口) {
+    定义 sock = fd_到Socket(fd)
+    如果 (sock == 空) { 返回 错误_坏文件描述符 }
+
+    // 检查端口是否已被使用
+    如果 (端口_已被绑定(端口)) { 返回 错误_地址已用 }
+
+    设置(sock, SOCK_本地IP, IP地址)
+    设置(sock, SOCK_本地端口, 端口)
+
+    // 传控: 更新TCB
+    如果 (sock[SOCK_TCB] != 空) {
+        设置(sock[SOCK_TCB], TCB_源端口, 端口)
+    }
+
+    返回 成功
+}
+
+// listen(): 开始监听
+
+函数 系统_listen(fd, 积压) {
+    定义 sock = fd_到Socket(fd)
+    如果 (sock == 空) { 返回 错误_坏文件描述符 }
+    如果 (sock[SOCK_类型] != SOCK_STREAM) { 返回 错误_不支持 }
+
+    如果 (积压 > 128) { 积压 = 128 }
+    设置(sock, SOCK_积压最大, 积压)
+    设置(sock, SOCK_状态, SS_监听)
+
+    // 传控: 设置状态为LISTEN
+    如果 (sock[SOCK_TCB] != 空) {
+        设置(sock[SOCK_TCB], TCB_状态, 传控_状态_监听)
+    }
+
+    返回 成功
+}
+
+// accept(): 接受连接
+
+函数 系统_accept(fd) {
+    定义 sock = fd_到Socket(fd)
+    如果 (sock == 空) { 返回 错误_坏文件描述符 }
+    如果 (sock[SOCK_状态] != SS_监听) { 返回 错误_无效参数 }
+
+    // 等待积压队列中有连接
+    当 (链表_为空(sock[SOCK_积压队列])) {
+        // 阻塞等待新连接
+        深睡当前进程("accept")
+    }
+
+    // 从积压队列取出一个已完成连接
+    定义 首节点 = 链表_首节点(sock[SOCK_积压队列])
+    定义 新sock = 链表_数据(首节点)
+    链表_删除(首节点)
+
+    // 为新socket分配fd
+    定义 当前 = 获取当前进程()
+    定义 新fd = 文件表_分配(当前[T_文件表])
+    如果 (新fd < 0) { 返回 新fd }
+
+    定义 文件 = Socket_创建文件(新sock)
+    文件表_设置(当前[T_文件表], 新fd, 文件)
+
+    返回 新fd
+}

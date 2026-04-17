@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+
+// §3 位置编码(Positional Encoding)
+// PE(pos, 2i)   = sin(pos / 10000^(2i/d))
+// PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+// 用定点近似sin/cos
+
+// 定点sin近似: 泰勒级数 sin(x) ≈ x - x³/6 + x⁵/120
+
+函数 Q_sin(x) {
+    // 归一化到[-π, π]
+    定义 PI = 3217    // π × 1024 ≈ 3217
+    当 (x > PI) { x = x - 2 * PI }
+    当 (x < -PI) { x = x + 2 * PI }
+    定义 x2 = Q乘(x, x)
+    定义 x3 = Q乘(x2, x)
+    定义 x5 = Q乘(x3, x2)
+    返回 x - Q除(x3, 6 * Q_ONE) + Q除(x5, 120 * Q_ONE)
+}
+
+// 定点cos: cos(x) = sin(x + π/2)
+函数 Q_cos(x) {
+    返回 Q_sin(x + 1608)    // π/2 × 1024 ≈ 1608
+}
+
+// 生成位置编码矩阵 [max_len × d_model]
+函数 位置编码_生成(最大长度, 模型维度) {
+    定义 PE = Tensor_创建(最大长度, 模型维度)
+
+    定义 可变 pos = 0
+    当 (pos < 最大长度) {
+        定义 可变 i = 0
+        当 (i < 模型维度 / 2) {
+            // 频率: 1 / 10000^(2i/d) 的定点近似
+            // RoPE频率: freq = 1024 / (1 + pos_scale * i)
+            定义 频率衰减 = Q_ONE + Q乘(i * Q_ONE, Q除(Q_ONE, (模型维度 / 2) * Q_ONE)) * 10
+            如果 (频率衰减 == 0) { 频率衰减 = 1 }
+            定义 角度 = Q除(pos * Q_ONE, 频率衰减)
+
+            Tensor_写(PE, pos, 2 * i, Q_sin(角度))
+            Tensor_写(PE, pos, 2 * i + 1, Q_cos(角度))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+    返回 PE
+}
+
+// §4 Layer Normalization — 层归一化
+// LN(x) = (x - μ) / σ * γ + β
+
+结构 LayerNorm {
+    维度,
+    gamma,    // u64 Tensor* [1 × 维度] 缩放参数
+    beta,    // u64 Tensor* [1 × 维度] 偏移参数
+}
+
+函数 LayerNorm_创建(维度) {
+    定义 ln = 堆_分配(LayerNorm)
+    ln.维度 = 维度
+    ln.gamma = Tensor_创建(1, 维度)
+    ln.beta = Tensor_创建(1, 维度)
+    // gamma初始化为1, beta初始化为0
+    定义 可变 i = 0
+    当 (i < 维度) {
+        Tensor_写(ln.gamma, 0, i, Q_ONE)
+        Tensor_写(ln.beta, 0, i, 0)
+        i = i + 1
+    }
+    返回 ln
+}
+
+函数 LayerNorm_销毁(ln) {
+    如果 (ln == 0) { 返回 }
+    如果 (ln.gamma != 0) { Tensor_释放(ln.gamma) }
+    如果 (ln.beta != 0) { Tensor_释放(ln.beta) }
+    堆_释放(ln)
+}
+
+// NTK-aware RoPE — 支持超长序列外推 (实验室反哺)
+// 理论: 当序列超出训练长度时，传统RoPE位置角度超出训练范围
+// NTK方案: 缩放基频 base_new = base × (len/train_len)^(d/(d-2))
+// 效果: LLaMA 2048→8192+, Mistral 4096→32768+
+
+定义 RoPE_默认基频 = 10000  // 标准RoPE基频
+定义 RoPE_训练最大长度 = 4096
+
+// NTK-aware基频缩放 (整数近似, ×1000)
+// 当max_position > train_max_len时生效
+函数 RoPE_NTK基频(当前位置, 头维度) {
+    如果 (当前位置 <= RoPE_训练最大长度) {
+        返回 RoPE_默认基频  // 在训练长度内，不缩放
+    }
+    // 缩放因子 = (当前位置/训练长度)^(d/(d-2))
+    // 整数近似: 当d=64时 d/(d-2)≈1.032, 当d=128时≈1.016
+    // 简化: 线性近似 base_new = base × (len/train_len)
+    定义 缩放 = 当前位置 * 1000 / RoPE_训练最大长度
+    返回 RoPE_默认基频 * 缩放 / 1000
+}
+
+// RoPE旋转角度计算 (NTK-aware版)
+// 返回: 位置pos在维度i的旋转角度 × 1024 (Q10格式)
+函数 RoPE_角度(位置, 维度索引, 头维度, 启用NTK) {
+    定义 基频 = 如果 (启用NTK) { RoPE_NTK基频(位置, 头维度) } 否则 { RoPE_默认基频 }
+    // θ_i = 1 / base^(2i/d) = base^(-2i/d)
+    // 整数近似: 频率衰减 = 基频 + 2i/d * 基频 * 衰减系数
+    定义 频率衰减 = 基频 + (2 * 维度索引 * 基频) / 头维度
+    如果 (频率衰减 == 0) { 频率衰减 = 1 }
+    返回 Q除(位置 * Q_ONE, 频率衰减)
+}
+
+// 应用NTK-aware RoPE旋转到向量x
+// x: [头数, 头维度] 每个位置的Q或K向量
+函数 RoPE_应用NTK(x, 位置, 头数, 头维度) {
+    定义 结果 = Tensor_创建(头数, 头维度)
+    定义 启用NTK = 位置 > RoPE_训练最大长度
+
+    定义 可变 h = 0
+    当 (h < 头数) {
+        定义 可变 i = 0
+        当 (i < 头维度 / 2) {
+            定义 角度 = RoPE_角度(位置, i, 头维度, 启用NTK)
+            定义 cos_val = Q_cos(角度)
+            定义 sin_val = Q_sin(角度)
+            定义 x1 = Tensor_读(x, h, 2 * i)
+            定义 x2 = Tensor_读(x, h, 2 * i + 1)
+            Tensor_写(结果, h, 2 * i,     Q乘(x1, cos_val) - Q乘(x2, sin_val))
+            Tensor_写(结果, h, 2 * i + 1, Q乘(x1, sin_val) + Q乘(x2, cos_val))
+            i = i + 1
+        }
+        h = h + 1
+    }
+    返回 结果
+}
+
+函数 LayerNorm_前向(ln, x) {
+    定义 结果 = Tensor_创建(x.行数, x.列数)
+
+    定义 可变 行 = 0
+    当 (行 < x.行数) {
+        // 1. 计算均值 μ
+        定义 可变 总和 = 0
+        定义 可变 j = 0
+        当 (j < x.列数) {
+            总和 = 总和 + Tensor_读(x, 行, j)
+            j = j + 1
+        }
+        定义 均值 = Q除(总和, x.列数 * Q_ONE)
+
+        // 2. 计算方差 σ²
+        定义 可变 方差和 = 0
+        j = 0
+        当 (j < x.列数) {
+            定义 差 = Tensor_读(x, 行, j) - 均值
+            方差和 = 方差和 + Q乘(差, 差)
+            j = j + 1
+        }
+        定义 方差 = Q除(方差和, x.列数 * Q_ONE)
+        定义 标准差 = Q开方(方差 + 1)    // +1防止除0(epsilon)
+
+        // 3. 归一化 + 缩放 + 偏移
+        j = 0
+        当 (j < x.列数) {
+            定义 归一化 = Q除(Tensor_读(x, 行, j) - 均值, 标准差)
+            定义 缩放 = Q乘(归一化, Tensor_读(ln.gamma, 0, j))
+            定义 最终 = 缩放 + Tensor_读(ln.beta, 0, j)
+            Tensor_写(结果, 行, j, 最终)
+            j = j + 1
+        }
+        行 = 行 + 1
+    }
+    返回 结果
+}

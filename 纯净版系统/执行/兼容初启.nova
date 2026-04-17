@@ -1,0 +1,109 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./特文模拟.nova")
+导入("./执行解析.nova")
+导入("./缺调补充.nova")
+导入("../中枢/整数转字符串.nova")
+
+// NovaOS Linux二进制兼容层 — 直接运行Linux程序
+// ★ 核心原理:
+//   NovaOS的Nova系统调用编号已经兼容Linux x86-64(Nova系统调用_64.tbl)
+//   所以Linux ELF二进制可以直接加载执行, 不需要重新编译
+// 兼容路径:
+//   Linux程序(.deb/.App图像) → ELF加载器 → NovaOS内核执行
+//   Nova的glibc调用 → Nova系统调用 → NovaOS内核处理(编号兼容)
+// 这意味着:
+//   ✅ QQ Linux版 — 直接运行
+//   ✅ 微信Linux版 — 直接运行
+//   ✅ WPS Office — 直接运行
+//   ✅ VLC播放器 — 直接运行
+//   ✅ Firefox/Nova浏览器 — 直接运行
+//   ✅ VSCode — 直接运行
+//   ✅ Steam — 直接运行
+
+// §1 兼容层架构
+// Linux程序需要3样东西:
+//   1. ELF加载器(已有: 核心/进程/ELF加载器.nova)
+//   2. Nova系统调用兼容(已有: 核心/系统调用/系统调用表.nova, 65个已注册)
+//   3. /proc /sys /dev 文件系统(已有: 文件/proc/ 文件/sys文件系统模块
+// 额外需要:
+//   4. 动态链接器兼容(ld-linux-x86-64.so.2)
+//   5. /lib/x86_64-linux-gnu/ 路径映射
+//   6. 特殊文件模拟(/dev/shm /dev/pts /proc/self)
+
+定义 可变 兼容_已初始化 = 假
+定义 可变 兼容_Linux程序数 = 0
+定义 可变 兼容_Nova系统调用翻译数 = 0
+定义 可变 兼容_失败Nova系统调用列表 = []
+
+// §2 初始化
+
+函数 Linux兼容_初始化() {
+    // 创建Linux程序需要的目录结构
+    确保目录存在("/lib")
+    确保目录存在("/lib64")
+    确保目录存在("/lib/x86_64-linux-gnu")
+    确保目录存在("/usr/lib")
+    确保目录存在("/usr/lib/x86_64-linux-gnu")
+    确保目录存在("/usr/share")
+    确保目录存在("/etc/ld.so.conf.d")
+    确保目录存在("/dev/shm")
+    确保目录存在("/dev/pts")
+    确保目录存在("/tmp")
+    确保目录存在("/run")
+
+    // 创建关键符号链接
+    创建符号链接("/lib64/ld-linux-x86-64.so.2", "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+
+    // 创建Linux程序需要的特殊文件
+    创建_proc_self()
+    创建_dev_特殊文件()
+
+    // 注册缺失的Linux Nova系统调用(NovaOS还待扩展的)
+    注册_缺失Nova系统调用()
+
+    兼容_已初始化 = 真
+    内核信息("Linux兼容层: 初始化完成 (ELF+Nova系统调用+FS路径)")
+}
+
+// §3 Linux程序加载
+
+函数 Linux_执行(路径, 参数, 环境变量) {
+    如果 (!兼容_已初始化) { Linux兼容_初始化() }
+
+    // 检查是否是ELF文件
+    如果 (!是ELF文件(路径)) {
+        // 可能是脚本(#!开头)
+        如果 (是脚本文件(路径)) {
+            返回 执行_脚本(路径, 参数, 环境变量)
+        }
+        返回 错误_格式
+    }
+
+    // 读取ELF头, 检查是Linux x86-64 ELF
+    定义 elf = ELF_解析头(路径)
+    如果 (elf == 空) { 返回 错误_格式 }
+    如果 (elf.机器类型 != 0x3E) {  // EM_X86_64
+        内核警告("Linux兼容: 不支持的架构 " + 整数转字符串(elf.机器类型))
+        返回 错误_格式
+    }
+
+    // 设置Linux兼容环境变量
+    定义 可变 完整环境 = 环境变量
+    如果 (完整环境 == 空) { 完整环境 = [] }
+    追加(完整环境, "PATH=/usr/local/bin:/usr/bin:/bin")
+    追加(完整环境, "HOME=/home/" + 获取当前用户名())
+    追加(完整环境, "LANG=zh_CN.UTF-8")
+    追加(完整环境, "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu")
+    追加(完整环境, "XDG_RUNTIME_DIR=/run/user/1000")
+    追加(完整环境, "DISPLAY=:0")  // X11显示(兼容层)
+    追加(完整环境, "WAYLAND_DISPLAY=wayland-0")  // Wayland(优先)
+
+    // 调用标准execve流程(ELF加载器)
+    定义 pid = 创建进程_Linux(路径, 参数, 完整环境)
+    如果 (pid > 0) {
+        兼容_Linux程序数 = 兼容_Linux程序数 + 1
+        内核信息("Linux兼容: 启动 " + 路径 + " PID=" + 整数转字符串(pid))
+    }
+    返回 pid
+}

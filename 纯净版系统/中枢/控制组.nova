@@ -1,0 +1,225 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./链表后继.nova")
+
+//   1. cgroup: Control Group — 资源限制/隔离/计费
+//   2. 层级结构: 树形, 子组继承父组的限制
+//   3. 子系统(控制器): cpu/memory/io/pids/cpuset等
+//   4. cgroup v2: 统一层级, 每个进程只属于一个cgroup
+//   5. cgroupfs: 通过文件系统接口管理(/sys/文件系统模块
+//   6. 用于: 容器资源限制/systemd服务管理/进程组控制
+
+定义 CGROUP_SUBSYS_CPU    = 0    // CPU时间限制
+定义 CGROUP_SUBSYS_MEMORY = 1    // 内存限制
+定义 CGROUP_SUBSYS_IO     = 2    // IO带宽限制
+定义 CGROUP_SUBSYS_PIDS   = 3    // 进程数限制
+定义 CGROUP_SUBSYS_CPUSET = 4    // CPU亲和性
+定义 CGROUP_SUBSYS_COUNT  = 5
+
+结构 cgroup {
+    名称,
+    父,    // u64 父cgroup
+    子列表,    // [] 子cgroup
+    进程列表,    // [] 属于此cgroup的进程PID
+
+    // 资源限制
+    cpu_权重,    // u32 CPU权重(1-10000, 默认100)
+    cpu_最大,    // u64 CPU最大使用(微秒/周期)
+    内存_最大,    // u64 内存上限(字节, 0=无限)
+    内存_当前,    // u64 当前内存使用
+    pids_最大,    // u32 最大进程数(0=无限)
+    pids_当前,    // u32 当前进程数
+
+    // 统计
+    cpu_使用_us,    // u64 CPU使用时间(微秒)
+    内存_峰值,    // u64 内存使用峰值
+    io_读字节,
+    io_写字节,
+    // 状态
+    冻结,    // u8 冻结状态(暂停所有进程)
+    引用计数,
+}
+
+定义 可变 cgroup_根 = 空
+定义 可变 cgroup_总数 = 0
+
+// 初始化
+
+函数 cgroup_初始化() {
+    cgroup_根 = cgroup_创建("/", 空)
+    cgroup_根.cpu_权重 = 100
+    cgroup_根.内存_最大 = 0       // 无限
+    cgroup_根.pids_最大 = 0       // 无限
+    cgroup_总数 = 1
+    内核信息("cgroup v2: 初始化 (cpu/memory/io/pids/cpuset)")
+}
+
+函数 cgroup_创建(名称, 父) {
+    定义 cg = cgroup {}
+    cg.名称 = 名称
+    cg.父 = 父
+    cg.子列表 = []
+    cg.进程列表 = []
+    cg.cpu_权重 = 100
+    cg.cpu_最大 = 0
+    cg.内存_最大 = 0
+    cg.内存_当前 = 0
+    cg.pids_最大 = 0
+    cg.pids_当前 = 0
+    cg.cpu_使用_us = 0
+    cg.内存_峰值 = 0
+    cg.io_读字节 = 0
+    cg.io_写字节 = 0
+    cg.冻结 = 0
+    cg.引用计数 = 1
+
+    如果 (父 != 空) {
+        追加(父.子列表, cg)
+        // 继承父的限制(如果未显式设置)
+    }
+    cgroup_总数 = cgroup_总数 + 1
+    返回 cg
+}
+
+// 进程管理 
+
+函数 cgroup_添加进程(cg, pid) {
+    如果 (cg == 空) { 返回 错误_无效参数 }
+    // 检查pids限制
+    如果 (cg.pids_最大 > 0 && cg.pids_当前 >= cg.pids_最大) {
+        返回 错误_无空间   // 达到进程数上限
+    }
+    追加(cg.进程列表, pid)
+    cg.pids_当前 = cg.pids_当前 + 1
+    返回 成功
+}
+
+函数 cgroup_移除进程(cg, pid) {
+    如果 (cg == 空) { 返回 }
+    定义 可变 i = 0
+    当 (i < 计数(cg.进程列表)) {
+        如果 (cg.进程列表[i] == pid) {
+            链表_删除(cg.进程列表, i)
+            cg.pids_当前 = cg.pids_当前 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// 资源限制检查 (调度器/内存分配器调用)
+
+函数 cgroup_检查内存(cg, 请求字节) {
+    如果 (cg == 空) { 返回 真 }
+    如果 (cg.内存_最大 == 0) { 返回 真 }  // 无限制
+    返回 (cg.内存_当前 + 请求字节) <= cg.内存_最大
+}
+
+函数 cgroup_记录内存(cg, 字节) {
+    如果 (cg == 空) { 返回 }
+    cg.内存_当前 = cg.内存_当前 + 字节
+    如果 (cg.内存_当前 > cg.内存_峰值) { cg.内存_峰值 = cg.内存_当前 }
+}
+
+函数 cgroup_释放内存(cg, 字节) {
+    如果 (cg == 空) { 返回 }
+    如果 (cg.内存_当前 >= 字节) { cg.内存_当前 = cg.内存_当前 - 字节 }
+    否则 { cg.内存_当前 = 0 }
+}
+
+函数 cgroup_获取CPU权重(cg) {
+    如果 (cg == 空) { 返回 100 }
+    返回 cg.cpu_权重
+}
+
+// cgroupfs接口 (写入控制文件)
+// echo 100M > /sys/文件系统模块
+
+函数 cgroup_写控制文件(cg, 文件名, 值) {
+    如果 (文件名 == "memory.max") {
+        cg.内存_最大 = 值
+    } 否则 如果 (文件名 == "cpu.weight") {
+        cg.cpu_权重 = 值
+        如果 (cg.cpu_权重 < 1) { cg.cpu_权重 = 1 }
+        如果 (cg.cpu_权重 > 10000) { cg.cpu_权重 = 10000 }
+    } 否则 如果 (文件名 == "pids.max") {
+        cg.pids_最大 = 值
+    } 否则 如果 (文件名 == "cgroup.freeze") {
+        cg.冻结 = 值
+    }
+    返回 成功
+}
+
+函数 cgroup_读控制文件(cg, 文件名) {
+    如果 (文件名 == "memory.max") { 返回 cg.内存_最大 }
+    如果 (文件名 == "memory.current") { 返回 cg.内存_当前 }
+    如果 (文件名 == "memory.peak") { 返回 cg.内存_峰值 }
+    如果 (文件名 == "cpu.weight") { 返回 cg.cpu_权重 }
+    如果 (文件名 == "pids.max") { 返回 cg.pids_最大 }
+    如果 (文件名 == "pids.current") { 返回 cg.pids_当前 }
+    如果 (文件名 == "cpu.stat") { 返回 cg.cpu_使用_us }
+    返回 0
+}
+
+// 冻结/解冻 
+
+函数 cgroup_冻结(cg) {
+    如果 (cg == 空) { 返回 }
+    cg.冻结 = 1
+    // 发送SIGSTOP给所有进程
+}
+
+函数 cgroup_解冻(cg) {
+    如果 (cg == 空) { 返回 }
+    cg.冻结 = 0
+    // 发送SIGCONT给所有进程
+}
+
+// 查询
+
+函数 cgroup_统计() { 返回 [cgroup_总数] }
+函数 cgroup_根组() { 返回 cgroup_根 }
+
+// 子系统名称 + cgroup查找
+
+函数 cgroup_子系统名(类型) {
+    如果 (类型 == CGROUP_SUBSYS_CPU) { 返回 "cpu" }
+    如果 (类型 == CGROUP_SUBSYS_MEMORY) { 返回 "memory" }
+    如果 (类型 == CGROUP_SUBSYS_IO) { 返回 "io" }
+    如果 (类型 == CGROUP_SUBSYS_PIDS) { 返回 "pids" }
+    如果 (类型 == CGROUP_SUBSYS_CPUSET) { 返回 "cpuset" }
+    返回 "unknown"
+}
+
+函数 cgroup_查找子组(cg, 名称) {
+    如果 (cg == 空) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(cg.子列表)) {
+        如果 (cg.子列表[i].名称 == 名称) { 返回 cg.子列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 cgroup_内存使用率(cg) {
+    如果 (cg == 空 || cg.内存_最大 == 0) { 返回 0 }
+    返回 cg.内存_当前 * 100 / cg.内存_最大
+}
+
+函数 cgroup_完整统计() {
+    返回 [cgroup_总数]
+}
+
+定义 可变 AI_控制组_运行指标 = 0
+定义 可变 AI_控制组_异常指标 = 0
+
+函数 AI_控制组_自诊断() {
+    AI_控制组_运行指标 = cgroup_总数
+    返回 AI_控制组_运行指标
+}
+
+函数 AI_控制组_优化建议() {
+    定义 指标 = AI_控制组_自诊断()
+    如果 (AI_控制组_运行指标 > 10000) { 返回 "控制组负载较高" }
+    返回 "控制组状态正常"
+}

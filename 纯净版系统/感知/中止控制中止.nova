@@ -1,0 +1,624 @@
+// NovaOS · AbortController / AbortSignal 完整实现
+// 功能:
+//  §1 AbortSignal: aborted/reason/throwIfAborted/onabort
+//  §2 AbortController: abort(reason)
+//  §3 AbortSignal.timeout(ms): 超时自动中止
+//  §4 AbortSignal.any(signals): 组合信号
+//  §5 信号的事件监听器管理
+//  §6 Response body: text/json/arrayBuffer/blob/formData
+//  §7 流式响应体: ReadableStream集成
+//  §8 AI总线: 智能资源优先级+预取决策+超时预测
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./事件系统核心.nova")
+导入("../中枢/硬链接.nova")
+导入("./取数网络请.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("./文档事件.nova")
+导入("../执行/控制台输出.nova")
+导入("../推理/小整数快速判.nova")
+导入("../外联/传输控制初始.nova")
+导入("../推理/智能总线鼠标.nova")
+导入("./文档节点.nova")
+导入("../标准/加法运算符.nova")
+导入("./表单数据.nova")
+导入("../推理/序列对象.nova")
+导入("../推理/智能总线资源.nova")
+导入("../中枢/字符串替换.nova")
+
+// §1 数据结构
+
+定义 SIGNAL_MAX_LISTENERS = 64
+定义 Q10 = 1024
+定义 Q_HALF = 512
+
+结构 AbortSignal_State {
+    已中止,
+    中止原因,       // JSValue
+    监听器列表,     // 回调数组指针
+    监听器数,       // 当前监听器数量
+    监听器容量,     // 最大容量
+    关联信号列表,   // AbortSignal.any()的子信号
+    关联信号数,
+    超时定时器,     // timeout定时器句柄
+    JS对象,         // 对应的JS AbortSignal对象
+}
+
+结构 AbortController_State {
+    信号,           // AbortSignal_State指针
+    JS对象,         // 对应的JS AbortController对象
+}
+
+结构 AbortListener {
+    回调,           // 函数指针
+    一次性,         // 是否once
+    已移除,         // 是否已移除
+}
+
+// §2 AbortSignal创建/状态管理
+
+函数 AbortSignal_创建(Nova运行时) {
+    定义 sig = 堆_分配(AbortSignal_State)
+    sig.已中止 = 假
+    sig.中止原因 = 0
+    sig.监听器容量 = SIGNAL_MAX_LISTENERS
+    sig.监听器数 = 0
+    sig.监听器列表 = 堆_分配(sig.监听器容量 * 24)  // AbortListener每个24字节
+    内存_置零(sig.监听器列表, sig.监听器容量 * 24)
+    sig.关联信号列表 = 0
+    sig.关联信号数 = 0
+    sig.超时定时器 = 0
+    // 创建JS对象
+    定义 jsobj = Nova对象_创建(Nova运行时, Nova运行时.Object原型)
+    Nova对象_设置属性(Nova运行时, jsobj, "aborted", Nova运行时.false值)
+    Nova对象_设置属性(Nova运行时, jsobj, "reason", Nova运行时.undefined值)
+    sig.JS对象 = jsobj
+    // 绑定原生方法
+    Nova对象_设置属性(Nova运行时, jsobj, "throwIfAborted", Nova原生函数_创建(Nova运行时, AbortSignal_throwIfAborted_原生, 0, "throwIfAborted"))
+    返回 sig
+}
+
+函数 AbortSignal_设置已中止(sig, Nova运行时, 原因) {
+    如果 (sig.已中止) { 返回 }  // 幂等
+    sig.已中止 = 真
+    sig.中止原因 = 原因
+    // 更新JS属性
+    Nova对象_设置属性(Nova运行时, sig.JS对象, "aborted", Nova运行时.true值)
+    Nova对象_设置属性(Nova运行时, sig.JS对象, "reason", 原因)
+    // 触发abort事件
+    AbortSignal_触发abort事件(sig, Nova运行时)
+}
+
+函数 AbortSignal_throwIfAborted_原生(Nova运行时, this值, argc, argv) {
+    // 如果信号已中止, 抛出异常
+    定义 sig = AbortSignal_从jsobj获取(this值)
+    如果 (sig != 0 && sig.已中止) {
+        返回 Nova值_抛出异常(Nova运行时, sig.中止原因)
+    }
+    返回 Nova运行时.undefined值
+}
+
+// §3 事件监听器管理 (abort事件)
+
+函数 AbortSignal_添加监听器(sig, 回调, 一次性) {
+    如果 (sig.已中止) {
+        // 已中止: 立即调用回调
+        调用(回调, 0)
+        返回
+    }
+    如果 (sig.监听器数 >= sig.监听器容量) {
+        // 扩容监听器列表
+        定义 新容量 = sig.监听器容量 * 2
+        定义 新列表 = 堆_分配(新容量 * 24)
+        内存_拷贝(新列表, sig.监听器列表, sig.监听器容量 * 24)
+        堆_释放(sig.监听器列表)
+        sig.监听器列表 = 新列表
+        sig.监听器容量 = 新容量
+    }
+    定义 off = sig.监听器数 * 24
+    内存_写64(sig.监听器列表 + off, 回调)
+    内存_写64(sig.监听器列表 + off + 8, 一次性)
+    内存_写64(sig.监听器列表 + off + 16, 0)  // 未移除
+    sig.监听器数 = sig.监听器数 + 1
+}
+
+函数 AbortSignal_移除监听器(sig, 回调) {
+    定义 可变 i = 0
+    当 (i < sig.监听器数) {
+        定义 off = i * 24
+        如果 (内存_读64(sig.监听器列表 + off) == 回调) {
+            内存_写64(sig.监听器列表 + off + 16, 1)  // 标记已移除
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 AbortSignal_触发abort事件(sig, Nova运行时) {
+    // 通知所有abort监听器
+    定义 可变 i = 0
+    当 (i < sig.监听器数) {
+        定义 off = i * 24
+        定义 已移除 = 内存_读64(sig.监听器列表 + off + 16)
+        如果 (!已移除) {
+            定义 cb = 内存_读64(sig.监听器列表 + off)
+            定义 once = 内存_读64(sig.监听器列表 + off + 8)
+            调用(cb, 0)
+            如果 (once) {
+                内存_写64(sig.监听器列表 + off + 16, 1)  // 自动移除
+            }
+        }
+        i = i + 1
+    }
+    // 触发DOM abort事件
+    定义 ev = 事件_创建("abort", 假, 假)
+    事件Target_dispatch事件(sig.JS对象, ev)
+}
+
+// §4 AbortController
+
+函数 AbortController_创建(Nova运行时) {
+    定义 ctrl = 堆_分配(AbortController_State)
+    ctrl.信号 = AbortSignal_创建(Nova运行时)
+    // 创建JS对象
+    定义 jsobj = Nova对象_创建(Nova运行时, Nova运行时.Object原型)
+    Nova对象_设置属性(Nova运行时, jsobj, "signal", ctrl.信号.JS对象)
+    Nova对象_设置属性(Nova运行时, jsobj, "abort", Nova原生函数_创建(Nova运行时, AbortController_abort_原生, 0, "abort"))
+    ctrl.JS对象 = jsobj
+    返回 ctrl
+}
+
+函数 AbortController_abort(ctrl, Nova运行时, 原因) {
+    如果 (ctrl.信号.已中止) { 返回 }  // 已经中止
+    定义 实际原因 = 原因
+    如果 (原因 == 0) {
+        // 默认DOMException AbortError
+        实际原因 = AbortError_创建(Nova运行时, "The operation was aborted.")
+    }
+    AbortSignal_设置已中止(ctrl.信号, Nova运行时, 实际原因)
+}
+
+函数 AbortController_abort_原生(Nova运行时, this值, argc, argv) {
+    定义 ctrl = AbortController_从jsobj获取(this值)
+    如果 (ctrl == 0) { 返回 Nova运行时.undefined值 }
+    定义 reason = 如果(argc > 0, argv[0], 0)
+    AbortController_abort(ctrl, Nova运行时, reason)
+    返回 Nova运行时.undefined值
+}
+
+函数 AbortError_创建(Nova运行时, 消息) {
+    // 创建DOMException("AbortError", message)
+    定义 err = Nova对象_创建(Nova运行时, Nova运行时.Error原型)
+    Nova对象_设置属性(Nova运行时, err, "name", Nova值_创建_String(Nova运行时, "AbortError"))
+    Nova对象_设置属性(Nova运行时, err, "message", Nova值_创建_String(Nova运行时, 消息))
+    Nova对象_设置属性(Nova运行时, err, "code", Nova值_创建_Number(Nova运行时, 20))  // ABORT_ERR
+    返回 err
+}
+
+// §5 AbortSignal.timeout(ms)
+
+函数 AbortSignal_timeout(Nova运行时, 毫秒) {
+    // 创建一个在指定时间后自动中止的信号
+    定义 sig = AbortSignal_创建(Nova运行时)
+    // 注册定时器
+    sig.超时定时器 = 定时器_创建(毫秒, AbortSignal_超时回调, sig)
+    返回 sig
+}
+
+函数 AbortSignal_超时回调(sig) {
+    // 超时: 中止原因为TimeoutError DOMException
+    如果 (sig.已中止) { 返回 }  // 已经中止
+    定义 Nova运行时 = 全局_Nova运行时_获取()
+    定义 err = Nova对象_创建(Nova运行时, Nova运行时.Error原型)
+    Nova对象_设置属性(Nova运行时, err, "name", Nova值_创建_String(Nova运行时, "TimeoutError"))
+    Nova对象_设置属性(Nova运行时, err, "message", Nova值_创建_String(Nova运行时, "The operation timed out."))
+    AbortSignal_设置已中止(sig, Nova运行时, err)
+    sig.超时定时器 = 0
+}
+
+// §6 AbortSignal.any(signals)
+
+函数 AbortSignal_any(Nova运行时, 信号列表, 信号数) {
+    // 组合多个信号: 任一中止则组合信号中止
+    定义 combined = AbortSignal_创建(Nova运行时)
+    // 检查是否已有信号已中止
+    定义 可变 i = 0
+    当 (i < 信号数) {
+        定义 child = 信号列表[i]
+        如果 (child.已中止) {
+            AbortSignal_设置已中止(combined, Nova运行时, child.中止原因)
+            返回 combined
+        }
+        i = i + 1
+    }
+    // 监听所有子信号
+    combined.关联信号列表 = 堆_分配(信号数 * 8)
+    combined.关联信号数 = 信号数
+    i = 0
+    当 (i < 信号数) {
+        内存_写64(combined.关联信号列表 + i * 8, 信号列表[i])
+        // 为每个子信号添加监听器
+        AbortSignal_添加监听器(信号列表[i], AbortSignal_any_子信号回调_创建(combined, Nova运行时), 真)
+        i = i + 1
+    }
+    返回 combined
+}
+
+函数 AbortSignal_any_子信号回调_创建(combined, Nova运行时) {
+    // 创建闭包: 子信号中止时中止组合信号
+    返回 函数() {
+        如果 (!combined.已中止) {
+            // 找到已中止的子信号的原因
+            定义 可变 j = 0
+            当 (j < combined.关联信号数) {
+                定义 child = 内存_读64(combined.关联信号列表 + j * 8)
+                如果 (child.已中止) {
+                    AbortSignal_设置已中止(combined, Nova运行时, child.中止原因)
+                    返回
+                }
+                j = j + 1
+            }
+        }
+    }
+}
+
+// §7 Response body: text/json/arrayBuffer/blob/formData
+
+函数 取数_Response_text(Nova运行时, resp) {
+    定义 promise = Nova承诺_创建(Nova运行时)
+    如果 (resp == 0) {
+        Nova承诺_resolve(Nova运行时, promise, Nova值_创建_String(Nova运行时, ""))
+        返回 promise
+    }
+    // 检查body是否已使用
+    如果 (resp.体已使用) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: body already consumed"))
+        返回 promise
+    }
+    resp.体已使用 = 真
+    如果 (resp.体数据 != 0 && resp.体长度 > 0) {
+        定义 文本 = 字符串_复制_N(resp.体数据, resp.体长度)
+        Nova承诺_resolve(Nova运行时, promise, Nova值_创建_String(Nova运行时, 文本))
+    } 否则 {
+        Nova承诺_resolve(Nova运行时, promise, Nova值_创建_String(Nova运行时, ""))
+    }
+    返回 promise
+}
+
+函数 取数_Response_json(Nova运行时, resp) {
+    定义 promise = Nova承诺_创建(Nova运行时)
+    如果 (resp == 0 || resp.体数据 == 0) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "SyntaxError: Unexpected end of JSON input"))
+        返回 promise
+    }
+    如果 (resp.体已使用) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: body already consumed"))
+        返回 promise
+    }
+    resp.体已使用 = 真
+    定义 文本 = 字符串_复制_N(resp.体数据, resp.体长度)
+    定义 结果 = JSON_解析(Nova运行时, 文本)
+    如果 (结果.成功) {
+        Nova承诺_resolve(Nova运行时, promise, 结果.值)
+    } 否则 {
+        Nova承诺_reject(Nova运行时, promise, 结果.错误)
+    }
+    返回 promise
+}
+
+函数 取数_Response_arrayBuffer(Nova运行时, resp) {
+    定义 promise = Nova承诺_创建(Nova运行时)
+    如果 (resp == 0) {
+        定义 空缓冲 = ArrayBuffer_创建(Nova运行时, 0)
+        Nova承诺_resolve(Nova运行时, promise, 空缓冲)
+        返回 promise
+    }
+    如果 (resp.体已使用) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: body already consumed"))
+        返回 promise
+    }
+    resp.体已使用 = 真
+    定义 ab = ArrayBuffer_创建(Nova运行时, resp.体长度)
+    如果 (resp.体长度 > 0) {
+        内存_拷贝(ArrayBuffer_获取数据指针(ab), resp.体数据, resp.体长度)
+    }
+    Nova承诺_resolve(Nova运行时, promise, ab)
+    返回 promise
+}
+
+函数 取数_Response_blob(Nova运行时, resp) {
+    定义 promise = Nova承诺_创建(Nova运行时)
+    如果 (resp == 0) {
+        定义 empty_blob = Blob_创建(Nova运行时, 0, 0, "")
+        Nova承诺_resolve(Nova运行时, promise, empty_blob)
+        返回 promise
+    }
+    如果 (resp.体已使用) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: body already consumed"))
+        返回 promise
+    }
+    resp.体已使用 = 真
+    // 从响应头提取Content-Type
+    定义 content_type = Headers_获取(resp.头, "content-type")
+    如果 (content_type == 0) { content_type = "" }
+    定义 blob = Blob_创建(Nova运行时, resp.体数据, resp.体长度, content_type)
+    Nova承诺_resolve(Nova运行时, promise, blob)
+    返回 promise
+}
+
+函数 取数_Response_formData(Nova运行时, resp) {
+    定义 promise = Nova承诺_创建(Nova运行时)
+    如果 (resp == 0 || resp.体已使用) {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: body already consumed"))
+        返回 promise
+    }
+    resp.体已使用 = 真
+    定义 content_type = Headers_获取(resp.头, "content-type")
+    如果 (字符串_包含(content_type, "multipart/form-data")) {
+        // 解析multipart/form-data
+        定义 boundary = 提取_boundary(content_type)
+        定义 fd = 解析_multipart(Nova运行时, resp.体数据, resp.体长度, boundary)
+        Nova承诺_resolve(Nova运行时, promise, fd)
+    } 否则如果 (字符串_包含(content_type, "application/x-www-form-urlencoded")) {
+        定义 文本 = 字符串_复制_N(resp.体数据, resp.体长度)
+        定义 fd = 解析_urlencoded(Nova运行时, 文本)
+        Nova承诺_resolve(Nova运行时, promise, fd)
+    } 否则 {
+        Nova承诺_reject(Nova运行时, promise, Nova值_创建_String(Nova运行时, "TypeError: Could not parse content as FormData"))
+    }
+    返回 promise
+}
+
+// §8 multipart/form-data解析器
+
+函数 提取_boundary(content_type) {
+    // 从multipart/form-data; boundary=xxx中提取boundary
+    定义 idx = 字符串_查找(content_type, "boundary=")
+    如果 (idx < 0) { 返回 "" }
+    返回 字符串_子串(content_type, idx + 9, 字符串长度(content_type))
+}
+
+函数 解析_multipart(Nova运行时, 数据, 长度, boundary) {
+    // 简化multipart解析: 按boundary分割
+    定义 fd = FormData_创建(Nova运行时)
+    定义 分隔符 = 字符串_拼接("--", boundary)
+    定义 文本 = 字符串_复制_N(数据, 长度)
+    定义 可变 pos = 0
+    定义 可变 部分开始 = 0
+    当 (pos < 长度) {
+        定义 idx = 字符串_查找_从(文本, 分隔符, pos)
+        如果 (idx < 0) { 跳出 }
+        如果 (部分开始 > 0) {
+            定义 部分 = 字符串_子串(文本, 部分开始, idx)
+            multipart_解析单部分(Nova运行时, fd, 部分)
+        }
+        部分开始 = idx + 字符串长度(分隔符)
+        // 跳过CRLF
+        如果 (部分开始 < 长度 && 字节取(文本, 部分开始) == 13) {
+            部分开始 = 部分开始 + 2
+        }
+        pos = 部分开始
+    }
+    返回 fd
+}
+
+函数 multipart_解析单部分(Nova运行时, fd, 部分文本) {
+    // 解析单个part: Content-Disposition头 + 空行 + 数据
+    定义 空行 = 字符串_查找(部分文本, "\r\n\r\n")
+    如果 (空行 < 0) { 返回 }
+    定义 头 = 字符串_子串(部分文本, 0, 空行)
+    定义 体 = 字符串_子串(部分文本, 空行 + 4, 字符串长度(部分文本))
+    // 提取name
+    定义 name_start = 字符串_查找(头, "name=\"")
+    如果 (name_start < 0) { 返回 }
+    name_start = name_start + 6
+    定义 name_end = 字符串_查找_从(头, "\"", name_start)
+    如果 (name_end < 0) { 返回 }
+    定义 名称 = 字符串_子串(头, name_start, name_end)
+    FormData_append(fd, Nova运行时, 名称, 体)
+}
+
+函数 解析_urlencoded(Nova运行时, 文本) {
+    // 解析application/x-www-form-urlencoded
+    定义 fd = FormData_创建(Nova运行时)
+    定义 可变 pos = 0
+    定义 len = 字符串长度(文本)
+    当 (pos < len) {
+        定义 amp = 字符串_查找_从(文本, "&", pos)
+        如果 (amp < 0) { amp = len }
+        定义 对 = 字符串_子串(文本, pos, amp)
+        定义 eq = 字符串_查找(对, "=")
+        如果 (eq >= 0) {
+            定义 k = URL_解码(字符串_子串(对, 0, eq))
+            定义 v = URL_解码(字符串_子串(对, eq + 1, 字符串长度(对)))
+            FormData_append(fd, Nova运行时, k, v)
+        }
+        pos = amp + 1
+    }
+    返回 fd
+}
+
+// §9 流式响应体: ReadableStream集成
+
+结构 StreamingBody {
+    缓冲区,
+    缓冲长度,
+    缓冲容量,
+    已关闭,
+    信号,       // 关联的AbortSignal
+    读取器,     // ReadableStream reader
+}
+
+函数 StreamingBody_创建(信号) {
+    定义 sb = 堆_分配(StreamingBody)
+    sb.缓冲容量 = 4096
+    sb.缓冲区 = 堆_分配(sb.缓冲容量)
+    sb.缓冲长度 = 0
+    sb.已关闭 = 假
+    sb.信号 = 信号
+    sb.读取器 = 0
+    // 如果有信号, 监听中止
+    如果 (信号 != 0) {
+        AbortSignal_添加监听器(信号, StreamingBody_中止回调_创建(sb), 真)
+    }
+    返回 sb
+}
+
+函数 StreamingBody_中止回调_创建(sb) {
+    返回 函数() {
+        StreamingBody_中止(sb)
+    }
+}
+
+函数 StreamingBody_追加数据(sb, 数据, 长度) {
+    如果 (sb.已关闭) { 返回 }
+    // 扩容缓冲区
+    当 (sb.缓冲长度 + 长度 > sb.缓冲容量) {
+        sb.缓冲容量 = sb.缓冲容量 * 2
+        定义 新缓冲 = 堆_分配(sb.缓冲容量)
+        内存_拷贝(新缓冲, sb.缓冲区, sb.缓冲长度)
+        堆_释放(sb.缓冲区)
+        sb.缓冲区 = 新缓冲
+    }
+    内存_拷贝(sb.缓冲区 + sb.缓冲长度, 数据, 长度)
+    sb.缓冲长度 = sb.缓冲长度 + 长度
+}
+
+函数 StreamingBody_中止(sb) {
+    sb.已关闭 = 真
+}
+
+函数 StreamingBody_释放(sb) {
+    如果 (sb.缓冲区 != 0) { 堆_释放(sb.缓冲区) }
+    堆_释放(sb)
+}
+
+// §10 fetch()中止集成
+
+函数 取数_检查中止信号(signal, Nova运行时) {
+    // 在fetch开始前检查信号
+    如果 (signal == 0) { 返回 假 }
+    如果 (signal.已中止) { 返回 真 }
+    返回 假
+}
+
+函数 取数_绑定中止信号(请求句柄, signal) {
+    // 将网络请求与信号关联
+    如果 (signal == 0) { 返回 }
+    AbortSignal_添加监听器(signal, 函数() {
+        网络_取消请求(请求句柄)
+    }, 真)
+}
+
+// §11 AbortSignal_辅助: 内部映射表
+
+定义 SIG_MAP_SIZE = 256
+定义 可变 信号映射表 = 0     // JS对象→AbortSignal_State
+定义 可变 控制器映射表 = 0   // JS对象→AbortController_State
+
+函数 AbortSignal_从jsobj获取(jsobj) {
+    如果 (信号映射表 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < SIG_MAP_SIZE) {
+        定义 off = i * 16
+        如果 (内存_读64(信号映射表 + off) == jsobj) {
+            返回 内存_读64(信号映射表 + off + 8)
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 AbortController_从jsobj获取(jsobj) {
+    如果 (控制器映射表 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < SIG_MAP_SIZE) {
+        定义 off = i * 16
+        如果 (内存_读64(控制器映射表 + off) == jsobj) {
+            返回 内存_读64(控制器映射表 + off + 8)
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 AbortSignal_注册映射(sig) {
+    如果 (信号映射表 == 0) {
+        信号映射表 = 堆_分配(SIG_MAP_SIZE * 16)
+        内存_置零(信号映射表, SIG_MAP_SIZE * 16)
+    }
+    定义 可变 i = 0
+    当 (i < SIG_MAP_SIZE) {
+        定义 off = i * 16
+        如果 (内存_读64(信号映射表 + off) == 0) {
+            内存_写64(信号映射表 + off, sig.JS对象)
+            内存_写64(信号映射表 + off + 8, sig)
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 AbortController_注册映射(ctrl) {
+    如果 (控制器映射表 == 0) {
+        控制器映射表 = 堆_分配(SIG_MAP_SIZE * 16)
+        内存_置零(控制器映射表, SIG_MAP_SIZE * 16)
+    }
+    定义 可变 i = 0
+    当 (i < SIG_MAP_SIZE) {
+        定义 off = i * 16
+        如果 (内存_读64(控制器映射表 + off) == 0) {
+            内存_写64(控制器映射表 + off, ctrl.JS对象)
+            内存_写64(控制器映射表 + off + 8, ctrl)
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// §12 AI总线: 智能资源优先级 + 预取决策 + 超时预测
+
+定义 EWMA_FETCH_ALPHA = 205  // 0.2 * Q10
+定义 可变 EWMA_取数延迟 = 0
+定义 可变 EWMA_取数超时率 = 0
+
+函数 智能_取数接口_AI加载优先级(url) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0 || url == 0) { 返回 Q_HALF }
+    返回 AI总线_资源优先级(bus, url)
+}
+
+函数 智能_取数接口_AI预取决策(url) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0 || url == 0) { 返回 假 }
+    定义 分数 = AI总线_资源优先级(bus, url)
+    返回 分数 > 600
+}
+
+函数 智能_取数接口_AI超时预测(url) {
+    // EWMA预测网络延迟, 动态调整timeout
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 30000 }  // 默认30s
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, EWMA_取数延迟)
+    Tensor_写(特征, 0, 1, EWMA_取数超时率)
+    Tensor_写(特征, 0, 2, AI总线_资源优先级(bus, url))
+    Tensor_写(特征, 0, 3, Q10)  // 偏置
+    定义 预测延迟 = AI总线_注意力权重(bus, 特征) * 50  // 映射到毫秒
+    Tensor_释放(特征)
+    如果 (预测延迟 < 5000) { 返回 5000 }
+    如果 (预测延迟 > 60000) { 返回 60000 }
+    返回 预测延迟
+}
+
+函数 智能_取数接口_AI反馈延迟(延迟_us, 是否超时) {
+    // 反馈实际网络延迟到EWMA
+    EWMA_取数延迟 = (EWMA_FETCH_ALPHA * 延迟_us + (Q10 - EWMA_FETCH_ALPHA) * EWMA_取数延迟) / Q10
+    如果 (是否超时) {
+        EWMA_取数超时率 = (EWMA_FETCH_ALPHA * Q10 + (Q10 - EWMA_FETCH_ALPHA) * EWMA_取数超时率) / Q10
+    } 否则 {
+        EWMA_取数超时率 = ((Q10 - EWMA_FETCH_ALPHA) * EWMA_取数超时率) / Q10
+    }
+}

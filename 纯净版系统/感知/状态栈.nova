@@ -1,0 +1,476 @@
+// NovaOS Canvas 2D上下文 — 状态栈/变换/路径/渐变/图像/像素/合成
+// 本模块实现HTML5 Canvas 2D渲染上下文完整API:
+//   1. 状态栈: save/restore(变换/裁剪/样式完整保存恢复)
+//   2. 变换: translate/scale/rotate/setTransform/resetTransform
+//   3. 矩形绘制: fillRect/strokeRect/clearRect
+//   4. 路径: beginPath/moveTo/lineTo/arc/bezier/closePath/fill/stroke
+//   5. 渐变: createLinearGradient/createRadialGradient
+//   6. 图像绘制: drawImage(9参数版)
+//   7. 像素操作: getImageData/putImageData/createImageData
+//   8. 合成: globalAlpha/globalCompositeOperation
+//   9. 阴影: shadowColor/shadowBlur/shadowOffsetX/Y
+// 与图形引擎后端、字体引擎、智能大脑深度耦合。
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/日志中枢.nova")
+导入("../中枢/公共智能.nova")
+导入("../引导/引导加载器.nova")
+导入("../稳态/图处显示.nova")
+导入("./图绘渲染上下.nova")
+导入("./内核直连层.nova")
+导入("../稳态/数学基础向量.nova")
+导入("./网缓画布结.nova")
+导入("../中枢/哈希函数.nova")
+导入("./画布渲染甲.nova")
+导入("./绘制矩形创建.nova")
+导入("./绘制画布绘.nova")
+
+
+函数 画布2D_save(ctx) {
+    如果 (ctx.栈深度 >= ctx.栈容量) { 返回 }
+    // 保存当前状态(浅复制)
+    定义 偏移 = ctx.状态栈 + ctx.栈深度 * 256
+    内存_复制(偏移, &ctx.当前状态, 256)
+    ctx.栈深度 = ctx.栈深度 + 1
+}
+
+函数 画布2D_restore(ctx) {
+    如果 (ctx.栈深度 == 0) { 返回 }
+    ctx.栈深度 = ctx.栈深度 - 1
+    定义 偏移 = ctx.状态栈 + ctx.栈深度 * 256
+    内存_复制(&ctx.当前状态, 偏移, 256)
+}
+
+// §3 变换
+
+函数 画布2D_translate(ctx, dx, dy) {
+    定义 t = SkMatrix_平移(dx, dy)
+    ctx.当前状态.矩阵 = SkMatrix_乘(ctx.当前状态.矩阵, t)
+}
+
+函数 画布2D_scale(ctx, sx, sy) {
+    定义 s = SkMatrix_缩放(sx, sy)
+    ctx.当前状态.矩阵 = SkMatrix_乘(ctx.当前状态.矩阵, s)
+}
+
+函数 画布2D_rotate(ctx, 角度) {
+    // 角度单位: 弧度×10000
+    // 旋转矩阵: [cos -sin; sin cos]
+    // 用泰勒级数近似cos/sin(定点精度)
+    定义 cos_val = 定点_cos(角度)
+    定义 sin_val = 定点_sin(角度)
+    定义 m = SkMatrix {}
+    m.m00 = cos_val; m.m01 = 0 - sin_val; m.m02 = 0
+    m.m10 = sin_val; m.m11 = cos_val; m.m12 = 0
+    m.m20 = 0; m.m21 = 0; m.m22 = 10000
+    ctx.当前状态.矩阵 = SkMatrix_乘(ctx.当前状态.矩阵, m)
+}
+
+函数 画布2D_setTransform(ctx, a, b, c, d, e, f) {
+    // 设置变换矩阵: [a c e; b d f; 0 0 1]
+    ctx.当前状态.矩阵.m00 = a
+    ctx.当前状态.矩阵.m01 = c
+    ctx.当前状态.矩阵.m02 = e
+    ctx.当前状态.矩阵.m10 = b
+    ctx.当前状态.矩阵.m11 = d
+    ctx.当前状态.矩阵.m12 = f
+    ctx.当前状态.矩阵.m20 = 0
+    ctx.当前状态.矩阵.m21 = 0
+    ctx.当前状态.矩阵.m22 = 10000
+}
+
+函数 画布2D_resetTransform(ctx) {
+    ctx.当前状态.矩阵 = SkMatrix_单位矩阵()
+}
+
+// §4 矩形绘制
+
+函数 画布2D_fillRect(ctx, x, y, w, h) {
+    如果 (w == 0 || h == 0) { 返回 }
+    定义 paint = 画布2D_创建填充画笔(ctx)
+    定义 rect = SkRect_创建(x, y, x + w, y + h)
+    // 应用变换
+    Sk画布_drawRect(ctx.skcanvas, rect, paint)
+}
+
+函数 画布2D_strokeRect(ctx, x, y, w, h) {
+    如果 (w == 0 && h == 0) { 返回 }
+    定义 paint = 画布2D_创建描边画笔(ctx)
+    定义 rect = SkRect_创建(x, y, x + w, y + h)
+    Sk画布_drawRect(ctx.skcanvas, rect, paint)
+}
+
+函数 画布2D_clearRect(ctx, x, y, w, h) {
+    // 清除矩形区域为透明
+    定义 px = x / 100; 定义 py = y / 100
+    定义 pw = w / 100; 定义 ph = h / 100
+    如果 (px < 0) { px = 0 }; 如果 (py < 0) { py = 0 }
+    如果 (px + pw > ctx.宽) { pw = ctx.宽 - px }
+    如果 (py + ph > ctx.高) { ph = ctx.高 - py }
+
+    定义 可变 cy = py
+    当 (cy < py + ph) {
+        定义 可变 cx = px
+        当 (cx < px + pw) {
+            Nova缓冲itmap_设置像素(ctx.位图, cx, cy, 0x00000000)
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+}
+
+// §5 路径API
+
+结构 路径段 {
+    类型,
+    x1, y1,
+    x2, y2,
+    x3, y3,
+}
+
+定义 路径_MOVETO = 0
+定义 路径_LINETO = 1
+定义 路径_QUADRATIC = 2
+定义 路径_BEZIER = 3
+定义 路径_ARC = 4
+定义 路径_CLOSE = 5
+
+函数 画布2D_beginPath(ctx) {
+    ctx.路径段列表 = []
+    ctx.路径段数 = 0
+    ctx.当前X = 0
+    ctx.当前Y = 0
+    ctx.路径起始X = 0
+    ctx.路径起始Y = 0
+}
+
+函数 画布2D_moveTo(ctx, x, y) {
+    追加(ctx.路径段列表, 路径段 { 类型: 路径_MOVETO, x1: x, y1: y, x2: 0, y2: 0, x3: 0, y3: 0 })
+    ctx.路径段数 = ctx.路径段数 + 1
+    ctx.当前X = x
+    ctx.当前Y = y
+    ctx.路径起始X = x
+    ctx.路径起始Y = y
+}
+
+函数 画布2D_lineTo(ctx, x, y) {
+    追加(ctx.路径段列表, 路径段 { 类型: 路径_LINETO, x1: x, y1: y, x2: 0, y2: 0, x3: 0, y3: 0 })
+    ctx.路径段数 = ctx.路径段数 + 1
+    ctx.当前X = x
+    ctx.当前Y = y
+}
+
+函数 画布2D_quadraticCurveTo(ctx, cpx, cpy, x, y) {
+    追加(ctx.路径段列表, 路径段 { 类型: 路径_QUADRATIC, x1: cpx, y1: cpy, x2: x, y2: y, x3: 0, y3: 0 })
+    ctx.路径段数 = ctx.路径段数 + 1
+    ctx.当前X = x
+    ctx.当前Y = y
+}
+
+函数 画布2D_bezierCurveTo(ctx, cp1x, cp1y, cp2x, cp2y, x, y) {
+    追加(ctx.路径段列表, 路径段 { 类型: 路径_BEZIER, x1: cp1x, y1: cp1y, x2: cp2x, y2: cp2y, x3: x, y3: y })
+    ctx.路径段数 = ctx.路径段数 + 1
+    ctx.当前X = x
+    ctx.当前Y = y
+}
+
+函数 画布2D_arc(ctx, cx, cy, 半径, 起始角, 结束角, 逆时针) {
+    // 将圆弧转换为贝塞尔曲线近似
+    追加(ctx.路径段列表, 路径段 { 类型: 路径_ARC, x1: cx, y1: cy, x2: 半径, y2: 起始角, x3: 结束角, y3: 逆时针 })
+    ctx.路径段数 = ctx.路径段数 + 1
+    // 更新当前点到圆弧终点
+    ctx.当前X = cx + 定点_乘(半径, 定点_cos(结束角))
+    ctx.当前Y = cy + 定点_乘(半径, 定点_sin(结束角))
+}
+
+函数 画布2D_closePath(ctx) {
+    如果 (ctx.路径段数 > 0) {
+        追加(ctx.路径段列表, 路径段 { 类型: 路径_CLOSE, x1: ctx.路径起始X, y1: ctx.路径起始Y, x2: 0, y2: 0, x3: 0, y3: 0 })
+        ctx.路径段数 = ctx.路径段数 + 1
+        ctx.当前X = ctx.路径起始X
+        ctx.当前Y = ctx.路径起始Y
+    }
+}
+
+函数 画布2D_rect(ctx, x, y, w, h) {
+    画布2D_moveTo(ctx, x, y)
+    画布2D_lineTo(ctx, x + w, y)
+    画布2D_lineTo(ctx, x + w, y + h)
+    画布2D_lineTo(ctx, x, y + h)
+    画布2D_closePath(ctx)
+}
+
+函数 画布2D_fill(ctx) {
+    如果 (ctx.路径段数 == 0) { 返回 }
+    定义 paint = 画布2D_创建填充画笔(ctx)
+    Sk画布_drawPath(ctx.skcanvas, ctx.路径段列表, paint, ctx.当前状态.矩阵)
+    画布_绘制调用数 = 画布_绘制调用数 + 1
+}
+
+函数 画布2D_stroke(ctx) {
+    如果 (ctx.路径段数 == 0) { 返回 }
+    定义 paint = 画布2D_创建描边画笔(ctx)
+    Sk画布_drawPath(ctx.skcanvas, ctx.路径段列表, paint, ctx.当前状态.矩阵)
+    画布_绘制调用数 = 画布_绘制调用数 + 1
+}
+
+// §6 渐变
+
+结构 CanvasGradient {
+    类型,
+    x0, y0, x1, y1,
+    r0, r1,
+    颜色停靠列表,
+    停靠数,
+}
+
+函数 画布2D_createLinearGradient(x0, y0, x1, y1) {
+    返回 CanvasGradient {
+        类型: 0,
+        x0: x0, y0: y0, x1: x1, y1: y1,
+        r0: 0, r1: 0,
+        颜色停靠列表: [],
+        停靠数: 0,
+    }
+}
+
+函数 画布2D_createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    返回 CanvasGradient {
+        类型: 1,
+        x0: x0, y0: y0, x1: x1, y1: y1,
+        r0: r0, r1: r1,
+        颜色停靠列表: [],
+        停靠数: 0,
+    }
+}
+
+函数 CanvasGradient_addColorStop(grad, 偏移, 颜色) {
+    如果 (grad == 空) { 返回 }
+    追加(grad.颜色停靠列表, { 偏移: 偏移, 颜色: 颜色 })
+    grad.停靠数 = grad.停靠数 + 1
+}
+
+// §7 图像绘制
+
+函数 画布2D_drawImage_3(ctx, 图像, dx, dy) {
+    如果 (图像 == 空) { 返回 }
+    画布2D_drawImage_9(ctx, 图像, 0, 0, 图像.宽, 图像.高, dx, dy, 图像.宽, 图像.高)
+}
+
+函数 画布2D_drawImage_5(ctx, 图像, dx, dy, dw, dh) {
+    如果 (图像 == 空) { 返回 }
+    画布2D_drawImage_9(ctx, 图像, 0, 0, 图像.宽, 图像.高, dx, dy, dw, dh)
+}
+
+函数 画布2D_drawImage_9(ctx, 图像, sx, sy, sw, sh, dx, dy, dw, dh) {
+    如果 (图像 == 空 || ctx == 空) { 返回 }
+    // 源区域裁剪
+    如果 (sx < 0) { dx = dx - sx * dw / sw; sw = sw + sx; sx = 0 }
+    如果 (sy < 0) { dy = dy - sy * dh / sh; sh = sh + sy; sy = 0 }
+    如果 (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) { 返回 }
+
+    // 缩放绘制: 双线性插值
+    定义 可变 行 = 0
+    当 (行 < dh) {
+        定义 源行 = sy + 行 * sh / dh
+        如果 (源行 >= 图像.高) { 跳出 }
+        定义 可变 列 = 0
+        当 (列 < dw) {
+            定义 源列 = sx + 列 * sw / dw
+            如果 (源列 >= 图像.宽) { 跳出 }
+            定义 像素 = 图像_获取像素(图像, 源列, 源行)
+            定义 目标x = dx + 列
+            定义 目标y = dy + 行
+            如果 (目标x >= 0 && 目标x < ctx.宽 && 目标y >= 0 && 目标y < ctx.高) {
+                // Alpha混合
+                定义 alpha = (像素 >> 24) & 0xFF
+                alpha = alpha * ctx.当前状态.globalAlpha / 255
+                如果 (alpha > 0) {
+                    画布_混合像素(ctx.位图, 目标x, 目标y, 像素, alpha)
+                }
+            }
+            列 = 列 + 1
+        }
+        行 = 行 + 1
+    }
+    画布_绘制调用数 = 画布_绘制调用数 + 1
+}
+
+函数 画布_混合像素(位图, x, y, 源色, alpha) {
+    定义 目标色 = Nova缓冲itmap_获取像素(位图, x, y)
+    定义 inv_a = 255 - alpha
+    定义 r = (((源色 >> 16) & 0xFF) * alpha + ((目标色 >> 16) & 0xFF) * inv_a) / 255
+    定义 g = (((源色 >> 8) & 0xFF) * alpha + ((目标色 >> 8) & 0xFF) * inv_a) / 255
+    定义 b = ((源色 & 0xFF) * alpha + (目标色 & 0xFF) * inv_a) / 255
+    Nova缓冲itmap_设置像素(位图, x, y, 0xFF000000 | (r << 16) | (g << 8) | b)
+}
+
+// §8 像素操作
+
+结构 ImageData {
+    宽, 高,
+    数据,
+    数据大小,
+}
+
+函数 画布2D_createImageData(宽, 高) {
+    定义 大小 = 宽 * 高 * 4
+    定义 数据 = 分配内存(大小)
+    内存_置零(数据, 大小)
+    返回 ImageData { 宽: 宽, 高: 高, 数据: 数据, 数据大小: 大小 }
+}
+
+函数 画布2D_getImageData(ctx, sx, sy, sw, sh) {
+    定义 imgdata = 画布2D_createImageData(sw, sh)
+    定义 可变 y = 0
+    当 (y < sh) {
+        定义 可变 x = 0
+        当 (x < sw) {
+            定义 像素 = 0
+            定义 实际x = sx + x
+            定义 实际y = sy + y
+            如果 (实际x >= 0 && 实际x < ctx.宽 && 实际y >= 0 && 实际y < ctx.高) {
+                像素 = Nova缓冲itmap_获取像素(ctx.位图, 实际x, 实际y)
+            }
+            // RGBA顺序存储
+            定义 偏移 = (y * sw + x) * 4
+            内存_写8(imgdata.数据 + 偏移, (像素 >> 16) & 0xFF)
+            内存_写8(imgdata.数据 + 偏移 + 1, (像素 >> 8) & 0xFF)
+            内存_写8(imgdata.数据 + 偏移 + 2, 像素 & 0xFF)
+            内存_写8(imgdata.数据 + 偏移 + 3, (像素 >> 24) & 0xFF)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    返回 imgdata
+}
+
+函数 画布2D_putImageData(ctx, imgdata, dx, dy) {
+    如果 (imgdata == 空) { 返回 }
+    定义 可变 y = 0
+    当 (y < imgdata.高) {
+        定义 可变 x = 0
+        当 (x < imgdata.宽) {
+            定义 偏移 = (y * imgdata.宽 + x) * 4
+            定义 r = 内存_读8(imgdata.数据 + 偏移)
+            定义 g = 内存_读8(imgdata.数据 + 偏移 + 1)
+            定义 b = 内存_读8(imgdata.数据 + 偏移 + 2)
+            定义 a = 内存_读8(imgdata.数据 + 偏移 + 3)
+            定义 像素 = (a << 24) | (r << 16) | (g << 8) | b
+            定义 目标x = dx + x
+            定义 目标y = dy + y
+            如果 (目标x >= 0 && 目标x < ctx.宽 && 目标y >= 0 && 目标y < ctx.高) {
+                Nova缓冲itmap_设置像素(ctx.位图, 目标x, 目标y, 像素)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// §9 合成与样式
+
+函数 画布2D_set_globalAlpha(ctx, alpha) {
+    如果 (alpha < 0) { alpha = 0 }
+    如果 (alpha > 255) { alpha = 255 }
+    ctx.当前状态.globalAlpha = alpha
+}
+
+函数 画布2D_set_fillStyle(ctx, 颜色) {
+    ctx.当前状态.填充颜色 = 颜色
+}
+
+函数 画布2D_set_strokeStyle(ctx, 颜色) {
+    ctx.当前状态.描边颜色 = 颜色
+}
+
+函数 画布2D_set_lineWidth(ctx, 宽度) {
+    如果 (宽度 <= 0) { 返回 }
+    ctx.当前状态.线宽 = 宽度
+}
+
+函数 画布2D_set_lineCap(ctx, 类型) {
+    ctx.当前状态.线端 = 类型
+}
+
+函数 画布2D_set_lineJoin(ctx, 类型) {
+    ctx.当前状态.线连 = 类型
+}
+
+函数 画布2D_set_shadowColor(ctx, 颜色) {
+    ctx.当前状态.阴影颜色 = 颜色
+}
+
+函数 画布2D_set_shadowBlur(ctx, 模糊) {
+    ctx.当前状态.阴影模糊 = 模糊
+}
+
+函数 画布2D_set_shadowOffsetX(ctx, 偏移) {
+    ctx.当前状态.阴影X偏移 = 偏移
+}
+
+函数 画布2D_set_shadowOffsetY(ctx, 偏移) {
+    ctx.当前状态.阴影Y偏移 = 偏移
+}
+
+// §10 画笔创建辅助
+
+函数 画布2D_创建填充画笔(ctx) {
+    返回 {
+        颜色: ctx.当前状态.填充颜色,
+        alpha: ctx.当前状态.globalAlpha,
+        样式: 0,
+    }
+}
+
+函数 画布2D_创建描边画笔(ctx) {
+    返回 {
+        颜色: ctx.当前状态.描边颜色,
+        alpha: ctx.当前状态.globalAlpha,
+        线宽: ctx.当前状态.线宽,
+        线端: ctx.当前状态.线端,
+        线连: ctx.当前状态.线连,
+        样式: 1,
+    }
+}
+
+函数 SkMatrix_单位矩阵() {
+    返回 { m00: 10000, m01: 0, m02: 0, m10: 0, m11: 10000, m12: 0, m20: 0, m21: 0, m22: 10000 }
+}
+
+函数 SkMatrix_平移(dx, dy) {
+    定义 m = SkMatrix_单位矩阵()
+    m.m02 = dx
+    m.m12 = dy
+    返回 m
+}
+
+函数 SkMatrix_缩放(sx, sy) {
+    定义 m = SkMatrix_单位矩阵()
+    m.m00 = sx
+    m.m11 = sy
+    返回 m
+}
+
+函数 SkMatrix_乘(a, b) {
+    定义 m = {}
+    m.m00 = (a.m00 * b.m00 + a.m01 * b.m10) / 10000
+    m.m01 = (a.m00 * b.m01 + a.m01 * b.m11) / 10000
+    m.m02 = (a.m00 * b.m02 + a.m01 * b.m12) / 10000 + a.m02
+    m.m10 = (a.m10 * b.m00 + a.m11 * b.m10) / 10000
+    m.m11 = (a.m10 * b.m01 + a.m11 * b.m11) / 10000
+    m.m12 = (a.m10 * b.m02 + a.m11 * b.m12) / 10000 + a.m12
+    m.m20 = 0; m.m21 = 0; m.m22 = 10000
+    返回 m
+}
+
+// §11 统计
+
+定义 可变 画布_绘制调用数 = 0
+
+函数 画布2D_统计() {
+    返回 {
+        绘制调用数: 画布_绘制调用数,
+    }
+}

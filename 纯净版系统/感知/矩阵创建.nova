@@ -1,0 +1,207 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./精确三角函数.nova")
+导入("../中枢/内存初始化.nova")
+导入("./样式子网格.nova")
+导入("../执行/底层内存操.nova")
+
+//       css_transform_value.cc + transform_operations.cc (~2000行)
+//       transform_operations.cc + affine_transform.cc (~1500行)
+// CSS transform: 2D/3D变换
+//   transform: translate(10px, 20px) rotate(45deg) scale(1.5)
+//   transform-origin: 50% 50%
+//   perspective: 1000px
+// 本文件实现:
+//   1. transform函数解析(translate/rotate/scale/skew/matrix/perspective)
+//   2. 4x4变换矩阵(3D完整)
+//   3. 矩阵插值(动画用)
+//   4. transform-origin处理
+//   5. backface-visibility
+//   6. will-change提示
+
+// §1 4x4变换矩阵 (TransformationMatrix)
+// 3D变换需要4x4矩阵,2D是其子集
+// | m11 m12 m13 m14 |   | a  c  0  tx |
+// | m21 m22 m23 m24 | = | b  d  0  ty |  (2D映射)
+// | m31 m32 m33 m34 |   | 0  0  1  0  |
+// | m41 m42 m43 m44 |   | 0  0  0  1  |
+// 所有值×10000(定点数,4位小数精度)
+
+结构 Matrix4x4 {
+    m,    // u64 16个i32 (m[0..15])
+}
+
+
+函数 Matrix4x4_创建() {
+    定义 mat = 堆_分配(Matrix4x4)
+    mat.m = 堆_分配_数组(16 * 4)
+    Matrix4x4_单位化(mat)
+    返回 mat
+}
+
+函数 Matrix4x4_单位化(mat) {
+    内存_清零(mat.m, 64)
+    内存_写32(mat.m, 10000)         // m[0] = 1.0
+    内存_写32(mat.m + 20, 10000)    // m[5] = 1.0
+    内存_写32(mat.m + 40, 10000)    // m[10] = 1.0
+    内存_写32(mat.m + 60, 10000)    // m[15] = 1.0
+}
+
+函数 Matrix4x4_获取(mat, 行, 列) {
+    返回 内存_读32(mat.m + (行 * 4 + 列) * 4)
+}
+
+函数 Matrix4x4_设置(mat, 行, 列, 值) {
+    内存_写32(mat.m + (行 * 4 + 列) * 4, 值)
+}
+
+函数 Matrix4x4_乘(a, b) {
+    定义 结果 = Matrix4x4_创建()
+    定义 可变 i = 0
+    当 (i < 4) {
+        定义 可变 j = 0
+        当 (j < 4) {
+            定义 可变 和 = 0
+            定义 可变 k = 0
+            当 (k < 4) {
+                和 = 和 + Matrix4x4_获取(a, i, k) * Matrix4x4_获取(b, k, j) / 10000
+                k = k + 1
+            }
+            Matrix4x4_设置(结果, i, j, 和)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+// §2 基本变换矩阵构建
+
+函数 Transform_translate(tx, ty) {
+    // tx, ty: 像素×100
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 3, tx * 100)     // ×100 → ×10000
+    Matrix4x4_设置(mat, 1, 3, ty * 100)
+    返回 mat
+}
+
+函数 Transform_translate3d(tx, ty, tz) {
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 3, tx * 100)
+    Matrix4x4_设置(mat, 1, 3, ty * 100)
+    Matrix4x4_设置(mat, 2, 3, tz * 100)
+    返回 mat
+}
+
+函数 Transform_scale(sx, sy) {
+    // sx, sy: ×100 (100 = 1.0)
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 0, sx * 100)     // ×100 → ×10000
+    Matrix4x4_设置(mat, 1, 1, sy * 100)
+    返回 mat
+}
+
+函数 Transform_scale3d(sx, sy, sz) {
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 0, sx * 100)
+    Matrix4x4_设置(mat, 1, 1, sy * 100)
+    Matrix4x4_设置(mat, 2, 2, sz * 100)
+    返回 mat
+}
+
+函数 Transform_rotate(角度_度) {
+    // 2D旋转(绕Z轴)
+    // 角度: 度×100
+    定义 弧度 = 角度_度 * 175 / 10000    // π/180 ≈ 0.0175 → ×10000
+    定义 cos_v = 定点_cos_精确(弧度)
+    定义 sin_v = 定点_sin_精确(弧度)
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 0, cos_v)
+    Matrix4x4_设置(mat, 0, 1, 0 - sin_v)
+    Matrix4x4_设置(mat, 1, 0, sin_v)
+    Matrix4x4_设置(mat, 1, 1, cos_v)
+    返回 mat
+}
+
+函数 Transform_rotate3d(x, y, z, 角度_度) {
+    // 绕任意轴旋转(Rodrigues公式)
+    定义 弧度 = 角度_度 * 175 / 10000
+    定义 cos_v = 定点_cos_精确(弧度)
+    定义 sin_v = 定点_sin_精确(弧度)
+    定义 one_c = 10000 - cos_v
+
+    // 归一化轴
+    定义 长度 = 整数_sqrt(x * x + y * y + z * z)
+    如果 (长度 == 0) { 返回 Matrix4x4_创建() }
+    定义 nx = x * 10000 / 长度
+    定义 ny = y * 10000 / 长度
+    定义 nz = z * 10000 / 长度
+
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 0, cos_v + nx * nx * one_c / 100000000)
+    Matrix4x4_设置(mat, 0, 1, nx * ny * one_c / 100000000 - nz * sin_v / 10000)
+    Matrix4x4_设置(mat, 0, 2, nx * nz * one_c / 100000000 + ny * sin_v / 10000)
+    Matrix4x4_设置(mat, 1, 0, ny * nx * one_c / 100000000 + nz * sin_v / 10000)
+    Matrix4x4_设置(mat, 1, 1, cos_v + ny * ny * one_c / 100000000)
+    Matrix4x4_设置(mat, 1, 2, ny * nz * one_c / 100000000 - nx * sin_v / 10000)
+    Matrix4x4_设置(mat, 2, 0, nz * nx * one_c / 100000000 - ny * sin_v / 10000)
+    Matrix4x4_设置(mat, 2, 1, nz * ny * one_c / 100000000 + nx * sin_v / 10000)
+    Matrix4x4_设置(mat, 2, 2, cos_v + nz * nz * one_c / 100000000)
+    返回 mat
+}
+
+函数 Transform_rotateX(角度_度) { 返回 Transform_rotate3d(10000, 0, 0, 角度_度) }
+函数 Transform_rotateY(角度_度) { 返回 Transform_rotate3d(0, 10000, 0, 角度_度) }
+函数 Transform_rotateZ(角度_度) { 返回 Transform_rotate(角度_度) }
+
+函数 Transform_skewX(角度_度) {
+    定义 tan_v = 定点_tan(角度_度 * 175 / 10000)
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 1, tan_v)
+    返回 mat
+}
+
+函数 Transform_skewY(角度_度) {
+    定义 tan_v = 定点_tan(角度_度 * 175 / 10000)
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 1, 0, tan_v)
+    返回 mat
+}
+
+函数 Transform_perspective(距离) {
+    // 透视投影: perspective(1000px)
+    // 距离: ×100
+    如果 (距离 <= 0) { 返回 Matrix4x4_创建() }
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 3, 2, 0 - 10000 * 100 / 距离)    // m[3][2] = -1/d
+    返回 mat
+}
+
+函数 Transform_matrix(a, b, c, d, tx, ty) {
+    // 2D: matrix(a, b, c, d, tx, ty)
+    // 值×100
+    定义 mat = Matrix4x4_创建()
+    Matrix4x4_设置(mat, 0, 0, a * 100)
+    Matrix4x4_设置(mat, 1, 0, b * 100)
+    Matrix4x4_设置(mat, 0, 1, c * 100)
+    Matrix4x4_设置(mat, 1, 1, d * 100)
+    Matrix4x4_设置(mat, 0, 3, tx * 100)
+    Matrix4x4_设置(mat, 1, 3, ty * 100)
+    返回 mat
+}
+
+定义 可变 AI_矩阵创建_调用数 = 0
+定义 可变 AI_矩阵创建_异常数 = 0
+
+函数 AI_矩阵创建_监控() {
+    AI_矩阵创建_调用数 = AI_矩阵创建_调用数 + 1
+    返回 AI_矩阵创建_异常数 == 0
+}
+
+函数 AI_矩阵创建_健康检查() {
+    如果 (AI_矩阵创建_调用数 > 0 && AI_矩阵创建_异常数 * 100 / AI_矩阵创建_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

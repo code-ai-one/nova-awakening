@@ -1,0 +1,218 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./原生系统块分.nova")
+导入("./字符串替换.nova")
+导入("./链表后继.nova")
+导入("./虚拟内存区.nova")
+导入("./进程描述符.nova")
+导入("./同步原语.nova")
+导入("./列表加头加尾.nova")
+
+//   1. copy_process: 分步复制子系统, 任一步失败则回滚已完成步骤
+//   2. dup_task_struct: 从SLUB分配task_struct, 复制父进程全部字段
+//   3. copy_mm: CLONE_VM共享/否则COW — 标记父子页表只读,缺页时复制
+//   4. copy_files: 引用计数的文件描述符表 — 共享或独立复制
+//   5. copy_fs: 文件系统上下文(cwd/root) — 引用计数共享或复制
+//   6. copy_sighand: 信号处理器表 — 引用计数
+//   7. copy_thread: 设置子进程内核栈, 使ret_from_fork返回到用户态
+//   8. clone标志验证: SIGHAND必须有VM, THREAD必须有SIGHAND等
+//   9. RLIMIT_NPROC: 每用户进程数限制
+//   10. vfork完成通知: completion机制
+
+// clone 标志 
+
+定义 CLONE_VM        = 0x00000100   // 共享地址空间(线程必须)
+定义 CLONE_FS        = 0x00000200   // 共享cwd/root/umask
+定义 CLONE_FILES     = 0x00000400   // 共享文件描述符表
+定义 CLONE_SIGHAND   = 0x00000800   // 共享信号处理器
+定义 CLONE_PIDFD     = 0x00001000   // 返回pidfd
+定义 CLONE_PTRACE    = 0x00002000   // 子进程被ptrace
+定义 CLONE_VFORK     = 0x00004000   // 父等待子exec/exit
+定义 CLONE_PARENT    = 0x00008000   // 与调用者同父
+定义 CLONE_THREAD    = 0x00010000   // 同线程组(共享PID)
+定义 CLONE_NEWNS     = 0x00020000   // 新mount namespace
+定义 CLONE_SYSVSEM   = 0x00040000   // 共享SysV信号量
+定义 CLONE_SET安全    = 0x00080000   // 设置安全
+定义 CLONE_CHILD_SETTID  = 0x01000000  // 在子进程中写TID
+定义 CLONE_CHILD_CLEARTID = 0x02000000 // exit时清TID并Nova快速锁唤醒
+定义 CLONE_UNTRACED  = 0x00800000   // 不可被ptrace
+定义 CLONE_NEWUSER   = 0x10000000   // 新user namespace
+定义 CLONE_NEWPID    = 0x20000000   // 新PID namespace
+
+定义 PF_KTHREAD      = 0x00200000   // 内核线程
+定义 PF_FORKNOEXEC   = 0x00000040   // fork后未exec
+定义 PF_EXITING      = 0x00000004   // 正在退出
+定义 PF_IO_WORKER    = 0x00000010   // IO工作线程
+定义 PF_USER_WORKER  = 0x00000020   // 用户空间工作线程
+
+定义 可变 总fork次数 = 0
+定义 可变 总fork失败 = 0
+
+// 引用计数的共享结构 
+// CLONE_FILES时refcount++而非复制, fork时refcount=1新建
+
+结构 文件表 {
+    表,    // 数组<u64> 文件描述符 → file*
+    最大fd,    // u32 当前分配的最大fd+1
+    引用数,    // u32 引用计数: >1表示被多个进程共享
+    下个fd,    // u32 下次分配从此fd开始搜索
+    close_on_exec,    // u64 位图: exec时自动关闭
+    锁,    // 自旋锁
+}
+
+结构 文件系统信息 {
+    根目录,    // u64 root Nova路径项
+    当前目录,    // u64 pwd Nova路径项
+    umask,    // u32 文件创建掩码
+    引用数,    // u32 引用计数
+}
+
+结构 信号处理表 {
+    处理器,    // 数组<u64, 64> 每个信号的处理函数(SIG_DFL/SIG_IGN/handler)
+    引用数,    // u32 引用计数
+    锁,    // 自旋锁
+}
+
+// mm_struct — 地址空间 
+
+结构 地址空间 {
+    PGD,    // u64 顶级页表物理地址
+    VMA链,    // 链表 vm_area_struct链表
+    VMA数,    // u32 映射区域数
+    代码段起,    // u64 start_code
+    代码段止,    // u64 end_code
+    数据段起,    // u64 start_data
+    数据段止,    // u64 end_data
+    栈顶,    // u64 start_stack
+    堆起,    // u64 start_brk
+    堆止,    // u64 brk
+    映射页数,    // u64 total_vm
+    常驻页数,    // u64 rss
+    引用数,    // u32 mm_users: 共享此mm的线程数
+    使用数,    // u32 mm_count: 内核引用数
+    锁,    // 自旋锁 Nova内存映射_lock (实际用读写锁)
+}
+
+// clone标志验证 
+
+函数 验证clone标志(标志) {
+    // CLONE_NEWNS和CLONE_FS互斥: 新namespace不能共享fs
+    如果 ((标志 & CLONE_NEWNS) != 0 && (标志 & CLONE_FS) != 0) {
+        返回 错误_无效参数
+    }
+    // CLONE_THREAD必须有CLONE_SIGHAND: 线程必须共享信号处理
+    如果 ((标志 & CLONE_THREAD) != 0 && (标志 & CLONE_SIGHAND) == 0) {
+        返回 错误_无效参数
+    }
+    // CLONE_SIGHAND必须有CLONE_VM: 共享信号处理必须共享地址空间
+    如果 ((标志 & CLONE_SIGHAND) != 0 && (标志 & CLONE_VM) == 0) {
+        返回 错误_无效参数
+    }
+    返回 成功
+}
+
+// dup_task_struct: 分配并复制进程描述符
+
+函数 dup_task_struct(父进程) {
+    // 从SLUB分配新的task_struct
+    定义 子进程 = kmalloc(进程描述符大小, 0)
+    如果 (子进程 == 0) { 返回 空 }
+
+    // 深拷贝父进程所有字段
+    内存复制(子进程, 父进程, 进程描述符大小)
+
+    // 分配独立的内核栈 
+    定义 栈 = 内核栈_分配()
+    如果 (栈 == 0) {
+        kfree(子进程)
+        返回 空
+    }
+    进程_设内核栈(子进程, 栈)
+
+    // 重置子进程专属字段
+    进程_设标志(子进程, PF_FORKNOEXEC)
+    设置(子进程, T_子进程列表, [])
+    设置(子进程, T_等待通道, 空)
+    设置(子进程, T_累计用户时间, 0)
+    设置(子进程, T_累计系统时间, 0)
+    设置(子进程, T_主动切换次数, 0)
+    设置(子进程, T_被动切换次数, 0)
+
+    返回 子进程
+}
+
+// copy_mm: 复制/共享地址空间
+// 关键: CLONE_VM时直接共享mm(线程), 否则做COW复制
+
+函数 copy_mm(标志, 子进程, 父进程) {
+    定义 父mm = 父进程[T_地址空间]
+    如果 (父mm == 空) {
+        // 内核线程没有mm
+        设置(子进程, T_地址空间, 空)
+        返回 成功
+    }
+
+    如果 ((标志 & CLONE_VM) != 0) {
+        // 线程: 共享地址空间, 引用计数+1
+        父mm.引用数 = 父mm.引用数 + 1
+        设置(子进程, T_地址空间, 父mm)
+        设置(子进程, T_页表, 父进程[T_页表])
+        返回 成功
+    }
+
+    // fork: COW复制
+    // 1. 创建新的mm_struct
+    定义 可变 新mm = 地址空间 {}
+    新mm.引用数 = 1
+    新mm.使用数 = 1
+    新mm.锁 = 自旋锁_创建()
+    新mm.VMA链 = 链表_创建()
+    新mm.VMA数 = 0
+    // 复制段地址
+    新mm.代码段起 = 父mm.代码段起
+    新mm.代码段止 = 父mm.代码段止
+    新mm.数据段起 = 父mm.数据段起
+    新mm.数据段止 = 父mm.数据段止
+    新mm.栈顶 = 父mm.栈顶
+    新mm.堆起 = 父mm.堆起
+    新mm.堆止 = 父mm.堆止
+
+    // 2. 复制页表 (COW: 标记所有可写页为只读)
+    定义 新PGD = 页表_复制COW(父mm.PGD)
+    如果 (新PGD == 0) {
+        返回 错误_无内存
+    }
+    新mm.PGD = 新PGD
+    新mm.映射页数 = 父mm.映射页数
+    新mm.常驻页数 = 父mm.常驻页数
+
+    // 3. 复制VMA链表 (每个VMA描述一个映射区域)
+    定义 可变 父VMA = 链表_首节点_或空(父mm.VMA链)
+    当 (父VMA != 空 && 父VMA != 父mm.VMA链) {
+        定义 vma数据 = 链表_数据(父VMA)
+        链表_尾插(新mm.VMA链, VMA_复制(vma数据))
+        新mm.VMA数 = 新mm.VMA数 + 1
+        父VMA = 链表_后继(父VMA)
+    }
+
+    设置(子进程, T_地址空间, 新mm)
+    设置(子进程, T_页表, 新PGD)
+    返回 成功
+}
+
+// copy_files: 复制/共享文件描述符表
+
+定义 可变 AI_验证克隆标_威胁计数 = 0
+
+函数 AI_验证克隆标_风险评分(操作类型, 权限级别, 来源可信度) {
+    定义 可变 风险 = 0
+    如果 (权限级别 > 500) { 风险 = 风险 + 300 }
+    如果 (来源可信度 < 200) { 风险 = 风险 + 400 }
+    如果 (风险 > 500) { AI_验证克隆标_威胁计数 = AI_验证克隆标_威胁计数 + 1 }
+    返回 风险
+}
+
+函数 AI_验证克隆标_异常行为检测(操作频率, 基线频率) {
+    如果 (基线频率 > 0 && 操作频率 > 基线频率 * 5) { 返回 真 }
+    返回 假
+}

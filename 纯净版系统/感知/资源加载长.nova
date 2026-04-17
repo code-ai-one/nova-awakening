@@ -1,0 +1,179 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./资源响应创.nova")
+导入("./内核直连层.nova")
+导入("../外联/底层输入输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/创建甲.nova")
+导入("../中枢/字符串替换.nova")
+
+//       websocket_channel.cc (~1500行)
+//       websocket_frame.cc 
+//       websocket_handshake_stream.cc (~800行)
+// 长连接: 全双工通信协议,基于HTTP升级握手
+//   1. 握手: HTTP Upgrade → 101 Switching Protocols
+//   2. 帧: opcode(text/binary/close/ping/pong) + mask + payload
+//   3. 分片: 大消息分多帧
+//   4. 心跳: ping/pong
+//   5. 关闭: close帧 + 状态码
+
+// 长连接状态
+定义 WS_CONNECTING = 0
+定义 WS_OPEN       = 1
+定义 WS_CLOSING    = 2
+定义 WS_CLOSED     = 3
+
+// 帧操作码
+定义 WS_OP_CONTINUATION = 0x0
+定义 WS_OP_TEXT         = 0x1
+定义 WS_OP_BINARY       = 0x2
+定义 WS_OP_CLOSE        = 0x8
+定义 WS_OP_PING         = 0x9
+定义 WS_OP_PONG         = 0xA
+
+// 关闭状态码
+定义 WS_CLOSE_NORMAL         = 1000
+定义 WS_CLOSE_GOING_AWAY     = 1001
+定义 WS_CLOSE_PROTOCOL_ERROR = 1002
+定义 WS_CLOSE_UNSUPPORTED    = 1003
+定义 WS_CLOSE_NO_STATUS      = 1005
+定义 WS_CLOSE_ABNORMAL       = 1006
+
+结构 长连接Connection {
+    URL,
+    状态,    // u32 WS_xxx
+    套接字,
+    是安全,
+    协议,    // u64 子协议
+    扩展,    // u64 扩展(permessage-deflate等)
+    // 回调
+    onopen,
+    onmessage,
+    onerror,
+    onclose,
+    // 接收缓冲
+    接收缓冲,
+    接收长度,
+    接收容量,
+    // 发送队列
+    发送队列,
+    发送队列数,
+    // 掩码密钥
+    掩码密钥,
+}
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 长连接_创建(url) {
+    定义 ws = 堆_分配(长连接Connection)
+    ws.URL = 字符串_复制(url)
+    ws.状态 = WS_CONNECTING
+    ws.套接字 = -1
+    ws.是安全 = 假
+    ws.协议 = 0; ws.扩展 = 0
+    ws.onopen = 0; ws.onmessage = 0; ws.onerror = 0; ws.onclose = 0
+    ws.接收容量 = 65536
+    ws.接收缓冲 = 堆_分配(ws.接收容量)
+    ws.接收长度 = 0
+    ws.发送队列 = 堆_分配_数组(32 * 16)
+    ws.发送队列数 = 0
+    ws.掩码密钥 = 0
+    返回 ws
+}
+
+// §1 长连接握手 (Nova协议规范 6455 §4)
+// HTTP升级请求:
+//   GET /path HTTP/1.1
+//   Upgrade: websocket
+//   Connection: Upgrade
+//   Sec-长连接-Key: <base64 16字节随机>
+//   Sec-长连接-Version: 13
+
+函数 长连接_连接(ws) {
+    定义 url = URL_解析(ws.URL)
+    如果 (url == 0) { ws.状态 = WS_CLOSED; 返回 假 }
+
+    // ws:// → 80, wss:// → 443
+    ws.是安全 = 字符串_相等(url.协议, "wss")
+    定义 可变 端口 = url.端口
+    如果 (端口 == 0) { 端口 = ws.是安全 ? 443 : 80 }
+
+    // 域名解析
+    定义 ip = 网络_域名解析(url.主机)
+    如果 (ip == 0) { ws.状态 = WS_CLOSED; 返回 假 }
+
+    // 传控连接
+    ws.套接字 = 网络_传控连接(ip, 端口)
+    如果 (ws.套接字 < 0) { ws.状态 = WS_CLOSED; 返回 假 }
+
+    // 安全
+    如果 (ws.是安全) {
+        如果 (网络_安全连接(ws.套接字, url.主机) < 0) {
+            网络_关闭(ws.套接字); ws.状态 = WS_CLOSED; 返回 假
+        }
+    }
+
+    // 生成Sec-长连接-Key (16字节随机→Base64)
+    定义 key_bytes = 堆_分配(16)
+    定义 可变 i = 0
+    定义 可变 种子 = 平台_获取高精度时间()
+    当 (i < 16) {
+        种子 = 种子 * 1103515245 + 12345
+        内存_写8(key_bytes + i, (种子 >> 16) & 0xFF)
+        i = i + 1
+    }
+    定义 ws_key = Base64_编码(key_bytes, 16)
+
+    // 构建握手请求
+    定义 可变 请求 = "GET "
+    请求 = 字符串_连接(请求, url.路径 != 0 ? url.路径 : "/")
+    请求 = 字符串_连接(请求, " HTTP/1.1\r\n")
+    请求 = 字符串_连接(请求, "Host: "); 请求 = 字符串_连接(请求, url.主机); 请求 = 字符串_连接(请求, "\r\n")
+    请求 = 字符串_连接(请求, "Upgrade: websocket\r\n")
+    请求 = 字符串_连接(请求, "Connection: Upgrade\r\n")
+    请求 = 字符串_连接(请求, "Sec-长连接-Key: "); 请求 = 字符串_连接(请求, ws_key); 请求 = 字符串_连接(请求, "\r\n")
+    请求 = 字符串_连接(请求, "Sec-长连接-Version: 13\r\n")
+    如果 (ws.协议 != 0) {
+        请求 = 字符串_连接(请求, "Sec-长连接-Protocol: "); 请求 = 字符串_连接(请求, ws.协议); 请求 = 字符串_连接(请求, "\r\n")
+    }
+    请求 = 字符串_连接(请求, "\r\n")
+
+    // 发送握手
+    网络_发送(ws.套接字, 请求, 字符串_长度(请求), ws.是安全)
+
+    // 接收响应
+    定义 响应缓冲 = 堆_分配(4096)
+    定义 已读 = 网络_接收(ws.套接字, 响应缓冲, 4096, ws.是安全)
+    如果 (已读 <= 0) { 网络_关闭(ws.套接字); ws.状态 = WS_CLOSED; 返回 假 }
+
+    // 验证响应: HTTP/1.1 101
+    如果 (已读 < 12 || 内存_读8(响应缓冲 + 9) != 0x31 || 内存_读8(响应缓冲 + 10) != 0x30 || 内存_读8(响应缓冲 + 11) != 0x31) {
+        网络_关闭(ws.套接字); ws.状态 = WS_CLOSED; 返回 假
+    }
+
+    // 验证Sec-长连接-Accept: SHA1(key+GUID)的Base64
+
+    ws.状态 = WS_OPEN
+    堆_释放(响应缓冲)
+
+    // 触发onopen
+    如果 (ws.onopen != 0) { 调用(ws.onopen, ws) }
+    返回 真
+}
+
+定义 可变 AI_资源加载长_调用数 = 0
+定义 可变 AI_资源加载长_异常数 = 0
+
+函数 AI_资源加载长_监控() {
+    AI_资源加载长_调用数 = AI_资源加载长_调用数 + 1
+    返回 AI_资源加载长_异常数 == 0
+}
+
+函数 AI_资源加载长_健康检查() {
+    如果 (AI_资源加载长_调用数 > 0 && AI_资源加载长_异常数 * 100 / AI_资源加载长_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

@@ -1,0 +1,114 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../稳态/原生系统双.nova")
+导入("./内核直连层.nova")
+
+// §10 采样器对象 (Sampler Object)
+
+结构 GLSampler {
+    ID,
+    minFilter,
+    magFilter,
+    wrapS,
+    wrapT,
+    wrapR,    // u32 3D纹理
+    minLOD,    // i32 Q10
+    maxLOD,
+    compareMode,
+    compareFunc,
+}
+
+
+函数 图绘2_createSampler() {
+    定义 s = 堆_分配(GLSampler)
+    s.ID = 1; s.minFilter = 0x2601; s.magFilter = 0x2601    // GL_LINEAR
+    s.wrapS = 0x2901; s.wrapT = 0x2901; s.wrapR = 0x2901   // GL_REPEAT
+    s.minLOD = -1000 * 1024; s.maxLOD = 1000 * 1024
+    返回 s
+}
+
+函数 图绘2_bindSampler(unit, sampler) {
+    // 绑定采样器到纹理单元
+    定义 cmd = 图处命令_分配(图处_CMD_BIND_SAMPLER, 8)
+    内存_写32(cmd + 8, unit)
+    内存_写32(cmd + 12, sampler)
+    图处命令_提交(cmd)
+}
+
+函数 图绘2_samplerParameteri(sampler, pname, param) {
+    如果 (sampler == 0) { 返回 }
+    // 设置采样器参数
+}
+
+// §11 实例化绘制 (Instanced Drawing)
+
+函数 图绘2_draw数组sInstanced(mode, first, count, instanceCount) {
+    // 绘制instanceCount个实例
+    // 顶点着色器中: gl_InstanceID 区分每个实例
+    // 配合vertexAttribDivisor使用per-instance属性
+    定义 可变 inst = 0
+    当 (inst < instanceCount) {
+        // 对每个实例, 执行draw(mode, first, count)
+        // 更新per-instance属性
+        inst = inst + 1
+    }
+}
+
+函数 图绘2_draw元素sInstanced(mode, count, type, offset, instanceCount) {
+    定义 可变 inst = 0
+    当 (inst < instanceCount) {
+        // 索引绘制每个实例
+        inst = inst + 1
+    }
+}
+
+函数 图绘2_drawRange元素s(mode, start, end, count, type, offset) {
+    // 带索引范围提示的绘制调用
+    定义 cmd = 图处命令_分配(图处_CMD_DRAW_RANGE_元素S, 24)
+    内存_写32(cmd + 8, mode)
+    内存_写32(cmd + 12, start)
+    内存_写32(cmd + 16, end)
+    内存_写32(cmd + 20, count)
+    内存_写32(cmd + 24, type)
+    内存_写64(cmd + 28, offset)
+    图处命令_提交(cmd)
+}
+
+// §12 缓冲数据操作(图绘2新增)
+
+函数 图绘2_bufferSubData(target, dstByteOffset, srcData, srcOffset, length) {
+    // 更新缓冲子区域
+    如果 (srcData == 0 || length <= 0) { 返回 }
+    定义 cmd = 图处命令_分配(图处_CMD_BUFFER_SUB_DATA, 20 + length)
+    内存_写32(cmd + 8, target)
+    内存_写64(cmd + 12, dstByteOffset)
+    内存_写32(cmd + 20, length)
+    内存_复制(cmd + 24, srcData + srcOffset, length)
+    图处命令_提交(cmd)
+}
+
+函数 图绘2_copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size) {
+    // 图处端缓冲间复制(无需回读CPU)
+    定义 cmd = 图处命令_分配(图处_CMD_COPY_BUF_SUB, 28)
+    内存_写32(cmd + 8, readTarget)
+    内存_写32(cmd + 12, writeTarget)
+    内存_写64(cmd + 16, readOffset)
+    内存_写64(cmd + 24, writeOffset)
+    内存_写64(cmd + 32, size)
+    图处命令_提交(cmd)
+}
+
+函数 图绘2_getBufferSubData(target, srcByteOffset, dstData, dstOffset, length) {
+    // 从图处缓冲回读数据到CPU (会导致图处→CPU同步)
+    如果 (dstData == 0 || length <= 0) { 返回 }
+    // 刷新图处命令队列, 确保之前的写入完成
+    图处命令_刷新()
+    // 读取图处缓冲内容
+    定义 cmd = 图处命令_分配(图处_CMD_GET_BUF_SUB, 20 + length)
+    内存_写32(cmd + 8, target)
+    内存_写64(cmd + 12, srcByteOffset)
+    内存_写32(cmd + 20, length)
+    图处命令_提交_同步(cmd)
+    // 将结果复制到目标
+    内存_复制(dstData + dstOffset, cmd + 24, length)
+}

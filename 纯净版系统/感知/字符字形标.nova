@@ -1,0 +1,212 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./图片解码器创.nova")
+导入("./内核直连层.nova")
+导入("./文字绘制最.nova")
+
+// §2 字符→字形ID (cmap查找)
+
+
+函数 字体_字符到字形(font, unicode) {
+    如果 (font == 0 || font.cmap4_segCount == 0) { 返回 0 }
+
+    // 二分查找Format 4段
+    定义 可变 低 = 0
+    定义 可变 高 = font.cmap4_segCount - 1
+
+    当 (低 <= 高) {
+        定义 中 = (低 + 高) / 2
+        定义 endCode = 读16大端(font.cmap4_endCode + 中 * 2)
+        定义 startCode = 读16大端(font.cmap4_startCode + 中 * 2)
+
+        如果 (unicode > endCode) { 低 = 中 + 1 }
+        否则 如果 (unicode < startCode) { 高 = 中 - 1 }
+        否则 {
+            // 找到段
+            定义 idRangeOffset = 读16大端(font.cmap4_idRangeOff + 中 * 2)
+            如果 (idRangeOffset == 0) {
+                定义 idDelta = 读16大端(font.cmap4_idDelta + 中 * 2)
+                返回 (unicode + idDelta) & 0xFFFF
+            } 否则 {
+                定义 glyphAddr = font.cmap4_idRangeOff + 中 * 2 + idRangeOffset + (unicode - startCode) * 2
+                定义 glyphID = 读16大端(glyphAddr)
+                如果 (glyphID != 0) {
+                    定义 idDelta = 读16大端(font.cmap4_idDelta + 中 * 2)
+                    返回 (glyphID + idDelta) & 0xFFFF
+                }
+                返回 0
+            }
+        }
+    }
+    返回 0    // .notdef
+}
+
+// §3 字形度量(hmtx)
+
+结构 GlyphMetrics {
+    advanceWidth,    // u16 字形推进宽度(font units)
+    leftSideBearing,    // i16 左侧空白
+    xMin,
+    yMin,
+    xMax,
+    yMax,
+}
+
+函数 字体_字形度量(font, glyphID) {
+    如果 (font == 0 || font.hmtx偏移 == 0) { 返回 0 }
+    定义 m = 堆_分配(GlyphMetrics)
+    定义 hmtx = font.数据 + font.hmtx偏移
+    定义 偏移 = hmtx + glyphID * 4
+    m.advanceWidth = 读16大端(偏移)
+    m.leftSideBearing = 读16大端(偏移 + 2)
+    返回 m
+}
+
+// §4 字形轮廓提取(glyf表)
+// 简单字形: 由一组轮廓(contour)组成, 每个轮廓是闭合曲线
+// 复合字形: 由多个简单字形组合(如ü = u + ¨)
+// 轮廓点类型: 在曲线上(on-curve) / 控制点(off-curve)
+// 二次贝塞尔: on → off → on (TrueType)
+
+结构 GlyphOutline {
+    点x,    // u64 i16数组
+    点y,    // u64 i16数组
+    点标志,    // u64 u8数组(bit0=on-curve)
+    点数,
+    轮廓结束,    // u64 u16数组(每个轮廓的最后一个点索引)
+    轮廓数,
+    xMin,
+    yMin,
+    xMax,
+    yMax,
+}
+
+函数 字体_提取字形(font, glyphID) {
+    如果 (font == 0 || font.glyf偏移 == 0 || font.loca偏移 == 0) { 返回 0 }
+
+    // 从loca表获取字形偏移
+    定义 loca = font.数据 + font.loca偏移
+    定义 可变 字形偏移 = 0
+    定义 可变 下一偏移 = 0
+    如果 (font.loca格式 == 0) {
+        字形偏移 = 读16大端(loca + glyphID * 2) * 2
+        下一偏移 = 读16大端(loca + (glyphID + 1) * 2) * 2
+    } 否则 {
+        字形偏移 = 读32大端(loca + glyphID * 4)
+        下一偏移 = 读32大端(loca + (glyphID + 1) * 4)
+    }
+
+    如果 (字形偏移 == 下一偏移) { 返回 0 }    // 空字形(.notdef或空格)
+
+    定义 glyf = font.数据 + font.glyf偏移 + 字形偏移
+    定义 numberOfContours = 读16大端(glyf)
+
+    如果 (numberOfContours < 0) {
+        // 复合字形: 递归解析子组件并合并轮廓
+        返回 字体_解析复合字形(font, glyf)
+    }
+
+    定义 outline = 堆_分配(GlyphOutline)
+    outline.轮廓数 = numberOfContours
+    outline.xMin = 读16大端(glyf + 2)
+    outline.yMin = 读16大端(glyf + 4)
+    outline.xMax = 读16大端(glyf + 6)
+    outline.yMax = 读16大端(glyf + 8)
+
+    // 读取轮廓结束索引
+    outline.轮廓结束 = 堆_分配_数组(numberOfContours * 2)
+    定义 可变 i = 0
+    定义 可变 最大点 = 0
+    当 (i < numberOfContours) {
+        定义 endPt = 读16大端(glyf + 10 + i * 2)
+        内存_写16(outline.轮廓结束 + i * 2, endPt)
+        如果 (endPt > 最大点) { 最大点 = endPt }
+        i = i + 1
+    }
+    outline.点数 = 最大点 + 1
+
+    // 跳过instructions
+    定义 instrOffset = 10 + numberOfContours * 2
+    定义 instrLen = 读16大端(glyf + instrOffset)
+    定义 flagsOffset = instrOffset + 2 + instrLen
+
+    // 读取flags
+    outline.点标志 = 堆_分配_数组(outline.点数)
+    定义 可变 fi = 0
+    定义 可变 foff = flagsOffset
+    当 (fi < outline.点数) {
+        定义 flag = 内存_读8(glyf + foff)
+        内存_写8(outline.点标志 + fi, flag)
+        foff = foff + 1
+        fi = fi + 1
+        如果 (flag & 0x08) {    // repeat
+            定义 重复 = 内存_读8(glyf + foff)
+            foff = foff + 1
+            定义 可变 r = 0
+            当 (r < 重复 && fi < outline.点数) {
+                内存_写8(outline.点标志 + fi, flag)
+                fi = fi + 1
+                r = r + 1
+            }
+        }
+    }
+
+    // 读取x坐标
+    outline.点x = 堆_分配_数组(outline.点数 * 2)
+    定义 可变 xi = 0
+    定义 可变 x累计 = 0
+    当 (xi < outline.点数) {
+        定义 flag = 内存_读8(outline.点标志 + xi)
+        如果 (flag & 0x02) {    // x短
+            定义 dx = 内存_读8(glyf + foff)
+            foff = foff + 1
+            如果 (flag & 0x10) { x累计 = x累计 + dx }
+            否则 { x累计 = x累计 - dx }
+        } 否则 {
+            如果 (!(flag & 0x10)) {
+                x累计 = x累计 + 读16大端有符号(glyf + foff)
+                foff = foff + 2
+            }
+        }
+        内存_写16(outline.点x + xi * 2, x累计)
+        xi = xi + 1
+    }
+
+    // 读取y坐标(类似x)
+    outline.点y = 堆_分配_数组(outline.点数 * 2)
+    定义 可变 yi = 0
+    定义 可变 y累计 = 0
+    当 (yi < outline.点数) {
+        定义 flag = 内存_读8(outline.点标志 + yi)
+        如果 (flag & 0x04) {
+            定义 dy = 内存_读8(glyf + foff)
+            foff = foff + 1
+            如果 (flag & 0x20) { y累计 = y累计 + dy }
+            否则 { y累计 = y累计 - dy }
+        } 否则 {
+            如果 (!(flag & 0x20)) {
+                y累计 = y累计 + 读16大端有符号(glyf + foff)
+                foff = foff + 2
+            }
+        }
+        内存_写16(outline.点y + yi * 2, y累计)
+        yi = yi + 1
+    }
+
+    返回 outline
+}
+
+定义 可变 AI_字符字形标_调用数 = 0
+定义 可变 AI_字符字形标_异常数 = 0
+
+函数 AI_字符字形标_监控() {
+    AI_字符字形标_调用数 = AI_字符字形标_调用数 + 1
+    返回 AI_字符字形标_异常数 == 0
+}
+
+函数 AI_字符字形标_健康检查() {
+    如果 (AI_字符字形标_调用数 > 0 && AI_字符字形标_异常数 * 100 / AI_字符字形标_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

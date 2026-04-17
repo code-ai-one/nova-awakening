@@ -1,0 +1,546 @@
+// NovaOS 扩展系统调用 — 补齐Linux兼容性关键缺失的Nova系统调用
+// 当前已注册: 65个基础 + 24个兼容层 = ~89个
+// 目标: 补充到200+, 覆盖glibc/Qt/GTK/Electron常用调用
+// 分类补充:
+//   A. 定时器类(timerfd/timer_create) — GUI事件循环核心
+//   B. 事件类(事件fd/signalfd) — 进程间通知
+//   C. 文件高级类(sendfile/splice/fallocate/inotify) — 性能关键
+//   D. 进程高级类(waitid/clone3/pidfd) — 现代进程管理
+//   E. 内存高级类(memfd/userfaultfd) — 容器/沙箱
+//   F. 网络高级类(accept4/recvmmsg/sendmmsg) — 高性能网络
+//   G. 杂项(seccomp/kcmp/sched_*) — 安全和调度
+
+导入("./日志中枢.nova")
+导入("./系统调用表.nova")
+导入("../推理/值乘.nova")
+导入("./内核打印.nova")
+导入("./时钟中枢.nova")
+导入("./哈希函数.nova")
+导入("../感知/内核直连层.nova")
+
+// §1 系统调用号定义 (严格
+
+定义 SYS_timer_create     = 222
+定义 SYS_timer_settime    = 223
+定义 SYS_timer_gettime    = 224
+定义 SYS_timer_getoverrun = 225
+定义 SYS_timer_delete     = 226
+定义 SYS_clock_settime    = 227
+定义 SYS_clock_nanosleep  = 230
+定义 SYS_timerfd_create   = 283
+定义 SYS_timerfd_settime  = 286
+定义 SYS_timerfd_gettime  = 287
+
+定义 SYS_事件fd2         = 290
+定义 SYS_signalfd4        = 289
+
+定义 SYS_sendfile         = 40
+定义 SYS_splice           = 275
+定义 SYS_tee              = 276
+定义 SYS_vmsplice         = 278
+定义 SYS_fallocate        = 285
+定义 SYS_inotify_init1    = 294
+定义 SYS_inotify_add_watch = 254
+定义 SYS_inotify_rm_watch = 255
+定义 SYS_readahead        = 187
+定义 SYS_fadvise64        = 221
+定义 SYS_sync             = 162
+定义 SYS_synNova公平调度           = 306
+定义 SYS_statfs           = 137
+定义 SYS_fstatfs          = 138
+定义 SYS_utimensat        = 280
+定义 SYS_renameat2        = 316
+定义 SYS_copy_file_range  = 326
+定义 SYS_preadv           = 295
+定义 SYS_pwritev          = 296
+定义 SYS_lstat            = 6
+定义 SYS_newfstatat       = 262
+定义 SYS_faccessat        = 269
+定义 SYS_fchmodat         = 268
+定义 SYS_fchownat         = 260
+定义 SYS_mkdirat          = 258
+定义 SYS_mknodat          = 259
+定义 SYS_unlinkat         = 263
+定义 SYS_symlinkat        = 266
+定义 SYS_readlinkat       = 267
+定义 SYS_linkat           = 265
+
+定义 SYS_waitid           = 247
+定义 SYS_set_tid_address  = 218
+定义 SYS_gettid           = 186
+定义 SYS_tgkill           = 234
+定义 SYS_sched_yield      = 24
+定义 SYS_sched_getaffinity = 204
+定义 SYS_sched_setaffinity = 203
+定义 SYS_sched_getscheduler = 145
+定义 SYS_sched_setscheduler = 144
+定义 SYS_sched_getparam   = 143
+定义 SYS_sched_setparam   = 142
+定义 SYS_getrusage        = 98
+定义 SYS_getrlimit        = 97
+定义 SYS_setrlimit        = 160
+定义 SYS_prlimit64        = 302
+定义 SYS_prctl            = 157
+定义 SYS_arch_prctl       = 158
+定义 SYS_capget           = 125
+定义 SYS_capset           = 126
+定义 SYS_umask            = 95
+定义 SYS_getgroups        = 115
+定义 SYS_setgroups        = 116
+定义 SYS_setreuid         = 113
+定义 SYS_setregid         = 114
+定义 SYS_setresuid        = 117
+定义 SYS_getresuid        = 118
+定义 SYS_setresgid        = 119
+定义 SYS_getresgid        = 120
+定义 SYS_clone3           = 435
+定义 SYS_pidfd_open       = 434
+定义 SYS_pidfd_send_signal = 424
+定义 SYS_pidfd_getfd      = 438
+
+定义 SYS_memfd_create     = 319
+定义 SYS_userfaultfd      = 323
+定义 SYS_madvise          = 28
+定义 SYS_mincore          = 27
+定义 SYS_mlock            = 149
+定义 SYS_mlock2           = 325
+定义 SYS_munlock          = 150
+定义 SYS_mlockall         = 151
+定义 SYS_munlockall       = 152
+定义 SYS_mremap           = 25
+定义 SYS_msync            = 26
+定义 SYS_process_madvise  = 440
+定义 SYS_process_vm_readv = 310
+定义 SYS_process_vm_writev = 311
+
+定义 SYS_accept4          = 288
+定义 SYS_recvmmsg         = 299
+定义 SYS_sendmmsg         = 307
+定义 SYS_socketpair       = 53
+定义 SYS_getsockname      = 51
+定义 SYS_getpeername      = 52
+定义 SYS_setsockopt       = 54
+定义 SYS_getsockopt       = 55
+定义 SYS_recvfrom         = 45
+定义 SYS_sendto           = 44
+定义 SYS_recvmsg          = 47
+定义 SYS_sendmsg          = 46
+
+定义 SYS_seccomp          = 317
+定义 SYS_kcmp             = 312
+定义 SYS_getrandom        = 318
+定义 SYS_landlock_create_ruleset = 444
+定义 SYS_landlock_add_rule = 445
+定义 SYS_landlock_restrict_self = 446
+定义 SYS_rseq             = 334
+定义 SYS_io_uring_setup   = 425
+定义 SYS_io_uring_enter   = 426
+定义 SYS_io_uring_register = 427
+定义 SYS_close_range      = 436
+定义 SYS_openat2          = 437
+定义 SYS_epoll_pwait2     = 441
+定义 SYS_mount_setattr    = 442
+定义 SYS_quotactl_fd      = 443
+
+定义 SYS_nova_ai_推理      = 0x8000
+定义 SYS_nova_ai_异常检测  = 0x8001
+定义 SYS_nova_ai_风险评分  = 0x8002
+定义 SYS_nova_内核打印    = 0x8010
+定义 SYS_nova_线程创建    = 0x8020
+定义 SYS_nova_线程退出    = 0x8021
+定义 SYS_nova_线程睡眠    = 0x8022
+定义 SYS_nova_进程创建    = 0x8030
+定义 SYS_nova_进程结束    = 0x8031
+定义 SYS_nova_GPU_提交    = 0x8040
+定义 SYS_nova_GPU_等待    = 0x8041
+定义 SYS_nova_内存池创建  = 0x8050
+定义 SYS_nova_内存池释放  = 0x8051
+定义 SYS_nova_消息发送    = 0x8060
+定义 SYS_nova_消息接收    = 0x8061
+定义 SYS_nova_诊断转储    = 0x8070
+定义 SYS_nova_内核探针    = 0x8071
+
+// NSCI理论: Nova系统调用智能分发 (Nova Syscall Intelligence)
+//   核心创新: 系统调用不再是简单查表跳转，而是通过AI分析
+//   调用模式、风险评估、性能统计、安全审计，实现
+//   智能分发、异常检测、自动调优
+
+定义 可变 NSCI全局统计 = NSCI统计结构 {}
+
+结构 NSCI统计结构 {
+    总调用次数,
+    安全拦截次数,
+    AI推理次数,
+    未知调用次数,
+    错误次数,
+    最大耗时_us,
+    总耗时_us         // u64
+}
+
+// §2 系统调用处理器注册
+
+定义 最大系统调用号 = 512
+定义 NOVA调用基址 = 0x8000
+定义 NOVA调用最大 = 128
+
+定义 可变 系统调用表 = 空        // u64[512] 函数指针数组
+定义 可变 nova调用表 = 空       // u64[128] Nova原创调用表
+定义 可变 调用计数器 = 空      // u64[512] 每个调用号的调用计数
+定义 可变 调用耗时表 = 空      // u64[512] 累计耗时
+
+函数 系统调用表_初始化() {
+    系统调用表 = 堆_分配(最大系统调用号 * 8)
+    nova调用表 = 堆_分配(NOVA调用最大 * 8)
+    调用计数器 = 堆_分配(最大系统调用号 * 8)
+    调用耗时表 = 堆_分配(最大系统调用号 * 8)
+    如果 (系统调用表 == 0 || nova调用表 == 0) {
+        内核打印("[NSCI] 系统调用表分配失败!")
+        返回
+    }
+    // 清零
+    内存_置零(系统调用表, 最大系统调用号 * 8)
+    内存_置零(nova调用表, NOVA调用最大 * 8)
+    内存_置零(调用计数器, 最大系统调用号 * 8)
+    内存_置零(调用耗时表, 最大系统调用号 * 8)
+    内核打印("[NSCI] 系统调用表初始化: Linux兼容槽 {} + Nova原创槽 {}", 最大系统调用号, NOVA调用最大)
+}
+
+函数 系统调用表_注册(调用号, 处理函数) {
+    如果 (系统调用表 == 空) { 返回 假 }
+    如果 (调用号 >= NOVA调用基址) {
+        // Nova原创调用
+        定义 idx = 调用号 - NOVA调用基址
+        如果 (idx >= NOVA调用最大) { 返回 假 }
+        内存_写64(nova调用表 + idx * 8, 处理函数)
+    } 否则 {
+        // Linux兼容调用
+        如果 (调用号 >= 最大系统调用号) { 返回 假 }
+        内存_写64(系统调用表 + 调用号 * 8, 处理函数)
+    }
+    返回 真
+}
+
+函数 系统调用表_查找(调用号) {
+    如果 (调用号 >= NOVA调用基址) {
+        定义 idx = 调用号 - NOVA调用基址
+        如果 (idx >= NOVA调用最大 || nova调用表 == 空) { 返回 0 }
+        返回 内存_读64(nova调用表 + idx * 8)
+    } 否则 {
+        如果 (调用号 >= 最大系统调用号 || 系统调用表 == 空) { 返回 0 }
+        返回 内存_读64(系统调用表 + 调用号 * 8)
+    }
+}
+
+// §3 智能系统调用分发器
+// NSCI-SD: 带安全审计、性能计时、AI风险检测的系统调用入口
+
+函数 系统调用_分发(调用号, arg0, arg1, arg2, arg3, arg4, arg5) {
+    NSCI全局统计.总调用次数 = NSCI全局统计.总调用次数 + 1
+    定义 开始 = 读取微秒()
+    // 安全检查
+    定义 安全 = 系统调用_安全检查(调用号, arg0, arg1)
+    如果 (安全 == 假) {
+        NSCI全局统计.安全拦截次数 = NSCI全局统计.安全拦截次数 + 1
+        返回 -1  // EPERM
+    }
+    // 查找处理器
+    定义 handler = 系统调用表_查找(调用号)
+    如果 (handler == 0) {
+        NSCI全局统计.未知调用次数 = NSCI全局统计.未知调用次数 + 1
+        返回 -38  // ENOSYS
+    }
+    // 调用计数
+    如果 (调用号 < 最大系统调用号 && 调用计数器 != 空) {
+        定义 cnt = 内存_读64(调用计数器 + 调用号 * 8)
+        内存_写64(调用计数器 + 调用号 * 8, cnt + 1)
+    }
+    // 执行处理器
+    定义 结果 = 调用函数(handler, arg0, arg1, arg2, arg3, arg4, arg5)
+    // 性能计时
+    定义 耗时 = 读取微秒() - 开始
+    NSCI全局统计.总耗时_us = NSCI全局统计.总耗时_us + 耗时
+    如果 (耗时 > NSCI全局统计.最大耗时_us) {
+        NSCI全局统计.最大耗时_us = 耗时
+    }
+    如果 (调用号 < 最大系统调用号 && 调用耗时表 != 空) {
+        定义 累计 = 内存_读64(调用耗时表 + 调用号 * 8)
+        内存_写64(调用耗时表 + 调用号 * 8, 累计 + 耗时)
+    }
+    // 错误统计
+    如果 (结果 < 0) {
+        NSCI全局统计.错误次数 = NSCI全局统计.错误次数 + 1
+    }
+    返回 结果
+}
+
+// §4 安全审计与AI风险检测
+
+// 危险调用号列表 (需要特权检查)
+定义 危险调用数 = 12
+
+函数 系统调用_是危险调用(调用号) {
+    // 检查是否是危险的系统调用
+    如果 (调用号 == SYS_renameat2) { 返回 真 }
+    如果 (调用号 == SYS_unlinkat) { 返回 真 }
+    如果 (调用号 == SYS_setresuid) { 返回 真 }
+    如果 (调用号 == SYS_setresgid) { 返回 真 }
+    如果 (调用号 == SYS_capset) { 返回 真 }
+    如果 (调用号 == SYS_seccomp) { 返回 真 }
+    如果 (调用号 == SYS_clone3) { 返回 真 }
+    如果 (调用号 == SYS_mount_setattr) { 返回 真 }
+    如果 (调用号 == SYS_landlock_restrict_self) { 返回 真 }
+    如果 (调用号 == SYS_userfaultfd) { 返回 真 }
+    如果 (调用号 == SYS_process_vm_readv) { 返回 真 }
+    如果 (调用号 == SYS_process_vm_writev) { 返回 真 }
+    返回 假
+}
+
+函数 系统调用_安全检查(调用号, arg0, arg1) {
+    // 基础安全检查
+    如果 (系统调用_是危险调用(调用号)) {
+        定义 进程 = 当前进程()
+        如果 (进程 == 0) { 返回 假 }
+        // 检查进程特权级别
+        定义 uid = 进程_获取有效UID(进程)
+        如果 (uid != 0) {
+            // 非root，AI风险评分
+            定义 特征 = Tensor_创建(4)
+            Tensor_写(特征, 0, 调用号)
+            Tensor_写(特征, 1, arg0)
+            Tensor_写(特征, 2, uid)
+            Tensor_写(特征, 3, 读取微秒())
+            定义 风险 = AI总线_风险评分(全局AI总线, 特征)
+            Tensor_释放(特征)
+            NSCI全局统计.AI推理次数 = NSCI全局统计.AI推理次数 + 1
+            如果 (风险 > 700) {
+                内核打印("[NSCI] 高风险调用拦截: syscall={} uid={} risk={}", 调用号, uid, 风险)
+                返回 假
+            }
+        }
+    }
+    返回 真
+}
+
+// §5 批量调用注册工具
+
+函数 系统调用_注册定时器类() {
+    系统调用表_注册(SYS_timer_create, 处理_timer_create)
+    系统调用表_注册(SYS_timer_settime, 处理_timer_settime)
+    系统调用表_注册(SYS_timer_gettime, 处理_timer_gettime)
+    系统调用表_注册(SYS_timer_getoverrun, 处理_timer_getoverrun)
+    系统调用表_注册(SYS_timer_delete, 处理_timer_delete)
+    系统调用表_注册(SYS_timerfd_create, 处理_timerfd_create)
+    系统调用表_注册(SYS_timerfd_settime, 处理_timerfd_settime)
+    系统调用表_注册(SYS_timerfd_gettime, 处理_timerfd_gettime)
+    系统调用表_注册(SYS_clock_settime, 处理_clock_settime)
+    系统调用表_注册(SYS_clock_nanosleep, 处理_clock_nanosleep)
+}
+
+函数 系统调用_注册文件高级类() {
+    系统调用表_注册(SYS_sendfile, 处理_sendfile)
+    系统调用表_注册(SYS_splice, 处理_splice)
+    系统调用表_注册(SYS_tee, 处理_tee)
+    系统调用表_注册(SYS_fallocate, 处理_fallocate)
+    系统调用表_注册(SYS_inotify_init1, 处理_inotify_init1)
+    系统调用表_注册(SYS_inotify_add_watch, 处理_inotify_add_watch)
+    系统调用表_注册(SYS_inotify_rm_watch, 处理_inotify_rm_watch)
+    系统调用表_注册(SYS_readahead, 处理_readahead)
+    系统调用表_注册(SYS_copy_file_range, 处理_copy_file_range)
+    系统调用表_注册(SYS_preadv, 处理_preadv)
+    系统调用表_注册(SYS_pwritev, 处理_pwritev)
+}
+
+函数 系统调用_注册进程高级类() {
+    系统调用表_注册(SYS_waitid, 处理_waitid)
+    系统调用表_注册(SYS_gettid, 处理_gettid)
+    系统调用表_注册(SYS_tgkill, 处理_tgkill)
+    系统调用表_注册(SYS_sched_yield, 处理_sched_yield)
+    系统调用表_注册(SYS_sched_getaffinity, 处理_sched_getaffinity)
+    系统调用表_注册(SYS_sched_setaffinity, 处理_sched_setaffinity)
+    系统调用表_注册(SYS_prctl, 处理_prctl)
+    系统调用表_注册(SYS_clone3, 处理_clone3)
+    系统调用表_注册(SYS_pidfd_open, 处理_pidfd_open)
+    系统调用表_注册(SYS_prlimit64, 处理_prlimit64)
+}
+
+函数 系统调用_注册内存高级类() {
+    系统调用表_注册(SYS_memfd_create, 处理_memfd_create)
+    系统调用表_注册(SYS_userfaultfd, 处理_userfaultfd)
+    系统调用表_注册(SYS_madvise, 处理_madvise)
+    系统调用表_注册(SYS_mincore, 处理_mincore)
+    系统调用表_注册(SYS_mlock, 处理_mlock)
+    系统调用表_注册(SYS_mlock2, 处理_mlock2)
+    系统调用表_注册(SYS_munlock, 处理_munlock)
+    系统调用表_注册(SYS_mremap, 处理_mremap)
+    系统调用表_注册(SYS_msync, 处理_msync)
+    系统调用表_注册(SYS_process_madvise, 处理_process_madvise)
+}
+
+函数 系统调用_注册网络高级类() {
+    系统调用表_注册(SYS_accept4, 处理_accept4)
+    系统调用表_注册(SYS_recvmmsg, 处理_recvmmsg)
+    系统调用表_注册(SYS_sendmmsg, 处理_sendmmsg)
+    系统调用表_注册(SYS_socketpair, 处理_socketpair)
+    系统调用表_注册(SYS_recvfrom, 处理_recvfrom)
+    系统调用表_注册(SYS_sendto, 处理_sendto)
+    系统调用表_注册(SYS_recvmsg, 处理_recvmsg)
+    系统调用表_注册(SYS_sendmsg, 处理_sendmsg)
+}
+
+函数 系统调用_注册安全类() {
+    系统调用表_注册(SYS_seccomp, 处理_seccomp)
+    系统调用表_注册(SYS_getrandom, 处理_getrandom)
+    系统调用表_注册(SYS_landlock_create_ruleset, 处理_landlock_create_ruleset)
+    系统调用表_注册(SYS_landlock_add_rule, 处理_landlock_add_rule)
+    系统调用表_注册(SYS_landlock_restrict_self, 处理_landlock_restrict_self)
+    系统调用表_注册(SYS_io_uring_setup, 处理_io_uring_setup)
+    系统调用表_注册(SYS_io_uring_enter, 处理_io_uring_enter)
+    系统调用表_注册(SYS_io_uring_register, 处理_io_uring_register)
+}
+
+函数 系统调用_注册Nova原创类() {
+    系统调用表_注册(SYS_nova_ai_推理, 处理_nova_ai_推理)
+    系统调用表_注册(SYS_nova_ai_异常检测, 处理_nova_ai_异常检测)
+    系统调用表_注册(SYS_nova_ai_风险评分, 处理_nova_ai_风险评分)
+    系统调用表_注册(SYS_nova_内核打印, 处理_nova_内核打印)
+    系统调用表_注册(SYS_nova_线程创建, 处理_nova_线程创建)
+    系统调用表_注册(SYS_nova_线程退出, 处理_nova_线程退出)
+    系统调用表_注册(SYS_nova_GPU_提交, 处理_nova_GPU_提交)
+    系统调用表_注册(SYS_nova_内存池创建, 处理_nova_内存池创建)
+    系统调用表_注册(SYS_nova_消息发送, 处理_nova_消息发送)
+    系统调用表_注册(SYS_nova_诊断转储, 处理_nova_诊断转储)
+}
+
+// §6 NSCI诊断与统一初始化
+
+函数 NSCI_初始化() {
+    内核打印("[NSCI] Nova系统调用智能分发 启动")
+    系统调用表_初始化()
+    // 注册所有类别
+    系统调用_注册定时器类()
+    系统调用_注册文件高级类()
+    系统调用_注册进程高级类()
+    系统调用_注册内存高级类()
+    系统调用_注册网络高级类()
+    系统调用_注册安全类()
+    系统调用_注册Nova原创类()
+    // 清理统计
+    NSCI全局统计.总调用次数 = 0
+    NSCI全局统计.安全拦截次数 = 0
+    NSCI全局统计.AI推理次数 = 0
+    NSCI全局统计.未知调用次数 = 0
+    NSCI全局统计.错误次数 = 0
+    NSCI全局统计.最大耗时_us = 0
+    NSCI全局统计.总耗时_us = 0
+    内核打印("[NSCI] 初始化完成 — 定时器/文件/进程/内存/网络/安全/Nova原创 已注册")
+}
+
+函数 NSCI_打印诊断() {
+    内核打印("╔════════════════════════════════════════════╗")
+    内核打印("║  NSCI 系统调用智能分发 诊断报告          ║")
+    内核打印("╠════════════════════════════════════════════╣")
+    内核打印("║ 总调用:       {}", NSCI全局统计.总调用次数)
+    内核打印("║ 安全拦截:     {}", NSCI全局统计.安全拦截次数)
+    内核打印("║ AI推理:       {}", NSCI全局统计.AI推理次数)
+    内核打印("║ 未知调用:     {}", NSCI全局统计.未知调用次数)
+    内核打印("║ 错误次数:     {}", NSCI全局统计.错误次数)
+    内核打印("║ 最大耗时:     {}μs", NSCI全局统计.最大耗时_us)
+    内核打印("║ 总耗时:       {}μs", NSCI全局统计.总耗时_us)
+    内核打印("╚════════════════════════════════════════════╝")
+}
+
+// §7 系统调用热点追踪 (Hotspot Tracking)
+
+函数 NSCI_获取热点调用(结果数组, 最大数) {
+    // 查找调用次数最多的前N个系统调用
+    如果 (调用计数器 == 空 || 结果数组 == 0) { 返回 0 }
+    定义 可变 已找 = 0
+    定义 可变 round = 0
+    当 (round < 最大数 && round < 10) {
+        定义 可变 最大值 = 0
+        定义 可变 最大号 = -1
+        定义 可变 i = 0
+        当 (i < 最大系统调用号) {
+            定义 cnt = 内存_读64(调用计数器 + i * 8)
+            如果 (cnt > 最大值) {
+                // 检查是否已在结果中
+                定义 可变 已有 = 假
+                定义 可变 j = 0
+                当 (j < 已找) {
+                    如果 (内存_读64(结果数组 + j * 8) == i) { 已有 = 真 }
+                    j = j + 1
+                }
+                如果 (已有 == 假) {
+                    最大值 = cnt
+                    最大号 = i
+                }
+            }
+            i = i + 1
+        }
+        如果 (最大号 >= 0) {
+            内存_写64(结果数组 + 已找 * 8, 最大号)
+            已找 = 已找 + 1
+        }
+        round = round + 1
+    }
+    返回 已找
+}
+
+函数 NSCI_获取调用计数(调用号) {
+    如果 (调用计数器 == 空 || 调用号 >= 最大系统调用号) { 返回 0 }
+    返回 内存_读64(调用计数器 + 调用号 * 8)
+}
+
+函数 NSCI_获取调用耗时(调用号) {
+    如果 (调用耗时表 == 空 || 调用号 >= 最大系统调用号) { 返回 0 }
+    返回 内存_读64(调用耗时表 + 调用号 * 8)
+}
+
+// §10 【原生独创】谐振系统调用频率分析器
+// 统计高频系统调用并优化分发路径
+
+定义 可变 _谐振调用_热表 = []
+定义 可变 _谐振调用_分析次数 = 0
+
+函数 谐振调用_记录(调用号) {
+    定义 可变 i = 0
+    当 (i < 计数(_谐振调用_热表)) {
+        如果 (_谐振调用_热表[i].号 == 调用号) {
+            _谐振调用_热表[i].次数 = _谐振调用_热表[i].次数 + 1
+            返回
+        }
+        i = i + 1
+    }
+    追加(_谐振调用_热表, { 号: 调用号, 次数: 1 })
+}
+
+函数 谐振调用_最热(前N) {
+    _谐振调用_分析次数 = _谐振调用_分析次数 + 1
+    // 选择排序取前N
+    定义 可变 结果 = []
+    定义 可变 k = 0
+    当 (k < 前N && k < 计数(_谐振调用_热表)) {
+        定义 可变 最大idx = k
+        定义 可变 j = k + 1
+        当 (j < 计数(_谐振调用_热表)) {
+            如果 (_谐振调用_热表[j].次数 > _谐振调用_热表[最大idx].次数) { 最大idx = j }
+            j = j + 1
+        }
+        如果 (最大idx != k) {
+            定义 临时 = _谐振调用_热表[k]
+            _谐振调用_热表[k] = _谐振调用_热表[最大idx]
+            _谐振调用_热表[最大idx] = 临时
+        }
+        追加(结果, _谐振调用_热表[k])
+        k = k + 1
+    }
+    返回 结果
+}
+
+函数 系统调用号_完整统计() {
+    返回 [
+        "最大系统调用号", 最大系统调用号,
+        "热表条目数", 计数(_谐振调用_热表),
+        "分析次数", _谐振调用_分析次数
+    ]
+}

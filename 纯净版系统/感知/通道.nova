@@ -1,0 +1,163 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档事件.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+
+// §5 BroadcastChannel
+
+结构 BroadcastChannel {
+    名称,
+    // 事件
+    onmessage,
+    onmessageerror,
+    // 已关闭
+    已关闭,
+    // 链表
+    下一个,    // u64 BroadcastChannel*
+}
+
+定义 可变 BC_链表头 = 0
+
+函数 BroadcastChannel_创建(名称) {
+    定义 bc = 堆_分配(BroadcastChannel)
+    bc.名称 = 字符串_复制(名称)
+    bc.onmessage = 0; bc.onmessageerror = 0; bc.已关闭 = 假
+    // 加入全局链表
+    bc.下一个 = BC_链表头; BC_链表头 = bc
+    返回 bc
+}
+
+函数 BroadcastChannel_postMessage(bc, 数据) {
+    如果 (bc == 0 || bc.已关闭) { 返回 }
+    // 广播到所有同名BroadcastChannel(除了自己)
+    定义 可变 other = BC_链表头
+    当 (other != 0) {
+        如果 (other != bc && !other.已关闭 && 字符串_相等(other.名称, bc.名称)) {
+            // 派发Message事件到other
+            如果 (other.onmessage != 0) {
+                // 克隆数据并派发
+            }
+        }
+        other = other.下一个
+    }
+}
+
+函数 BroadcastChannel_close(bc) {
+    如果 (bc == 0) { 返回 }
+    bc.已关闭 = 真
+}
+
+// §6 Dedicated 工线
+
+结构 Dedicated工线 {
+    // 基本信息
+    名称,
+    脚本URL,
+    脚本类型,    // u8 SCRIPT_CLASSIC / SCRIPT_MODULE
+    状态,    // u8 WORKER_STATE_xxx
+    // 通信
+    外部端口,    // u64 MessagePort* (主线程侧)
+    内部端口,    // u64 MessagePort* (工线线程侧)
+    // 回调(主线程侧)
+    onmessage,
+    onmessageerror,
+    onerror,
+    // 执行上下文
+    全局作用域,    // u64 工线GlobalScope*
+    // V8 Nova运行时实例
+    Nova运行时实例,
+}
+
+结构 工线GlobalScope {
+    类型,    // u8 WORKER_xxx
+    名称,
+    位置,    // u64 工线Location*
+    // 导入脚本
+    导入脚本,    // [32]u64
+    导入数,
+    // 定时器
+    定时器头,
+    定时器ID,
+    // self引用
+    self,    // u64 Dedicated工线GlobalScope*
+    // 消息端口
+    端口,    // u64 MessagePort*
+}
+
+函数 工线_创建(url, 名称, 脚本类型) {
+    定义 w = 堆_分配(Dedicated工线)
+    w.脚本URL = 字符串_复制(url)
+    w.名称 = 如果(名称 != 0, 字符串_复制(名称), "")
+    w.脚本类型 = 脚本类型; w.状态 = WORKER_STATE_CREATED
+    // 创建消息通道
+    定义 mc = MessageChannel_创建()
+    w.外部端口 = mc.port1; w.内部端口 = mc.port2
+    w.onmessage = 0; w.onmessageerror = 0; w.onerror = 0
+    // 创建执行上下文
+    w.全局作用域 = 工线_创建全局作用域(WORKER_DEDICATED, w.名称, w.内部端口)
+    w.Nova运行时实例 = 0
+    // 启动工线线程
+    工线_启动(w)
+    返回 w
+}
+
+函数 工线_创建全局作用域(类型, 名称, 端口) {
+    定义 gs = 堆_分配(工线GlobalScope)
+    gs.类型 = 类型; gs.名称 = 名称; gs.位置 = 0
+    gs.导入数 = 0; gs.定时器头 = 0; gs.定时器ID = 0
+    gs.self = gs; gs.端口 = 端口
+    返回 gs
+}
+
+函数 工线_启动(w) {
+    如果 (w == 0) { 返回 }
+    w.状态 = WORKER_STATE_RUNNING
+    // 1. 创建新V8 Nova运行时实例
+    // 2. 加载并执行脚本
+    // 3. 开始消息循环
+    // 启动内部端口
+    MessagePort_start(w.内部端口)
+}
+
+// worker.postMessage(data, transfer)
+函数 工线_postMessage(w, 数据, transferList, transferCount) {
+    如果 (w == 0 || w.状态 != WORKER_STATE_RUNNING) { 返回 }
+    MessagePort_postMessage(w.外部端口, 数据, transferList, transferCount)
+}
+
+// worker.terminate()
+函数 工线_terminate(w) {
+    如果 (w == 0) { 返回 }
+    w.状态 = WORKER_STATE_TERMINATED
+    MessagePort_close(w.外部端口)
+    MessagePort_close(w.内部端口)
+    // 终止V8 Nova运行时实例
+}
+
+// 工线内部: self.postMessage(data, transfer)
+函数 工线Scope_postMessage(gs, 数据, transferList, transferCount) {
+    如果 (gs == 0 || gs.端口 == 0) { 返回 }
+    MessagePort_postMessage(gs.端口, 数据, transferList, transferCount)
+}
+
+// 工线内部: importScripts(url1, url2, ...)
+函数 工线Scope_importScripts(gs, urls, 数量) {
+    如果 (gs == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < 数量 && gs.导入数 < 32) {
+        定义 url = 内存_读64(urls + i * 8)
+        如果 (url != 0) {
+            // 同步加载并执行脚本
+            gs.导入脚本[gs.导入数] = url
+            gs.导入数 = gs.导入数 + 1
+        }
+        i = i + 1
+    }
+}
+
+// 工线内部: self.close()
+函数 工线Scope_close(gs) {
+    如果 (gs == 0) { 返回 }
+    // 不再接受新任务, 完成当前任务后关闭
+}

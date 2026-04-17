@@ -1,0 +1,194 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./历史接口甲.nova")
+
+// 对应: nova/Nova渲染核心/dom/事件s/ (~5000行)
+//       nova/Nova渲染核心/timing/ 
+//       nova/renderer/modules/fetch/ (~8000行)
+// Web 接口是JS↔浏览器引擎的桥梁:
+//   JS调用 fetch() → V8绑定层 → NovaOS 取数实现 → 网络栈
+//   JS调用 setTimeout() → V8绑定层 → 事件循环定时器
+//   JS调用 add事件Listener() → V8绑定层 → DOM事件系统
+// 本文件实现核心Web 接口的Nova侧绑定:
+//   ① 取数 接口 (fetch/Request/Response/Headers)
+//   ② Timers (setTimeout/setInterval/requestAnimationFrame)
+//   ③ 事件Target (add事件Listener/remove事件Listener/dispatch事件)
+//   ④ Console (log/warn/error/time/timeEnd)
+//   ⑤ Performance (now/mark/measure)
+//   ⑥ 历史 (pushState/replaceState/back/forward)
+//   ⑦ Location (href/assign/replace/reload)
+
+// §1 取数 接口
+// fetch(url, options?) → 承诺<Response>
+// 完整流程:
+//   1. 构建Request对象
+//   2. 安全检查(CSP/CORS/混合内容)
+//   3. 通过IPC发送到Network进程
+//   4. 接收响应 → 构建Response对象
+//   5. resolve 承诺
+
+// Request模式
+定义 请求模式_cors       = 0
+定义 请求模式_no_cors    = 1
+定义 请求模式_same_origin = 2
+定义 请求模式_navigate   = 3
+
+// Request凭证
+定义 凭证_omit           = 0
+定义 凭证_same_origin    = 1
+定义 凭证_include        = 2
+
+// Request缓存
+定义 缓存_default        = 0
+定义 缓存_no_store       = 1
+定义 缓存_reload         = 2
+定义 缓存_no_cache       = 3
+定义 缓存_force_cache    = 4
+
+// Request重定向
+定义 重定向_follow       = 0
+定义 重定向_error        = 1
+定义 重定向_manual       = 2
+
+结构 取数Request {
+    url,    // u64 字符串
+    方法,    // u64 "GET"/"POST"/...
+    头部,    // u64 Headers对象
+    体,    // u64 请求体数据
+    体长度,
+    模式,    // u32 请求模式_xxx
+    凭证,    // u32 凭证_xxx
+    缓存,    // u32 缓存_xxx
+    重定向,    // u32 重定向_xxx
+    信号,    // u64 AbortSignal*
+    referrer,
+}
+
+结构 取数Response {
+    状态码,    // u32 200/404/500...
+    状态文本,    // u64 "OK"/"Not Found"...
+    头部,    // u64 Headers对象
+    体,    // u64 响应体数据
+    体长度,
+    类型,    // u32 0=basic 1=cors 2=opaque
+    url,
+    已重定向,
+    ok,    // 布尔 200-299
+}
+
+结构 Headers {
+    键,    // [64]u64
+    值,    // [64]u64
+    数量,
+}
+
+
+函数 Headers_创建() {
+    定义 h = 堆_分配(Headers)
+    h.数量 = 0
+    返回 h
+}
+
+函数 Headers_set(h, 键, 值) {
+    如果 (h == 0) { 返回 }
+    // 查找已有
+    定义 可变 i = 0
+    当 (i < h.数量) {
+        如果 (字符串_相等_忽略大小写(h.键[i], 键)) {
+            h.值[i] = 值
+            返回
+        }
+        i = i + 1
+    }
+    如果 (h.数量 < 64) {
+        h.键[h.数量] = 键
+        h.值[h.数量] = 值
+        h.数量 = h.数量 + 1
+    }
+}
+
+函数 Headers_get(h, 键) {
+    如果 (h == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < h.数量) {
+        如果 (字符串_相等_忽略大小写(h.键[i], 键)) { 返回 h.值[i] }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 Headers_has(h, 键) { 返回 Headers_get(h, 键) != 0 }
+
+函数 Headers_delete(h, 键) {
+    如果 (h == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < h.数量) {
+        如果 (字符串_相等_忽略大小写(h.键[i], 键)) {
+            h.数量 = h.数量 - 1
+            h.键[i] = h.键[h.数量]
+            h.值[i] = h.值[h.数量]
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// fetch()实现
+函数 网接口_fetch(Nova运行时实例, url, options) {
+    // 1. 构建Request
+    定义 req = 堆_分配(取数Request)
+    req.url = url
+    req.方法 = 如果(options != 0, 选项_读字符串(options, "method"), "GET")
+    req.头部 = 如果(options != 0, 选项_读对象(options, "headers"), Headers_创建())
+    req.体 = 如果(options != 0, 选项_读字符串(options, "body"), 0)
+    req.模式 = 请求模式_cors
+    req.凭证 = 凭证_same_origin
+    req.缓存 = 缓存_default
+    req.重定向 = 重定向_follow
+
+    // 2. 创建承诺
+    定义 promise = Nova_创建承诺(Nova运行时实例)
+
+    // 3. 安全检查(CSP/CORS)
+    // 通过IPC发送到Browser进程检查
+
+    // 4. 通过IPC发送网络请求到Network进程
+    定义 ipc数据 = 取数_序列化请求(req)
+    // Nova通信_发送(Nova通信_请求_网络发送, ipc数据, ...)
+
+    // 5. 注册响应回调
+    取数_注册回调(req, promise, Nova运行时实例)
+
+    返回 promise
+}
+
+// Response方法
+函数 Response_json(resp) {
+    如果 (resp == 0 || resp.体 == 0) { 返回 0 }
+    返回 序列_解析(resp.体, resp.体长度)
+}
+
+函数 Response_text(resp) {
+    如果 (resp == 0 || resp.体 == 0) { 返回 "" }
+    返回 字符串_从内存(resp.体, resp.体长度)
+}
+
+函数 Response_arrayBuffer(resp) {
+    如果 (resp == 0) { 返回 0 }
+    返回 resp.体
+}
+
+定义 可变 AI_网接口头部_调用数 = 0
+定义 可变 AI_网接口头部_异常数 = 0
+
+函数 AI_网接口头部_监控() {
+    AI_网接口头部_调用数 = AI_网接口头部_调用数 + 1
+    返回 AI_网接口头部_异常数 == 0
+}
+
+函数 AI_网接口头部_健康检查() {
+    如果 (AI_网接口头部_调用数 > 0 && AI_网接口头部_异常数 * 100 / AI_网接口头部_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

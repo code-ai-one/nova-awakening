@@ -1,0 +1,117 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../稳态/原生系统双.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("./删除接口扩.nova")
+
+// §5 3D纹理 / 2D纹理数组
+
+结构 Texture3D {
+    ID,
+    宽度,
+    高度,
+    深度,
+    级别数,
+    内部格式,
+    数据,
+}
+
+
+函数 图绘2_tex图像3D(target, level, internalformat, width, height, depth, border, format, type, data) {
+    如果 (target != GL_TEXTURE_3D && target != GL_TEXTURE_2D_ARRAY) { 返回 }
+    // 分配3D纹理内存: width * height * depth * bpp
+    定义 bpp = 图绘_获取字节每像素(format, type)
+    定义 大小 = width * height * depth * bpp
+    // 如果data != 0, 复制数据
+}
+
+函数 图绘2_texSub图像3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, data) {
+    如果 (data == 0) { 返回 }
+    // 更新3D纹理子区域
+}
+
+函数 图绘2_tex存储3D(target, levels, internalformat, width, height, depth) {
+    // 不可变纹理存储: 一次分配所有mipmap级别
+    定义 可变 w = width; 定义 可变 h = height; 定义 可变 d = depth
+    定义 可变 lv = 0
+    当 (lv < levels) {
+        // 分配level lv: w×h×d
+        如果 (w > 1) { w = w / 2 }
+        如果 (h > 1) { h = h / 2 }
+        如果 (target == GL_TEXTURE_3D && d > 1) { d = d / 2 }
+        lv = lv + 1
+    }
+}
+
+函数 图绘2_tex存储2D(target, levels, internalformat, width, height) {
+    定义 可变 w = width; 定义 可变 h = height
+    定义 可变 lv = 0
+    当 (lv < levels) {
+        如果 (w > 1) { w = w / 2 }
+        如果 (h > 1) { h = h / 2 }
+        lv = lv + 1
+    }
+}
+
+// §6 帧缓冲完善 (MRT / Blit)
+
+结构 渲染buffer {
+    ID,
+    宽度,
+    高度,
+    内部格式,
+    采样数,    // u32 MSAA
+}
+
+函数 图绘2_renderbuffer存储Multisample(target, samples, internalformat, width, height) {
+    // MSAA渲染缓冲
+    如果 (samples > 16) { samples = 16 }
+    // 分配 samples * width * height * bpp
+}
+
+函数 图绘2_blitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter) {
+    // 将读帧缓冲的矩形区域复制到绘制帧缓冲
+    定义 cmd = 图处命令_分配(图处_CMD_BLIT_FRAMEBUFFER, 40)
+    内存_写32(cmd + 8, srcX0); 内存_写32(cmd + 12, srcY0)
+    内存_写32(cmd + 16, srcX1); 内存_写32(cmd + 20, srcY1)
+    内存_写32(cmd + 24, dstX0); 内存_写32(cmd + 28, dstY0)
+    内存_写32(cmd + 32, dstX1); 内存_写32(cmd + 36, dstY1)
+    内存_写32(cmd + 40, mask); 内存_写32(cmd + 44, filter)
+    图处命令_提交(cmd)
+}
+
+// 多渲染目标(MRT)
+函数 图绘2_drawBuffers(n, bufs) {
+    // 设置多个颜色附件为绘制目标(MRT)
+    如果 (n <= 0 || n > 8 || bufs == 0) { 返回 }
+    定义 cmd = 图处命令_分配(图处_CMD_DRAW_BUFFERS, 4 + n * 4)
+    内存_写32(cmd + 8, n)
+    定义 可变 i = 0
+    当 (i < n) {
+        内存_写32(cmd + 12 + i * 4, 内存_读32(bufs + i * 4))
+        i = i + 1
+    }
+    图处命令_提交(cmd)
+}
+
+函数 图绘2_readBuffer(src) {
+    // 设置读取源: GL_COLOR_ATTACHMENT0..N / GL_BACK
+    定义 cmd = 图处命令_分配(图处_CMD_READ_BUFFER, 4)
+    内存_写32(cmd + 8, src)
+    图处命令_提交(cmd)
+}
+
+函数 图绘2_invalidateFramebuffer(target, n, attachments) {
+    // 提示图处: 这些附件的内容不再需要(tile-based 图处优化)
+    如果 (n <= 0 || attachments == 0) { 返回 }
+    定义 cmd = 图处命令_分配(图处_CMD_INVALIDATE_FB, 8 + n * 4)
+    内存_写32(cmd + 8, target)
+    内存_写32(cmd + 12, n)
+    定义 可变 i = 0
+    当 (i < n) {
+        内存_写32(cmd + 16 + i * 4, 内存_读32(attachments + i * 4))
+        i = i + 1
+    }
+    图处命令_提交(cmd)
+}

@@ -1,0 +1,290 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+
+// NovaOS x86-64 特权指令
+
+函数 关中断() { 汇编 { "cli" } }
+函数 开中断() { 汇编 { "sti" } }
+函数 停机() { 汇编 { "hlt" } }
+函数 暂停() { 汇编 { "pause" } }
+
+函数 读CR0() {
+    定义 可变 值 = 0
+    汇编 { "mov rax, cr0" "mov [rbp-8], rax" }
+    返回 值
+}
+
+函数 写CR0(值) {
+    汇编 { "mov rax, [rbp+16]" "mov cr0, rax" }
+}
+
+函数 读CR2() {
+    定义 可变 值 = 0
+    汇编 { "mov rax, cr2" "mov [rbp-8], rax" }
+    返回 值
+}
+
+函数 读CR3() {
+    定义 可变 值 = 0
+    汇编 { "mov rax, cr3" "mov [rbp-8], rax" }
+    返回 值
+}
+
+函数 写CR3(值) {
+    汇编 { "mov rax, [rbp+16]" "mov cr3, rax" }
+}
+
+函数 读CR4() {
+    定义 可变 值 = 0
+    汇编 { "mov rax, cr4" "mov [rbp-8], rax" }
+    返回 值
+}
+
+函数 写CR4(值) {
+    汇编 { "mov rax, [rbp+16]" "mov cr4, rax" }
+}
+
+函数 加载GDT(基址, 界限) {
+    // LGDT需要一个6字节的结构: [2字节界限, 4/8字节基址]
+    汇编 {
+        "sub rsp, 16"
+        "mov rax, [rbp+24]"
+        "mov [rsp], ax"
+        "mov rax, [rbp+16]"
+        "mov [rsp+2], rax"
+        "lgdt [rsp]"
+        "add rsp, 16"
+    }
+}
+
+函数 加载IDT(基址, 界限) {
+    汇编 {
+        "sub rsp, 16"
+        "mov rax, [rbp+24]"
+        "mov [rsp], ax"
+        "mov rax, [rbp+16]"
+        "mov [rsp+2], rax"
+        "lidt [rsp]"
+        "add rsp, 16"
+    }
+}
+
+函数 加载TR(选择子) {
+    汇编 { "mov ax, [rbp+16]" "ltr ax" }
+}
+
+函数 刷新TLB(地址) {
+    汇编 { "mov rax, [rbp+16]" "invlpg [rax]" }
+}
+
+函数 刷新全部TLB() {
+    定义 cr3 = 读CR3()
+    写CR3(cr3)
+}
+
+函数 读取时间戳() {
+    定义 可变 值 = 0
+    汇编 {
+        "rdtsc"
+        "shl rdx, 32"
+        "or rax, rdx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+// 别名(被SMP启动/内核映射/异常处理引用)
+函数 读取CR3() {
+    // 读取CR3寄存器(页表基址)
+    定义 可变 值 = 0
+    汇编 {
+        "mov rax, cr3"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+函数 特权_读取MSR(寄存器) { 返回 rdmsr(寄存器) }
+
+// MSR读写 
+
+函数 rdmsr(寄存器) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov ecx, [rbp+16]"
+        "rdmsr"
+        "shl rdx, 32"
+        "or rax, rdx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 wrmsr(寄存器, 值) {
+    汇编 {
+        "mov ecx, [rbp+24]"
+        "mov rax, [rbp+16]"
+        "mov rdx, rax"
+        "shr rdx, 32"
+        "wrmsr"
+    }
+}
+
+定义 MSR_IA32_接口C_BASE    = 0x1B
+定义 MSR_IA32_SYSENTER_CS  = 0x174
+定义 MSR_IA32_SYSENTER_ESP = 0x175
+定义 MSR_IA32_SYSENTER_EIP = 0x176
+定义 MSR_IA32_EFER         = 0xC0000080
+定义 MSR_IA32_STAR         = 0xC0000081
+定义 MSR_IA32_LSTAR        = 0xC0000082
+定义 MSR_IA32_CSTAR        = 0xC0000083
+定义 MSR_IA32_FMASK        = 0xC0000084
+定义 MSR_IA32_FS_BASE      = 0xC0000100
+定义 MSR_IA32_GS_BASE      = 0xC0000101
+定义 MSR_IA32_KERNEL_GS_BASE = 0xC0000102
+定义 MSR_IA32_TSC_AUX      = 0xC0000103
+
+// Nova系统调用/sysret设置 
+
+函数 设置Nova系统调用(入口地址) {
+    // STAR: 高32位=[用户CS(Ring3)+16][内核CS(Ring0)]
+    // 内核CS=0x08, 用户CS=0x1B (0x18|3)
+    定义 star = (0x001B0008 << 32)
+    wrmsr(MSR_IA32_STAR, star)
+
+    // LSTAR: Nova系统调用入口地址
+    wrmsr(MSR_IA32_LSTAR, 入口地址)
+
+    // FMASK: Nova系统调用时清除的RFLAGS位 (IF=0x200, TF=0x100, DF=0x400)
+    wrmsr(MSR_IA32_FMASK, 0x700)
+}
+
+// CPUID 
+
+函数 cpuid(叶, 子叶) {
+    定义 可变 eax = 0
+    定义 可变 ebx = 0
+    定义 可变 ecx = 0
+    定义 可变 edx = 0
+    汇编 {
+        "mov eax, [rbp+24]"
+        "mov ecx, [rbp+16]"
+        "cpuid"
+        "mov [rbp-8], rax"
+        "mov [rbp-16], rbx"
+        "mov [rbp-24], rcx"
+        "mov [rbp-32], rdx"
+    }
+    返回 [eax, ebx, ecx, edx]
+}
+
+// SWAPGS 
+
+函数 swapgs() {
+    汇编 { "swapgs" }
+}
+
+函数 特权_设置GS基址(基址) {
+    wrmsr(MSR_IA32_GS_BASE, 基址)
+}
+
+函数 特权_设置内核GS基址(基址) {
+    wrmsr(MSR_IA32_KERNEL_GS_BASE, 基址)
+}
+
+函数 特权_读取GS基址() {
+    返回 rdmsr(MSR_IA32_GS_BASE)
+}
+
+// XSAVE/XRSTOR (FPU/SSE/AVX状态保存恢复)
+
+函数 xsave(地址, 掩码) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov eax, [rbp+16]"
+        "xor edx, edx"
+        "xsave [rdi]"
+    }
+}
+
+函数 xrstor(地址, 掩码) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov eax, [rbp+16]"
+        "xor edx, edx"
+        "xrstor [rdi]"
+    }
+}
+
+函数 fxsave(地址) {
+    汇编 { "mov rdi, [rbp+16]" "fxsave [rdi]" }
+}
+
+函数 fxrstor(地址) {
+    汇编 { "mov rdi, [rbp+16]" "fxrstor [rdi]" }
+}
+
+// WBINVD (写回并无效化缓存)
+
+函数 wbinvd() {
+    汇编 { "wbinvd" }
+}
+
+函数 clflush(地址) {
+    汇编 { "mov rdi, [rbp+16]" "clflush [rdi]" }
+}
+
+
+函数 特权指令_完整统计() {
+    返回 [特权指令_执行次数]
+}
+
+// 特权指令辅助
+
+函数 特权指令_健康检查() {
+    返回 "特权指令子系统健康"
+}
+
+定义 CR0_PE = 0x01
+定义 CR0_MP = 0x02
+定义 CR0_EM = 0x04
+定义 CR0_TS = 0x08
+定义 CR0_PG = 0x80000000
+定义 CR4_PAE = 0x20
+定义 CR4_PSE = 0x10
+定义 CR4_OSFXSR = 0x200
+定义 CR4_OSXMMEXCPT = 0x400
+
+函数 特权指令_CR0标志名(位) {
+    如果 (位 == CR0_PE) { 返回 "PE" }
+    如果 (位 == CR0_MP) { 返回 "MP" }
+    如果 (位 == CR0_PG) { 返回 "PG" }
+    返回 "BIT_" + 十六进制(位)
+}
+
+函数 特权指令_CR4标志名(位) {
+    如果 (位 == CR4_PAE) { 返回 "PAE" }
+    如果 (位 == CR4_PSE) { 返回 "PSE" }
+    如果 (位 == CR4_OSFXSR) { 返回 "OSFXSR" }
+    返回 "BIT_" + 十六进制(位)
+}
+
+函数 特权指令_重置统计() {
+    特权指令_执行次数 = 0
+}
+
+定义 可变 AI_特权指令_风暴阈值 = 10000
+定义 可变 AI_特权指令_预测IRQ = 0
+
+函数 AI_特权指令_风暴检测(触发频率) {
+    如果 (触发频率 > AI_特权指令_风暴阈值) {
+        AI_特权指令_风暴阈值 = AI_特权指令_风暴阈值 * 3 / 2
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_特权指令_自适应合并(当前延迟) {
+    如果 (当前延迟 < 100) { 返回 16 }
+    如果 (当前延迟 < 500) { 返回 8 }
+    返回 1
+}

@@ -1,0 +1,194 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./着色器程序.nova")
+
+// Skia→Nova: 图处后端 — OpenGL ES / Vulkan 命令抽象
+// 对应: skia/src/gpu/ (~50000行C++)
+//       skia/src/gpu/gl/GrGLGpu.cpp (~4000行)
+//       skia/src/gpu/GrDrawOpAtlas.cpp (~1200行)
+//       skia/src/gpu/GrResourceProvider.cpp (~800行)
+// 图处渲染管线:
+//   顶点数据 → 顶点着色器 → 光栅化 → 片段着色器 → 混合 → 帧缓冲
+// 【Nova特色】AI驱动图处资源管理:
+//   ① 纹理图集智能布局(bin-packing + 预测访问模式)
+//   ② 着色器编译缓存 + 预编译预测
+//   ③ 图处内存压力自适应(降级分辨率)
+
+// §1 图处上下文
+
+定义 图处_BACKEND_GL     = 0
+定义 图处_BACKEND_VULKAN = 1
+定义 图处_BACKEND_METAL  = 2
+
+结构 GrContext {
+    后端类型,
+    // 能力
+    最大纹理尺寸,
+    支持NPOT,    // 布尔 non-power-of-two
+    支持FBO,
+    支持实例化,
+    最大采样数,
+    // 资源管理
+    纹理缓存,    // u64 GrTexture缓存*
+    着色器缓存,    // u64 GrShader缓存*
+    命令缓冲,    // u64 图处命令缓冲*
+    // 统计
+    纹理内存用量,
+    纹理内存上限,
+    绘制调用计数,
+    帧号,
+}
+
+
+函数 GrContext_创建(后端) {
+    定义 ctx = 堆_分配(GrContext)
+    ctx.后端类型 = 后端
+    ctx.最大纹理尺寸 = 4096
+    ctx.支持NPOT = 真
+    ctx.支持FBO = 真
+    ctx.支持实例化 = 真
+    ctx.最大采样数 = 4
+    ctx.纹理缓存 = GrTexture缓存_创建()
+    ctx.着色器缓存 = GrShader缓存_创建()
+    ctx.命令缓冲 = 图处命令缓冲_创建(65536)
+    ctx.纹理内存用量 = 0
+    ctx.纹理内存上限 = 256 * 1024 * 1024    // 256MB
+    ctx.绘制调用计数 = 0
+    ctx.帧号 = 0
+    返回 ctx
+}
+
+函数 GrContext_开始帧(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.帧号 = ctx.帧号 + 1
+    ctx.绘制调用计数 = 0
+}
+
+函数 GrContext_结束帧(ctx) {
+    如果 (ctx == 0) { 返回 }
+    // 刷新命令缓冲→图处
+    图处命令缓冲_刷新(ctx.命令缓冲)
+    // 清理过期纹理
+    GrTexture缓存_清理(ctx.纹理缓存, ctx.帧号)
+}
+
+// §2 纹理管理
+
+定义 TEX_FORMAT_RGBA8    = 0
+定义 TEX_FORMAT_RGB8     = 1
+定义 TEX_FORMAT_ALPHA8   = 2
+定义 TEX_FORMAT_R8       = 3
+定义 TEX_FORMAT_RGB565   = 4
+
+结构 GrTexture {
+    gpu_id,    // u32 图处纹理句柄
+    宽,
+    高,
+    格式,    // u8 TEX_FORMAT_xxx
+    mipmap,
+    内存大小,
+    最后使用帧,
+    引用计数,
+    下一个,    // u64 缓存链
+}
+
+结构 GrTexture缓存 {
+    桶,    // [256]u64 hash→GrTexture*链表
+    总数,
+    总内存,
+}
+
+函数 GrTexture缓存_创建() {
+    定义 c = 堆_分配(GrTexture缓存)
+    定义 可变 i = 0
+    当 (i < 256) { c.桶[i] = 0; i = i + 1 }
+    c.总数 = 0; c.总内存 = 0
+    返回 c
+}
+
+函数 GrTexture_创建(ctx, 宽, 高, 格式, 数据) {
+    如果 (ctx == 0) { 返回 0 }
+    定义 tex = 堆_分配(GrTexture)
+    tex.宽 = 宽; tex.高 = 高; tex.格式 = 格式; tex.mipmap = 假
+    tex.引用计数 = 1
+    tex.最后使用帧 = ctx.帧号
+
+    // 计算内存
+    定义 bpp = 4    // 默认RGBA8
+    如果 (格式 == TEX_FORMAT_ALPHA8 || 格式 == TEX_FORMAT_R8) { bpp = 1 }
+    如果 (格式 == TEX_FORMAT_RGB565) { bpp = 2 }
+    如果 (格式 == TEX_FORMAT_RGB8) { bpp = 3 }
+    tex.内存大小 = 宽 * 高 * bpp
+
+    // 图处命令: 创建纹理
+    tex.gpu_id = 图处命令_创建纹理(ctx.命令缓冲, 宽, 高, 格式)
+
+    // 上传数据
+    如果 (数据 != 0) {
+        图处命令_纹理上传(ctx.命令缓冲, tex.gpu_id, 0, 0, 宽, 高, 数据)
+    }
+
+    ctx.纹理内存用量 = ctx.纹理内存用量 + tex.内存大小
+
+    // 放入缓存
+    定义 cache = ctx.纹理缓存
+    定义 桶号 = tex.gpu_id % 256
+    tex.下一个 = cache.桶[桶号]
+    cache.桶[桶号] = tex
+    cache.总数 = cache.总数 + 1
+    cache.总内存 = cache.总内存 + tex.内存大小
+
+    返回 tex
+}
+
+函数 GrTexture_更新子区域(ctx, tex, x, y, 宽, 高, 数据) {
+    如果 (ctx == 0 || tex == 0 || 数据 == 0) { 返回 }
+    图处命令_纹理上传(ctx.命令缓冲, tex.gpu_id, x, y, 宽, 高, 数据)
+    tex.最后使用帧 = ctx.帧号
+}
+
+函数 GrTexture_生成mipmap(ctx, tex) {
+    如果 (ctx == 0 || tex == 0 || tex.mipmap) { 返回 }
+    图处命令_生成mipmap(ctx.命令缓冲, tex.gpu_id)
+    tex.mipmap = 真
+    // mipmap额外占~33%内存
+    定义 额外 = tex.内存大小 / 3
+    ctx.纹理内存用量 = ctx.纹理内存用量 + 额外
+    tex.内存大小 = tex.内存大小 + 额外
+}
+
+函数 GrTexture_释放(ctx, tex) {
+    如果 (tex == 0) { 返回 }
+    tex.引用计数 = tex.引用计数 - 1
+    如果 (tex.引用计数 > 0) { 返回 }
+    如果 (ctx != 0) {
+        图处命令_删除纹理(ctx.命令缓冲, tex.gpu_id)
+        ctx.纹理内存用量 = ctx.纹理内存用量 - tex.内存大小
+    }
+    堆_释放(tex)
+}
+
+函数 GrTexture缓存_清理(cache, 当前帧) {
+    如果 (cache == 0) { 返回 }
+    // 清除超过60帧未使用的纹理
+    定义 可变 i = 0
+    当 (i < 256) {
+        定义 可变 前驱 = 0
+        定义 可变 当前 = cache.桶[i]
+        当 (当前 != 0) {
+            定义 下一 = 当前.下一个
+            如果 (当前.引用计数 <= 0 && 当前帧 - 当前.最后使用帧 > 60) {
+                // 移除
+                如果 (前驱 == 0) { cache.桶[i] = 下一 }
+                否则 { 前驱.下一个 = 下一 }
+                cache.总数 = cache.总数 - 1
+                cache.总内存 = cache.总内存 - 当前.内存大小
+                堆_释放(当前)
+            } 否则 {
+                前驱 = 当前
+            }
+            当前 = 下一
+        }
+        i = i + 1
+    }
+}

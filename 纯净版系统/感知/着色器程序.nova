@@ -1,0 +1,180 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./程序入口.nova")
+
+// §3 着色器程序
+
+定义 SHADER_STAGE_VERTEX    = 0
+定义 SHADER_STAGE_FRAGMENT  = 1
+
+结构 GrShaderProgram {
+    gpu_id,
+    顶点着色器源,
+    片段着色器源,
+    // uniform位置缓存
+    uniform数量,
+    uniform名称,    // u64 字符串数组
+    uniform位置,    // u64 i32数组
+    // 属性
+    属性数量,
+}
+
+结构 GrShader缓存 {
+    程序表,    // u64 GrShaderProgram*数组
+    程序数,
+    程序容量,
+}
+
+函数 GrShader缓存_创建() {
+    定义 c = 堆_分配(GrShader缓存)
+    c.程序容量 = 64
+    c.程序表 = 堆_分配_数组(64 * 8)
+    c.程序数 = 0
+    返回 c
+}
+
+// 内置着色器: 纯色填充
+定义 内置顶点着色器_纯色 =
+    "attribute vec2 aPos;\n"
+    "uniform mat3 uTransform;\n"
+    "void main() {\n"
+    "  vec3 p = uTransform * vec3(aPos, 1.0);\n"
+    "  gl_Position = vec4(p.xy, 0.0, 1.0);\n"
+    "}\n"
+
+定义 内置片段着色器_纯色 =
+    "precision mediump float;\n"
+    "uniform vec4 uColor;\n"
+    "void main() {\n"
+    "  gl_FragColor = uColor;\n"
+    "}\n"
+
+// 内置着色器: 纹理贴图
+定义 内置顶点着色器_纹理 =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aTexCoord;\n"
+    "uniform mat3 uTransform;\n"
+    "varying vec2 vTexCoord;\n"
+    "void main() {\n"
+    "  vec3 p = uTransform * vec3(aPos, 1.0);\n"
+    "  gl_Position = vec4(p.xy, 0.0, 1.0);\n"
+    "  vTexCoord = aTexCoord;\n"
+    "}\n"
+
+定义 内置片段着色器_纹理 =
+    "precision mediump float;\n"
+    "uniform sampler2D uTexture;\n"
+    "uniform float uAlpha;\n"
+    "varying vec2 vTexCoord;\n"
+    "void main() {\n"
+    "  gl_FragColor = texture2D(uTexture, vTexCoord) * uAlpha;\n"
+    "}\n"
+
+函数 GrShader_编译(ctx, 顶点源, 片段源) {
+    如果 (ctx == 0) { 返回 0 }
+    定义 prog = 堆_分配(GrShaderProgram)
+    prog.顶点着色器源 = 顶点源
+    prog.片段着色器源 = 片段源
+    prog.gpu_id = 图处命令_编译着色器(ctx.命令缓冲, 顶点源, 片段源)
+    prog.uniform数量 = 0
+    prog.属性数量 = 0
+
+    // 放入缓存
+    定义 cache = ctx.着色器缓存
+    如果 (cache.程序数 < cache.程序容量) {
+        内存_写64(cache.程序表 + cache.程序数 * 8, prog)
+        cache.程序数 = cache.程序数 + 1
+    }
+    返回 prog
+}
+
+// §4 顶点缓冲与绘制操作
+
+定义 PRIM_TRIANGLES      = 0
+定义 PRIM_TRIANGLE_STRIP = 1
+定义 PRIM_TRIANGLE_FAN   = 2
+定义 PRIM_LINES          = 3
+
+结构 GrVertexBuffer {
+    gpu_id,
+    数据,
+    字节大小,
+    顶点数,
+    步长,    // u32 bytes per vertex
+    是动态,
+}
+
+结构 GrDrawOp {
+    着色器,    // u64 GrShaderProgram*
+    顶点缓冲,    // u64 GrVertexBuffer*
+    索引缓冲,
+    图元类型,    // u8 PRIM_xxx
+    顶点偏移,
+    顶点数,
+    // 纹理绑定
+    纹理0,    // u64 GrTexture*
+    纹理1,
+    // uniform数据
+    变换矩阵,    // [9]i32 3x3 Q10
+    颜色,    // [4]i32 RGBA Q10
+    透明度,    // i32 Q10
+}
+
+函数 GrVertexBuffer_创建(ctx, 数据, 字节大小, 步长, 动态) {
+    如果 (ctx == 0) { 返回 0 }
+    定义 vb = 堆_分配(GrVertexBuffer)
+    vb.数据 = 数据
+    vb.字节大小 = 字节大小
+    vb.步长 = 步长
+    vb.顶点数 = 字节大小 / 步长
+    vb.是动态 = 动态
+    vb.gpu_id = 图处命令_创建顶点缓冲(ctx.命令缓冲, 数据, 字节大小, 动态)
+    返回 vb
+}
+
+函数 GrDrawOp_执行(ctx, op) {
+    如果 (ctx == 0 || op == 0) { 返回 }
+    定义 cmd = ctx.命令缓冲
+
+    // 绑定着色器
+    如果 (op.着色器 != 0) {
+        图处命令_使用着色器(cmd, op.着色器.gpu_id)
+    }
+
+    // 设置uniform
+    图处命令_设uniform_矩阵3(cmd, "uTransform", op.变换矩阵)
+    图处命令_设uniform_vec4(cmd, "uColor", op.颜色[0], op.颜色[1], op.颜色[2], op.颜色[3])
+    图处命令_设uniform_float(cmd, "uAlpha", op.透明度)
+
+    // 绑定纹理
+    如果 (op.纹理0 != 0) {
+        图处命令_绑定纹理(cmd, 0, op.纹理0.gpu_id)
+    }
+    如果 (op.纹理1 != 0) {
+        图处命令_绑定纹理(cmd, 1, op.纹理1.gpu_id)
+    }
+
+    // 绑定顶点缓冲
+    如果 (op.顶点缓冲 != 0) {
+        图处命令_绑定顶点缓冲(cmd, op.顶点缓冲.gpu_id)
+    }
+
+    // 绘制
+    图处命令_绘制(cmd, op.图元类型, op.顶点偏移, op.顶点数)
+    ctx.绘制调用计数 = ctx.绘制调用计数 + 1
+}
+
+定义 可变 AI_着色器程序_热点函数 = []
+
+函数 AI_着色器程序_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_着色器程序_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_着色器程序_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

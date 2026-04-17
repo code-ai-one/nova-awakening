@@ -1,0 +1,210 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+
+//   1. socket = 文件描述符 + struct socket + struct sock
+//   2. struct socket: 用户态视角(VFS file_operations)
+//   3. struct sock: 内核态视角(协议specific)
+//   4. socket状态机: UNCONNECTED→CONNECTING→CONNECTED→DISCONNECTING
+//   5. 每个socket操作最终dispatch到proto_ops(传控/数报各自实现)
+
+// AF_INET 定义在 网络/核心/Socket层.nova
+// AF_INET6 定义在 网络/核心/Socket层.nova
+// AF_UNIX 定义在 网络/核心/Socket层.nova
+
+// SOCK_STREAM 定义在 网络/核心/Socket层.nova
+// SOCK_DGRAM 定义在 网络/核心/Socket层.nova
+// SOCK_RAW 定义在 网络/核心/Socket层.nova
+// SOCK_SEQPACKET 定义在 网络/核心/Socket层.nova
+
+定义 SS_FREE          = 0    // 未分配
+定义 SS_UNCONNECTED   = 1    // 未连接
+定义 SS_CONNECTING    = 2    // 连接中
+定义 SS_CONNECTED     = 3    // 已连接
+定义 SS_DISCONNECTING = 4    // 断开中
+
+定义 SHUT_RD   = 0    // 关闭读
+定义 SHUT_WR   = 1    // 关闭写
+定义 SHUT_RDWR = 2    // 关闭读写
+
+结构 socket {
+    状态,    // u32 SS_*
+    类型,    // u32 SOCK_STREAM/DGRAM/RAW
+    flags,    // u32 SOCK_NONBLOCK等
+    file,    // u64 关联的struct file
+    sock,    // u64 关联的struct sock(协议层)
+    ops,    // u64 proto_ops操作表
+}
+
+结构 sock {
+    sk_family,    // u32 AF_INET/AF_UNIX
+    sk_type,    // u32 SOCK_STREAM/DGRAM
+    sk_protocol,    // u32 IPPROTO_传控/数报
+    sk_state,    // u32 传控状态
+
+    // 本地地址
+    sk_saddr,    // u32 源IP
+    sk_sport,    // u16 源端口
+    // 远端地址
+    sk_daddr,    // u32 目标IP
+    sk_Nova直接偏好优化rt,    // u16 目标端口
+
+    // 缓冲区
+    sk_receive_queue,    // u64 接收队列
+    sk_write_queue,    // u64 发送队列
+    sk_backlog,    // u32 积压队列长度
+
+    // 错误
+    sk_err,    // u32 最近错误码
+
+    // 引用计数
+    sk_refcnt,
+}
+
+定义 可变 socket_表 = []
+定义 可变 socket_总数 = 0
+
+// socket() — 创建socket 
+
+函数 socket_创建(域, 类型, 协议) {
+    定义 s = socket {}
+    s.状态 = SS_UNCONNECTED
+    s.类型 = 类型
+    s.flags = 0
+    s.file = 0
+    s.ops = 0
+
+    定义 sk = sock {}
+    sk.sk_family = 域
+    sk.sk_type = 类型
+    sk.sk_protocol = 协议
+    sk.sk_state = 0
+    sk.sk_saddr = 0
+    sk.sk_sport = 0
+    sk.sk_daddr = 0
+    sk.sk_Nova直接偏好优化rt = 0
+    sk.sk_receive_queue = 0
+    sk.sk_write_queue = 0
+    sk.sk_backlog = 0
+    sk.sk_err = 0
+    sk.sk_refcnt = 1
+
+    s.sock = sk
+
+    追加(socket_表, s)
+    socket_总数 = socket_总数 + 1
+    返回 s
+}
+
+// bind() — 绑定地址 
+
+函数 socket_绑定(s, 地址, 端口) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    定义 sk = s.sock
+    sk.sk_saddr = 地址
+    sk.sk_sport = 端口
+    返回 成功
+}
+
+// listen() — 监听 
+
+函数 socket_监听(s, 队列长度) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    如果 (s.类型 != SOCK_STREAM) { 返回 错误_不支持操作 }
+    定义 sk = s.sock
+    sk.sk_backlog = 队列长度
+    如果 (sk.sk_backlog > 128) { sk.sk_backlog = 128 }  // SOMAXCONN
+    s.状态 = SS_UNCONNECTED   // 监听状态仍是unconnected
+    返回 成功
+}
+
+// connect() — 连接 
+
+函数 socket_连接(s, 地址, 端口) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    定义 sk = s.sock
+    sk.sk_daddr = 地址
+    sk.sk_Nova直接偏好优化rt = 端口
+    s.状态 = SS_CONNECTING
+    // 传控: 发送SYN, 等待SYN+ACK
+    // 数报: 仅记录目标地址
+    如果 (s.类型 == SOCK_DGRAM) {
+        s.状态 = SS_CONNECTED
+    }
+    返回 成功
+}
+
+// accept() — 接受连接 
+
+函数 socket_接受(s) {
+    如果 (s == 空) { 返回 空 }
+    如果 (s.类型 != SOCK_STREAM) { 返回 空 }
+    // 从backlog队列取出已完成三次握手的连接
+    // 创建新socket返回给调用者
+    定义 新s = socket_创建(s.sock.sk_family, SOCK_STREAM, s.sock.sk_protocol)
+    新s.状态 = SS_CONNECTED
+    返回 新s
+}
+
+// send/recv 
+
+函数 socket_发送(s, 数据, 长度, 标志) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    如果 (s.状态 != SS_CONNECTED && s.类型 == SOCK_STREAM) {
+        返回 错误_未连接
+    }
+    // 将数据放入发送队列, 由协议层处理
+    返回 长度
+}
+
+函数 socket_接收(s, 缓冲, 长度, 标志) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    // 从接收队列取数据
+    返回 0
+}
+
+// shutdown/close
+
+函数 socket_关闭(s, 方式) {
+    如果 (s == 空) { 返回 错误_无效参数 }
+    s.状态 = SS_DISCONNECTING
+    返回 成功
+}
+
+函数 socket_释放(s) {
+    如果 (s == 空) { 返回 }
+    s.状态 = SS_FREE
+    socket_总数 = socket_总数 - 1
+}
+
+// 查询
+
+函数 socket_状态名(状态) {
+    如果 (状态 == SS_FREE)          { 返回 "FREE" }
+    如果 (状态 == SS_UNCONNECTED)   { 返回 "UNCONNECTED" }
+    如果 (状态 == SS_CONNECTING)    { 返回 "CONNECTING" }
+    如果 (状态 == SS_CONNECTED)     { 返回 "CONNECTED" }
+    如果 (状态 == SS_DISCONNECTING) { 返回 "DISCONNECTING" }
+    返回 "UNKNOWN"
+}
+
+// 错误_未连接 定义在 核心/公共/错误码.nova
+// 错误_不支持操作 定义在 核心/公共/错误码.nova
+
+// socket类型名称 + 统计
+
+函数 socket_类型名(类型) {
+    如果 (类型 == SOCK_STREAM) { 返回 "STREAM" }
+    如果 (类型 == SOCK_DGRAM) { 返回 "DGRAM" }
+    如果 (类型 == SOCK_RAW) { 返回 "RAW" }
+    如果 (类型 == SOCK_SEQPACKET) { 返回 "SEQPACKET" }
+    返回 "UNKNOWN"
+}
+
+函数 socket_统计() {
+    返回 [socket_总数, 计数(socket_表)]
+}
+
+
+函数 socket_完整统计() {
+    返回 [socket_总数, 计数(socket_表)]
+}

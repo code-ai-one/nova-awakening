@@ -1,0 +1,85 @@
+// Nova · 项目系统 · Profile解析器
+// 根据profile裁剪模块树，决定哪些子系统参与编译
+
+// Profile有效性校验
+
+导入("../../标准库/基础.nova")
+导入("../../运行时/字典引擎/字典引擎.nova")
+
+函数 Profile_是合法(名称) {
+    如果 (字符串相等(名称, "analysis-host")) { 返回 真 }
+    如果 (字符串相等(名称, "linux-user")) { 返回 真 }
+    如果 (字符串相等(名称, "kernel-qemu")) { 返回 真 }
+    如果 (字符串相等(名称, "kernel-physical")) { 返回 真 }
+    // 跨语言原生重置Profile
+    如果 (字符串相等(名称, "strict-native")) { 返回 真 }
+    如果 (字符串相等(名称, "hosted-compatible")) { 返回 真 }
+    如果 (字符串相等(名称, "hybrid-bridge")) { 返回 真 }
+    // 兼容旧项目: 无profile时默认linux-user
+    如果 (字符串相等(名称, "")) { 返回 真 }
+    返回 假
+}
+
+// 重置Profile类型判断
+函数 Profile_是重置Profile(名称) {
+    如果 (字符串相等(名称, "strict-native")) { 返回 真 }
+    如果 (字符串相等(名称, "hosted-compatible")) { 返回 真 }
+    如果 (字符串相等(名称, "hybrid-bridge")) { 返回 真 }
+    返回 假
+}
+
+// Profile裁剪: 决定子系统是否参与当前profile
+// 返回: 裁剪后的子系统列表 [[名称, manifest路径], ...]
+函数 Profile_裁剪子系统(合同, 活跃profile) {
+    定义 子系统 = 合同[6]
+    如果 (计数(子系统) == 0) { 返回 [] }
+    // 当前策略: 所有子系统默认参与，后续按标签细化
+    // kernel-physical可以排除analysis-only子系统
+    // analysis-host可以排除baremetal-only子系统
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 计数(子系统)) {
+        追加(结果, 子系统[i])
+        i = i + 1
+    }
+    返回 结果
+}
+
+// Profile解析优先级
+// CLI > 项目文件 > 默认值
+函数 Profile_解析(CLI_profile, 合同_profile) {
+    如果 (CLI_profile != 空 且 字节长度(CLI_profile) > 0) {
+        如果 (Profile_是合法(CLI_profile)) { 返回 CLI_profile }
+    }
+    如果 (合同_profile != 空 且 字节长度(合同_profile) > 0) {
+        如果 (Profile_是合法(合同_profile)) { 返回 合同_profile }
+    }
+    返回 "linux-user"
+}
+
+// Profile最小交付物描述
+函数 Profile_交付物清单(profile名) {
+    如果 (字符串相等(profile名, "analysis-host")) {
+        返回 ["project_contract_report", "语义_报告", "ir_report"]
+    }
+    如果 (字符串相等(profile名, "linux-user")) {
+        返回 ["elf_binary", "symbol_map", "line_map"]
+    }
+    如果 (字符串相等(profile名, "kernel-qemu")) {
+        返回 ["kernel_elf", "qemu_bundle", "serial_profile"]
+    }
+    如果 (字符串相等(profile名, "kernel-physical")) {
+        返回 ["disk_image", "rollback_metadata", "hardware_profile"]
+    }
+    // 跨语言原生重置Profile交付物
+    如果 (字符串相等(profile名, "strict-native")) {
+        返回 ["native_project_report", "equivalence_report", "clone_scan_report", "elf_binary"]
+    }
+    如果 (字符串相等(profile名, "hosted-compatible")) {
+        返回 ["native_project_report", "equivalence_report", "clone_scan_report", "compatibility_boundary_report", "elf_binary"]
+    }
+    如果 (字符串相等(profile名, "hybrid-bridge")) {
+        返回 ["native_project_report", "equivalence_report", "clone_scan_report", "ffi_bridge_report", "elf_binary"]
+    }
+    返回 ["elf_binary"]
+}

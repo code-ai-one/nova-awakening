@@ -1,0 +1,168 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./创建.nova")
+导入("./文档节点.nova")
+导入("../中枢/字符串替换.nova")
+
+// §5 createOffer / createAnswer
+
+函数 R传控eerConnection_createOffer(pc, 选项) {
+    如果 (pc == 0) { 返回 0 }
+    // 收集本地媒体能力
+    // 生成SDP offer
+    定义 sdp = SDP_生成_offer(0)
+    定义 desc = 堆_分配(RTCSessionDescription)
+    desc.类型 = SDP_TYPE_OFFER
+    desc.sdp = sdp
+    返回 desc    // 返回承诺<RTCSessionDescription>
+}
+
+函数 R传控eerConnection_createAnswer(pc, 选项) {
+    如果 (pc == 0 || pc.远端描述 == 0) { 返回 0 }
+    定义 sdp = SDP_生成_answer(pc.远端描述, 0)
+    定义 desc = 堆_分配(RTCSessionDescription)
+    desc.类型 = SDP_TYPE_ANSWER
+    desc.sdp = sdp
+    返回 desc
+}
+
+// §6 setLocalDescription / setRemoteDescription
+
+函数 R传控eerConnection_setLocalDescription(pc, desc) {
+    如果 (pc == 0 || desc == 0) { 返回 }
+
+    如果 (desc.类型 == SDP_TYPE_OFFER) {
+        pc.信令状态 = SIGNAL_STATE_HAVE_LOCAL_OFFER
+    } 否则 如果 (desc.类型 == SDP_TYPE_ANSWER) {
+        pc.信令状态 = SIGNAL_STATE_STABLE
+    }
+
+    pc.本地描述 = desc
+
+    // 开始ICE候选收集
+    如果 (pc.ice收集状态 == ICE_GATHER_NEW) {
+        ICE_开始收集(pc)
+    }
+}
+
+函数 R传控eerConnection_setRemoteDescription(pc, desc) {
+    如果 (pc == 0 || desc == 0) { 返回 }
+
+    如果 (desc.类型 == SDP_TYPE_OFFER) {
+        pc.信令状态 = SIGNAL_STATE_HAVE_REMOTE_OFFER
+    } 否则 如果 (desc.类型 == SDP_TYPE_ANSWER) {
+        pc.信令状态 = SIGNAL_STATE_STABLE
+    }
+
+    pc.远端描述 = desc
+
+    // 处理远端媒体描述(创建远端轨道)
+    // 开始ICE连接检查
+    如果 (pc.本地描述 != 0) {
+        ICE_开始连接检查(pc)
+    }
+}
+
+// §7 addIceCandidate
+
+函数 R传控eerConnection_addIceCandidate(pc, candidate) {
+    如果 (pc == 0 || candidate == 0) { 返回 }
+    如果 (pc.远端候选数量 < pc.候选容量) {
+        内存_写64(pc.远端候选列表 + pc.远端候选数量 * 8, candidate)
+        pc.远端候选数量 = pc.远端候选数量 + 1
+    }
+    // 如果已在检查: 添加到检查列表
+}
+
+// §8 ICE收集 — 收集本地候选
+
+函数 ICE_开始收集(pc) {
+    如果 (pc == 0) { 返回 }
+    pc.ice收集状态 = ICE_GATHER_GATHERING
+
+    // 1. Host候选: 枚举本地网络接口
+    ICE_收集Host候选(pc)
+
+    // 2. Server Reflexive候选: STUN请求
+    ICE_收集STUN候选(pc)
+
+    // 3. Relay候选: TURN分配
+    ICE_收集TURN候选(pc)
+
+    pc.ice收集状态 = ICE_GATHER_COMPLETE
+}
+
+函数 ICE_收集Host候选(pc) {
+    // 枚举本地IP地址
+    // 为每个IP创建host候选
+    定义 c = ICECandidate_创建(ICE_CANDIDATE_HOST, 0, "0.0.0.0", 9, 0)
+    c.优先级 = ICECandidate_计算优先级(ICE_CANDIDATE_HOST, 65535, 1)
+    如果 (pc.本地候选数量 < pc.候选容量) {
+        内存_写64(pc.本地候选列表 + pc.本地候选数量 * 8, c)
+        pc.本地候选数量 = pc.本地候选数量 + 1
+    }
+    // 触发onicecandidate回调
+}
+
+函数 ICE_收集STUN候选(pc) {
+    如果 (pc == 0 || pc.ICE服务器数量 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < pc.ICE服务器数量) {
+        定义 url = pc.ICE服务器[i]
+        如果 (字符串_开头是(url, "stun:")) {
+            定义 响应 = STUN_发送Binding请求(url)
+            如果 (响应 != 0) {
+                定义 c = ICECandidate_创建(ICE_CANDIDATE_SRFLX, 0, 响应.IP, 响应.端口, 0)
+                c.优先级 = ICECandidate_计算优先级(ICE_CANDIDATE_SRFLX, 65535, 1)
+                如果 (pc.本地候选数量 < pc.候选容量) {
+                    内存_分64(pc.本地候选列表 + pc.本地候选数量 * 8, c)
+                    pc.本地候选数量 = pc.本地候选数量 + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 ICE_收集TURN候选(pc) {
+    如果 (pc == 0 || pc.ICE服务器数量 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < pc.ICE服务器数量) {
+        定义 url = pc.ICE服务器[i]
+        如果 (字符串_开头是(url, "turn:")) {
+            定义 响应 = TURN_发送Allocate请求(url)
+            如果 (响应 != 0) {
+                定义 c = ICECandidate_创建(ICE_CANDIDATE_RELAY, 0, 响应.IP, 响应.端口, 0)
+                c.优先级 = ICECandidate_计算优先级(ICE_CANDIDATE_RELAY, 0, 1)
+                如果 (pc.本地候选数量 < pc.候选容量) {
+                    内存_分64(pc.本地候选列表 + pc.本地候选数量 * 8, c)
+                    pc.本地候选数量 = pc.本地候选数量 + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 ICE_开始连接检查(pc) {
+    如果 (pc == 0) { 返回 }
+    pc.ice状态 = ICE_STATE_CHECKING
+    // 对每对(本地候选, 远端候选)进行连接检查
+    // 发送STUN Binding Request
+    // 选择最优对
+}
+
+定义 可变 AI_感知己_调用数 = 0
+定义 可变 AI_感知己_异常数 = 0
+
+函数 AI_感知己_监控() {
+    AI_感知己_调用数 = AI_感知己_调用数 + 1
+    返回 AI_感知己_异常数 == 0
+}
+
+函数 AI_感知己_健康检查() {
+    如果 (AI_感知己_调用数 > 0 && AI_感知己_异常数 * 100 / AI_感知己_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

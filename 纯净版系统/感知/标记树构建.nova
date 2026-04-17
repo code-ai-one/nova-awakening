@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式解析.nova")
+导入("./核心状态机.nova")
+导入("../推理/智能总线鼠标.nova")
+导入("./树构建器.nova")
+导入("./元素甲.nova")
+导入("./元素栈创建.nova")
+导入("./文档节点.nova")
+导入("./文档接口属.nova")
+导入("./格式化列表创.nova")
+导入("./原生独创用.nova")
+导入("./文档创建.nova")
+导入("../推理/智能总线资源.nova")
+
+函数 HTMLTreeBuilder_重建格式化元素(tb) {
+    // 检查格式化列表中是否有未关闭的格式化元素
+    定义 格式列表 = tb.格式化列表
+    如果 (格式列表.数量 == 0) { 返回 }
+
+    // 从最后一个marker后开始, 重建所有格式化元素
+    定义 可变 start = 格式列表.数量 - 1
+    // 找最后一个marker
+    当 (start > 0) {
+        定义 元 = 内存_读64(格式列表.元素 + start * 8)
+        如果 (元 == 格式化标记_标记) { start = start + 1; 跳出 }
+        start = start - 1
+    }
+
+    定义 可变 i = start
+    当 (i < 格式列表.数量) {
+        定义 元 = 内存_读64(格式列表.元素 + i * 8)
+        如果 (元 != 格式化标记_标记) {
+            // 检查该元素是否仍在开放元素栈中
+            定义 扩展 = 元素_获取扩展(元)
+            如果 (扩展 != 0 && !元素栈_包含标签(tb.开放元素栈, 扩展.标签名原子)) {
+                // 元素已不在栈中: 重建一个新元素
+                定义 新元素 = Document_create元素(tb.文档, 扩展.标签名)
+                定义 当前 = 元素栈_顶部(tb.开放元素栈)
+                如果 (当前 != 0) { 节点_appendChild(当前, 新元素) }
+                元素栈_压入(tb.开放元素栈, 新元素)
+                // 更新格式化列表中的引用
+                内存_分64(格式列表.元素 + i * 8, 新元素)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §5 HTMLDocumentParser — 解析器总控
+// 协调令牌izer和TreeBuilder,驱动整个解析流程
+// (对应 HTMLDocumentParser)
+
+结构 HTMLDocumentParser {
+ 令牌izer,    // u64 HTML令牌izer*
+ tree_builder,    // u64 HTMLTreeBuilder*
+ 文档,    // u64 Document*
+ 已完成,
+}
+
+函数 HTMLDocumentParser_创建(文档) {
+ 定义 parser = 堆_分配(HTMLDocumentParser)
+ parser.令牌izer = HTML令牌izer_创建()
+ parser.tree_builder = HTMLTreeBuilder_创建(文档, parser.令牌izer)
+ parser.文档 = 文档
+ parser.已完成 = 假
+
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 != 0) {
+ 扩展.解析器 = parser
+ 扩展.解析状态 = 解析状态_解析中
+ }
+
+ 返回 parser
+}
+
+函数 HTMLDocumentParser_解析(parser, html字符串) {
+ // 主解析入口: 将HTML字符串解析为DOM树
+ HTML令牌izer_设置输入(parser.令牌izer, html字符串)
+ 元素_初始化原子表()
+
+ 定义 令牌 = HTML令牌_创建()
+
+ 当 (!parser.已完成) {
+ 定义 结果 = HTML令牌izer_下一个令牌(parser.令牌izer, 令牌)
+ HTMLTreeBuilder_处理令牌(parser.tree_builder, 令牌)
+
+ 如果 (结果 == -1) {
+ parser.已完成 = 真
+ }
+ }
+
+ // 解析完成
+ Document_完成解析(parser.文档)
+}
+
+函数 HTML解析器_解析片段(html文本, 上下文元素) {
+ // innerHTML用: 解析HTML片段,返回DocumentFragment
+ // 对应 HTMLDocumentParser::ParseDocumentFragment
+ 定义 文档 = Document_创建("about:blank")
+ 定义 parser = HTMLDocumentParser_创建(文档)
+ HTMLDocumentParser_解析(parser, html文本)
+ 返回 文档
+}
+
+// 传统方案: HTML解析纯文本处理, 不理解内容语义
+// Nova: AI总线在解析阶段即开始语义理解和预测
+
+函数 智能_HTMLTreeBuilder_AI节点语义(节点) {
+ 定义 bus = 全局AI总线
+ 如果 (bus == 0 || 节点 == 0) { 返回 }
+ // 解析器创建节点时立即触发AI语义分类
+ // 由AI总线的语义嵌入引擎(标签32维+类名32维+结构8维→Nova多层感知器→角色)
+ 定义 角色 = AI总线_语义分类(bus, 节点)
+ 节点.语义角色 = 角色
+}
+
+函数 智能_HTMLTreeBuilder_AI预加载提示(url, 资源类型) {
+ 定义 bus = 全局AI总线
+ 如果 (bus == 0 || url == 0) { 返回 }
+ // HTML解析到资源引用时, AI总线决定预加载优先级
+ 定义 优先级 = AI总线_资源优先级(bus, url)
+ // 高优先级资源立即发起预加载
+}

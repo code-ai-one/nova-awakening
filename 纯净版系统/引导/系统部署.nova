@@ -1,0 +1,287 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../标准/文件.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/阶段契约.nova")
+导入("../推理/权重持久.nova")
+导入("./安装流程编.nova")
+导入("../中枢/应用Bundle.nova")
+导入("../中枢/设备绑定.nova")
+导入("../中枢/加密框架.nova")
+
+// §5 系统部署
+
+定义 部署_构建根 = "/cdrom/build"
+定义 部署_启动产物目录 = "/mnt/nova/boot/artifacts"
+定义 部署_启动配置路径 = "/mnt/nova/boot/boot.cfg"
+定义 部署_产物清单路径 = "/mnt/nova/boot/artifacts/manifest.cfg"
+定义 部署_桥接清单路径 = "/mnt/nova/boot/artifacts/bridge.cfg"
+定义 部署_默认版本 = "1.0.0"
+
+定义 可变 部署_已安装产物 = []
+
+函数 安装_写文本(路径, 文本) {
+    返回 文件_写全部(路径, 文本, 字串_长度(文本))
+}
+
+函数 安装_确保目录(路径) {
+    如果 (!目录_存在(路径)) {
+        目录_创建默认(路径)
+    }
+}
+
+函数 安装_记录产物(名称, 相对路径, 阶段, 版本) {
+    追加(部署_已安装产物, [名称, 相对路径, 阶段, 版本])
+}
+
+函数 安装_复制构建产物(名称, 源路径, 相对路径, 阶段, 版本, 必需) {
+    定义 目标路径 = "/mnt/nova" + 相对路径
+    如果 (!文件_存在(源路径)) {
+        如果 (必需) {
+            安装_日志("缺失必需构建产物: " + 源路径, 日志_错误)
+        } 否则 {
+            安装_日志("跳过可选构建产物: " + 源路径, 日志_警告)
+        }
+        返回 假
+    }
+    文件_复制(源路径, 目标路径)
+    安装_记录产物(名称, 相对路径, 阶段, 版本)
+    安装_日志("已部署产物: " + 名称 + " -> " + 相对路径, 日志_信息)
+    返回 真
+}
+
+函数 安装_部署目录结构() {
+    定义 目录列表 = [
+        "/mnt/nova/boot",
+        "/mnt/nova/boot/efi",
+        "/mnt/nova/boot/efi/EFI",
+        "/mnt/nova/boot/efi/EFI/BOOT",
+        "/mnt/nova/boot/artifacts",
+        "/mnt/nova/boot/logs",
+        "/mnt/nova/内核",
+        "/mnt/nova/内核/核心",
+        "/mnt/nova/内核/AI",
+        "/mnt/nova/内核/驱动",
+        "/mnt/nova/内核/网络",
+        "/mnt/nova/内核/文件",
+        "/mnt/nova/内核/内存",
+        "/mnt/nova/内核/启动",
+        "/mnt/nova/用户",
+        "/mnt/nova/配置",
+        "/mnt/nova/AI模型",
+        "/mnt/nova/字体",
+        "/mnt/nova/日志",
+        "/mnt/nova/临时",
+        "/mnt/nova/bundles",
+        "/mnt/nova/bundles/apps",
+        "/mnt/nova/bundles/services",
+        "/mnt/nova/bundles/system",
+        "/mnt/nova/licenses"
+    ]
+    定义 可变 i = 0
+    当 (i < 计数(目录列表)) {
+        安装_确保目录(目录列表[i])
+        i = i + 1
+    }
+}
+
+函数 安装_部署构建产物() {
+    部署_已安装产物 = []
+
+    安装_复制构建产物("kernel.elf", 部署_构建根 + "/kernel.elf", "/boot/artifacts/kernel.elf", 阶段_内核核心, 部署_默认版本, 真)
+    安装_复制构建产物("kernel.bin", 部署_构建根 + "/kernel.bin", "/boot/artifacts/kernel.bin", 阶段_内核核心, 部署_默认版本, 假)
+
+    定义 EFI源路径 = 部署_构建根 + "/nova.efi"
+    如果 (!文件_存在(EFI源路径)) {
+        EFI源路径 = "/cdrom/boot/nova.efi"
+    }
+    安装_复制构建产物("nova.efi", EFI源路径, "/boot/artifacts/nova.efi", 阶段_boot, 部署_默认版本, 真)
+
+    安装_复制构建产物("bridge.cfg", 部署_构建根 + "/bridge/bridge.cfg", "/boot/artifacts/bridge.cfg", 阶段_外部桥接, 部署_默认版本, 假)
+    安装_复制构建产物("modules.lst", 部署_构建根 + "/modules.lst", "/boot/artifacts/modules.lst", 阶段_浏览器外衣, 部署_默认版本, 假)
+}
+
+函数 安装_生成产物清单() {
+    定义 清单 = "# NovaOS build artifact manifest\n"
+    清单 = 清单 + "artifact.count=" + 整数转字符串(计数(部署_已安装产物)) + "\n"
+    清单 = 清单 + "bridge.control=virtio-serial\n"
+    清单 = 清单 + "bridge.frame=ivshmem\n"
+    清单 = 清单 + "bridge.semantic=dom-diff\n"
+    清单 = 清单 + "runtime.default_stage=" + 阶段_浏览器外衣 + "\n"
+
+    定义 可变 i = 0
+    当 (i < 计数(部署_已安装产物)) {
+        定义 产物 = 部署_已安装产物[i]
+        定义 索引 = 整数转字符串(i)
+        清单 = 清单 + "artifact." + 索引 + ".name=" + 产物[0] + "\n"
+        清单 = 清单 + "artifact." + 索引 + ".path=" + 产物[1] + "\n"
+        清单 = 清单 + "artifact." + 索引 + ".stage=" + 产物[2] + "\n"
+        清单 = 清单 + "artifact." + 索引 + ".version=" + 产物[3] + "\n"
+        i = i + 1
+    }
+
+    安装_写文本(部署_产物清单路径, 清单)
+}
+
+函数 安装_部署系统() {
+    安装.阶段消息 = "正在部署NovaOS..."
+    安装.阶段进度 = 0
+
+    // 挂载目标分区
+    安装_日志("挂载目标分区...", 日志_信息)
+    VFS_挂载("/dev/sda2", "/mnt/nova", "ext4")
+    VFS_挂载("/dev/sda1", "/mnt/nova/boot/efi", "vfat")
+    安装.阶段进度 = 50
+
+    // 创建目录结构
+    安装_日志("创建目录结构...", 日志_信息)
+    安装_部署目录结构()
+    安装.阶段进度 = 150
+
+    // 部署编译产物
+    安装_日志("部署编译产物清单...", 日志_信息)
+    安装_部署构建产物()
+    安装_生成产物清单()
+    安装.总包数 = 计数(部署_已安装产物)
+    安装.已安装包数 = 安装.总包数
+    安装.阶段进度 = 320
+
+    // 部署引导加载器
+    安装_日志("部署引导加载器...", 日志_信息)
+    安装_部署引导(安装.UEFI模式)
+    安装.阶段进度 = 500
+
+    // 部署龙编译器
+    安装_日志("复制龙编译器...", 日志_信息)
+    文件_复制("/cdrom/龙编译器", "/mnt/nova/龙编译器")
+    安装.阶段进度 = 600
+
+    // 部署字体
+    安装_日志("安装字体 (ASCII 8x16 + HZK16中文)...", 日志_信息)
+    文件_复制("/cdrom/字体", "/mnt/nova/字体")
+    安装.阶段进度 = 650
+
+    // 部署AI模型(可选)
+    如果 (安装.安装AI模型) {
+        安装_日志("部署本地AI模型: " + 安装.推荐_AI模型 + " ...", 日志_信息)
+        安装.阶段消息 = "部署AI模型 (可能需要几分钟)..."
+        文件_复制("/cdrom/AI模型/" + 安装.推荐_AI模型, "/mnt/nova/AI模型/")
+        安装_日志("AI模型部署完成", 日志_信息)
+    } 否则 {
+        安装_日志("跳过本地AI模型(使用纯云端模式)", 日志_信息)
+    }
+    安装.阶段进度 = 800
+
+    // 部署系统Bundle与采集设备指纹
+    安装_日志("采集设备指纹...", 日志_信息)
+    设备_采集指纹()
+    安装_日志("设备指纹: " + 设备_指纹转字符串(), 日志_信息)
+    安装_部署系统Bundles()
+    安装.阶段进度 = 850
+
+    // 生成配置文件
+    安装_日志("生成系统配置...", 日志_信息)
+    安装_生成配置()
+    安装.阶段进度 = 900
+
+    // 安装引导项
+    安装_日志("写入引导记录...", 日志_信息)
+    安装_写入引导记录()
+    安装.阶段进度 = 1000
+
+    安装.阶段消息 = "系统部署完成!"
+    安装_日志("═══ 系统部署完成 ═══", 日志_信息)
+}
+
+函数 安装_部署引导(uefi模式) {
+    如果 (uefi模式) {
+        如果 (文件_存在("/mnt/nova/boot/artifacts/nova.efi")) {
+            文件_复制("/mnt/nova/boot/artifacts/nova.efi", "/mnt/nova/boot/efi/EFI/BOOT/BOOTX64.EFI")
+            安装_日志("UEFI引导已绑定编译产物 nova.efi", 日志_信息)
+        } 否则 {
+            安装_日志("缺失 UEFI 产物 nova.efi", 日志_错误)
+        }
+    } 否则 {
+        如果 (文件_存在("/cdrom/boot/nova_mbr")) {
+            文件_复制("/cdrom/boot/nova_mbr", "/mnt/nova/boot/nova_mbr")
+            安装_日志("传统BIOS引导已部署", 日志_信息)
+        } 否则 {
+            安装_日志("缺失 BIOS 引导产物 nova_mbr", 日志_警告)
+        }
+    }
+}
+
+函数 安装_生成配置() {
+    定义 配置 = "# NovaOS 系统配置\n"
+    配置 = 配置 + "内核.版本=" + 部署_默认版本 + "\n"
+    配置 = 配置 + "内核.内存=" + 整数转字符串(安装.推荐_内存分配) + "\n"
+    配置 = 配置 + "内核.镜像=/boot/artifacts/kernel.elf\n"
+    配置 = 配置 + "内核.镜像备份=/boot/artifacts/kernel.bin\n"
+    配置 = 配置 + "显示.分辨率=" + 安装.推荐_分辨率 + "\n"
+    配置 = 配置 + "AI.模型=" + 安装.推荐_AI模型 + "\n"
+    配置 = 配置 + "AI.云端=启用\n"
+    配置 = 配置 + "运行时.默认阶段=" + 阶段_浏览器外衣 + "\n"
+    配置 = 配置 + "桥接.控制=virtio-serial\n"
+    配置 = 配置 + "桥接.视觉=ivshmem\n"
+    配置 = 配置 + "桥接.语义=dom-diff\n"
+    配置 = 配置 + "桥接.清单=/boot/artifacts/manifest.cfg\n"
+    配置 = 配置 + "用户.名称=" + 安装.用户名 + "\n"
+    配置 = 配置 + "用户.语言=" + 安装.语言 + "\n"
+    配置 = 配置 + "用户.时区=" + 安装.时区 + "\n"
+    安装_写文本("/mnt/nova/配置/系统.conf", 配置)
+}
+
+函数 安装_写入引导记录() {
+    定义 引导配置 = "default NovaOS\ntimeout 3\n\n"
+    引导配置 = 引导配置 + "label NovaOS\n"
+    引导配置 = 引导配置 + "  kernel /boot/artifacts/kernel.elf\n"
+    引导配置 = 引导配置 + "  append root=/dev/sda2 ai=auto stage=" + 阶段_AI运行时 + " manifest=/boot/artifacts/manifest.cfg bridge_control=virtio-serial bridge_frame=ivshmem bridge_semantic=dom-diff\n"
+    如果 (文件_存在("/mnt/nova/boot/artifacts/modules.lst")) {
+        引导配置 = 引导配置 + "  module /boot/artifacts/modules.lst\n"
+    }
+    如果 (文件_存在(部署_桥接清单路径)) {
+        引导配置 = 引导配置 + "  module /boot/artifacts/bridge.cfg\n"
+    }
+    安装_写文本(部署_启动配置路径, 引导配置)
+}
+
+// §6 系统Bundle部署
+
+函数 安装_部署系统Bundles() {
+    安装_日志("部署系统Bundle...", 日志_信息)
+
+    定义 bundle清单 = [
+        ["龙壳.nsys",      "/bundles/system/龙壳.nsys",      "系统终端"],
+        ["龙仓.nsys",      "/bundles/system/龙仓.nsys",      "包管理器"],
+        ["龙编译器.nsys",  "/bundles/system/龙编译器.nsys",  "Nova编译器"],
+        ["龙审.nsys",      "/bundles/system/龙审.nsys",      "代码检查器"],
+        ["龙调.nsys",      "/bundles/system/龙调.nsys",      "调试器"],
+    ]
+
+    定义 可变 已部署 = 0
+    定义 可变 i = 0
+    当 (i < 计数(bundle清单)) {
+        定义 项 = bundle清单[i]
+        定义 源 = 部署_构建根 + "/bundles/" + 项[0]
+        定义 目标 = "/mnt/nova" + 项[1]
+        如果 (文件_存在(源)) {
+            文件_复制(源, 目标)
+            安装_记录产物(项[2], 项[1], "bundle", 部署_默认版本)
+            安装_日志("  Bundle: " + 项[2] + " -> " + 项[1], 日志_信息)
+            已部署 = 已部署 + 1
+        } 否则 {
+            安装_日志("  跳过(未找到): " + 项[0], 日志_警告)
+        }
+        i = i + 1
+    }
+
+    定义 可变 注册表 = "# NovaOS Bundle Registry\n"
+    注册表 = 注册表 + "bundle.count=" + 整数转字符串(已部署) + "\n"
+    注册表 = 注册表 + "bundle.format=napp-v1\n"
+    注册表 = 注册表 + "bundle.signing=HMAC-SHA256\n"
+    注册表 = 注册表 + "bundle.encryption=AES-256-CBC\n"
+    注册表 = 注册表 + "device.fingerprint=" + 设备_指纹转字符串() + "\n"
+    安装_写文本("/mnt/nova/bundles/registry.cfg", 注册表)
+
+    安装_日志("Bundle部署完成: " + 整数转字符串(已部署) + " 个", 日志_信息)
+}

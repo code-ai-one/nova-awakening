@@ -1,0 +1,481 @@
+// NovaOS 渲染引擎 — RTCDataChannel(P2P数据通道) + RTP收发器
+// 子系统: 渲染引擎/媒体/实时通信/WebRTC
+// 实现: W3C RTCDataChannel接口 + 消息队列 + 流控
+//   RTCRtpSender/Receiver + 收发器管理 + SCTP模拟
+// 原创: NovaOS · 纯中文原生系统编程 · AI原生网络质量预测
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/辅助存根.nova")
+
+// §0 常量定义
+
+定义 DC_STATE_CONNECTING = 0
+定义 DC_STATE_OPEN = 1
+定义 DC_STATE_CLOSING = 2
+定义 DC_STATE_CLOSED = 3
+定义 DC_MSG_STRING = 0
+定义 DC_MSG_BINARY = 1
+定义 DC_最大发送队列 = 256
+定义 DC_最大通道数 = 16
+定义 DC_默认缓冲大小 = 65536
+定义 PC_STATE_NEW = 0
+定义 PC_STATE_CONNECTING = 1
+定义 PC_STATE_CONNECTED = 2
+定义 PC_STATE_DISCONNECTED = 3
+定义 PC_STATE_FAILED = 4
+定义 PC_STATE_CLOSED = 5
+定义 SIGNAL_STATE_STABLE = 0
+定义 SIGNAL_STATE_HAVE_LOCAL_OFFER = 1
+定义 SIGNAL_STATE_HAVE_REMOTE_OFFER = 2
+定义 SIGNAL_STATE_CLOSED = 3
+定义 ICE_STATE_NEW = 0
+定义 ICE_STATE_CHECKING = 1
+定义 ICE_STATE_CONNECTED = 2
+定义 ICE_STATE_COMPLETED = 3
+定义 ICE_STATE_FAILED = 4
+定义 ICE_STATE_CLOSED = 5
+定义 RTP_方向_发送接收 = 0
+定义 RTP_方向_仅发送 = 1
+定义 RTP_方向_仅接收 = 2
+定义 RTP_方向_不活跃 = 3
+
+// §0.5 统计与AI数据结构
+
+结构 数据通道统计 {
+    通道创建次数,
+    通道关闭次数,
+    消息发送次数,
+    消息接收次数,
+    发送字节总数,
+    接收字节总数,
+    字符串消息数,
+    二进制消息数,
+    发送队列满次数,
+    缓冲溢出次数,
+    收发器创建次数,
+    addTrack次数,
+    连接关闭次数,
+    AI网络调用次数,
+    AI网络命中次数,
+    总处理耗时_纳秒,
+    错误总数,
+    重传次数,
+}
+
+结构 AI网络质量状态 {
+    历史发送速率,        // u64 字节/秒
+    历史接收速率,        // u64 字节/秒
+    历史RTT,             // u32 Q10 毫秒
+    历史丢包率,          // u32 Q10
+    连续发送成功数,
+    连续发送失败数,
+    预测网络良好,
+    采样计数器,
+    学习权重,            // u32 Q10
+}
+
+定义 可变 全局数据通道统计 = 0
+定义 可变 全局网络质量AI = 0
+定义 可变 全局数据通道已初始化 = 假
+
+// §0.7 生命周期
+
+
+函数 数据通道_初始化全局() {
+    如果 (全局数据通道已初始化 == 真) { 返回 错误_已存在 }
+    全局数据通道统计 = 堆_分配_清零(144)
+    如果 (全局数据通道统计 == 空) { 返回 错误_内存不足 }
+    全局网络质量AI = 堆_分配_清零(48)
+    如果 (全局网络质量AI != 空) {
+        全局网络质量AI.预测网络良好 = 真
+        全局网络质量AI.学习权重 = 128
+    }
+    全局数据通道已初始化 = 真
+    打印("[数据通道] 初始化完成")
+    返回 0
+}
+
+函数 数据通道_销毁全局() {
+    如果 (全局数据通道统计 != 空) { 堆_释放(全局数据通道统计); 全局数据通道统计 = 0 }
+    如果 (全局网络质量AI != 空) { 堆_释放(全局网络质量AI); 全局网络质量AI = 0 }
+    全局数据通道已初始化 = 假
+    返回 0
+}
+
+// §1 数据通道核心
+
+结构 RTCDataChannel {
+    标签,    // u64 通道名称
+    id,    // u32 SCTP流ID
+    状态,    // u32 DC_STATE_xxx
+    有序,    // 布尔 ordered
+    最大重传次数,    // i32 maxRetransmits (-1=无限)
+    最大延迟,    // i32 maxPacketLifeTime ms (-1=无限)
+    协议,    // u64 protocol字符串
+    // 缓冲
+    发送缓冲,
+    发送缓冲大小,
+    bufferedAmount,
+    // 回调
+    onopen,
+    onclose,
+    onmessage,
+    onerror,
+    onbufferedamountlow,
+    bufferedAmountLowThreshold,
+}
+
+函数 R传控eerConnection_createDataChannel(pc, 标签, 选项) {
+    如果 (pc == 0) { 返回 0 }
+
+    定义 dc = 堆_分配(RTCDataChannel)
+    dc.标签 = 标签 != 0 ? 字符串_复制(标签) : ""
+    dc.id = pc.数据通道数量
+    dc.状态 = DC_STATE_CONNECTING
+    dc.有序 = 真
+    dc.最大重传次数 = -1; dc.最大延迟 = -1
+    dc.发送缓冲 = 堆_分配(65536)
+    dc.发送缓冲大小 = 65536
+    dc.bufferedAmount = 0
+
+    // 注册
+    如果 (pc.数据通道数量 < 16) {
+        内存_写64(pc.数据通道列表 + pc.数据通道数量 * 8, dc)
+        pc.数据通道数量 = pc.数据通道数量 + 1
+    }
+
+    // 触发negotiationneeded
+    返回 dc
+}
+
+函数 RTCDataChannel_send(dc, 数据, 长度) {
+    如果 (dc == 0 || dc.状态 != DC_STATE_OPEN) { 返回 }
+    // 通过SCTP发送
+    dc.bufferedAmount = dc.bufferedAmount + 长度
+}
+
+函数 RTCDataChannel_close(dc) {
+    如果 (dc == 0) { 返回 }
+    dc.状态 = DC_STATE_CLOSING
+    // 发送SCTP关闭
+    dc.状态 = DC_STATE_CLOSED
+}
+
+// §12 addTrack / addStream
+
+函数 R传控eerConnection_addTrack(pc, track, stream) {
+    如果 (pc == 0 || track == 0) { 返回 0 }
+    // 创建RTCRtpSender
+    // 添加到收发器列表
+    // 触发negotiationneeded
+    返回 0    // RTCRtpSender
+}
+
+函数 R传控eerConnection_close(pc) {
+    如果 (pc == 0) { 返回 }
+    pc.连接状态 = PC_STATE_CLOSED
+    pc.信令状态 = SIGNAL_STATE_CLOSED
+    pc.ice状态 = ICE_STATE_CLOSED
+    // 关闭所有数据通道
+    定义 可变 i = 0
+    当 (i < pc.数据通道数量) {
+        定义 dc = 内存_读64(pc.数据通道列表 + i * 8)
+        如果 (dc != 0) { RTCDataChannel_close(dc) }
+        i = i + 1
+    }
+}
+
+// Nova: AI总线统一协调所有子系统的AI决策
+
+函数 智能_WebRTC_AI初始化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    // 模块注册到AI总线
+    打印("[WebRTC] AI总线注册完成")
+}
+
+// §4 RTCRtpSender / RTCRtpReceiver 结构
+
+结构 RTCRtpSender {
+    轨道,            // u64 MediaStreamTrack*
+    种类,            // u8 0=音频 1=视频
+    SSRC,
+    编解码器,        // u64 编解码器配置列表
+    活跃,
+    已暂停,
+    参数,            // u64 RTCRtpSendParameters*
+}
+
+结构 RTCRtpReceiver {
+    轨道,            // u64 MediaStreamTrack*
+    种类,
+    SSRC,
+    已暂停,
+    抖动缓冲延迟,    // u32 Q10 毫秒
+}
+
+结构 RTCRtpTransceiver {
+    发送器,          // u64 RTCRtpSender*
+    接收器,          // u64 RTCRtpReceiver*
+    方向,            // u8 RTP_方向_xxx
+    当前方向,
+    mid,             // u64 媒体ID字符串
+    已停止,
+}
+
+函数 RTCRtpSender_创建(轨道, 种类) {
+    定义 sender = 堆_分配(RTCRtpSender)
+    如果 (sender == 空) { 返回 空 }
+    sender.轨道 = 轨道
+    sender.种类 = 种类
+    sender.SSRC = 0
+    sender.活跃 = 真
+    sender.已暂停 = 假
+    sender.参数 = 0
+    返回 sender
+}
+
+函数 RTCRtpReceiver_创建(种类) {
+    定义 receiver = 堆_分配(RTCRtpReceiver)
+    如果 (receiver == 空) { 返回 空 }
+    receiver.轨道 = 0
+    receiver.种类 = 种类
+    receiver.SSRC = 0
+    receiver.已暂停 = 假
+    receiver.抖动缓冲延迟 = 50 * 1024   // 50ms Q10
+    返回 receiver
+}
+
+函数 RTCRtpTransceiver_创建(sender, receiver, 方向) {
+    定义 tc = 堆_分配(RTCRtpTransceiver)
+    如果 (tc == 空) { 返回 空 }
+    tc.发送器 = sender
+    tc.接收器 = receiver
+    tc.方向 = 方向
+    tc.当前方向 = 方向
+    tc.mid = 0
+    tc.已停止 = 假
+    如果 (全局数据通道统计 != 空) {
+        全局数据通道统计.收发器创建次数 = 全局数据通道统计.收发器创建次数 + 1
+    }
+    返回 tc
+}
+
+// §5 增强版addTrack
+
+函数 R传控eerConnection_addTrack_增强(pc, track, stream, 种类) {
+    如果 (pc == 空 || track == 空) { 返回 空 }
+    // 创建Sender
+    定义 sender = RTCRtpSender_创建(track, 种类)
+    如果 (sender == 空) { 返回 空 }
+    // 创建Receiver
+    定义 receiver = RTCRtpReceiver_创建(种类)
+    // 创建Transceiver
+    定义 tc = RTCRtpTransceiver_创建(sender, receiver, RTP_方向_发送接收)
+    如果 (全局数据通道统计 != 空) {
+        全局数据通道统计.addTrack次数 = 全局数据通道统计.addTrack次数 + 1
+    }
+    // 触发negotiationneeded
+    返回 sender
+}
+
+// §6 增强DataChannel — 带消息类型和队列
+
+结构 DC消息 {
+    类型,        // u8 DC_MSG_STRING | DC_MSG_BINARY
+    数据,
+    长度,
+    下一个,      // u64 DC消息*
+}
+
+函数 RTCDataChannel_sendString(dc, 文本) {
+    如果 (dc == 空 || dc.状态 != DC_STATE_OPEN || 文本 == 空) { 返回 错误_无效参数 }
+    定义 长度 = 字节长度(文本)
+    如果 (长度 == 0) { 返回 0 }
+    如果 (dc.bufferedAmount + 长度 > dc.发送缓冲大小) {
+        如果 (全局数据通道统计 != 空) {
+            全局数据通道统计.缓冲溢出次数 = 全局数据通道统计.缓冲溢出次数 + 1
+        }
+        返回 错误_容量不足
+    }
+    dc.bufferedAmount = dc.bufferedAmount + 长度
+    如果 (全局数据通道统计 != 空) {
+        全局数据通道统计.消息发送次数 = 全局数据通道统计.消息发送次数 + 1
+        全局数据通道统计.发送字节总数 = 全局数据通道统计.发送字节总数 + 长度
+        全局数据通道统计.字符串消息数 = 全局数据通道统计.字符串消息数 + 1
+    }
+    // AI反馈
+    AI网络_记录发送(长度, 真)
+    返回 0
+}
+
+函数 RTCDataChannel_sendBinary(dc, 数据, 长度) {
+    如果 (dc == 空 || dc.状态 != DC_STATE_OPEN || 数据 == 空) { 返回 错误_无效参数 }
+    如果 (长度 <= 0) { 返回 0 }
+    如果 (dc.bufferedAmount + 长度 > dc.发送缓冲大小) {
+        如果 (全局数据通道统计 != 空) {
+            全局数据通道统计.缓冲溢出次数 = 全局数据通道统计.缓冲溢出次数 + 1
+        }
+        返回 错误_容量不足
+    }
+    dc.bufferedAmount = dc.bufferedAmount + 长度
+    如果 (全局数据通道统计 != 空) {
+        全局数据通道统计.消息发送次数 = 全局数据通道统计.消息发送次数 + 1
+        全局数据通道统计.发送字节总数 = 全局数据通道统计.发送字节总数 + 长度
+        全局数据通道统计.二进制消息数 = 全局数据通道统计.二进制消息数 + 1
+    }
+    AI网络_记录发送(长度, 真)
+    返回 0
+}
+
+函数 RTCDataChannel_销毁(dc) {
+    如果 (dc == 空) { 返回 }
+    如果 (dc.发送缓冲 != 空) { 堆_释放(dc.发送缓冲) }
+    堆_释放(dc)
+}
+
+// §7 AI基因 — 网络质量预测
+// 能力: 自适应 + 预测 + 学习
+// 四阶段: 数据采集→特征提取→决策→执行
+
+函数 AI网络_记录发送(字节数, 成功) {
+    如果 (全局网络质量AI == 空) { 返回 }
+    定义 AI = 全局网络质量AI
+    AI.采样计数器 = AI.采样计数器 + 1
+
+    AI.历史发送速率 = (AI.历史发送速率 * 7 + 字节数) / 8
+    如果 (成功 == 真) {
+        AI.连续发送成功数 = AI.连续发送成功数 + 1
+        AI.连续发送失败数 = 0
+    } 否则 {
+        AI.连续发送失败数 = AI.连续发送失败数 + 1
+        AI.连续发送成功数 = 0
+        AI.历史丢包率 = (AI.历史丢包率 * 15 + 1024) / 16
+    }
+
+    如果 (AI.采样计数器 < 16) { 返回 }
+    AI.采样计数器 = 0
+    如果 (全局数据通道统计 != 空) {
+        全局数据通道统计.AI网络调用次数 = 全局数据通道统计.AI网络调用次数 + 1
+    }
+
+    如果 (AI.连续发送失败数 > 5 || AI.历史丢包率 > 100) {
+        AI.预测网络良好 = 假
+    } 否则 如果 (AI.连续发送成功数 > 20 && AI.历史丢包率 < 20) {
+        AI.预测网络良好 = 真
+    }
+
+    如果 (AI.预测网络良好 == 真 && 成功 == 真) {
+        如果 (全局数据通道统计 != 空) {
+            全局数据通道统计.AI网络命中次数 = 全局数据通道统计.AI网络命中次数 + 1
+        }
+    }
+}
+
+// §8 统计输出与诊断
+
+函数 数据通道_打印统计() {
+    如果 (全局数据通道统计 == 空) {
+        打印("[数据通道] 统计未初始化")
+        返回
+    }
+    打印("┌──────────────────────────────────────┐")
+    打印("│   数据通道+收发器 · 统计报告        │")
+    打印("├──────────────────────────────────────┤")
+    打印(字符串拼接("│ 通道创建:         ", 转字符串(全局数据通道统计.通道创建次数)))
+    打印(字符串拼接("│ 通道关闭:         ", 转字符串(全局数据通道统计.通道关闭次数)))
+    打印(字符串拼接("│ 消息发送:         ", 转字符串(全局数据通道统计.消息发送次数)))
+    打印(字符串拼接("│ 消息接收:         ", 转字符串(全局数据通道统计.消息接收次数)))
+    打印(字符串拼接("│ 发送字节(KB):     ", 转字符串(全局数据通道统计.发送字节总数 / 1024)))
+    打印(字符串拼接("│ 接收字节(KB):     ", 转字符串(全局数据通道统计.接收字节总数 / 1024)))
+    打印(字符串拼接("│ 字符串消息:       ", 转字符串(全局数据通道统计.字符串消息数)))
+    打印(字符串拼接("│ 二进制消息:       ", 转字符串(全局数据通道统计.二进制消息数)))
+    打印(字符串拼接("│ 缓冲溢出:         ", 转字符串(全局数据通道统计.缓冲溢出次数)))
+    打印(字符串拼接("│ 收发器创建:       ", 转字符串(全局数据通道统计.收发器创建次数)))
+    打印(字符串拼接("│ addTrack:         ", 转字符串(全局数据通道统计.addTrack次数)))
+    打印(字符串拼接("│ AI网络调用:       ", 转字符串(全局数据通道统计.AI网络调用次数)))
+    打印(字符串拼接("│ AI网络命中:       ", 转字符串(全局数据通道统计.AI网络命中次数)))
+    打印(字符串拼接("│ 总耗时(μs):       ", 转字符串(全局数据通道统计.总处理耗时_纳秒 / 1000)))
+    打印(字符串拼接("│ 错误:             ", 转字符串(全局数据通道统计.错误总数)))
+    打印("└──────────────────────────────────────┘")
+}
+
+函数 数据通道_导出诊断() {
+    如果 (全局网络质量AI == 空) {
+        打印("[网络质量AI] 未初始化")
+        返回
+    }
+    定义 AI = 全局网络质量AI
+    打印("[网络质量AI] === 诊断 ===")
+    打印(字符串拼接("  历史发送速率(B/s): ", 转字符串(AI.历史发送速率)))
+    打印(字符串拼接("  历史丢包率(Q10): ", 转字符串(AI.历史丢包率)))
+    打印(字符串拼接("  连续发送成功: ", 转字符串(AI.连续发送成功数)))
+    打印(字符串拼接("  连续发送失败: ", 转字符串(AI.连续发送失败数)))
+    打印(字符串拼接("  预测网络良好: ", 转字符串(AI.预测网络良好)))
+}
+
+// §9 对外接口
+
+函数 数据通道_获取统计() { 返回 全局数据通道统计 }
+函数 数据通道_获取AI状态() { 返回 全局网络质量AI }
+函数 数据通道_预测网络良好() {
+    如果 (全局网络质量AI == 空) { 返回 真 }
+    返回 全局网络质量AI.预测网络良好
+}
+函数 数据通道_是否已初始化() { 返回 全局数据通道已初始化 }
+
+函数 RTCDataChannel_获取状态(dc) {
+    如果 (dc == 空) { 返回 DC_STATE_CLOSED }
+    返回 dc.状态
+}
+
+函数 RTCDataChannel_获取标签(dc) {
+    如果 (dc == 空) { 返回 空 }
+    返回 dc.标签
+}
+
+函数 RTCDataChannel_获取bufferedAmount(dc) {
+    如果 (dc == 空) { 返回 0 }
+    返回 dc.bufferedAmount
+}
+
+函数 RTCDataChannel_是否有序(dc) {
+    如果 (dc == 空) { 返回 真 }
+    返回 dc.有序
+}
+
+函数 RTCDataChannel_设置bufferedAmountLowThreshold(dc, 阈值) {
+    如果 (dc == 空) { 返回 }
+    dc.bufferedAmountLowThreshold = 阈值
+}
+
+函数 RTCRtpSender_获取轨道(sender) {
+    如果 (sender == 空) { 返回 空 }
+    返回 sender.轨道
+}
+
+函数 RTCRtpSender_替换轨道(sender, 新轨道) {
+    如果 (sender == 空) { 返回 错误_无效参数 }
+    sender.轨道 = 新轨道
+    返回 0
+}
+
+函数 RTCRtpTransceiver_获取方向(tc) {
+    如果 (tc == 空) { 返回 RTP_方向_不活跃 }
+    返回 tc.方向
+}
+
+函数 RTCRtpTransceiver_设置方向(tc, 方向) {
+    如果 (tc == 空) { 返回 错误_无效参数 }
+    tc.方向 = 方向
+    返回 0
+}
+
+函数 RTCRtpTransceiver_停止(tc) {
+    如果 (tc == 空) { 返回 }
+    tc.已停止 = 真
+    tc.方向 = RTP_方向_不活跃
+}

@@ -1,0 +1,164 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// NovaOS 浏览器内核 · 反检测层 · 指纹伪装引擎
+// 内核级浏览器指纹生成与管理，不可被JS层检测
+// 职责: 画布指纹/图绘指纹/音频Context指纹/字体指纹/
+//       Navigator属性/Screen属性/时区/语言/硬件特征 全维度伪装
+// 原理: 在内核层拦截所有指纹采集接口，返回一致且真实的伪造数据
+
+定义 指纹_Navigator      = 0
+定义 指纹_Screen         = 1
+定义 指纹_画布         = 2
+定义 指纹_图绘          = 3
+定义 指纹_音频          = 4
+定义 指纹_字体           = 5
+定义 指纹_时区           = 6
+定义 指纹_语言           = 7
+定义 指纹_硬件           = 8
+定义 指纹_WebRTC         = 9
+定义 指纹_电池           = 10
+定义 指纹_存储配额       = 11
+定义 指纹_Performance    = 12
+定义 指纹_维度总数       = 13
+
+结构 浏览器指纹配置 {
+    // Navigator
+    user智能体,
+    platform,
+    语言,
+    语言列表,    // []
+    硬件并发数,
+    设备内存,    // u32 GB
+    最大触摸点,
+    // Screen
+    屏幕宽,
+    屏幕高,
+    可用宽,
+    可用高,
+    色深,
+    像素比,    // u32 ×100
+    // 画布
+    画布噪声种子,
+    画布噪声强度,    // u32 0-10
+    // 图绘
+    图绘厂商,
+    图绘渲染器,
+    图绘扩展,    // []
+    图绘参数,    // [] [参数名, 值] 列表
+    // 音频
+    音频噪声种子,
+    音频采样率,
+    // 字体
+    安装字体,    // []
+    // 时区
+    时区名称,
+    时区偏移,    // i32 分钟
+    // WebRTC
+    本地IP,
+    公网IP,
+    WebRTC禁用,
+    // 电池
+    电池电量,    // u32 百分比
+    电池充电中,
+    // 行为噪声
+    性能计时噪声,    // u32 微秒抖动范围
+}
+
+结构 指纹模板 {
+    名称,
+    操作系统,
+    浏览器,
+    配置,    // 浏览器指纹配置
+}
+
+定义 可变 指纹_当前配置 = 空
+定义 可变 指纹_模板库 = []
+定义 可变 指纹_已初始化 = 假
+定义 可变 指纹_拦截次数 = 0
+定义 可变 指纹_PRNG种子 = 0       // 确定性伪随机(同一会话内一致)
+
+// §1 初始化 — 构建真实指纹模板库
+
+函数 指纹伪装_初始化() {
+    指纹_模板库 = []
+
+    定义 win11_Nova浏览器 = 浏览器指纹配置 {}
+    win11_Nova浏览器.user智能体 = "行业/5.0 (Nova系统 10.0; Win64; x64) Apple行业标准/537.36 (KHTML, like Nova引擎) Nova浏览器/120.0.0.0 Safari/537.36"
+    win11_Nova浏览器.platform = "Win32"
+    win11_Nova浏览器.语言 = "zh-CN"
+    win11_Nova浏览器.语言列表 = ["zh-CN", "zh", "en-US", "en"]
+    win11_Nova浏览器.硬件并发数 = 8
+    win11_Nova浏览器.设备内存 = 8
+    win11_Nova浏览器.最大触摸点 = 0
+    win11_Nova浏览器.屏幕宽 = 1920; win11_Nova浏览器.屏幕高 = 1080
+    win11_Nova浏览器.可用宽 = 1920; win11_Nova浏览器.可用高 = 1032
+    win11_Nova浏览器.色深 = 24; win11_Nova浏览器.像素比 = 100
+    win11_Nova浏览器.画布噪声种子 = 0x1A2B3C4D
+    win11_Nova浏览器.画布噪声强度 = 2
+    win11_Nova浏览器.图绘厂商 = "行业 Inc. (NVIDIA)"
+    win11_Nova浏览器.图绘渲染器 = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    win11_Nova浏览器.图绘扩展 = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_texture_filter_anisotropic", "OES_texture_float", "WEBGL_compressed_texture_s3tc", "WEBGL_debug_renderer_info"]
+    win11_Nova浏览器.音频噪声种子 = 0x5E6F7A8B; win11_Nova浏览器.音频采样率 = 44100
+    win11_Nova浏览器.安装字体 = ["Arial", "Calibri", "Consolas", "Courier New", "Georgia", "Helvetica", "Microsoft YaHei", "Segoe UI", "Tahoma", "Times New Roman", "Verdana"]
+    win11_Nova浏览器.时区名称 = "Asia/Shanghai"; win11_Nova浏览器.时区偏移 = -480
+    win11_Nova浏览器.WebRTC禁用 = 假; win11_Nova浏览器.电池电量 = 87; win11_Nova浏览器.电池充电中 = 真
+    win11_Nova浏览器.性能计时噪声 = 50
+
+    定义 t1 = 指纹模板 {}
+    t1.名称 = "Win11-Nova浏览器120"; t1.操作系统 = "Windows"; t1.浏览器 = "Nova浏览器"
+    t1.配置 = win11_Nova浏览器
+    追加(指纹_模板库, t1)
+
+    定义 mac_Nova浏览器 = 浏览器指纹配置 {}
+    mac_Nova浏览器.user智能体 = "行业/5.0 (Macintosh; Intel Mac OS X 10_15_7) Apple行业标准/537.36 (KHTML, like Nova引擎) Nova浏览器/120.0.0.0 Safari/537.36"
+    mac_Nova浏览器.platform = "MacIntel"
+    mac_Nova浏览器.语言 = "en-US"
+    mac_Nova浏览器.语言列表 = ["en-US", "en"]
+    mac_Nova浏览器.硬件并发数 = 10; mac_Nova浏览器.设备内存 = 16; mac_Nova浏览器.最大触摸点 = 0
+    mac_Nova浏览器.屏幕宽 = 2560; mac_Nova浏览器.屏幕高 = 1440
+    mac_Nova浏览器.可用宽 = 2560; mac_Nova浏览器.可用高 = 1415
+    mac_Nova浏览器.色深 = 30; mac_Nova浏览器.像素比 = 200
+    mac_Nova浏览器.画布噪声种子 = 0xAB12CD34; mac_Nova浏览器.画布噪声强度 = 2
+    mac_Nova浏览器.图绘厂商 = "行业 Inc. (Apple)"
+    mac_Nova浏览器.图绘渲染器 = "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)"
+    mac_Nova浏览器.图绘扩展 = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "OES_texture_float", "WEBGL_debug_renderer_info"]
+    mac_Nova浏览器.音频噪声种子 = 0xCC11DD22; mac_Nova浏览器.音频采样率 = 44100
+    mac_Nova浏览器.安装字体 = ["Arial", "Courier New", "Georgia", "Helvetica", "Helvetica Neue", "Menlo", "Monaco", "PingFang SC", "SF Pro", "Times New Roman"]
+    mac_Nova浏览器.时区名称 = "America/New_York"; mac_Nova浏览器.时区偏移 = 300
+    mac_Nova浏览器.WebRTC禁用 = 假; mac_Nova浏览器.电池电量 = 0; mac_Nova浏览器.电池充电中 = 假
+    mac_Nova浏览器.性能计时噪声 = 30
+
+    定义 t2 = 指纹模板 {}
+    t2.名称 = "Mac-Nova浏览器120"; t2.操作系统 = "macOS"; t2.浏览器 = "Nova浏览器"
+    t2.配置 = mac_Nova浏览器
+    追加(指纹_模板库, t2)
+
+    定义 win_ff = 浏览器指纹配置 {}
+    win_ff.user智能体 = "行业/5.0 (Nova系统 10.0; Win64; x64; rv:121.0) Nova引擎/20100101 Firefox/121.0"
+    win_ff.platform = "Win32"
+    win_ff.语言 = "zh-CN"; win_ff.语言列表 = ["zh-CN", "zh", "en-US"]
+    win_ff.硬件并发数 = 12; win_ff.设备内存 = 0; win_ff.最大触摸点 = 0
+    win_ff.屏幕宽 = 1920; win_ff.屏幕高 = 1080
+    win_ff.可用宽 = 1920; win_ff.可用高 = 1040
+    win_ff.色深 = 24; win_ff.像素比 = 100
+    win_ff.画布噪声种子 = 0x55667788; win_ff.画布噪声强度 = 3
+    win_ff.图绘厂商 = "行业"
+    win_ff.图绘渲染器 = "行业 -- NVIDIA GeForce GTX 1660"
+    win_ff.图绘扩展 = ["ANGLE_instanced_arrays", "EXT_blend_minmax"]
+    win_ff.音频噪声种子 = 0xEE00FF11; win_ff.音频采样率 = 44100
+    win_ff.安装字体 = ["Arial", "Calibri", "Consolas", "Courier New", "Georgia", "Microsoft YaHei", "Segoe UI", "Tahoma", "Times New Roman"]
+    win_ff.时区名称 = "Asia/Shanghai"; win_ff.时区偏移 = -480
+    win_ff.WebRTC禁用 = 假; win_ff.电池电量 = 72; win_ff.电池充电中 = 假
+    win_ff.性能计时噪声 = 100
+
+    定义 t3 = 指纹模板 {}
+    t3.名称 = "Win-Firefox121"; t3.操作系统 = "Windows"; t3.浏览器 = "Firefox"
+    t3.配置 = win_ff
+    追加(指纹_模板库, t3)
+
+    指纹_当前配置 = win11_Nova浏览器
+    指纹_PRNG种子 = 内联汇编_返回值("rdtsc")
+    指纹_已初始化 = 真
+    指纹_拦截次数 = 0
+ }

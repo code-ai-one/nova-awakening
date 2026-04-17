@@ -1,0 +1,215 @@
+module_count	517
+import_decl_count	1400
+modules_with_imports	496
+modules_without_imports	21
+cross_module_edge_count	7455
+missing_import_edge_count	125
+missing_import_source_module_count	30
+missing_import_target_module_count	19
+missing_import_source	系统扩展/P0-裸机/原子操作编码.nova	count=17
+missing_import_source	系统扩展/P0-裸机/无GC运行时.nova	count=14
+missing_import_source	平台/GPU/内核编译/内核编译器.nova	count=9
+missing_import_source	系统扩展/P0-裸机/特权指令编码.nova	count=9
+missing_import_source	运行时/自检/模块自检.nova	count=9
+missing_import_source	平台/GPU/核心/设备管理.nova	count=8
+missing_import_source	系统扩展/P0-裸机/易变访问.nova	count=8
+missing_import_source	编译器/模块系统/模块接口契约.nova	count=6
+missing_import_source	平台/GPU/内存/显存管理.nova	count=5
+missing_import_source	标准库/加密/哈希.nova	count=4
+missing_import_source	编译器/模块系统/增量缓存.nova	count=4
+missing_import_source	Nova.nova	count=3
+missing_import_source	标准库/文件/读写/文件读写.nova	count=3
+missing_import_source	标准库/转换器/Forth转换器.nova	count=3
+missing_import_source	内存/分配器/分配器.nova	count=2
+missing_import_source	平台/GPU/计算/张量计算.nova	count=2
+missing_import_source	智能基因/AI基因入口.nova	count=2
+missing_import_source	智能基因/核心/知识.nova	count=2
+missing_import_source	标准库/检索增强/检索增强.nova	count=2
+missing_import_source	编译器/模块系统/并行编译.nova	count=2
+missing_import_source	编译器/项目系统/构建配置.nova	count=2
+missing_import_source	IR/字节码/编码器.nova	count=1
+missing_import_source	标准库/系统/内存池.nova	count=1
+missing_import_source	系统扩展/P0-裸机/链接脚本支持.nova	count=1
+missing_import_source	系统扩展/P1-类型/指针类型.nova	count=1
+missing_import_source	系统扩展/P1-类型/枚举类型.nova	count=1
+missing_import_source	系统扩展/P1-类型/联合体.nova	count=1
+missing_import_source	编译器/前端入口.nova	count=1
+missing_import_source	编译器/标准前导.nova	count=1
+missing_import_source	运行时/游戏引擎/场景图.nova	count=1
+missing_import_target	平台/代码生成/x86_64/代码生成器.nova	count=48
+missing_import_target	平台/GPU/核心/FFI桥接.nova	count=24
+missing_import_target	自举兼容桥.nova	count=9
+missing_import_target	运行时/字典引擎/字典引擎.nova	count=9
+missing_import_target	编译器/模块系统/模块图编译器.nova	count=7
+missing_import_target	标准库/内存管理/内存管理.nova	count=6
+missing_import_target	标准库/数学/线性代数.nova	count=4
+missing_import_target	标准库/转换器/转换验证.nova	count=3
+missing_import_target	编译器/前端入口.nova	count=3
+missing_import_target	标准库/基础.nova	count=2
+missing_import_target	编译器/规划/类型系统/基础类型/基础类型.nova	count=2
+missing_import_target	标准库/意识/意识.nova	count=1
+missing_import_target	标准库/数学/工具.nova	count=1
+missing_import_target	标准库/智能安全/AI安全.nova	count=1
+missing_import_target	标准库/游戏框架/游戏框架.nova	count=1
+missing_import_target	标准库/系统/代理框架.nova	count=1
+missing_import_target	标准库/集合/栈/栈.nova	count=1
+missing_import_target	编译器/词法/字符工具.nova	count=1
+missing_import_target	编译器/项目系统/渲染合同.nova	count=1
+missing_import_symbol	编译_表达式	count=48
+missing_import_symbol	外部调用	count=19
+missing_import_symbol	字符串相等	count=9
+missing_import_symbol	缓冲区	count=5
+missing_import_symbol	向量_点积	count=4
+missing_import_symbol	外部调用字符串	count=4
+missing_import_symbol	模块_计算哈希	count=4
+missing_import_symbol	缓冲写	count=3
+missing_import_symbol	Slab_分配	count=2
+missing_import_symbol	Slab_释放	count=2
+missing_import_symbol	模块_编译单个	count=2
+missing_import_symbol	类型_大小	count=2
+missing_import_symbol	AABB_创建	count=1
+missing_import_symbol	Slab_创建	count=1
+missing_import_symbol	Slab_已分配	count=1
+missing_import_symbol	加载动态库	count=1
+missing_import_symbol	字典设	count=1
+missing_import_symbol	审计_记录	count=1
+missing_import_symbol	工作记忆_写入	count=1
+missing_import_symbol	工作记忆_创建	count=1
+missing_import_symbol	常量表_注册	count=1
+missing_import_symbol	弹出	count=1
+missing_import_symbol	最大公约数	count=1
+missing_import_symbol	查找映射	count=1
+missing_import_symbol	模块_扫描项目	count=1
+missing_import_symbol	添加映射	count=1
+missing_import_symbol	管线阶段_创建	count=1
+missing_import_symbol	缓冲写64	count=1
+missing_import_symbol	行号追踪_全局重置	count=1
+missing_import_symbol	词法引擎_全局重置	count=1
+missing_import_symbol	语法引擎_全局重置	count=1
+missing_import_symbol	转换_token	count=1
+missing_import_symbol	追加	count=1
+missing_import_edge	IR/字节码/编码器.nova	function=Nova编码_语句	target_module=标准库/集合/栈/栈.nova	target_symbol=弹出
+missing_import_edge	Nova.nova	function=编译器_重置全部状态	target_module=编译器/前端入口.nova	target_symbol=行号追踪_全局重置
+missing_import_edge	Nova.nova	function=编译器_重置全部状态	target_module=编译器/前端入口.nova	target_symbol=词法引擎_全局重置
+missing_import_edge	Nova.nova	function=编译器_重置全部状态	target_module=编译器/前端入口.nova	target_symbol=语法引擎_全局重置
+missing_import_edge	内存/分配器/分配器.nova	function=分配器_分配	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_分配
+missing_import_edge	内存/分配器/分配器.nova	function=分配器_释放	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_释放
+missing_import_edge	平台/GPU/内存/显存管理.nova	function=GPU显存_分配	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内存/显存管理.nova	function=GPU显存_释放	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内存/显存管理.nova	function=GPU显存_传输	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内存/显存管理.nova	function=GPU显存_异步传输	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内存/显存管理.nova	function=GPU显存_清零	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU内核_编译_NVIDIA	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU内核_编译_NVIDIA	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用字符串
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU内核_编译_AMD	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU内核_编译_AMD	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用字符串
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU内核_启动	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU同步	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU流_创建	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU流_同步	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/内核编译/内核编译器.nova	function=GPU流_销毁	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU管理器_枚举设备	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_尝试加载候选	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=加载动态库
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_填充NVIDIA信息	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_填充NVIDIA信息	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用字符串
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_填充AMD信息	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_填充AMD信息	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用字符串
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU_枚举Intel设备	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/核心/设备管理.nova	function=GPU管理器_选择设备	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/计算/张量计算.nova	function=GPU_通用矩阵乘	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	平台/GPU/计算/张量计算.nova	function=GPU_批量GEMM	target_module=平台/GPU/核心/FFI桥接.nova	target_symbol=外部调用
+missing_import_edge	智能基因/AI基因入口.nova	function=智能基因_初始化	target_module=标准库/系统/代理框架.nova	target_symbol=工作记忆_创建
+missing_import_edge	智能基因/AI基因入口.nova	function=智能基因_记住	target_module=标准库/意识/意识.nova	target_symbol=工作记忆_写入
+missing_import_edge	智能基因/核心/知识.nova	function=知识_反向查询	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	智能基因/核心/知识.nova	function=知识_最短路径	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	标准库/加密/哈希.nova	function=rle编码	target_module=自举兼容桥.nova	target_symbol=缓冲写
+missing_import_edge	标准库/加密/哈希.nova	function=rle编码	target_module=自举兼容桥.nova	target_symbol=缓冲区
+missing_import_edge	标准库/加密/哈希.nova	function=rle解码	target_module=自举兼容桥.nova	target_symbol=缓冲写
+missing_import_edge	标准库/加密/哈希.nova	function=rle解码	target_module=自举兼容桥.nova	target_symbol=缓冲区
+missing_import_edge	标准库/文件/读写/文件读写.nova	function=_文件_补充读缓冲	target_module=自举兼容桥.nova	target_symbol=缓冲区
+missing_import_edge	标准库/文件/读写/文件读写.nova	function=文件_刷新	target_module=自举兼容桥.nova	target_symbol=缓冲写
+missing_import_edge	标准库/文件/读写/文件读写.nova	function=文件_刷新	target_module=自举兼容桥.nova	target_symbol=缓冲区
+missing_import_edge	标准库/检索增强/检索增强.nova	function=向量_检索	target_module=标准库/数学/线性代数.nova	target_symbol=向量_点积
+missing_import_edge	标准库/检索增强/检索增强.nova	function=混合_检索	target_module=标准库/数学/线性代数.nova	target_symbol=向量_点积
+missing_import_edge	标准库/系统/内存池.nova	function=缓冲池_创建	target_module=自举兼容桥.nova	target_symbol=缓冲区
+missing_import_edge	标准库/转换器/Forth转换器.nova	function=Fort_初始化映射	target_module=标准库/转换器/转换验证.nova	target_symbol=添加映射
+missing_import_edge	标准库/转换器/Forth转换器.nova	function=Fort_转换_token	target_module=标准库/转换器/转换验证.nova	target_symbol=查找映射
+missing_import_edge	标准库/转换器/Forth转换器.nova	function=Fort_Forth转Nova	target_module=标准库/转换器/转换验证.nova	target_symbol=转换_token
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_交换_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_比较交换_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_加_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_减_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_递增_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_递减_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_位测试设置_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_位测试清除_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_位测试翻转_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_与_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_或_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_异或_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_读_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__原子_写_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__自旋锁_获取_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__自旋锁_释放_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/原子操作编码.nova	function=编译_处理__自旋锁_尝试_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内核_分配_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内核_分配清零_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__页_分配连续_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__页_释放_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存写8_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存写16_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存写32_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存写64_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存清零_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存复制_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存填充_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__内存比较_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_处理__栈分配_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/无GC运行时.nova	function=编译_无GC操作	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_写8_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_写16_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_写32_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_写64_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_读32_偏移_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__volatile_写32_偏移_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_处理__VGA写字符_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/易变访问.nova	function=编译_volatile操作	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__读MSR_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__写MSR_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口读8_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口读16_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口读32_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口写8_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口写16_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_处理__端口写32_	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/特权指令编码.nova	function=编译_特权指令	target_module=平台/代码生成/x86_64/代码生成器.nova	target_symbol=编译_表达式
+missing_import_edge	系统扩展/P0-裸机/链接脚本支持.nova	function=链接_修正符号	target_module=自举兼容桥.nova	target_symbol=缓冲写64
+missing_import_edge	系统扩展/P1-类型/指针类型.nova	function=指针_解析类型	target_module=编译器/规划/类型系统/基础类型/基础类型.nova	target_symbol=类型_大小
+missing_import_edge	系统扩展/P1-类型/枚举类型.nova	function=枚举_生成x86	target_module=编译器/词法/字符工具.nova	target_symbol=常量表_注册
+missing_import_edge	系统扩展/P1-类型/联合体.nova	function=联合_解析	target_module=编译器/规划/类型系统/基础类型/基础类型.nova	target_symbol=类型_大小
+missing_import_edge	编译器/前端入口.nova	function=_语法_遍历	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/标准前导.nova	function=标准前导_最小公倍数	target_module=标准库/数学/工具.nova	target_symbol=最大公约数
+missing_import_edge	编译器/模块系统/增量缓存.nova	function=缓存_安全文件名	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_计算哈希
+missing_import_edge	编译器/模块系统/增量缓存.nova	function=缓存_依赖哈希一致	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_计算哈希
+missing_import_edge	编译器/模块系统/增量缓存.nova	function=缓存_恢复模块状态	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_计算哈希
+missing_import_edge	编译器/模块系统/增量缓存.nova	function=缓存_需要重编	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_计算哈希
+missing_import_edge	编译器/模块系统/并行编译.nova	function=并行_执行批次	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_编译单个
+missing_import_edge	编译器/模块系统/并行编译.nova	function=并行_编译全部	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_编译单个
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=契约_影响分析	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=契约_自动发现	target_module=编译器/模块系统/模块图编译器.nova	target_symbol=模块_扫描项目
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=契约_检查双方依赖冲突	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=符号_可访问	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=符号_列出公开	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/模块系统/模块接口契约.nova	function=契约_验证完整性	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	编译器/项目系统/构建配置.nova	function=构建配置_验证	target_module=标准库/基础.nova	target_symbol=追加
+missing_import_edge	编译器/项目系统/构建配置.nova	function=构建配置_序列化	target_module=标准库/基础.nova	target_symbol=字典设
+missing_import_edge	运行时/游戏引擎/场景图.nova	function=场景图_按名称查找	target_module=运行时/字典引擎/字典引擎.nova	target_symbol=字符串相等
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M14_引擎	target_module=标准库/游戏框架/游戏框架.nova	target_symbol=AABB_创建
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M16_AI	target_module=标准库/数学/线性代数.nova	target_symbol=向量_点积
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M9_内存	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_分配
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M9_内存	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_创建
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M9_内存	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_已分配
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M9_内存	target_module=标准库/内存管理/内存管理.nova	target_symbol=Slab_释放
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_代码生成	target_module=标准库/数学/线性代数.nova	target_symbol=向量_点积
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_M15_AI宿主	target_module=标准库/智能安全/AI安全.nova	target_symbol=审计_记录
+missing_import_edge	运行时/自检/模块自检.nova	function=自检_项目合同	target_module=编译器/项目系统/渲染合同.nova	target_symbol=管线阶段_创建

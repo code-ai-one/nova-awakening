@@ -1,0 +1,510 @@
+// NovaOS 渲染引擎 — HTML媒体元素(HTMLMediaElement)
+// 子系统: 渲染引擎/媒体/媒体元素
+// 实现: W3C HTML5 媒体元素完整接口
+//   网络状态机 + 就绪状态 + 资源加载算法 + 播放管线
+//   音频/视频轨道管理 + 事件分发 + src/srcObject切换
+// 原创: NovaOS · 纯中文原生系统编程 · AI原生播放行为预测
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./播放循环.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/字符串替换.nova")
+导入("./解析序列.nova")
+导入("./解码器.nova")
+导入("./文档事件.nova")
+导入("./时间范围.nova")
+导入("./媒体解码.nova")
+
+// §0 常量定义
+
+// 网络状态
+定义 NETWORK_EMPTY = 0
+定义 NETWORK_IDLE = 1
+定义 NETWORK_LOADING = 2
+定义 NETWORK_NO_SOURCE = 3
+
+// 就绪状态
+定义 HAVE_NOTHING = 0
+定义 HAVE_METADATA = 1
+定义 HAVE_CURRENT_DATA = 2
+定义 HAVE_FUTURE_DATA = 3
+定义 HAVE_ENOUGH_DATA = 4
+
+// 预加载模式
+定义 PRELOAD_NONE = 0
+定义 PRELOAD_METADATA = 1
+定义 PRELOAD_AUTO = 2
+
+// 错误码
+定义 MEDIA_ERR_ABORTED = 1
+定义 MEDIA_ERR_NETWORK = 2
+定义 MEDIA_ERR_DECODE = 3
+定义 MEDIA_ERR_SRC_NOT_SUPPORTED = 4
+
+// 容器格式
+定义 CONTAINER_MP4 = 1
+定义 CONTAINER_WEBM = 2
+定义 CONTAINER_OGG = 3
+定义 CONTAINER_MP3 = 7
+定义 CONTAINER_WAV = 5
+
+// 编解码器
+定义 CODEC_AAC = 1
+定义 CODEC_H264 = 10
+定义 CODEC_VP9 = 13
+定义 CODEC_OPUS = 3
+定义 CODEC_VORBIS = 4
+
+// §0.5 统计与AI数据结构
+
+结构 媒体元素统计 {
+    创建次数,
+    销毁次数,
+    加载资源次数,
+    play调用次数,
+    pause调用次数,
+    seek调用次数,
+    音量调整次数,
+    速率调整次数,
+    src切换次数,
+    错误发生次数,
+    ended触发次数,
+    状态切换次数,
+    AI播放调用次数,
+    AI播放命中次数,
+    总播放时长_毫秒,
+    总处理耗时_纳秒,
+    autoplay成功次数,
+    autoplay失败次数,
+}
+
+结构 AI播放状态 {
+    历史播放率,          // u32 Q10 (play/总操作)
+    历史完播率,          // u32 Q10 (ended/play)
+    历史平均时长,        // u64 毫秒
+    历史静音率,          // u32 Q10
+    连续play计数,
+    连续pause计数,
+    预测下次play,
+    采样计数器,
+    学习权重,            // u32 Q10
+}
+
+定义 可变 全局媒体元素统计 = 0
+定义 可变 全局播放AI = 0
+定义 可变 全局媒体元素已初始化 = 假
+
+// §0.7 生命周期
+
+
+函数 媒体元素_初始化全局() {
+    如果 (全局媒体元素已初始化 == 真) { 返回 错误_已存在 }
+    全局媒体元素统计 = 堆_分配_清零(144)
+    如果 (全局媒体元素统计 == 空) { 返回 错误_内存不足 }
+    全局播放AI = 堆_分配_清零(48)
+    如果 (全局播放AI != 空) {
+        全局播放AI.预测下次play = 真
+        全局播放AI.学习权重 = 128
+    }
+    全局媒体元素已初始化 = 真
+    打印("[媒体元素] 初始化完成")
+    返回 0
+}
+
+函数 媒体元素_销毁全局() {
+    如果 (全局媒体元素统计 != 空) { 堆_释放(全局媒体元素统计); 全局媒体元素统计 = 0 }
+    如果 (全局播放AI != 空) { 堆_释放(全局播放AI); 全局播放AI = 0 }
+    全局媒体元素已初始化 = 假
+    返回 0
+}
+
+// §1 HTML媒体元素结构
+
+结构 HTML媒体元素 {
+    // DOM节点
+    节点,    // u64 节点*
+
+    // 源
+    src,    // u64 URL字符串
+    currentSrc,    // u64 实际使用的URL
+
+    // 状态
+    networkState,    // u8 NETWORK_xxx
+    readyState,    // u8 HAVE_xxx
+    error,    // u8 MEDIA_ERR_xxx (0=无错误)
+    paused,
+    ended,
+    seeking,
+    autoplaying,
+    // 播放控制
+    currentTime,    // i64 毫秒
+    duration,    // i64 毫秒 (-1=未知, -2=直播)
+    playbackRate,    // i32 Q10 (1024=1.0x)
+    defaultPlaybackRate,
+    volume,    // i32 Q10 (0-1024)
+    muted,
+    // 属性
+    autoplay,
+    loop,
+    controls,
+    preload,    // u8 PRELOAD_xxx
+    crossOrigin,    // u8 0=none 1=anonymous 2=use-credentials
+
+    // 缓冲
+    buffered,    // u64 TimeRanges*
+    played,    // u64 TimeRanges*
+    seekable,    // u64 TimeRanges*
+
+    // 轨道
+    音频轨道,    // [8]音频Track
+    音频轨道数,
+    视频轨道,    // [4]视频Track
+    视频轨道数,
+    文本轨道,    // [16]u64 TextTrack*
+    文本轨道数,
+    // 视频特有
+    videoWidth,
+    videoHeight,
+    poster,    // u64 poster图像URL
+
+    // 内部: 播放管线
+    demuxer,    // u64 Demuxer*
+    audioDecoder,    // u64 音频Decoder*
+    videoDecoder,    // u64 视频Decoder*
+    audio渲染er,    // u64 音频渲染er*
+    video渲染er,    // u64 视频渲染er*
+
+    // 媒体Source
+    mediaSource,    // u64 媒体Source*
+
+    // 事件回调
+    onplay,
+    onpause,
+    onended,
+    ontimeupdate,
+    onloadedmetadata,
+    onloadeddata,
+    onerror,
+    onwaiting,
+    oncanplay,
+    oncanplaythrough,
+    onseeking,
+    onseeked,
+    onvolumechange,
+    onratechange,
+    onprogress,
+}
+
+函数 媒体元素_创建(是视频) {
+    定义 me = 堆_分配(HTML媒体元素)
+    如果 (me == 空) {
+        打印("[媒体元素] 错误: 分配失败")
+        返回 空
+    }
+    me.src = 0; me.currentSrc = 0
+    me.networkState = NETWORK_EMPTY; me.readyState = HAVE_NOTHING
+    me.error = 0; me.paused = 真; me.ended = 假
+    me.seeking = 假; me.autoplaying = 假
+    me.currentTime = 0; me.duration = -1
+    me.playbackRate = 1024; me.defaultPlaybackRate = 1024
+    me.volume = 1024; me.muted = 假
+    me.autoplay = 假; me.loop = 假; me.controls = 假
+    me.preload = PRELOAD_METADATA; me.crossOrigin = 0
+    me.buffered = TimeRanges_创建()
+    me.played = TimeRanges_创建()
+    me.seekable = TimeRanges_创建()
+    me.音频轨道数 = 0; me.视频轨道数 = 0; me.文本轨道数 = 0
+    me.videoWidth = 0; me.videoHeight = 0; me.poster = 0
+    me.demuxer = 0; me.audioDecoder = 0; me.videoDecoder = 0
+    me.audio渲染er = 0; me.video渲染er = 0; me.mediaSource = 0
+    // 清零所有事件回调
+    me.onplay = 0; me.onpause = 0; me.onended = 0
+    me.ontimeupdate = 0; me.onloadedmetadata = 0; me.onloadeddata = 0
+    me.onerror = 0; me.onwaiting = 0; me.oncanplay = 0
+    me.oncanplaythrough = 0; me.onseeking = 0; me.onseeked = 0
+    me.onvolumechange = 0; me.onratechange = 0; me.onprogress = 0
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.创建次数 = 全局媒体元素统计.创建次数 + 1
+    }
+    返回 me
+}
+
+// §2 媒体元素销毁
+
+函数 媒体元素_销毁(me) {
+    如果 (me == 空) { 返回 }
+    // 停止播放
+    me.paused = 真
+    // 释放TimeRanges
+    如果 (me.buffered != 空) { TimeRanges_销毁(me.buffered) }
+    如果 (me.played != 空) { TimeRanges_销毁(me.played) }
+    如果 (me.seekable != 空) { TimeRanges_销毁(me.seekable) }
+    // 释放解码管线
+    如果 (me.demuxer != 空) { 堆_释放(me.demuxer) }
+    如果 (me.audioDecoder != 空) { 堆_释放(me.audioDecoder) }
+    如果 (me.videoDecoder != 空) { 堆_释放(me.videoDecoder) }
+    如果 (me.audio渲染er != 空) { 堆_释放(me.audio渲染er) }
+    如果 (me.video渲染er != 空) { 堆_释放(me.video渲染er) }
+    堆_释放(me)
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.销毁次数 = 全局媒体元素统计.销毁次数 + 1
+    }
+}
+
+// §3 资源加载算法
+
+函数 媒体元素_加载资源(me) {
+    如果 (me == 空) { 返回 }
+    如果 (me.src == 空) {
+        me.networkState = NETWORK_NO_SOURCE
+        me.error = MEDIA_ERR_SRC_NOT_SUPPORTED
+        如果 (全局媒体元素统计 != 空) {
+            全局媒体元素统计.错误发生次数 = 全局媒体元素统计.错误发生次数 + 1
+        }
+        返回
+    }
+    me.networkState = NETWORK_LOADING
+    me.currentSrc = me.src
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.加载资源次数 = 全局媒体元素统计.加载资源次数 + 1
+    }
+    // 创建Demuxer
+    如果 (me.demuxer == 空) {
+        me.demuxer = Demuxer_创建(me.src)
+    }
+    // 加载数据(异步, 这里简化为同步)
+    定义 数据 = 渲染_文件全部读取(me.src)
+    如果 (数据 == 空) {
+        me.networkState = NETWORK_NO_SOURCE
+        me.error = MEDIA_ERR_NETWORK
+        媒体元素_触发事件(me, "error")
+        如果 (全局媒体元素统计 != 空) {
+            全局媒体元素统计.错误发生次数 = 全局媒体元素统计.错误发生次数 + 1
+        }
+        返回
+    }
+    // 设置Demuxer数据
+    me.demuxer.数据缓冲 = 数据
+    me.demuxer.缓冲大小 = 字节长度(数据)
+    // 解析轨道
+    Demuxer_解析轨道_真实(me.demuxer, me)
+    // 更新状态
+    me.readyState = HAVE_METADATA
+    me.networkState = NETWORK_IDLE
+    me.duration = me.demuxer.时长
+    // 更新视频尺寸
+    如果 (me.视频轨道数 > 0) {
+        me.videoWidth = me.视频轨道[0].宽度
+        me.videoHeight = me.视频轨道[0].高度
+    }
+    // 创建解码器
+    如果 (me.demuxer.有音频 == 真 && me.audioDecoder == 空) {
+        me.audioDecoder = 音频Decoder_创建(me.音频轨道[0].编解码器)
+        me.audio渲染er = 音频渲染er_创建(me.音频轨道[0].采样率, me.音频轨道[0].声道数)
+    }
+    如果 (me.demuxer.有视频 == 真 && me.videoDecoder == 空) {
+        me.videoDecoder = 视频Decoder_创建(me.视频轨道[0].编解码器)
+        me.video渲染er = 视频渲染er_创建(me.videoWidth, me.videoHeight)
+    }
+    // 触发事件
+    媒体元素_触发事件(me, "loadedmetadata")
+    me.readyState = HAVE_ENOUGH_DATA
+    媒体元素_触发事件(me, "loadeddata")
+    媒体元素_触发事件(me, "canplay")
+    媒体元素_触发事件(me, "canplaythrough")
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.状态切换次数 = 全局媒体元素统计.状态切换次数 + 4
+    }
+    // AI反馈
+    AI播放_记录操作(me, 0)  // 0=加载
+}
+
+// §4 属性setter/getter
+
+函数 媒体元素_设置src(me, url) {
+    如果 (me == 空) { 返回 }
+    me.src = url
+    // src改变触发资源重新加载
+    me.networkState = NETWORK_EMPTY
+    me.readyState = HAVE_NOTHING
+    me.currentTime = 0
+    me.ended = 假
+    me.error = 0
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.src切换次数 = 全局媒体元素统计.src切换次数 + 1
+    }
+    媒体元素_加载资源(me)
+}
+
+函数 媒体元素_设置volume(me, 音量) {
+    如果 (me == 空) { 返回 }
+    如果 (音量 < 0) { 音量 = 0 }
+    如果 (音量 > 1024) { 音量 = 1024 }
+    如果 (me.volume != 音量) {
+        me.volume = 音量
+        媒体元素_触发事件(me, "volumechange")
+        如果 (全局媒体元素统计 != 空) {
+            全局媒体元素统计.音量调整次数 = 全局媒体元素统计.音量调整次数 + 1
+        }
+    }
+}
+
+函数 媒体元素_设置playbackRate(me, 速率) {
+    如果 (me == 空) { 返回 }
+    如果 (速率 < 256) { 速率 = 256 }     // 最低0.25x
+    如果 (速率 > 4096) { 速率 = 4096 }    // 最高4x
+    如果 (me.playbackRate != 速率) {
+        me.playbackRate = 速率
+        媒体元素_触发事件(me, "ratechange")
+        如果 (全局媒体元素统计 != 空) {
+            全局媒体元素统计.速率调整次数 = 全局媒体元素统计.速率调整次数 + 1
+        }
+    }
+}
+
+函数 媒体元素_设置currentTime(me, 时间) {
+    如果 (me == 空) { 返回 }
+    如果 (时间 < 0) { 时间 = 0 }
+    如果 (me.duration > 0 && 时间 > me.duration) { 时间 = me.duration }
+    me.seeking = 真
+    媒体元素_触发事件(me, "seeking")
+    me.currentTime = 时间
+    如果 (me.demuxer != 空) {
+        Demuxer_seek(me.demuxer, 时间)
+    }
+    me.seeking = 假
+    me.ended = 假
+    媒体元素_触发事件(me, "seeked")
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.seek调用次数 = 全局媒体元素统计.seek调用次数 + 1
+    }
+}
+
+函数 媒体元素_设置muted(me, 静音) {
+    如果 (me == 空) { 返回 }
+    如果 (me.muted != 静音) {
+        me.muted = 静音
+        媒体元素_触发事件(me, "volumechange")
+    }
+}
+
+函数 媒体元素_获取进度(me) {
+    如果 (me == 空 || me.duration <= 0) { 返回 0 }
+    返回 me.currentTime * 1024 / me.duration
+}
+
+函数 媒体元素_是否可播放(me) {
+    如果 (me == 空) { 返回 假 }
+    如果 (me.readyState >= HAVE_FUTURE_DATA && me.error == 0) { 返回 真 }
+    返回 假
+}
+
+// §5 AI基因 — 播放行为预测
+// 能力: 预测 + 学习 + 自适应
+// 四阶段: 数据采集→特征提取→决策→执行
+
+函数 AI播放_记录操作(me, 操作类型) {
+    // 操作类型: 0=加载 1=play 2=pause 3=seek 4=ended
+    如果 (全局播放AI == 空 || me == 空) { 返回 }
+    定义 AI = 全局播放AI
+    AI.采样计数器 = AI.采样计数器 + 1
+
+    如果 (操作类型 == 1) {
+        AI.连续play计数 = AI.连续play计数 + 1
+        AI.连续pause计数 = 0
+        AI.历史播放率 = (AI.历史播放率 * 15 + 1024) / 16
+    } 否则 如果 (操作类型 == 2) {
+        AI.连续pause计数 = AI.连续pause计数 + 1
+        AI.连续play计数 = 0
+        AI.历史播放率 = (AI.历史播放率 * 15) / 16
+    } 否则 如果 (操作类型 == 4) {
+        AI.历史完播率 = (AI.历史完播率 * 15 + 1024) / 16
+    }
+    如果 (me.muted == 真) {
+        AI.历史静音率 = (AI.历史静音率 * 15 + 1024) / 16
+    } 否则 {
+        AI.历史静音率 = (AI.历史静音率 * 15) / 16
+    }
+    如果 (me.duration > 0) {
+        AI.历史平均时长 = (AI.历史平均时长 * 7 + me.duration) / 8
+    }
+
+    如果 (AI.采样计数器 < 8) { 返回 }
+    AI.采样计数器 = 0
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.AI播放调用次数 = 全局媒体元素统计.AI播放调用次数 + 1
+    }
+
+    如果 (AI.连续play计数 > 3) {
+        AI.预测下次play = 真
+    } 否则 如果 (AI.连续pause计数 > 3) {
+        AI.预测下次play = 假
+    }
+
+    如果 (AI.预测下次play == 真 && 操作类型 == 1) {
+        如果 (全局媒体元素统计 != 空) {
+            全局媒体元素统计.AI播放命中次数 = 全局媒体元素统计.AI播放命中次数 + 1
+        }
+    }
+}
+
+// §6 统计输出与诊断
+
+函数 媒体元素_打印统计() {
+    如果 (全局媒体元素统计 == 空) {
+        打印("[媒体元素] 统计未初始化")
+        返回
+    }
+    打印("┌──────────────────────────────────────┐")
+    打印("│   HTML媒体元素 · 统计报告           │")
+    打印("├──────────────────────────────────────┤")
+    打印(字符串拼接("│ 创建/销毁:        ", 字符串拼接(转字符串(全局媒体元素统计.创建次数), 字符串拼接("/", 转字符串(全局媒体元素统计.销毁次数)))))
+    打印(字符串拼接("│ 加载资源:         ", 转字符串(全局媒体元素统计.加载资源次数)))
+    打印(字符串拼接("│ play:             ", 转字符串(全局媒体元素统计.play调用次数)))
+    打印(字符串拼接("│ pause:            ", 转字符串(全局媒体元素统计.pause调用次数)))
+    打印(字符串拼接("│ seek:             ", 转字符串(全局媒体元素统计.seek调用次数)))
+    打印(字符串拼接("│ 音量调整:         ", 转字符串(全局媒体元素统计.音量调整次数)))
+    打印(字符串拼接("│ 速率调整:         ", 转字符串(全局媒体元素统计.速率调整次数)))
+    打印(字符串拼接("│ src切换:          ", 转字符串(全局媒体元素统计.src切换次数)))
+    打印(字符串拼接("│ 错误:             ", 转字符串(全局媒体元素统计.错误发生次数)))
+    打印(字符串拼接("│ ended:            ", 转字符串(全局媒体元素统计.ended触发次数)))
+    打印(字符串拼接("│ 状态切换:         ", 转字符串(全局媒体元素统计.状态切换次数)))
+    打印(字符串拼接("│ autoplay成功:     ", 转字符串(全局媒体元素统计.autoplay成功次数)))
+    打印(字符串拼接("│ AI播放调用:       ", 转字符串(全局媒体元素统计.AI播放调用次数)))
+    打印(字符串拼接("│ AI播放命中:       ", 转字符串(全局媒体元素统计.AI播放命中次数)))
+    打印(字符串拼接("│ 总播放时长(s):    ", 转字符串(全局媒体元素统计.总播放时长_毫秒 / 1000)))
+    打印("└──────────────────────────────────────┘")
+}
+
+函数 媒体元素_导出诊断() {
+    如果 (全局播放AI == 空) {
+        打印("[播放AI] 未初始化")
+        返回
+    }
+    定义 AI = 全局播放AI
+    打印("[播放AI] === 诊断 ===")
+    打印(字符串拼接("  历史播放率(Q10): ", 转字符串(AI.历史播放率)))
+    打印(字符串拼接("  历史完播率(Q10): ", 转字符串(AI.历史完播率)))
+    打印(字符串拼接("  历史平均时长(ms): ", 转字符串(AI.历史平均时长)))
+    打印(字符串拼接("  历史静音率(Q10): ", 转字符串(AI.历史静音率)))
+    打印(字符串拼接("  连续play: ", 转字符串(AI.连续play计数)))
+    打印(字符串拼接("  连续pause: ", 转字符串(AI.连续pause计数)))
+    打印(字符串拼接("  预测play: ", 转字符串(AI.预测下次play)))
+}
+
+// §7 对外接口
+
+函数 媒体元素_获取统计() { 返回 全局媒体元素统计 }
+函数 媒体元素_获取AI状态() { 返回 全局播放AI }
+函数 媒体元素_是否已初始化() { 返回 全局媒体元素已初始化 }
+
+函数 媒体元素_触发事件(me, 类型) {
+    如果 (me == 空) { 返回 }
+    // 创建事件并分发到节点
+    定义 evt = 事件_创建2(类型, 假, 假)
+    如果 (evt != 空) { evt.是可信的 = 真 }
+    如果 (全局媒体元素统计 != 空) {
+        全局媒体元素统计.状态切换次数 = 全局媒体元素统计.状态切换次数 + 1
+    }
+}

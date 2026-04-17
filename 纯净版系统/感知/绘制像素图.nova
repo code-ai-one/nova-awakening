@@ -1,0 +1,128 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./网缓着色着.nova")
+导入("./格式检测.nova")
+导入("./内核直连层.nova")
+导入("./图位图像素缓.nova")
+导入("../中枢/内存初始化.nova")
+导入("./内存管理纹.nova")
+导入("./图形上下文.nova")
+导入("./网缓图像从位.nova")
+
+// §5 SkPixmap — 像素视图
+
+结构 SkPixmap {
+    像素,
+    宽,
+    高,
+    行字节,
+    颜色类型,
+}
+
+
+函数 SkPixmap_从位图(bm) {
+    如果 (bm == 0) { 返回 0 }
+    定义 pm = 堆_分配(SkPixmap)
+    pm.像素 = bm.像素
+    pm.宽 = bm.宽; pm.高 = bm.高
+    pm.行字节 = bm.行字节
+    pm.颜色类型 = bm.颜色类型
+    返回 pm
+}
+
+函数 SkPixmap_读取(pm, x, y) {
+    如果 (pm == 0 || x >= pm.宽 || y >= pm.高) { 返回 0 }
+    定义 bpp = Nova缓冲itmap_bpp(pm.颜色类型)
+    定义 偏移 = y * pm.行字节 + x * bpp
+    如果 (pm.颜色类型 == COLORTYPE_RGBA8888) {
+        返回 内存_读32(pm.像素 + 偏移)
+    }
+    返回 0
+}
+
+函数 SkPixmap_写入(pm, x, y, rgba) {
+    如果 (pm == 0 || x >= pm.宽 || y >= pm.高) { 返回 }
+    定义 bpp = Nova缓冲itmap_bpp(pm.颜色类型)
+    定义 偏移 = y * pm.行字节 + x * bpp
+    如果 (pm.颜色类型 == COLORTYPE_RGBA8888) {
+        内存_写32(pm.像素 + 偏移, rgba)
+    }
+}
+
+// §6 图像操作
+
+// 缩放: 双线性插值
+函数 Sk图像_缩放(img, 新宽, 新高) {
+    Sk图像_确保解码(img)
+    如果 (img == 0 || img.位图 == 0) { 返回 0 }
+
+    定义 dst = Nova缓冲itmap_创建(新宽, 新高, img.颜色类型)
+    定义 x比 = img.宽 * 1024 / 新宽      // Q10
+    定义 y比 = img.高 * 1024 / 新高
+
+    定义 可变 dy = 0
+    当 (dy < 新高) {
+        定义 sy = dy * y比 / 1024
+        定义 fy = (dy * y比 % 1024)       // 小数部分
+        定义 sy1 = sy + 1
+        如果 (sy1 >= img.高) { sy1 = img.高 - 1 }
+
+        定义 可变 dx = 0
+        当 (dx < 新宽) {
+            定义 sx = dx * x比 / 1024
+            定义 fx = (dx * x比 % 1024)
+            定义 sx1 = sx + 1
+            如果 (sx1 >= img.宽) { sx1 = img.宽 - 1 }
+
+            // 4像素双线性插值
+            定义 p00 = Nova缓冲itmap_读像素(img.位图, sx, sy)
+            定义 p10 = Nova缓冲itmap_读像素(img.位图, sx1, sy)
+            定义 p01 = Nova缓冲itmap_读像素(img.位图, sx, sy1)
+            定义 p11 = Nova缓冲itmap_读像素(img.位图, sx1, sy1)
+
+            定义 top = SkColor_lerp(p00, p10, fx * 256 / 1024)
+            定义 bot = SkColor_lerp(p01, p11, fx * 256 / 1024)
+            定义 像素 = SkColor_lerp(top, bot, fy * 256 / 1024)
+
+            Nova缓冲itmap_写像素(dst, dx, dy, 像素)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+
+    返回 Sk图像_从位图(dst)
+}
+
+// 裁剪子区域
+函数 Sk图像_裁剪(img, x, y, 宽, 高) {
+    Sk图像_确保解码(img)
+    如果 (img == 0 || img.位图 == 0) { 返回 0 }
+    如果 (x + 宽 > img.宽) { 宽 = img.宽 - x }
+    如果 (y + 高 > img.高) { 高 = img.高 - y }
+    如果 (宽 <= 0 || 高 <= 0) { 返回 0 }
+
+    定义 dst = Nova缓冲itmap_创建(宽, 高, img.颜色类型)
+    定义 可变 dy = 0
+    当 (dy < 高) {
+        定义 可变 dx = 0
+        当 (dx < 宽) {
+            定义 像素 = Nova缓冲itmap_读像素(img.位图, x + dx, y + dy)
+            Nova缓冲itmap_写像素(dst, dx, dy, 像素)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    返回 Sk图像_从位图(dst)
+}
+
+// 上传到图处
+函数 Sk图像_上传图处(img, ctx) {
+    Sk图像_确保解码(img)
+    如果 (img == 0 || ctx == 0 || img.位图 == 0) { 返回 }
+    如果 (img.gpu纹理 != 0) { 返回 }    // 已上传
+
+    img.gpu纹理 = GrTexture_创建(ctx, img.宽, img.高, TEX_FORMAT_RGBA8, img.位图.像素)
+    如果 (img.gpu纹理 != 0) {
+        img.来源 = IMAGE_SOURCE_图处
+    }
+}

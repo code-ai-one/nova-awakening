@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/进程标识分.nova")
+导入("./进程文件初.nova")
+导入("../中枢/字符串替换.nova")
+导入("./进程文件查找.nova")
+导入("../中枢/中断请求描述.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/墙钟设置.nova")
+
+// 内置proc条目注册
+
+函数 proNova公平调度_注册_内置条目() {
+    proNova公平调度_注册("meminfo", proc_meminfo_读)
+    proNova公平调度_注册("cpuinfo", proc_cpuinfo_读)
+    proNova公平调度_注册("version", proc_version_读)
+    proNova公平调度_注册("uptime", proc_uptime_读)
+    proNova公平调度_注册("stat", proc_stat_读)
+    proNova公平调度_注册("interrupts", proc_interrupts_读)
+    proNova公平调度_注册("Nova负载均值", proc_Nova负载均值_读)
+    proNova公平调度_注册("filesystems", proc_filesystems_读)
+    proNova公平调度_注册("mounts", proc_mounts_读)
+
+    // 创建子目录
+    proNova公平调度_创建目录("net", proc_根)
+    proNova公平调度_创建目录("sys", proc_根)
+    proNova公平调度_创建目录("bus", proc_根)
+    proNova公平调度_创建目录("driver", proc_根)
+}
+
+// 内置proc文件读取函数
+
+函数 proc_version_读(数据) {
+    返回 "NovaOS version 0.1.0 (nova@novaos) (龙编译器 1.0) #1 SMP\n"
+}
+
+函数 proc_uptime_读(数据) {
+    定义 秒 = 当前时间_秒() / 1000
+    返回 字符串格式("%d.%02d %d.%02d\n", 秒, 0, 秒, 0)
+}
+
+函数 proc_stat_读(数据) {
+    定义 可变 输出 = "cpu  0 0 0 0 0 0 0 0 0 0\n"
+    输出 = 输出 + 字符串格式("processes %d\n", 进程_总创建数())
+    输出 = 输出 + 字符串格式("procs_running %d\n", 进程_运行中数())
+    输出 = 输出 + 字符串格式("procs_blocked %d\n", 进程_阻塞数())
+    返回 输出
+}
+
+函数 proc_interrupts_读(数据) {
+    返回 IRQ_打印统计_字符串()
+}
+
+函数 proc_Nova负载均值_读(数据) {
+    返回 "0.00 0.00 0.00 1/1 1\n"
+}
+
+函数 proc_filesystems_读(数据) {
+    定义 可变 输出 = ""
+    输出 = 输出 + "节点v\tproc\n"
+    输出 = 输出 + "节点v\tsysfs\n"
+    输出 = 输出 + "节点v\tramfs\n"
+    输出 = 输出 + "节点v\tdevtmpfs\n"
+    输出 = 输出 + "\text4\n"
+    返回 输出
+}
+
+函数 proc_mounts_读(数据) {
+    返回 "none / ext4 rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\n"
+}
+
+// VFS操作表
+
+函数 proNova公平调度_获取Nova文件节点操作() {
+    返回 {
+        查找: proNova公平调度_Nova文件节点_查找
+    }
+}
+
+函数 proNova公平调度_Nova文件节点_查找(父Nova文件节点, 名称) {
+    定义 条目 = proNova公平调度_在目录中查找(proc_根, 名称)
+    如果 (条目 != 空) {
+        返回 条目.Nova文件节点号
+    }
+
+    // 检查是否是PID目录
+    定义 pid = 字符串_转整数(名称)
+    如果 (pid > 0 && 进程_按PID查找(pid) != 空) {
+        返回 0x10000 + pid
+    }
+
+    返回 错误码_不存在
+}
+
+函数 进程状态_转字符串(状态) {
+    匹配 (状态) {
+        0 => 返回 "R (running)"
+        1 => 返回 "S (sleeping)"
+        2 => 返回 "D (disk sleep)"
+        3 => 返回 "T (stopped)"
+        4 => 返回 "Z (zombie)"
+        _ => 返回 "? (unknown)"
+    }
+}
+
+函数 进程状态_字符(状态) {
+    匹配 (状态) {
+        0 => 返回 'R'
+        1 => 返回 'S'
+        2 => 返回 'D'
+        3 => 返回 'T'
+        4 => 返回 'Z'
+        _ => 返回 '?'
+    }
+}
+
+函数 vma_权限字符串(vma) {
+    定义 可变 s = ""
+    s = s + (vma.标志 & VMA_READ ? "r" : "-")
+    s = s + (vma.标志 & VMA_WRITE ? "w" : "-")
+    s = s + (vma.标志 & VMA_EXEC ? "x" : "-")
+    s = s + (vma.标志 & VMA_SHARED ? "s" : "p")
+    返回 s
+}

@@ -1,0 +1,135 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+
+// §2 Path2D
+
+结构 PathCommand {
+    类型,    // u8 PATH_xxx
+    x1,    // i32 Q10
+    y1,
+    x2,
+    y2,
+    x3,    // i32 Nova三次方的第三控制点 / arc的radius
+    y3,
+    参数1,    // i32 arc: startAngle / ellipse: rotation
+    参数2,    // i32 arc: endAngle
+    参数3,    // i32 arc: counterclockwise / ellipse: radiusX
+}
+
+结构 Path2D {
+    命令,    // u64 PathCommand*数组
+    命令数,
+    命令容量,
+    // 当前点
+    当前X,    // i32 Q10
+    当前Y,
+    // 起始点(closePath用)
+    起始X,
+    起始Y,
+}
+
+
+函数 Path2D_创建() {
+    定义 p = 堆_分配(Path2D)
+    p.命令容量 = 256
+    p.命令 = 堆_分配_数组(256 * 大小of(PathCommand))
+    p.命令数 = 0
+    p.当前X = 0; p.当前Y = 0; p.起始X = 0; p.起始Y = 0
+    返回 p
+}
+
+函数 Path2D_添加命令(p, 类型, x1, y1, x2, y2, x3, y3) {
+    如果 (p == 0 || p.命令数 >= p.命令容量) { 返回 }
+    定义 cmd = p.命令 + p.命令数 * 大小of(PathCommand)
+    cmd.类型 = 类型; cmd.x1 = x1; cmd.y1 = y1
+    cmd.x2 = x2; cmd.y2 = y2; cmd.x3 = x3; cmd.y3 = y3
+    cmd.参数1 = 0; cmd.参数2 = 0; cmd.参数3 = 0
+    p.命令数 = p.命令数 + 1
+}
+
+函数 Path2D_moveTo(p, x, y) {
+    如果 (p == 0) { 返回 }
+    Path2D_添加命令(p, PATH_MOVE, x, y, 0, 0, 0, 0)
+    p.当前X = x; p.当前Y = y; p.起始X = x; p.起始Y = y
+}
+
+函数 Path2D_lineTo(p, x, y) {
+    如果 (p == 0) { 返回 }
+    Path2D_添加命令(p, PATH_LINE, x, y, 0, 0, 0, 0)
+    p.当前X = x; p.当前Y = y
+}
+
+函数 Path2D_quadraticCurveTo(p, cpx, cpy, x, y) {
+    如果 (p == 0) { 返回 }
+    Path2D_添加命令(p, PATH_QUAD, cpx, cpy, x, y, 0, 0)
+    p.当前X = x; p.当前Y = y
+}
+
+函数 Path2D_bezierCurveTo(p, cp1x, cp1y, cp2x, cp2y, x, y) {
+    如果 (p == 0) { 返回 }
+    Path2D_添加命令(p, PATH_Nova三次方, cp1x, cp1y, cp2x, cp2y, x, y)
+    p.当前X = x; p.当前Y = y
+}
+
+函数 Path2D_arc(p, cx, cy, radius, startAngle, endAngle, ccw) {
+    如果 (p == 0) { 返回 }
+    定义 cmd_idx = p.命令数
+    Path2D_添加命令(p, PATH_ARC, cx, cy, 0, 0, radius, 0)
+    如果 (cmd_idx < p.命令数) {
+        定义 cmd = p.命令 + cmd_idx * 大小of(PathCommand)
+        cmd.参数1 = startAngle; cmd.参数2 = endAngle; cmd.参数3 = ccw
+    }
+}
+
+函数 Path2D_ellipse(p, cx, cy, rx, ry, rotation, startAngle, endAngle, ccw) {
+    如果 (p == 0) { 返回 }
+    定义 cmd_idx = p.命令数
+    Path2D_添加命令(p, PATH_ELLIPSE, cx, cy, rx, ry, 0, 0)
+    如果 (cmd_idx < p.命令数) {
+        定义 cmd = p.命令 + cmd_idx * 大小of(PathCommand)
+        cmd.参数1 = rotation; cmd.参数2 = startAngle; cmd.参数3 = endAngle
+    }
+}
+
+函数 Path2D_rect(p, x, y, w, h) {
+    如果 (p == 0) { 返回 }
+    Path2D_moveTo(p, x, y)
+    Path2D_lineTo(p, x + w, y)
+    Path2D_lineTo(p, x + w, y + h)
+    Path2D_lineTo(p, x, y + h)
+    Path2D_closePath(p)
+}
+
+函数 Path2D_roundRect(p, x, y, w, h, radii) {
+    如果 (p == 0) { 返回 }
+    // 圆角矩形: 4个arc + 4条line
+    Path2D_moveTo(p, x + radii, y)
+    Path2D_lineTo(p, x + w - radii, y)
+    Path2D_arc(p, x + w - radii, y + radii, radii, -1571, 0, 假)    // -PI/2→0
+    Path2D_lineTo(p, x + w, y + h - radii)
+    Path2D_arc(p, x + w - radii, y + h - radii, radii, 0, 1571, 假)
+    Path2D_lineTo(p, x + radii, y + h)
+    Path2D_arc(p, x + radii, y + h - radii, radii, 1571, 3142, 假)
+    Path2D_lineTo(p, x, y + radii)
+    Path2D_arc(p, x + radii, y + radii, radii, 3142, -1571, 假)
+    Path2D_closePath(p)
+}
+
+函数 Path2D_closePath(p) {
+    如果 (p == 0) { 返回 }
+    Path2D_添加命令(p, PATH_CLOSE, p.起始X, p.起始Y, 0, 0, 0, 0)
+    p.当前X = p.起始X; p.当前Y = p.起始Y
+}
+
+函数 Path2D_addPath(dst, src) {
+    如果 (dst == 0 || src == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < src.命令数 && dst.命令数 < dst.命令容量) {
+        定义 s = src.命令 + i * 大小of(PathCommand)
+        定义 d = dst.命令 + dst.命令数 * 大小of(PathCommand)
+        内存_复制(d, s, 大小of(PathCommand))
+        dst.命令数 = dst.命令数 + 1
+        i = i + 1
+    }
+}

@@ -1,0 +1,102 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §3 渐变 (Gradient)
+
+结构 GradientStop {
+    偏移,    // i32 Q10 (0-1024)
+    颜色,    // u32 RGBA
+}
+
+结构 画布Gradient {
+    类型,    // u8 0=linear 1=radial 2=conic
+    // linear
+    x0,    // i32; y0: i32; x1: i32; y1: i32
+    // radial
+    r0,    // i32; r1: i32
+    // conic
+    startAngle,
+    // stops
+    stops,    // [16]GradientStop
+    stop数,
+}
+
+
+函数 画布_createLinearGradient(x0, y0, x1, y1) {
+    定义 g = 堆_分配(画布Gradient)
+    g.类型 = 0; g.x0 = x0; g.y0 = y0; g.x1 = x1; g.y1 = y1
+    g.stop数 = 0
+    返回 g
+}
+
+函数 画布_createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    定义 g = 堆_分配(画布Gradient)
+    g.类型 = 1; g.x0 = x0; g.y0 = y0; g.r0 = r0
+    g.x1 = x1; g.y1 = y1; g.r1 = r1; g.stop数 = 0
+    返回 g
+}
+
+函数 画布_createConicGradient(startAngle, cx, cy) {
+    定义 g = 堆_分配(画布Gradient)
+    g.类型 = 2; g.x0 = cx; g.y0 = cy; g.startAngle = startAngle
+    g.stop数 = 0
+    返回 g
+}
+
+函数 Gradient_addColorStop(g, offset, 颜色) {
+    如果 (g == 0 || g.stop数 >= 16) { 返回 }
+    g.stops[g.stop数].偏移 = offset
+    g.stops[g.stop数].颜色 = 颜色
+    g.stop数 = g.stop数 + 1
+}
+
+函数 Gradient_采样(g, t) {
+    如果 (g == 0 || g.stop数 == 0) { 返回 0xFF000000 }
+    如果 (g.stop数 == 1) { 返回 g.stops[0].颜色 }
+    // 查找t在哪两个stop之间
+    如果 (t <= g.stops[0].偏移) { 返回 g.stops[0].颜色 }
+    如果 (t >= g.stops[g.stop数 - 1].偏移) { 返回 g.stops[g.stop数 - 1].颜色 }
+    定义 可变 i = 0
+    当 (i < g.stop数 - 1) {
+        如果 (t >= g.stops[i].偏移 && t <= g.stops[i + 1].偏移) {
+            // 线性插值
+            定义 范围 = g.stops[i + 1].偏移 - g.stops[i].偏移
+            如果 (范围 == 0) { 返回 g.stops[i].颜色 }
+            定义 比例 = (t - g.stops[i].偏移) * 1024 / 范围
+            返回 颜色_插值(g.stops[i].颜色, g.stops[i + 1].颜色, 比例)
+        }
+        i = i + 1
+    }
+    返回 g.stops[0].颜色
+}
+
+函数 颜色_插值(c1, c2, t) {
+    // t: Q10 (0-1024)
+    定义 r1 = (c1 >> 16) & 0xFF; 定义 g1 = (c1 >> 8) & 0xFF
+    定义 b1 = c1 & 0xFF; 定义 a1 = (c1 >> 24) & 0xFF
+    定义 r2 = (c2 >> 16) & 0xFF; 定义 g2 = (c2 >> 8) & 0xFF
+    定义 b2 = c2 & 0xFF; 定义 a2 = (c2 >> 24) & 0xFF
+    定义 r = r1 + (r2 - r1) * t / 1024
+    定义 g = g1 + (g2 - g1) * t / 1024
+    定义 b = b1 + (b2 - b1) * t / 1024
+    定义 a = a1 + (a2 - a1) * t / 1024
+    返回 (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// §4 图案 (Pattern)
+
+结构 画布Pattern {
+    图像,    // u64 图像Bitmap* 或 画布*
+    重复X,
+    重复Y,
+    变换,    // [6]i32 2D仿射变换矩阵 Q10
+}
+
+函数 画布_createPattern(image, repetition) {
+    定义 p = 堆_分配(画布Pattern)
+    p.图像 = image
+    // repetition: "repeat" / "repeat-x" / "repeat-y" / "no-repeat"
+    p.重复X = 真; p.重复Y = 真    // 默认repeat
+    p.变换[0] = 1024; p.变换[3] = 1024    // 单位矩阵
+    返回 p
+}

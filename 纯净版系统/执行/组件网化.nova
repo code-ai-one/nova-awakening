@@ -1,0 +1,311 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("./节点操作.nova")
+导入("./标签处理.nova")
+导入("../中枢/整数转字符串.nova")
+
+// NovaOS 浏览器内核 · 第四层 · NovaGUI组件Web化适配
+// 对接L6 NovaGUI: 将NovaGUI组件映射为Web标准元素
+// 职责: 桌面/窗口/组件全基于Web标准渲染，双向桥接
+// 核心: NovaGUI组件 ↔ HTML/CSS/JS 双向映射
+
+定义 类型_容器 = "容器"
+定义 类型_文本 = "文本"
+定义 类型_按钮 = "按钮"
+定义 类型_输入 = "输入"
+定义 类型_图片 = "图片"
+定义 类型_列表 = "列表"
+定义 类型_滑块 = "滑块"
+
+结构 浏览器壳组件节点 {
+    ID,
+    类型,
+    标签,
+    x,
+    y,
+    宽,
+    高,
+    文本,
+}
+
+// NovaGUI组件 → HTML标签
+// 按钮 → <button>
+// 输入框 → <input>
+// 文本 → <span>/<p>
+// 容器 → <div>
+// 列表 → <ul>/<li>
+// 图片 → <img>
+// 滑块 → <input type="range">
+
+结构 组件映射 {
+    组件类型,
+    HTML标签,
+    CSS类名,
+    双向绑定,    // 布尔 是否支持双向数据绑定
+}
+
+结构 Web化桥接 {
+    映射表,    // [] 组件映射列表
+    活跃绑定,    // [] [NovaGUI元素ID, DOM节点ID] 列表
+    事件转发,    // [] [DOM事件, NovaGUI事件] 列表
+    样式缓存,    // [] 已转换的CSS缓存
+}
+
+定义 可变 Web化_桥接 = 空
+定义 可变 Web化_已初始化 = 假
+定义 可变 Web化_下一个组件ID = 1
+
+函数 元素_创建(类型, 标签, x, y, 宽, 高) {
+    定义 元素 = 浏览器壳组件节点 {}
+    元素.ID = Web化_下一个组件ID
+    Web化_下一个组件ID = Web化_下一个组件ID + 1
+    元素.类型 = 类型
+    元素.标签 = 标签
+    元素.x = x
+    元素.y = y
+    元素.宽 = 宽
+    元素.高 = 高
+    元素.文本 = ""
+    返回 元素
+}
+
+函数 元素_获取属性(元素, 键) {
+    如果 (元素 == 空) { 返回 "" }
+    如果 (键 == "文字") { 返回 元素.文本 }
+    如果 (键 == "背景色") { 返回 0 }
+    返回 ""
+}
+
+函数 元素_设置属性(元素, 键, 值) {
+    如果 (元素 == 空) { 返回 }
+    如果 (键 == "文字") {
+        元素.文本 = 值
+    }
+}
+
+函数 事件_触发(元素ID, 事件名, 数据) {
+    如果 (元素ID == 0 || 事件名 == 空) { 返回 }
+    定义 可变 i = 0
+    当 (i < 计数(Web化_桥接.事件转发)) {
+        定义 绑定 = Web化_桥接.事件转发[i]
+        如果 (绑定.元素ID == 元素ID 且 绑定.事件名 == 事件名) {
+            如果 (绑定.回调 != 空) {
+                绑定.回调(元素ID, 事件名, 数据)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §1 初始化 — 建立组件映射表
+
+函数 组件Web化_初始化() {
+    Web化_桥接 = Web化桥接 {}
+    Web化_桥接.映射表 = []
+    Web化_桥接.活跃绑定 = []
+    Web化_桥接.事件转发 = []
+    Web化_桥接.样式缓存 = []
+
+    // 注册NovaGUI→HTML映射
+    组件Web化_注册(类型_容器, "div", "nova-container", 假)
+    组件Web化_注册(类型_文本, "span", "nova-text", 假)
+    组件Web化_注册(类型_按钮, "button", "nova-button", 真)
+    组件Web化_注册(类型_输入, "input", "nova-input", 真)
+    组件Web化_注册(类型_图片, "img", "nova-image", 假)
+    组件Web化_注册(类型_列表, "ul", "nova-list", 假)
+    组件Web化_注册(类型_滑块, "input", "nova-slider", 真)
+
+    // 注册事件转发
+    组件Web化_注册事件("click", "点击")
+    组件Web化_注册事件("input", "输入变更")
+    组件Web化_注册事件("focus", "获焦")
+    组件Web化_注册事件("blur", "失焦")
+    组件Web化_注册事件("mouseover", "悬停")
+    组件Web化_注册事件("keydown", "按键按下")
+    组件Web化_注册事件("scroll", "滚动")
+
+    Web化_已初始化 = 真
+    内核信息("GUI组件Web化: 浏览器壳组件 ↔ HTML桥接就绪")
+}
+
+函数 组件Web化_注册(gui类型, html标签, css类, 双向) {
+    定义 映射 = 组件映射 {}
+    映射.组件类型 = gui类型
+    映射.HTML标签 = html标签
+    映射.CSS类名 = css类
+    映射.双向绑定 = 双向
+    追加(Web化_桥接.映射表, 映射)
+}
+
+函数 组件Web化_注册事件(dom事件, gui事件) {
+    追加(Web化_桥接.事件转发, [dom事件, gui事件])
+}
+
+// §2 NovaGUI元素 → DOM节点转换
+
+函数 组件Web化_元素转DOM(文档, gui元素) {
+    // 查找映射
+    定义 映射 = 组件Web化_查找映射(gui元素.类型)
+    如果 (映射 == 空) { 返回 空 }
+
+    // 创建DOM节点
+    定义 标签ID = DOM_标签名到ID(映射.HTML标签)
+    定义 节点 = DOM_创建节点(文档, 节点_元素, 映射.HTML标签, 标签ID)
+
+    // 设置class
+    DOM_设置属性(文档, 节点.ID, "class", 映射.CSS类名)
+
+    // 转换NovaGUI属性 → HTML属性
+    组件Web化_转换属性(文档, 节点, gui元素)
+
+    // 建立绑定
+    追加(Web化_桥接.活跃绑定, [gui元素.ID, 节点.ID])
+
+    返回 节点
+}
+
+函数 组件Web化_转换属性(文档, 节点, gui元素) {
+    // 背景色 → style.background-color
+    定义 背景色 = 元素_获取属性(gui元素, "背景色")
+    如果 (背景色 != 空 && 背景色 != 0) {
+        定义 颜色串 = 组件Web化_颜色转CSS(背景色)
+        定义 样式 = "background-color:" + 颜色串
+        DOM_设置属性(文档, 节点.ID, "style", 样式)
+    }
+
+    // 文字 → textContent / value
+    定义 文字 = 元素_获取属性(gui元素, "文字")
+    如果 (文字 != 空 && 字符串长度(文字) > 0) {
+        如果 (gui元素.类型 == 类型_输入) {
+            DOM_设置属性(文档, 节点.ID, "value", 文字)
+        } 否则 {
+            节点.文本内容 = 文字
+        }
+    }
+
+    // 位置和尺寸 → CSS
+    定义 可变 css = ""
+    如果 (gui元素.x > 0) { css = css + "left:" + 整数转字符串(gui元素.x) + "px;" }
+    如果 (gui元素.y > 0) { css = css + "top:" + 整数转字符串(gui元素.y) + "px;" }
+    如果 (gui元素.宽 > 0) { css = css + "width:" + 整数转字符串(gui元素.宽) + "px;" }
+    如果 (gui元素.高 > 0) { css = css + "height:" + 整数转字符串(gui元素.高) + "px;" }
+
+    如果 (字符串长度(css) > 0) {
+        定义 已有样式 = DOM_获取属性(文档, 节点.ID, "style")
+        DOM_设置属性(文档, 节点.ID, "style", 已有样式 + css)
+    }
+}
+
+函数 组件Web化_查找映射(gui类型) {
+    定义 可变 i = 0
+    当 (i < 计数(Web化_桥接.映射表)) {
+        如果 (Web化_桥接.映射表[i].组件类型 == gui类型) {
+            返回 Web化_桥接.映射表[i]
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+// §3 DOM节点 → NovaGUI元素转换 (反向)
+
+函数 组件Web化_DOM转元素(dom节点) {
+    // HTML标签 → NovaGUI类型
+    定义 gui类型 = 类型_容器   // 默认
+
+    如果 (dom节点.标签名 == "button") { gui类型 = 类型_按钮 }
+    否则 如果 (dom节点.标签名 == "input") { gui类型 = 类型_输入 }
+    否则 如果 (dom节点.标签名 == "span" || dom节点.标签名 == "p") { gui类型 = 类型_文本 }
+    否则 如果 (dom节点.标签名 == "img") { gui类型 = 类型_图片 }
+    否则 如果 (dom节点.标签名 == "ul" || dom节点.标签名 == "ol") { gui类型 = 类型_列表 }
+
+    定义 元素 = 元素_创建(gui类型, dom节点.标签名, 0, 0, 100, 30)
+
+    // 转换HTML属性 → NovaGUI属性
+    如果 (dom节点.文本内容 != "" && dom节点.文本内容 != 空) {
+        元素_设置属性(元素, "文字", dom节点.文本内容)
+    }
+
+    返回 元素
+}
+
+// §4 事件转发 — DOM事件 ↔ NovaGUI事件
+
+函数 组件Web化_转发DOM事件(dom事件名, dom节点ID) {
+    // 查找绑定关系
+    定义 gui元素ID = 组件Web化_查找GUI绑定(dom节点ID)
+    如果 (gui元素ID == 0) { 返回 }
+
+    // 查找事件映射
+    定义 可变 i = 0
+    当 (i < 计数(Web化_桥接.事件转发)) {
+        如果 (Web化_桥接.事件转发[i][0] == dom事件名) {
+            // 触发对应NovaGUI事件
+            事件_触发(gui元素ID, Web化_桥接.事件转发[i][1], 空)
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 组件Web化_查找GUI绑定(dom节点ID) {
+    定义 可变 i = 0
+    当 (i < 计数(Web化_桥接.活跃绑定)) {
+        如果 (Web化_桥接.活跃绑定[i][1] == dom节点ID) {
+            返回 Web化_桥接.活跃绑定[i][0]
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+// §5 NovaGUI主题 → CSS主题
+
+函数 组件Web化_生成主题CSS() {
+    定义 可变 css = ":root{\n"
+    css = css + "  --nova-bg-primary: #edf3fa;\n"
+    css = css + "  --nova-bg-surface: rgba(255,255,255,0.78);\n"
+    css = css + "  --nova-bg-input: rgba(255,255,255,0.82);\n"
+    css = css + "  --nova-text-primary: #10233f;\n"
+    css = css + "  --nova-text-secondary: #617894;\n"
+    css = css + "  --nova-accent: #60a5fa;\n"
+    css = css + "  --nova-success: #22c55e;\n"
+    css = css + "  --nova-warning: #f59e0b;\n"
+    css = css + "  --nova-error: #ef4444;\n"
+    css = css + "  --nova-radius: 14px;\n"
+    css = css + "  --nova-font: 'Nova Sans', system-ui, sans-serif;\n"
+    css = css + "}\n"
+    css = css + ".nova-button{background:linear-gradient(135deg,#ffffff,#dbeafe 52%,#ccfbf1);color:#133b69;border:1px solid rgba(191,219,254,0.92);border-radius:var(--nova-radius);padding:8px 16px;cursor:pointer;font-family:var(--nova-font);font-weight:700;box-shadow:0 12px 24px rgba(148,163,184,0.16)}\n"
+    css = css + ".nova-input{background:var(--nova-bg-input);color:var(--nova-text-primary);border:1px solid rgba(226,232,240,0.92);border-radius:var(--nova-radius);padding:8px 12px;font-family:var(--nova-font);box-shadow:inset 0 1px 0 rgba(255,255,255,0.96)}\n"
+    css = css + ".nova-container{display:flex;flex-direction:column}\n"
+    css = css + ".nova-text{color:var(--nova-text-primary);font-family:var(--nova-font)}\n"
+    返回 css
+}
+
+函数 组件Web化_颜色转CSS(颜色值) {
+    // u32颜色 → CSS hex
+    定义 r = (颜色值 >> 16) & 0xFF
+    定义 g = (颜色值 >> 8) & 0xFF
+    定义 b = 颜色值 & 0xFF
+    返回 "rgb(" + 整数转字符串(r) + "," + 整数转字符串(g) + "," + 整数转字符串(b) + ")"
+}
+
+函数 组件Web化_统计() {
+    返回 [计数(Web化_桥接.映射表), 计数(Web化_桥接.活跃绑定),
+          计数(Web化_桥接.事件转发)]
+}
+
+定义 可变 AI_组件网化_热节点缓存 = 0
+
+函数 AI_组件网化_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { AI_组件网化_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 AI_组件网化_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}

@@ -1,0 +1,249 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../执行/底层内存操.nova")
+导入("../中枢/字符串替换.nova")
+
+//       layout_grid.cc 
+//       grid_track_sizing_algorithm.cc (~2000行)
+//       grid_positioning.cc (~1000行)
+// CSS 网格: 二维网格布局系统
+//   display: grid;
+//   grid-template-columns: 1fr 2fr 200px;
+//   grid-template-rows: auto 1fr;
+//   grid-gap: 10px;
+//   grid-template-areas: "header header" "sidebar content";
+// 网格布局算法(CSS 网格 Level 1):
+//   1. 解析grid-template → 轨道定义
+//   2. 放置显式项 (grid-column/grid-row)
+//   3. 自动放置剩余项
+//   4. 轨道大小计算 (固定/fr/auto/minmax)
+//   5. 对齐 (justify-items/align-items/justify-content/align-content)
+
+// §1 网格轨道定义
+
+定义 轨道_固定   = 0     // 200px
+定义 轨道_百分比 = 1     // 50%
+定义 轨道_fr     = 2     // 1fr (弹性单位)
+定义 轨道_auto   = 3     // auto
+定义 轨道_minmax = 4     // minmax(min, max)
+定义 轨道_minContent = 5 // min-content
+定义 轨道_maxContent = 6 // max-content
+定义 轨道_fitContent = 7 // fit-content(limit)
+
+结构 网格TrackDef {
+    类型,    // u32 轨道_xxx
+    值,    // i32 固定值(×100) 或 fr值(×100)
+    最小值,    // i32 minmax的min
+    最大值,    // i32 minmax的max
+    最小类型,    // u32 minmax中min的类型
+    最大类型,    // u32 minmax中max的类型
+}
+
+结构 网格Track {
+    定义,    // u64 网格TrackDef*
+    基础大小,    // i32 计算后的实际大小(×100像素)
+    增长限制,    // i32 增长上限
+    自由空间份额,    // i32 fr分配的空间
+    是弹性,    // 布尔 是否是fr轨道
+}
+
+// §2 网格项放置
+
+结构 网格Item {
+    布局对象,    // u64 布局Object*
+    列起始,    // i32 grid-column-start (1-based, -1=auto)
+    列结束,    // i32 grid-column-end
+    行起始,    // i32 grid-row-start
+    行结束,    // i32 grid-row-end
+    列跨度,    // u32 跨几列
+    行跨度,    // u32 跨几行
+    // 命名区域
+    区域名,    // u64 grid-area名称
+}
+
+结构 网格布局 {
+    // 轨道定义
+    列轨道,    // u64 网格Track*数组
+    列数,
+    行轨道,    // u64 网格Track*数组
+    行数,
+    // 间距
+    列间距,    // i32 column-gap (×100)
+    行间距,    // i32 row-gap (×100)
+    // 项列表
+    项列表,    // u64 网格Item*数组
+    项数量,
+    项容量,
+    // 放置网格(占用标记)
+    占用网格,    // u64 bool二维数组[行][列]
+    占用列数,
+    占用行数,
+    // 命名区域
+    区域模板,    // u64 区域名→位置映射
+    区域数量,
+    // 对齐
+    justify_items,    // u32 0=stretch 1=start 2=end 3=center
+    align_items,
+    justify_content,
+    align_content,
+}
+
+
+函数 网格布局_创建(layout) {
+    定义 grid = 堆_分配(网格布局)
+    定义 style = layout.样式
+
+    // 解析grid-template-columns
+    grid.列轨道 = 堆_分配_数组(32 * 32)
+    grid.列数 = 0
+    如果 (style != 0 && style.grid_template_columns != 0) {
+        grid.列数 = 网格布局_解析轨道(style.grid_template_columns, grid.列轨道, layout.宽度)
+    }
+    如果 (grid.列数 == 0) { grid.列数 = 1 }    // 默认1列
+
+    // 解析grid-template-rows
+    grid.行轨道 = 堆_分配_数组(32 * 32)
+    grid.行数 = 0
+    如果 (style != 0 && style.grid_template_rows != 0) {
+        grid.行数 = 网格布局_解析轨道(style.grid_template_rows, grid.行轨道, layout.高度)
+    }
+
+    // 间距
+    grid.列间距 = 0; grid.行间距 = 0
+    如果 (style != 0) {
+        grid.列间距 = style.column_gap
+        grid.行间距 = style.row_gap
+    }
+
+    // 项列表
+    grid.项容量 = 64
+    grid.项列表 = 堆_分配_数组(grid.项容量 * 48)
+    grid.项数量 = 0
+
+    // 占用网格
+    grid.占用列数 = grid.列数
+    grid.占用行数 = 32    // 初始容量
+    grid.占用网格 = 堆_分配_数组(grid.占用行数 * grid.占用列数)
+    内存_清零(grid.占用网格, grid.占用行数 * grid.占用列数)
+
+    // 对齐
+    如果 (style != 0) {
+        grid.justify_items = style.justify_items
+        grid.align_items = style.align_items
+        grid.justify_content = style.justify_content
+        grid.align_content = style.align_content
+    }
+
+    返回 grid
+}
+
+函数 网格布局_解析轨道(轨道字符串, 轨道数组, 可用大小) {
+    // 解析 "1fr 2fr 200px auto minmax(100px, 1fr)"
+    如果 (轨道字符串 == 0) { 返回 0 }
+    定义 长度 = 字符串_长度(轨道字符串)
+    定义 可变 pos = 0
+    定义 可变 轨道数 = 0
+
+    当 (pos < 长度 && 轨道数 < 32) {
+        // 跳过空白
+        当 (pos < 长度 && 内存_读8(轨道字符串 + pos) == 0x20) { pos = pos + 1 }
+        如果 (pos >= 长度) { 跳出 }
+
+        定义 偏移 = 轨道数组 + 轨道数 * 32
+
+        定义 c = 内存_读8(轨道字符串 + pos)
+
+        // auto
+        如果 (c == 0x61 && pos + 4 <= 长度 && 字符串_等于N(轨道字符串 + pos, 4, "auto")) {
+            内存_写32(偏移, 轨道_auto)
+            内存_写32(偏移 + 4, 0)
+            pos = pos + 4
+            轨道数 = 轨道数 + 1
+            继续
+        }
+
+        // minmax(
+        如果 (c == 0x6D && pos + 7 <= 长度 && 字符串_等于N(轨道字符串 + pos, 7, "minmax(")) {
+            内存_写32(偏移, 轨道_minmax)
+            pos = pos + 7
+            // 解析min值
+            定义 min_val = 网格布局_解析单值(轨道字符串, 长度, pos)
+            内存_写32(偏移 + 8, min_val.值)
+            内存_写32(偏移 + 16, min_val.类型)
+            // 跳过逗号
+            当 (pos < 长度 && (内存_读8(轨道字符串 + pos) == 0x2C || 内存_读8(轨道字符串 + pos) == 0x20)) { pos = pos + 1 }
+            // 解析max值
+            定义 max_val = 网格布局_解析单值(轨道字符串, 长度, pos)
+            内存_写32(偏移 + 12, max_val.值)
+            内存_写32(偏移 + 20, max_val.类型)
+            // 跳过 )
+            当 (pos < 长度 && 内存_读8(轨道字符串 + pos) != 0x29) { pos = pos + 1 }
+            如果 (pos < 长度) { pos = pos + 1 }
+            轨道数 = 轨道数 + 1
+            继续
+        }
+
+        // 数字值(带单位): 200px / 50% / 1fr
+        定义 val = 网格布局_解析单值(轨道字符串, 长度, pos)
+        内存_写32(偏移, val.类型)
+        内存_写32(偏移 + 4, val.值)
+        // 跳过已解析的部分
+        当 (pos < 长度 && 内存_读8(轨道字符串 + pos) != 0x20) { pos = pos + 1 }
+        轨道数 = 轨道数 + 1
+    }
+
+    返回 轨道数
+}
+
+结构 网格TrackValue { 类型: u32, 值: i32 }
+
+函数 网格布局_解析单值(文本, 长度, pos) {
+    定义 v = 网格TrackValue {}
+    v.类型 = 轨道_auto; v.值 = 0
+
+    当 (pos < 长度 && 内存_读8(文本 + pos) == 0x20) { pos = pos + 1 }
+
+    定义 可变 数值 = 0
+    定义 可变 有数字 = 假
+    当 (pos < 长度 && ((内存_读8(文本 + pos) >= 0x30 && 内存_读8(文本 + pos) <= 0x39) || 内存_读8(文本 + pos) == 0x2E)) {
+        如果 (内存_读8(文本 + pos) != 0x2E) {
+            数值 = 数值 * 10 + (内存_读8(文本 + pos) - 0x30)
+            有数字 = 真
+        }
+        pos = pos + 1
+    }
+
+    如果 (!有数字) { 返回 v }
+
+    // 检查单位
+    如果 (pos + 1 < 长度 && 内存_读8(文本 + pos) == 0x66 && 内存_读8(文本 + pos + 1) == 0x72) {
+        // fr
+        v.类型 = 轨道_fr; v.值 = 数值 * 100; pos = pos + 2
+    }
+    否则 如果 (pos + 1 < 长度 && 内存_读8(文本 + pos) == 0x70 && 内存_读8(文本 + pos + 1) == 0x78) {
+        // px
+        v.类型 = 轨道_固定; v.值 = 数值 * 100; pos = pos + 2
+    }
+    否则 如果 (pos < 长度 && 内存_读8(文本 + pos) == 0x25) {
+        // %
+        v.类型 = 轨道_百分比; v.值 = 数值 * 100; pos = pos + 1
+    }
+    否则 {
+        v.类型 = 轨道_固定; v.值 = 数值 * 100
+    }
+    返回 v
+}
+
+定义 可变 AI_网格布局创_样式缓存命中 = 0
+
+函数 AI_网格布局创_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_网格布局创_布局缓存(元素哈希) {
+    AI_网格布局创_样式缓存命中 = AI_网格布局创_样式缓存命中 + 1
+    返回 元素哈希
+}

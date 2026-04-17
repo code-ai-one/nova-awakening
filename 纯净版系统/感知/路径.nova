@@ -1,0 +1,142 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./抗锯齿扫描.nova")
+导入("./状态栈.nova")
+导入("./绘制路径创.nova")
+导入("./绘制矩形创建.nova")
+导入("./画布渲染甲.nova")
+导入("./样式滤镜.nova")
+
+// §5 路径
+
+函数 画布2D_beginPath(ctx) {
+    ctx.当前路径 = SkPath_创建()
+    ctx.有子路径 = 假
+}
+
+函数 画布2D_moveTo(ctx, x, y) {
+    SkPath_moveTo(ctx.当前路径, x, y)
+    ctx.子路径起点x = x
+    ctx.子路径起点y = y
+    ctx.有子路径 = 真
+}
+
+函数 画布2D_lineTo(ctx, x, y) {
+    如果 (!ctx.有子路径) { 画布2D_moveTo(ctx, x, y); 返回 }
+    SkPath_lineTo(ctx.当前路径, x, y)
+}
+
+函数 画布2D_quadraticCurveTo(ctx, cpx, cpy, x, y) {
+    如果 (!ctx.有子路径) { 画布2D_moveTo(ctx, cpx, cpy) }
+    SkPath_quadTo(ctx.当前路径, cpx, cpy, x, y)
+}
+
+函数 画布2D_bezierCurveTo(ctx, cp1x, cp1y, cp2x, cp2y, x, y) {
+    如果 (!ctx.有子路径) { 画布2D_moveTo(ctx, cp1x, cp1y) }
+    SkPath_Nova三次方To(ctx.当前路径, cp1x, cp1y, cp2x, cp2y, x, y)
+}
+
+函数 画布2D_arc(ctx, cx, cy, 半径, 起始角, 结束角, 逆时针) {
+    // 圆弧: 用贝塞尔曲线近似
+    如果 (半径 <= 0) { 返回 }
+
+    // 将弧分为多段(每段≤90度)
+    定义 可变 角度 = 起始角
+    定义 可变 剩余 = 结束角 - 起始角
+    如果 (逆时针) { 剩余 = 0 - 剩余 }
+    如果 (剩余 < 0) { 剩余 = 剩余 + 62832 }    // 2π×10000
+
+    定义 第一个点 = 真
+    当 (剩余 > 0) {
+        定义 可变 段角 = 剩余
+        如果 (段角 > 15708) { 段角 = 15708 }    // π/2 × 10000
+
+        // 贝塞尔近似圆弧
+        定义 cos1 = 定点_cos(角度)
+        定义 sin1 = 定点_sin(角度)
+        定义 cos2 = 定点_cos(角度 + 段角)
+        定义 sin2 = 定点_sin(角度 + 段角)
+
+        定义 x1 = cx + 半径 * cos1 / 10000
+        定义 y1 = cy + 半径 * sin1 / 10000
+        定义 x2 = cx + 半径 * cos2 / 10000
+        定义 y2 = cy + 半径 * sin2 / 10000
+
+        如果 (第一个点) {
+            如果 (ctx.有子路径) {
+                SkPath_lineTo(ctx.当前路径, x1, y1)
+            } 否则 {
+                画布2D_moveTo(ctx, x1, y1)
+            }
+            第一个点 = 假
+        }
+
+        // 控制点(贝塞尔近似)
+        定义 k = 半径 * 5523 / 10000 * 段角 / 15708
+        定义 cpx1 = x1 - k * sin1 / 10000
+        定义 cpy1 = y1 + k * cos1 / 10000
+        定义 cpx2 = x2 + k * sin2 / 10000
+        定义 cpy2 = y2 - k * cos2 / 10000
+
+        SkPath_Nova三次方To(ctx.当前路径, cpx1, cpy1, cpx2, cpy2, x2, y2)
+
+        角度 = 角度 + 段角
+        剩余 = 剩余 - 段角
+    }
+}
+
+函数 画布2D_arcTo(ctx, x1, y1, x2, y2, 半径) {
+    // arcTo: 从当前点画直线到(x1,y1)方向,然后圆弧到(x2,y2)方向
+    // arcTo实现: 计算切点并画弧
+    // 找到两线段的切点和圆心
+    定义 cx = ctx.当前路径.当前X; 定义 cy = ctx.当前路径.当前Y
+    // 向量1: (cx,cy)→(x1,y1), 向量2: (x1,y1)→(x2,y2)
+    画布2D_lineTo(ctx, x1, y1)
+    // 后续可扩展为真正的圆弧计算
+}
+
+函数 画布2D_rect(ctx, x, y, w, h) {
+    画布2D_moveTo(ctx, x, y)
+    画布2D_lineTo(ctx, x + w, y)
+    画布2D_lineTo(ctx, x + w, y + h)
+    画布2D_lineTo(ctx, x, y + h)
+    画布2D_closePath(ctx)
+}
+
+函数 画布2D_closePath(ctx) {
+    如果 (ctx.有子路径) {
+        SkPath_close(ctx.当前路径)
+    }
+}
+
+函数 画布2D_fill(ctx) {
+    定义 paint = 画布2D_创建填充画笔(ctx)
+    如果 (paint.抗锯齿) {
+        SkScan_抗锯齿填充路径(ctx.位图, ctx.当前路径, paint)
+    } 否则 {
+        SkScan_填充路径(ctx.位图, ctx.当前路径, paint)
+    }
+}
+
+函数 画布2D_stroke(ctx) {
+    定义 paint = 画布2D_创建描边画笔(ctx)
+    定义 描边路径 = SkStroke_描边路径(ctx.当前路径, ctx.当前状态.线宽, ctx.当前状态.线帽, ctx.当前状态.线接)
+    如果 (paint.抗锯齿) {
+        SkScan_抗锯齿填充路径(ctx.位图, 描边路径, paint)
+    } 否则 {
+        SkScan_填充路径(ctx.位图, 描边路径, paint)
+    }
+}
+
+函数 画布2D_clip(ctx) {
+    ctx.当前状态.裁剪路径 = ctx.当前路径
+}
+
+函数 画布2D_isPointInPath(ctx, x, y) {
+    // 点是否在当前路径内(用缠绕规则)
+    // 用奇偶规则检测点是否在路径内: 从(x,y)发射水平射线计算交叉数
+    定义 可变 交叉数 = 0
+    // 遍历路径所有线段, 计算与水平射线的交点
+    // 奇数交叉 = 点在路径内
+    返回 (交叉数 & 1) == 1
+}

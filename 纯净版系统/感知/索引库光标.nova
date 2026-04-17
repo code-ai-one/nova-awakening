@@ -1,0 +1,174 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./索引库键范围.nova")
+导入("./索引库比较.nova")
+导入("./文档节点.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/辅助有符号读.nova")
+
+// §4 IDBCursor — 游标遍历
+
+定义 IDB_CURSOR_NEXT        = 0
+定义 IDB_CURSOR_NEXTUNIQUE  = 1
+定义 IDB_CURSOR_PREV        = 2
+定义 IDB_CURSOR_PREVUNIQUE  = 3
+
+结构 IDBCursor {
+    方向,    // u32 next/nextunique/prev/prevunique
+    源,    // u64 IDBObjectStore* 或 IDBIndex*
+    当前位置,    // i32 当前记录索引
+    键,    // u64 当前键
+    主键,    // u64 当前主键
+    值,    // u64 当前值
+    已完成,
+}
+
+函数 IDBObjectStore_openCursor(store, 范围, 方向) {
+    如果 (store == 0) { 返回 0 }
+
+    定义 cursor = 堆_分配(IDBCursor)
+    cursor.源 = store
+    cursor.方向 = 方向
+    cursor.已完成 = 假
+
+    如果 (方向 == IDB_CURSOR_PREV || 方向 == IDB_CURSOR_PREVUNIQUE) {
+        cursor.当前位置 = store.记录数量 - 1
+    } 否则 {
+        cursor.当前位置 = 0
+    }
+
+    // 定位到第一个匹配项
+    如果 (cursor.当前位置 >= 0 && cursor.当前位置 < store.记录数量) {
+        定义 偏移 = store.记录列表 + cursor.当前位置 * 16
+        cursor.键 = 内存_读64(偏移)
+        cursor.主键 = cursor.键
+        cursor.值 = 内存_读64(偏移 + 8)
+    } 否则 {
+        cursor.已完成 = 真
+    }
+
+    返回 cursor
+}
+
+函数 IDBCursor_continue(cursor) {
+    如果 (cursor == 0 || cursor.已完成) { 返回 }
+    定义 store = cursor.源
+
+    如果 (cursor.方向 == IDB_CURSOR_NEXT || cursor.方向 == IDB_CURSOR_NEXTUNIQUE) {
+        cursor.当前位置 = cursor.当前位置 + 1
+    } 否则 {
+        cursor.当前位置 = cursor.当前位置 - 1
+    }
+
+    如果 (cursor.当前位置 < 0 || cursor.当前位置 >= store.记录数量) {
+        cursor.已完成 = 真
+        cursor.键 = 0; cursor.值 = 0
+        返回
+    }
+
+    定义 偏移 = store.记录列表 + cursor.当前位置 * 16
+    cursor.键 = 内存_读64(偏移)
+    cursor.主键 = cursor.键
+    cursor.值 = 内存_读64(偏移 + 8)
+}
+
+函数 IDBCursor_advance(cursor, 步数) {
+    定义 可变 i = 0
+    当 (i < 步数 && !cursor.已完成) {
+        IDBCursor_continue(cursor)
+        i = i + 1
+    }
+}
+
+函数 IDBCursor_update(cursor, 新值) {
+    如果 (cursor == 0 || cursor.已完成) { 返回 0 }
+    定义 store = cursor.源
+    如果 (cursor.当前位置 >= 0 && cursor.当前位置 < store.记录数量) {
+        定义 偏移 = store.记录列表 + cursor.当前位置 * 16
+        内存_写64(偏移 + 8, 新值)
+        cursor.值 = 新值
+    }
+    返回 IDBRequest_创建_成功(cursor.键)
+}
+
+函数 IDBCursor_delete(cursor) {
+    如果 (cursor == 0 || cursor.已完成) { 返回 0 }
+    返回 IDBObjectStore_delete(cursor.源, cursor.键)
+}
+
+// §5 IDBIndex — 索引
+
+函数 IDBObjectStore_createIndex(store, 名称, 键路径, 选项) {
+    如果 (store == 0 || store.索引数量 >= store.索引容量) { 返回 0 }
+
+    定义 idx = 堆_分配(IDBIndex)
+    idx.名称 = 字符串_复制(名称)
+    idx.键路径 = 字符串_复制(键路径)
+    idx.唯一 = 假; idx.多值 = 假
+    如果 (选项 != 0) {
+        定义 u = Nova对象_获取属性(0, 选项, "unique")
+        如果 (u != 0) { idx.唯一 = JSValue_ToBoolean(0, u) }
+        定义 m = Nova对象_获取属性(0, 选项, "multiEntry")
+        如果 (m != 0) { idx.多值 = JSValue_ToBoolean(0, m) }
+    }
+    idx.条目容量 = 1024
+    idx.条目列表 = 堆_分配_数组(1024 * 16)
+    idx.条目数量 = 0
+    idx.对象存储 = store
+
+    // 对已有记录建立索引
+    定义 可变 i = 0
+    当 (i < store.记录数量) {
+        定义 偏移 = store.记录列表 + i * 16
+        定义 主键 = 内存_读64(偏移)
+        定义 值 = 内存_读64(偏移 + 8)
+        定义 索引键 = IDB_提取键(值, 键路径)
+        如果 (索引键 != 0 && idx.条目数量 < idx.条目容量) {
+            定义 e偏移 = idx.条目列表 + idx.条目数量 * 16
+            内存_写64(e偏移, 索引键)
+            内存_写64(e偏移 + 8, 主键)
+            idx.条目数量 = idx.条目数量 + 1
+        }
+        i = i + 1
+    }
+
+    内存_写64(store.索引列表 + store.索引数量 * 8, idx)
+    store.索引数量 = store.索引数量 + 1
+    返回 idx
+}
+
+函数 IDBIndex_get(idx, 键) {
+    如果 (idx == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < idx.条目数量) {
+        定义 偏移 = idx.条目列表 + i * 16
+        如果 (IDB_比较键(内存_读64(偏移), 键) == 0) {
+            定义 主键 = 内存_读64(偏移 + 8)
+            返回 IDBObjectStore_get(idx.对象存储, 主键)
+        }
+        i = i + 1
+    }
+    返回 IDBRequest_创建_成功(0)
+}
+
+函数 IDBIndex_getAll(idx, 查询, 限制) {
+    如果 (idx == 0) { 返回 [0, 0] }
+    定义 可变 max = 限制
+    如果 (max <= 0) { max = idx.条目数量 }
+    定义 结果 = 堆_分配_数组(max * 8)
+    定义 可变 计数 = 0
+    定义 可变 i = 0
+    当 (i < idx.条目数量 && 计数 < max) {
+        定义 偏移 = idx.条目列表 + i * 16
+        定义 主键 = 内存_读64(偏移 + 8)
+        定义 查找idx = IDBObjectStore_查找(idx.对象存储, 主键)
+        如果 (查找idx >= 0) {
+            定义 值 = 内存_读64(idx.对象存储.记录列表 + 查找idx * 16 + 8)
+            内存_写64(结果 + 计数 * 8, 值)
+            计数 = 计数 + 1
+        }
+        i = i + 1
+    }
+    返回 [结果, 计数]
+}

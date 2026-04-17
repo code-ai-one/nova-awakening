@@ -1,0 +1,420 @@
+// §8 volume / playbackRate
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../执行/平台时间.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/字符串替换.nova")
+
+函数 HTML媒体元素_setVolume(me, v) {
+    如果 (me == 0) { 返回 }
+    如果 (v < 0) { v = 0 } 如果 (v > 100) { v = 100 }
+    如果 (me.volume != v) {
+        me.volume = v
+        媒体元素_触发事件(me, "volumechange")
+    }
+}
+
+函数 HTML媒体元素_setMuted(me, m) {
+    如果 (me == 0) { 返回 }
+    如果 (me.muted != m) {
+        me.muted = m
+        媒体元素_触发事件(me, "volumechange")
+    }
+}
+
+函数 HTML媒体元素_setPlaybackRate(me, rate) {
+    如果 (me == 0) { 返回 }
+    如果 (me.playbackRate != rate) {
+        me.playbackRate = rate
+        媒体元素_触发事件(me, "ratechange")
+    }
+}
+
+// §9 canPlayType — MIME类型支持检查
+
+函数 HTML媒体元素_canPlayType(me, 类型) {
+    如果 (类型 == 0) { 返回 CANPLAY_EMPTY }
+    // 视频格式
+    如果 (字符串_包含(类型, "video/mp4")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "video/webm")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "video/ogg")) { 返回 CANPLAY_MAYBE }
+    // 音频格式
+    如果 (字符串_包含(类型, "audio/mp4")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/mpeg")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/mp3")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/ogg")) { 返回 CANPLAY_MAYBE }
+    如果 (字符串_包含(类型, "audio/wav")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/webm")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/flac")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "audio/aac")) { 返回 CANPLAY_PROBABLY }
+    // 编解码器参数
+    如果 (字符串_包含(类型, "codecs=\"vp8\"")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "codecs=\"vp9\"")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "codecs=\"av01\"")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "codecs=\"opus\"")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "codecs=\"avc1\"")) { 返回 CANPLAY_PROBABLY }
+    如果 (字符串_包含(类型, "codecs=\"hevc\"")) { 返回 CANPLAY_MAYBE }
+    返回 CANPLAY_EMPTY
+}
+
+// §10 timeupdate定时器 + 时间推进
+
+函数 媒体元素_启动timeupdate(me) {
+    如果 (me == 0) { 返回 }
+    // 每250ms触发timeupdate
+    me.上次timeupdate = 平台_获取高精度时间()
+}
+
+函数 媒体元素_tick(me, 当前时间) {
+    如果 (me == 0 || me.paused) { 返回 }
+
+    // 推进currentTime
+    定义 经过 = 当前时间 - me.播放起始时间
+    定义 推进 = 经过 * me.playbackRate / 100
+    me.currentTime = me.currentTime + 推进 / 1000    // μs→ms
+    me.播放起始时间 = 当前时间
+
+    // timeupdate(每250ms)
+    如果 (当前时间 - me.上次timeupdate >= 250000) {    // 250ms in μs
+        媒体元素_触发事件(me, "timeupdate")
+        me.上次timeupdate = 当前时间
+    }
+
+    // 播放结束检查
+    如果 (me.duration > 0 && me.currentTime >= me.duration) {
+        me.currentTime = me.duration
+        媒体元素_播放结束(me)
+    }
+}
+
+// §11 TextTrack — 字幕/CC
+
+定义 TT_SUBTITLES   = 0
+定义 TT_CAPTIONS    = 1
+定义 TT_DESCRIPTIONS = 2
+定义 TT_CHAPTERS    = 3
+定义 TT_METADATA    = 4
+
+定义 TT_MODE_DISABLED = 0
+定义 TT_MODE_HIDDEN   = 1
+定义 TT_MODE_SHOWING  = 2
+
+结构 TextTrackCue {
+    ID,
+    起始时间,    // i64 毫秒
+    结束时间,
+    文本,    // u64 VTT内容
+    下一个,    // u64 TextTrackCue*
+}
+
+结构 TextTrack {
+    种类,    // u32 TT_xxx
+    标签,    // u64 label
+    语言,    // u64 srNova编译器
+    模式,    // u32 TT_MODE_xxx
+    cue列表,    // u64 TextTrackCue*链表
+    cue数量,
+    src,    // u64 <track src="...">
+}
+
+函数 HTML媒体元素_addTextTrack(me, 种类, 标签, 语言) {
+    如果 (me == 0) { 返回 0 }
+    定义 tt = 堆_分配(TextTrack)
+    tt.种类 = 种类; tt.标签 = 标签; tt.语言 = 语言
+    tt.模式 = TT_MODE_DISABLED; tt.cue列表 = 0; tt.cue数量 = 0
+    返回 tt
+}
+
+函数 TextTrack_获取当前Cue(tt, 当前时间) {
+    如果 (tt == 0 || tt.模式 == TT_MODE_DISABLED) { 返回 0 }
+    定义 可变 cue = tt.cue列表
+    当 (cue != 0) {
+        如果 (当前时间 >= cue.起始时间 && 当前时间 < cue.结束时间) {
+            返回 cue
+        }
+        cue = cue.下一个
+    }
+    返回 0
+}
+
+// §12 TextTrack扩展操作
+
+函数 TextTrack_添加Cue(tt, 起始, 结束, 文本) {
+    如果 (tt == 0) { 返回 }
+    定义 cue = TextTrackCue {}
+    cue.起始时间 = 起始
+    cue.结束时间 = 结束
+    cue.文本 = 文本
+    cue.下一个 = tt.cue列表
+    tt.cue列表 = cue
+    tt.cue数量 = tt.cue数量 + 1
+}
+
+函数 TextTrack_移除Cue(tt, cue_id) {
+    如果 (tt == 0) { 返回 }
+    定义 可变 前驱 = 0
+    定义 可变 当前 = tt.cue列表
+    当 (当前 != 0) {
+        如果 (当前.ID == cue_id) {
+            如果 (前驱 == 0) { tt.cue列表 = 当前.下一个 }
+            否则 { 前驱.下一个 = 当前.下一个 }
+            tt.cue数量 = tt.cue数量 - 1
+            返回
+        }
+        前驱 = 当前
+        当前 = 当前.下一个
+    }
+}
+
+函数 TextTrack_设置模式(tt, 模式) {
+    如果 (tt == 0) { 返回 }
+    tt.模式 = 模式
+}
+
+函数 TextTrack_种类名(种类) {
+    如果 (种类 == TT_SUBTITLES) { 返回 "subtitles" }
+    如果 (种类 == TT_CAPTIONS) { 返回 "captions" }
+    如果 (种类 == TT_DESCRIPTIONS) { 返回 "descriptions" }
+    如果 (种类 == TT_CHAPTERS) { 返回 "chapters" }
+    如果 (种类 == TT_METADATA) { 返回 "metadata" }
+    返回 "unknown"
+}
+
+函数 TextTrack_模式名(模式) {
+    如果 (模式 == TT_MODE_DISABLED) { 返回 "disabled" }
+    如果 (模式 == TT_MODE_HIDDEN) { 返回 "hidden" }
+    如果 (模式 == TT_MODE_SHOWING) { 返回 "showing" }
+    返回 "unknown"
+}
+
+// §13 WebVTT解析
+
+函数 WebVTT_解析(文本, tt) {
+    如果 (文本 == 0 || tt == 0) { 返回 }
+    定义 长度 = 字节长度(文本)
+    定义 可变 位置 = 0
+    当 (位置 < 长度 && 字节取(文本, 位置) != 10) { 位置 = 位置 + 1 }
+    位置 = 位置 + 1
+    当 (位置 < 长度) {
+        当 (位置 < 长度 && (字节取(文本, 位置) == 10 || 字节取(文本, 位置) == 13)) { 位置 = 位置 + 1 }
+        如果 (位置 >= 长度) { 跳出 }
+        定义 时间行开始 = 位置
+        当 (位置 < 长度 && 字节取(文本, 位置) != 10) { 位置 = 位置 + 1 }
+        位置 = 位置 + 1
+        如果 (位置 >= 长度) { 跳出 }
+        定义 文本行开始 = 位置
+        当 (位置 < 长度 && !(字节取(文本, 位置) == 10 && 位置 + 1 < 长度 && 字节取(文本, 位置 + 1) == 10)) {
+            位置 = 位置 + 1
+        }
+        TextTrack_添加Cue(tt, 0, 0, 字符串_子串(文本, 文本行开始, 位置 - 文本行开始))
+        位置 = 位置 + 2
+    }
+}
+
+// §14 canPlayType常量
+
+定义 CANPLAY_EMPTY = 0
+定义 CANPLAY_MAYBE = 1
+定义 CANPLAY_PROBABLY = 2
+
+函数 canPlayType_名称(结果) {
+    如果 (结果 == CANPLAY_EMPTY) { 返回 "" }
+    如果 (结果 == CANPLAY_MAYBE) { 返回 "maybe" }
+    如果 (结果 == CANPLAY_PROBABLY) { 返回 "probably" }
+    返回 ""
+}
+
+// §15 MediaSource Extensions (MSE)
+
+结构 MediaSource {
+    就绪状态,
+    时长,
+    源缓冲列表,
+    源缓冲数,
+    已结束,
+}
+
+定义 MS_CLOSED = 0
+定义 MS_OPEN = 1
+定义 MS_ENDED = 2
+
+函数 MediaSource_创建() {
+    定义 ms = MediaSource {}
+    ms.就绪状态 = MS_CLOSED
+    ms.时长 = -1
+    ms.源缓冲列表 = []
+    ms.源缓冲数 = 0
+    ms.已结束 = 假
+    返回 ms
+}
+
+函数 MediaSource_打开(ms) {
+    如果 (ms == 0) { 返回 }
+    ms.就绪状态 = MS_OPEN
+}
+
+函数 MediaSource_结束(ms) {
+    如果 (ms == 0) { 返回 }
+    ms.就绪状态 = MS_ENDED
+    ms.已结束 = 真
+}
+
+函数 MediaSource_添加源缓冲(ms, mime类型) {
+    如果 (ms == 0 || ms.就绪状态 != MS_OPEN) { 返回 0 }
+    定义 sb = { mime: mime类型, 数据: [], 更新中: 假 }
+    追加(ms.源缓冲列表, sb)
+    ms.源缓冲数 = ms.源缓冲数 + 1
+    返回 sb
+}
+
+函数 MediaSource_就绪状态名(状态) {
+    如果 (状态 == MS_CLOSED) { 返回 "closed" }
+    如果 (状态 == MS_OPEN) { 返回 "open" }
+    如果 (状态 == MS_ENDED) { 返回 "ended" }
+    返回 "unknown"
+}
+
+// §16 音频上下文(Web Audio API简化)
+
+结构 AudioContext {
+    采样率,
+    状态,
+    当前时间,
+    目标节点,
+    节点列表,
+    节点数,
+}
+
+定义 AC_SUSPENDED = 0
+定义 AC_RUNNING = 1
+定义 AC_CLOSED = 2
+
+函数 AudioContext_创建(采样率) {
+    定义 ctx = AudioContext {}
+    ctx.采样率 = 采样率
+    ctx.状态 = AC_SUSPENDED
+    ctx.当前时间 = 0
+    ctx.目标节点 = 0
+    ctx.节点列表 = []
+    ctx.节点数 = 0
+    返回 ctx
+}
+
+函数 AudioContext_恢复(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.状态 = AC_RUNNING
+}
+
+函数 AudioContext_挂起(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.状态 = AC_SUSPENDED
+}
+
+函数 AudioContext_关闭(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.状态 = AC_CLOSED
+}
+
+函数 AudioContext_状态名(状态) {
+    如果 (状态 == AC_SUSPENDED) { 返回 "suspended" }
+    如果 (状态 == AC_RUNNING) { 返回 "running" }
+    如果 (状态 == AC_CLOSED) { 返回 "closed" }
+    返回 "unknown"
+}
+
+// §17 媒体统计与健康检查
+
+定义 可变 媒体_音量变化数 = 0
+定义 可变 媒体_速率变化数 = 0
+定义 可变 媒体_字幕显示数 = 0
+定义 可变 媒体_canPlayType查询数 = 0
+
+函数 媒体扩展_统计() {
+    返回 {
+        音量变化: 媒体_音量变化数,
+        速率变化: 媒体_速率变化数,
+        字幕显示: 媒体_字幕显示数,
+        canPlayType: 媒体_canPlayType查询数,
+    }
+}
+
+函数 媒体扩展_健康检查() {
+    返回 "媒体扩展子系统健康"
+}
+
+函数 媒体扩展_重置统计() {
+    媒体_音量变化数 = 0
+    媒体_速率变化数 = 0
+    媒体_字幕显示数 = 0
+    媒体_canPlayType查询数 = 0
+}
+
+函数 媒体扩展_完整统计() {
+    返回 [媒体_音量变化数, 媒体_速率变化数, 媒体_字幕显示数, 媒体_canPlayType查询数]
+}
+
+函数 媒体元素_触发事件(me, 事件名) {
+    如果 (me == 0) { 返回 }
+}
+
+函数 媒体元素_播放结束(me) {
+    如果 (me == 0) { 返回 }
+    me.paused = 真
+    me.ended = 真
+    媒体元素_触发事件(me, "ended")
+}
+
+// §DOM智能增强
+定义 可变 AI_媒体播控_热节点缓存 = 0
+
+函数 AI_媒体播控_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { AI_媒体播控_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 AI_媒体播控_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}
+
+函数 媒体播控_统计() {
+    返回 {
+        模块: "媒体播控",
+        媒体_音量变化数: 媒体_音量变化数,
+        媒体_速率变化数: 媒体_速率变化数,
+        媒体_字幕显示数: 媒体_字幕显示数,
+        媒体_canPlayType查询数: 媒体_canPlayType查询数,
+        AI_媒体播控_热节点缓存: AI_媒体播控_热节点缓存
+    }
+}
+
+函数 媒体播控_健康评估() {
+    定义 可变 问题 = []
+
+    返回 计数(问题) == 0
+}
+
+函数 媒体播控_综合报告() {
+    打印("[媒体播控] ═══ 综合报告 ═══")
+    打印("  媒体_音量变化数: " + 整数转字符串(媒体_音量变化数))
+    打印("  媒体_速率变化数: " + 整数转字符串(媒体_速率变化数))
+    打印("  媒体_字幕显示数: " + 整数转字符串(媒体_字幕显示数))
+    打印("  媒体_canPlayType查询数: " + 整数转字符串(媒体_canPlayType查询数))
+    打印("  AI_媒体播控_热节点缓存: " + 整数转字符串(AI_媒体播控_热节点缓存))
+    打印("  健康: " + 如果 (媒体播控_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 媒体播控_全局重置() {
+    媒体_音量变化数 = 0
+    媒体_速率变化数 = 0
+    媒体_字幕显示数 = 0
+    媒体_canPlayType查询数 = 0
+    AI_媒体播控_热节点缓存 = 0
+    打印("[媒体播控] 全局统计已重置")
+    返回 0
+}

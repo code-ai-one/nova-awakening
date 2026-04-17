@@ -1,0 +1,123 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./引擎复位与.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/高级中控设置.nova")
+导入("./初始化.nova")
+导入("../中枢/虚分配.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §3 完整图处型号数据库
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NV_识别完整型号(gpu) {
+    定义 did = gpu.设备ID
+
+    如果 (did == 0x2684) { gpu.型号名 = "RTX 4090"; NV状态.SM数 = 128; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 384; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2702) { gpu.型号名 = "RTX 4080 SUPER"; NV状态.SM数 = 80; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2704) { gpu.型号名 = "RTX 4080"; NV状态.SM数 = 76; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2782) { gpu.型号名 = "RTX 4070 Ti SUPER"; NV状态.SM数 = 66; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2786) { gpu.型号名 = "RTX 4070 Ti"; NV状态.SM数 = 60; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2783) { gpu.型号名 = "RTX 4070 SUPER"; NV状态.SM数 = 56; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2786) { gpu.型号名 = "RTX 4070"; NV状态.SM数 = 46; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2803) { gpu.型号名 = "RTX 4060 Ti"; NV状态.SM数 = 34; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 128; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2882) { gpu.型号名 = "RTX 4060"; NV状态.SM数 = 24; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 128; NV状态.架构代 = NV_ARCH_ADA }
+
+    否则如果 (did >= 0x2900 && did <= 0x29FF) {
+        gpu.型号名 = "RTX 50系列"
+        NV状态.架构代 = NV_ARCH_BLACKWELL
+        NV状态.显存类型 = "GDDR7"
+        NV状态.显存总线宽 = 256
+        NV状态.SM数 = 170  // 估算
+    }
+
+    否则如果 (did == 0x2204) { gpu.型号名 = "RTX 3090"; NV状态.SM数 = 82; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 384; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x2206) { gpu.型号名 = "RTX 3080"; NV状态.SM数 = 68; NV状态.显存类型 = "GDDR6X"; NV状态.显存总线宽 = 320; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x2484) { gpu.型号名 = "RTX 3070"; NV状态.SM数 = 46; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x2504) { gpu.型号名 = "RTX 3060 Ti"; NV状态.SM数 = 38; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x2544) { gpu.型号名 = "RTX 3060"; NV状态.SM数 = 28; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_AMPERE }
+
+    否则如果 (did == 0x1E04) { gpu.型号名 = "RTX 2080 Ti"; NV状态.SM数 = 68; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 352; NV状态.架构代 = NV_ARCH_TURING }
+    否则如果 (did == 0x1E82) { gpu.型号名 = "RTX 2080"; NV状态.SM数 = 46; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_TURING }
+    否则如果 (did == 0x1F02) { gpu.型号名 = "RTX 2070"; NV状态.SM数 = 36; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_TURING }
+    否则如果 (did == 0x1F82) { gpu.型号名 = "RTX 2060"; NV状态.SM数 = 30; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_TURING }
+    // GTX 16系列 (Turing, 无RT/Tensor Core)
+    否则如果 (did == 0x2182) { gpu.型号名 = "GTX 1660 Ti"; NV状态.SM数 = 24; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_TURING }
+    否则如果 (did == 0x2184) { gpu.型号名 = "GTX 1660"; NV状态.SM数 = 22; NV状态.显存类型 = "GDDR5"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_TURING }
+
+    否则如果 (did == 0x1B80) { gpu.型号名 = "GTX 1080"; NV状态.SM数 = 20; NV状态.显存类型 = "GDDR5X"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_PASCAL }
+    否则如果 (did == 0x1B81) { gpu.型号名 = "GTX 1070"; NV状态.SM数 = 15; NV状态.显存类型 = "GDDR5"; NV状态.显存总线宽 = 256; NV状态.架构代 = NV_ARCH_PASCAL }
+    否则如果 (did == 0x1C81) { gpu.型号名 = "GTX 1060"; NV状态.SM数 = 10; NV状态.显存类型 = "GDDR5"; NV状态.显存总线宽 = 192; NV状态.架构代 = NV_ARCH_PASCAL }
+    否则如果 (did == 0x1C82) { gpu.型号名 = "GTX 1050 Ti"; NV状态.SM数 = 6; NV状态.显存类型 = "GDDR5"; NV状态.显存总线宽 = 128; NV状态.架构代 = NV_ARCH_PASCAL }
+
+    否则如果 (did == 0x2330) { gpu.型号名 = "H100 SXM"; NV状态.SM数 = 132; NV状态.显存类型 = "HBM3"; NV状态.显存总线宽 = 5120; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x2331) { gpu.型号名 = "H100 PCIe"; NV状态.SM数 = 114; NV状态.显存类型 = "HBM3"; NV状态.显存总线宽 = 5120; NV状态.架构代 = NV_ARCH_ADA }
+    否则如果 (did == 0x20B0) { gpu.型号名 = "A100 SXM"; NV状态.SM数 = 108; NV状态.显存类型 = "HBM2e"; NV状态.显存总线宽 = 5120; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x20B5) { gpu.型号名 = "A100 PCIe"; NV状态.SM数 = 108; NV状态.显存类型 = "HBM2e"; NV状态.显存总线宽 = 5120; NV状态.架构代 = NV_ARCH_AMPERE }
+    否则如果 (did == 0x26B5) { gpu.型号名 = "L40"; NV状态.SM数 = 142; NV状态.显存类型 = "GDDR6"; NV状态.显存总线宽 = 384; NV状态.架构代 = NV_ARCH_ADA }
+
+    否则 {
+        gpu.型号名 = "NVIDIA 图处(0x" + 整数转十六进制(did) + ")"
+        NV状态.架构代 = NV_ARCH_TURING  // 默认假设
+        NV状态.SM数 = 0
+    }
+
+    // 计算能力标志
+    gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_COMPUTE | 图处_CAP_DISPLAY | 图处_CAP_VULKAN
+    如果 (NV状态.架构代 >= NV_ARCH_VOLTA) {
+        gpu.能力 = gpu.能力 | 图处_CAP_智能_ACCEL     // Tensor Core
+    }
+    如果 (NV状态.架构代 >= NV_ARCH_TURING) {
+        gpu.能力 = gpu.能力 | 图处_CAP_RAY_TRACE    // RT Core
+    }
+    gpu.能力 = gpu.能力 | 图处_CAP_VIDEO_DECODE | 图处_CAP_VIDEO_ENCODE
+    gpu.计算单元数 = NV状态.SM数
+}
+
+// §4 完整图处初始化序列
+
+函数 NV_初始化(gpu) {
+    内核信息("NV驱动: 初始化 " + gpu.型号名 + " (" + NV状态.显存类型 + ")")
+
+    // 步骤1: 映射BAR0 MMIO
+    NV状态.mmio = ioremap(gpu.BAR0_地址, gpu.BAR0_大小)
+    如果 (NV状态.mmio == 0) {
+        内核错误("NV驱动: BAR0映射失败")
+        返回 错误_IO
+    }
+    NV状态.gpu = gpu
+
+    // 步骤2: 读取BOOT_0确认芯片
+    NV状态.芯片ID = MMIO读32(NV状态.mmio + NV_PMC_BOOT_0)
+    内核信息("NV驱动: BOOT_0=0x" + 整数转十六进制(NV状态.芯片ID))
+
+    // 步骤3: 引擎复位
+    NV_引擎复位()
+
+    // 步骤4: 使能所有引擎
+    NV_引擎使能()
+
+    // 步骤5: 初始化PTIMER
+    NV_PTIMER_初始化()
+
+    // 步骤6: 探测图处拓扑(GPC/TPC/SM)
+    NV_探测拓扑()
+
+    // 步骤7: 初始化PFIFO(命令通道)
+    NV_PFIFO_初始化()
+
+    // 步骤8: 初始化PGRAPH
+    NV_PGRAPH_初始化()
+
+    // 步骤9: 初始化显示引擎
+    NV_PDISPLAY_初始化()
+
+    // 步骤10: 配置中断
+    NV_中断初始化()
+
+    NV状态.已初始化 = 真
+    内核信息("NV驱动: " + gpu.型号名 + " 就绪 SM=" +
+             整数转字符串(NV状态.SM数) + " GPC=" + 整数转字符串(NV状态.GPC数) +
+             " " + NV状态.显存类型 + "/" + 整数转字符串(NV状态.显存总线宽) + "bit")
+    返回 成功
+}

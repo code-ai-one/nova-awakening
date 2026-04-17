@@ -1,0 +1,1034 @@
+// 4. 玻璃桌面图标 (逐行渐变: 上亮下暗 + 高光顶线)
+// 图标基色RGB分量 (用于计算渐变)
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../推理/值乘.nova")
+导入("./端口输入.nova")
+
+定义 图标R = [59, 16, 139, 245, 239]
+定义 图标G = [130, 185, 92, 158, 68]
+定义 图标B = [246, 129, 246, 11, 68]
+定义 可变 ic = 0
+当 (ic < 5) {
+    定义 ic_r = 图标R[ic]
+    定义 ic_g = 图标G[ic]
+    定义 ic_b = 图标B[ic]
+    定义 ic_top = 48 + ic * 90
+    定义 可变 iy = 0
+    当 (iy < 46) {
+        定义 ig_t = iy * 256 / 46
+        // 上亮下暗: 顶部加40亮度, 底部减20
+        定义 可变 pr = ic_r + (256 - ig_t) * 40 / 256 - ig_t * 20 / 256
+        定义 可变 pg = ic_g + (256 - ig_t) * 40 / 256 - ig_t * 20 / 256
+        定义 可变 pb = ic_b + (256 - ig_t) * 40 / 256 - ig_t * 20 / 256
+        如果 (pr > 255) { pr = 255 }
+        如果 (pg > 255) { pg = 255 }
+        如果 (pb > 255) { pb = 255 }
+        如果 (pr < 0) { pr = 0 }
+        如果 (pg < 0) { pg = 0 }
+        如果 (pb < 0) { pb = 0 }
+        定义 ic_col = pr * 65536 + pg * 256 + pb
+        // 高光顶线
+        如果 (iy == 0) { ic_col = (pr + 60) * 65536 + (pg + 60) * 256 + (pb + 60) }
+        定义 可变 ix = 0
+        当 (ix < 46) {
+            内存写32(LFB + (ic_top + iy) * 行字节 + (22 + ix) * 4, ic_col)
+            ix = ix + 1
+        }
+        iy = iy + 1
+    }
+    // 阴影(底部2行右侧2列)
+    定义 可变 sh_i = 0
+    当 (sh_i < 46) {
+        内存写32(LFB + (ic_top + 46) * 行字节 + (24 + sh_i) * 4, 0x00040408)
+        内存写32(LFB + (ic_top + 47) * 行字节 + (25 + sh_i) * 4, 0x00020204)
+        sh_i = sh_i + 1
+    }
+    // 图标内简笔符号(白色, 居中)
+    定义 图标符 = [70, 62, 123, 35, 42]  // F > { # *
+    定义 ic_ch = (图标符[ic] - 32) * 8
+    如果 (ic_ch >= 0 && ic_ch < 760) {
+        定义 可变 icr = 0
+        当 (icr < 8) {
+            定义 icrd = 字体[ic_ch + icr]
+            定义 可变 icb = 0
+            当 (icb < 8) {
+                如果 ((icrd >> (7 - icb)) & 1) {
+                    内存写32(LFB + (ic_top + 19 + icr) * 行字节 + (37 + icb) * 4, 0x00FFFFFF)
+                }
+                icb = icb + 1
+            }
+            icr = icr + 1
+        }
+    }
+    ic = ic + 1
+}
+// 桌面图标标签文字
+定义 图标名0 = [70,105,108,101,115]       // "Files"
+定义 图标名1 = [84,101,114,109]           // "Term"
+定义 图标名2 = [67,111,100,101]           // "Code"
+定义 图标名3 = [77,117,115,105,99]       // "Music"
+定义 图标名4 = [83,101,116,117,112]       // "Setup"
+定义 图标名长 = [5, 4, 4, 5, 5]
+定义 图标名列 = [图标名0, 图标名1, 图标名2, 图标名3, 图标名4]
+
+定义 可变 ln = 0
+当 (ln < 5) {
+    定义 当前名 = 图标名列[ln]
+    定义 名长 = 图标名长[ln]
+    定义 lbl_y = 55 + ln * 90 + 48
+    定义 可变 lc = 0
+    当 (lc < 名长) {
+        定义 lci = (当前名[lc] - 32) * 8
+        如果 (lci >= 0 && lci < 760) {
+            定义 可变 lr = 0
+            当 (lr < 8) {
+                定义 lrd = 字体[lci + lr]
+                定义 可变 lb2 = 0
+                当 (lb2 < 8) {
+                    如果 ((lrd >> (7 - lb2)) & 1) {
+                        内存写32(LFB + (lbl_y + lr) * 行字节 + (22 + lc * 9 + lb2) * 4, 0x00C0C0C0)
+                    }
+                    lb2 = lb2 + 1
+                }
+                lr = lr + 1
+            }
+        }
+        lc = lc + 1
+    }
+    ln = ln + 1
+}
+打印("[渲染] 壁纸+系统栏+任务栏+图标+标签 OK")
+
+// 5. AI对话窗口 — 阴影 + 玻璃渐变 + 高光边框
+
+// NGIR理论: Nova Glass Icon Rendering
+// 核心创新:
+//  1) 玻璃介质散射模型(简化): C_out = α*C_icon + (1-α)*C_bg + S_spec
+//  2) 双层高光边界: 顶部冷高光 + 边缘漫反射
+//  3) AI自适应布局: 使用视觉拥挤度/语义分组预测最优位置
+//  4) 动态呼吸动画: 帧相位驱动亮度扰动, 避免静态机械感
+
+定义 NGIR_MAX_ICONS = 128
+定义 NGIR_MAX_LABEL = 64
+定义 NGIR_GRID_COLS = 10
+定义 NGIR_GRID_ROWS = 8
+定义 NGIR_CELL_W = 96
+定义 NGIR_CELL_H = 96
+定义 NGIR_ICON_W = 46
+定义 NGIR_ICON_H = 46
+定义 NGIR_GLOW_RADIUS = 6
+定义 NGIR_SHADOW_OFFSET_X = 2
+定义 NGIR_SHADOW_OFFSET_Y = 2
+定义 NGIR_SELECTION_PAD = 4
+定义 NGIR_CACHE_MAX = 256
+
+定义 可变 NGIR_图标总数 = 0
+定义 可变 NGIR_渲染帧数 = 0
+定义 可变 NGIR_AI布局次数 = 0
+定义 可变 NGIR_重排次数 = 0
+定义 可变 NGIR_命中测试次数 = 0
+定义 可变 NGIR_缓存命中 = 0
+定义 可变 NGIR_缓存未命中 = 0
+
+结构 NGIR颜色 {
+    r,
+    g,
+    b,
+    a,
+}
+
+结构 NGIR图标 {
+    id,
+    名称,
+    名称长度,
+    符号码,
+    x,
+    y,
+    w,
+    h,
+    网格列,
+    网格行,
+    选中,
+    悬停,
+    可见,
+    可拖拽,
+    基色R,
+    基色G,
+    基色B,
+    强调R,
+    强调G,
+    强调B,
+    阴影强度,
+    高光强度,
+    呼吸相位,
+    标签颜色,
+    哈希,
+    图片路径,
+    图片纹理,
+}
+
+定义 图标图片_文件 = "../资源/图标/图标_文件.png"
+定义 图标图片_终端 = "../资源/图标/图标_终端.png"
+定义 图标图片_代码 = "../资源/图标/图标_代码.png"
+定义 图标图片_音乐 = "../资源/图标/图标_音乐.png"
+定义 图标图片_设置 = "../资源/图标/图标_设置.png"
+定义 图标图片_笔记 = "../资源/图标/图标_笔记.png"
+定义 图标图片_浏览 = "../资源/图标/图标_浏览.png"
+定义 图标图片_AI   = "../资源/图标/图标_AI.png"
+
+结构 NGIR主题 {
+    名称,
+    背景暗度,
+    玻璃透明度,
+    高光强度,
+    阴影强度,
+    标签亮度,
+    边框亮度,
+    冷色偏移,
+    暖色偏移,
+}
+
+结构 NGIR动画状态 {
+    时间毫秒,
+    全局相位,
+    鼠标x,
+    鼠标y,
+    鼠标按下,
+    最近点击图标,
+}
+
+结构 NGIR布局统计 {
+    拥挤度,
+    对齐分,
+    语义分组分,
+    可达性分,
+    总评分,
+}
+
+定义 可变 NGIR_图标池 = 0
+定义 可变 NGIR_当前主题 = 0
+定义 可变 NGIR_动画 = 0
+定义 可变 NGIR_布局表 = 0
+
+// § 工具函数
+
+函数 NGIR_夹取(v, lo, hi) {
+    如果 (v < lo) { 返回 lo }
+    如果 (v > hi) { 返回 hi }
+    返回 v
+}
+
+函数 NGIR_颜色打包(r, g, b) {
+    r = NGIR_夹取(r, 0, 255)
+    g = NGIR_夹取(g, 0, 255)
+    b = NGIR_夹取(b, 0, 255)
+    返回 r * 65536 + g * 256 + b
+}
+
+函数 NGIR_颜色混合(c0, c1, t256) {
+    定义 r0 = (c0 >> 16) & 255
+    定义 g0 = (c0 >> 8) & 255
+    定义 b0 = c0 & 255
+    定义 r1 = (c1 >> 16) & 255
+    定义 g1 = (c1 >> 8) & 255
+    定义 b1 = c1 & 255
+    定义 r = r0 + (r1 - r0) * t256 / 256
+    定义 g = g0 + (g1 - g0) * t256 / 256
+    定义 b = b0 + (b1 - b0) * t256 / 256
+    返回 NGIR_颜色打包(r, g, b)
+}
+
+函数 NGIR_像素写(LFB, 行字节, x, y, col) {
+    如果 (x < 0 || y < 0) { 返回 }
+    内存写32(LFB + y * 行字节 + x * 4, col)
+}
+
+函数 NGIR_矩形填充(LFB, 行字节, x, y, w, h, col) {
+    定义 可变 yy = 0
+    当 (yy < h) {
+        定义 可变 xx = 0
+        当 (xx < w) {
+            NGIR_像素写(LFB, 行字节, x + xx, y + yy, col)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+函数 NGIR_带边框矩形(LFB, 行字节, x, y, w, h, fill, border) {
+    NGIR_矩形填充(LFB, 行字节, x, y, w, h, fill)
+    定义 可变 i = 0
+    当 (i < w) {
+        NGIR_像素写(LFB, 行字节, x + i, y, border)
+        NGIR_像素写(LFB, 行字节, x + i, y + h - 1, border)
+        i = i + 1
+    }
+    i = 0
+    当 (i < h) {
+        NGIR_像素写(LFB, 行字节, x, y + i, border)
+        NGIR_像素写(LFB, 行字节, x + w - 1, y + i, border)
+        i = i + 1
+    }
+}
+
+函数 NGIR_圆角遮罩(x, y, w, h, r) {
+    // 返回1表示在圆角矩形内
+    如果 (x >= r && x < w - r) { 返回 1 }
+    如果 (y >= r && y < h - r) { 返回 1 }
+    定义 cx = 如果(x < r, r, w - r - 1)
+    定义 cy = 如果(y < r, r, h - r - 1)
+    定义 dx = x - cx
+    定义 dy = y - cy
+    如果 (dx * dx + dy * dy <= r * r) { 返回 1 }
+    返回 0
+}
+
+函数 NGIR_绘制圆角玻璃(LFB, 行字节, x, y, w, h, r, base_r, base_g, base_b, alpha256, 主题) {
+    定义 可变 yy = 0
+    当 (yy < h) {
+        定义 t = yy * 256 / h
+        // 上亮下暗 + 冷暖偏移
+        定义 top_r = base_r + 40 + 主题.冷色偏移
+        定义 top_g = base_g + 35
+        定义 top_b = base_b + 48 + 主题.冷色偏移
+        定义 bot_r = base_r - 24 + 主题.暖色偏移
+        定义 bot_g = base_g - 22 + 主题.暖色偏移
+        定义 bot_b = base_b - 18
+        定义 row_r = top_r + (bot_r - top_r) * t / 256
+        定义 row_g = top_g + (bot_g - top_g) * t / 256
+        定义 row_b = top_b + (bot_b - top_b) * t / 256
+        row_r = NGIR_夹取(row_r, 0, 255)
+        row_g = NGIR_夹取(row_g, 0, 255)
+        row_b = NGIR_夹取(row_b, 0, 255)
+        定义 row_col = NGIR_颜色打包(row_r, row_g, row_b)
+        定义 可变 xx = 0
+        当 (xx < w) {
+            如果 (NGIR_圆角遮罩(xx, yy, w, h, r) == 1) {
+                // 读取背景并alpha混合
+                定义 bg = 内存读32(LFB + (y + yy) * 行字节 + (x + xx) * 4)
+                定义 mix = NGIR_颜色混合(bg, row_col, alpha256)
+                NGIR_像素写(LFB, 行字节, x + xx, y + yy, mix)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+函数 NGIR_绘制高光顶线(LFB, 行字节, x, y, w, r, 强度) {
+    定义 可变 i = 0
+    当 (i < w) {
+        // 中心更亮,边缘衰减
+        定义 d = i - w / 2
+        如果 (d < 0) { d = 0 - d }
+        定义 fall = 256 - d * 256 / (w / 2 + 1)
+        fall = NGIR_夹取(fall, 0, 256)
+        定义 add = 强度 * fall / 256
+        定义 col = NGIR_颜色打包(180 + add, 220 + add / 2, 255)
+        如果 (NGIR_圆角遮罩(i, 0, w, 1 + r, r) == 1) {
+            NGIR_像素写(LFB, 行字节, x + i, y, col)
+        }
+        i = i + 1
+    }
+}
+
+函数 NGIR_绘制底部阴影(LFB, 行字节, x, y, w, h, 强度) {
+    定义 col1 = NGIR_颜色打包(强度, 强度, 强度 * 2)
+    定义 col2 = NGIR_颜色打包(强度 / 2, 强度 / 2, 强度)
+    定义 可变 i = 0
+    当 (i < w) {
+        NGIR_像素写(LFB, 行字节, x + NGIR_SHADOW_OFFSET_X + i, y + h + NGIR_SHADOW_OFFSET_Y, col1)
+        NGIR_像素写(LFB, 行字节, x + NGIR_SHADOW_OFFSET_X + 1 + i, y + h + NGIR_SHADOW_OFFSET_Y + 1, col2)
+        i = i + 1
+    }
+}
+
+函数 NGIR_绘制内符号(LFB, 行字节, x, y, 码, 字体, col) {
+    定义 fi = (码 - 32) * 8
+    如果 (fi < 0 || fi >= 760) { 返回 }
+    定义 可变 r = 0
+    当 (r < 8) {
+        定义 row = 字体[fi + r]
+        定义 可变 b = 0
+        当 (b < 8) {
+            如果 ((row >> (7 - b)) & 1) {
+                NGIR_像素写(LFB, 行字节, x + b, y + r, col)
+            }
+            b = b + 1
+        }
+        r = r + 1
+    }
+}
+
+函数 NGIR_绘制标签(LFB, 行字节, x, y, 文本, 长度, 字体, 主色, 阴影色) {
+    定义 可变 c = 0
+    当 (c < 长度) {
+        定义 fi = (文本[c] - 32) * 8
+        如果 (fi >= 0 && fi < 760) {
+            定义 可变 r = 0
+            当 (r < 8) {
+                定义 row = 字体[fi + r]
+                定义 可变 b = 0
+                当 (b < 8) {
+                    如果 ((row >> (7 - b)) & 1) {
+                        // 阴影
+                        NGIR_像素写(LFB, 行字节, x + c * 9 + b + 1, y + r + 1, 阴影色)
+                        // 主色
+                        NGIR_像素写(LFB, 行字节, x + c * 9 + b, y + r, 主色)
+                    }
+                    b = b + 1
+                }
+                r = r + 1
+            }
+        }
+        c = c + 1
+    }
+}
+
+// § 图标池与主题初始化
+
+函数 NGIR_创建主题_默认() {
+    定义 t = 堆分配(NGIR主题)
+    t.名称 = "NovaGlassDefault"
+    t.背景暗度 = 24
+    t.玻璃透明度 = 180
+    t.高光强度 = 52
+    t.阴影强度 = 8
+    t.标签亮度 = 208
+    t.边框亮度 = 188
+    t.冷色偏移 = 10
+    t.暖色偏移 = -4
+    返回 t
+}
+
+函数 NGIR_创建主题_夜间() {
+    定义 t = 堆分配(NGIR主题)
+    t.名称 = "NovaGlassNight"
+    t.背景暗度 = 42
+    t.玻璃透明度 = 164
+    t.高光强度 = 38
+    t.阴影强度 = 12
+    t.标签亮度 = 188
+    t.边框亮度 = 158
+    t.冷色偏移 = 4
+    t.暖色偏移 = -12
+    返回 t
+}
+
+函数 NGIR_图标哈希(名称, 长度) {
+    定义 可变 h = 2166136261
+    定义 可变 i = 0
+    当 (i < 长度) {
+        h = h ^ 名称[i]
+        h = h * 16777619
+        i = i + 1
+    }
+    返回 h & 0x7FFFFFFF
+}
+
+函数 NGIR_创建图标(id, 名称, 长度, 符号码, 网格列, 网格行, r, g, b) {
+    定义 ic = 堆分配(NGIR图标)
+    ic.id = id
+    ic.名称 = 名称
+    ic.名称长度 = 长度
+    ic.符号码 = 符号码
+    ic.网格列 = 网格列
+    ic.网格行 = 网格行
+    ic.x = 22 + 网格列 * NGIR_CELL_W
+    ic.y = 48 + 网格行 * NGIR_CELL_H
+    ic.w = NGIR_ICON_W
+    ic.h = NGIR_ICON_H
+    ic.选中 = 假
+    ic.悬停 = 假
+    ic.可见 = 真
+    ic.可拖拽 = 真
+    ic.基色R = r
+    ic.基色G = g
+    ic.基色B = b
+    ic.强调R = NGIR_夹取(r + 40, 0, 255)
+    ic.强调G = NGIR_夹取(g + 40, 0, 255)
+    ic.强调B = NGIR_夹取(b + 40, 0, 255)
+    ic.阴影强度 = 8
+    ic.高光强度 = 48
+    ic.呼吸相位 = (id * 47) & 255
+    ic.标签颜色 = NGIR_颜色打包(216, 180, 254)
+    ic.哈希 = NGIR_图标哈希(名称, 长度)
+    ic.图片路径 = 0
+    ic.图片纹理 = 0
+    返回 ic
+}
+
+函数 NGIR_设图标图片(ic, 路径) {
+    如果 (ic == 0) { 返回 }
+    ic.图片路径 = 路径
+    // 紫金主题色覆盖
+    ic.基色R = 88
+    ic.基色G = 28
+    ic.基色B = 135
+}
+
+函数 NGIR_初始化图标池() {
+    NGIR_图标池 = 堆分配(NGIR_MAX_ICONS * 8)
+    NGIR_图标总数 = 0
+
+    定义 名0 = [70,105,108,101,115]            // Files
+    定义 名1 = [84,101,114,109]                // Term
+    定义 名2 = [67,111,100,101]                // Code
+    定义 名3 = [77,117,115,105,99]            // Music
+    定义 名4 = [83,101,116,117,112]            // Setup
+    定义 名5 = [78,111,116,101]                // Note
+    定义 名6 = [87,101,98]                     // Web
+    定义 名7 = [65,73]                         // AI
+
+    定义 ic0 = NGIR_创建图标(0, 名0, 5, 70, 0, 0, 88, 28, 135)
+    NGIR_设图标图片(ic0, 图标图片_文件)
+    NGIR_注册图标(ic0)
+    定义 ic1 = NGIR_创建图标(1, 名1, 4, 62, 0, 1, 88, 28, 135)
+    NGIR_设图标图片(ic1, 图标图片_终端)
+    NGIR_注册图标(ic1)
+    定义 ic2 = NGIR_创建图标(2, 名2, 4, 123, 0, 2, 88, 28, 135)
+    NGIR_设图标图片(ic2, 图标图片_代码)
+    NGIR_注册图标(ic2)
+    定义 ic3 = NGIR_创建图标(3, 名3, 5, 35, 0, 3, 88, 28, 135)
+    NGIR_设图标图片(ic3, 图标图片_音乐)
+    NGIR_注册图标(ic3)
+    定义 ic4 = NGIR_创建图标(4, 名4, 5, 42, 0, 4, 88, 28, 135)
+    NGIR_设图标图片(ic4, 图标图片_设置)
+    NGIR_注册图标(ic4)
+    定义 ic5 = NGIR_创建图标(5, 名5, 4, 78, 1, 0, 88, 28, 135)
+    NGIR_设图标图片(ic5, 图标图片_笔记)
+    NGIR_注册图标(ic5)
+    定义 ic6 = NGIR_创建图标(6, 名6, 3, 87, 1, 1, 88, 28, 135)
+    NGIR_设图标图片(ic6, 图标图片_浏览)
+    NGIR_注册图标(ic6)
+    定义 ic7 = NGIR_创建图标(7, 名7, 2, 65, 1, 2, 88, 28, 135)
+    NGIR_设图标图片(ic7, 图标图片_AI)
+    NGIR_注册图标(ic7)
+}
+
+函数 NGIR_注册图标(icon) {
+    如果 (icon == 0) { 返回 }
+    如果 (NGIR_图标总数 >= NGIR_MAX_ICONS) { 返回 }
+    内存写64(NGIR_图标池 + NGIR_图标总数 * 8, icon)
+    NGIR_图标总数 = NGIR_图标总数 + 1
+}
+
+函数 NGIR_获取图标(i) {
+    如果 (i < 0 || i >= NGIR_图标总数) { 返回 0 }
+    返回 内存读64(NGIR_图标池 + i * 8)
+}
+
+函数 NGIR_初始化动画() {
+    NGIR_动画 = 堆分配(NGIR动画状态)
+    NGIR_动画.时间毫秒 = 0
+    NGIR_动画.全局相位 = 0
+    NGIR_动画.鼠标x = 0
+    NGIR_动画.鼠标y = 0
+    NGIR_动画.鼠标按下 = 假
+    NGIR_动画.最近点击图标 = -1
+}
+
+函数 NGIR_初始化() {
+    NGIR_当前主题 = NGIR_创建主题_默认()
+    NGIR_初始化图标池()
+    NGIR_初始化动画()
+    NGIR_布局表 = 堆分配(NGIR_GRID_COLS * NGIR_GRID_ROWS * 4)
+    定义 可变 i = 0
+    当 (i < NGIR_GRID_COLS * NGIR_GRID_ROWS) {
+        内存写32(NGIR_布局表 + i * 4, -1)
+        i = i + 1
+    }
+    NGIR_重建布局表()
+    打印("[NGIR] Glass Icon Rendering 初始化完成")
+}
+
+// § 布局系统
+
+函数 NGIR_网格索引(c, r) {
+    如果 (c < 0 || c >= NGIR_GRID_COLS || r < 0 || r >= NGIR_GRID_ROWS) { 返回 -1 }
+    返回 r * NGIR_GRID_COLS + c
+}
+
+函数 NGIR_重建布局表() {
+    定义 可变 i = 0
+    当 (i < NGIR_GRID_COLS * NGIR_GRID_ROWS) {
+        内存写32(NGIR_布局表 + i * 4, -1)
+        i = i + 1
+    }
+    i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0 && ic.可见) {
+            定义 idx = NGIR_网格索引(ic.网格列, ic.网格行)
+            如果 (idx >= 0) { 内存写32(NGIR_布局表 + idx * 4, i) }
+        }
+        i = i + 1
+    }
+}
+
+函数 NGIR_寻找空网格() {
+    定义 可变 r = 0
+    当 (r < NGIR_GRID_ROWS) {
+        定义 可变 c = 0
+        当 (c < NGIR_GRID_COLS) {
+            定义 idx = NGIR_网格索引(c, r)
+            如果 (idx >= 0 && 内存读32(NGIR_布局表 + idx * 4) < 0) {
+                返回 idx
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    返回 -1
+}
+
+函数 NGIR_碰撞修复() {
+    // 解决多个图标占同网格的冲突
+    定义 可变 i = 0
+    定义 可变 冲突数 = 0
+    NGIR_重建布局表()
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0 && ic.可见) {
+            定义 idx = NGIR_网格索引(ic.网格列, ic.网格行)
+            如果 (idx >= 0) {
+                定义 owner = 内存读32(NGIR_布局表 + idx * 4)
+                如果 (owner != i && owner >= 0) {
+                    定义 free = NGIR_寻找空网格()
+                    如果 (free >= 0) {
+                        ic.网格列 = free % NGIR_GRID_COLS
+                        ic.网格行 = free / NGIR_GRID_COLS
+                        ic.x = 22 + ic.网格列 * NGIR_CELL_W
+                        ic.y = 48 + ic.网格行 * NGIR_CELL_H
+                        冲突数 = 冲突数 + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    如果 (冲突数 > 0) {
+        NGIR_重排次数 = NGIR_重排次数 + 冲突数
+        NGIR_重建布局表()
+    }
+}
+
+函数 NGIR_命中测试(x, y) {
+    NGIR_命中测试次数 = NGIR_命中测试次数 + 1
+    定义 可变 i = NGIR_图标总数 - 1
+    当 (i >= 0) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0 && ic.可见) {
+            如果 (x >= ic.x && x < ic.x + ic.w && y >= ic.y && y < ic.y + ic.h + 18) {
+                返回 i
+            }
+        }
+        i = i - 1
+    }
+    返回 -1
+}
+
+函数 NGIR_更新悬停(mx, my) {
+    定义 idx = NGIR_命中测试(mx, my)
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0) {
+            ic.悬停 = (i == idx)
+        }
+        i = i + 1
+    }
+}
+
+函数 NGIR_点击(mx, my) {
+    定义 idx = NGIR_命中测试(mx, my)
+    NGIR_动画.最近点击图标 = idx
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0) {
+            ic.选中 = (i == idx)
+        }
+        i = i + 1
+    }
+}
+
+// § AI布局优化 (NGIR-AI)
+
+函数 NGIR_布局统计计算() {
+    定义 st = 堆分配(NGIR布局统计)
+    st.拥挤度 = 0
+    st.对齐分 = 0
+    st.语义分组分 = 0
+    st.可达性分 = 0
+    st.总评分 = 0
+
+    // 拥挤度: 平均相邻距离越小越拥挤
+    定义 可变 pairs = 0
+    定义 可变 dist_sum = 0
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 a = NGIR_获取图标(i)
+        定义 可变 j = i + 1
+        当 (j < NGIR_图标总数) {
+            定义 b = NGIR_获取图标(j)
+            定义 dx = a.x - b.x
+            定义 dy = a.y - b.y
+            如果 (dx < 0) { dx = 0 - dx }
+            如果 (dy < 0) { dy = 0 - dy }
+            dist_sum = dist_sum + dx + dy
+            pairs = pairs + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    如果 (pairs > 0) {
+        定义 avg = dist_sum / pairs
+        st.拥挤度 = 1.0 - NGIR_夹取(avg, 0, 800) / 800.0
+    }
+
+    // 对齐分: 行列对齐程度
+    定义 可变 aligned = 0
+    i = 0
+    当 (i < NGIR_图标总数) {
+        定义 a = NGIR_获取图标(i)
+        如果 ((a.x - 22) % NGIR_CELL_W == 0 && (a.y - 48) % NGIR_CELL_H == 0) {
+            aligned = aligned + 1
+        }
+        i = i + 1
+    }
+    st.对齐分 = aligned / 如果(NGIR_图标总数 > 0, NGIR_图标总数, 1)
+
+    // 语义分组分(简化): 根据哈希前缀靠近
+    定义 可变 group_good = 0
+    pairs = 0
+    i = 0
+    当 (i < NGIR_图标总数) {
+        定义 a = NGIR_获取图标(i)
+        定义 可变 j2 = i + 1
+        当 (j2 < NGIR_图标总数) {
+            定义 b = NGIR_获取图标(j2)
+            定义 ga = (a.哈希 >> 8) & 15
+            定义 gb = (b.哈希 >> 8) & 15
+            如果 (ga == gb) {
+                定义 md = a.x - b.x; 如果 (md < 0) { md = 0 - md }
+                md = md + 如果(a.y > b.y, a.y - b.y, b.y - a.y)
+                如果 (md < NGIR_CELL_W * 2) { group_good = group_good + 1 }
+            }
+            pairs = pairs + 1
+            j2 = j2 + 1
+        }
+        i = i + 1
+    }
+    st.语义分组分 = group_good / 如果(pairs > 0, pairs, 1)
+
+    // 可达性分: 左上优先,减少鼠标移动
+    定义 可变 access = 0
+    i = 0
+    当 (i < NGIR_图标总数) {
+        定义 a2 = NGIR_获取图标(i)
+        access = access + (1000 - NGIR_夹取(a2.x + a2.y, 0, 1000))
+        i = i + 1
+    }
+    st.可达性分 = access / 如果(NGIR_图标总数 > 0, NGIR_图标总数 * 1000, 1)
+
+    st.总评分 = st.对齐分 * 0.35 + st.语义分组分 * 0.3 + st.可达性分 * 0.2 + (1.0 - st.拥挤度) * 0.15
+    返回 st
+}
+
+函数 NGIR_AI_布局优化() {
+    如果 (全局AI总线 == 0) { 返回 }
+    NGIR_AI布局次数 = NGIR_AI布局次数 + 1
+    定义 st = NGIR_布局统计计算()
+    定义 tensor = Tensor_创建(6)
+    Tensor_写(tensor, 0, st.拥挤度)
+    Tensor_写(tensor, 1, st.对齐分)
+    Tensor_写(tensor, 2, st.语义分组分)
+    Tensor_写(tensor, 3, st.可达性分)
+    Tensor_写(tensor, 4, st.总评分)
+    Tensor_写(tensor, 5, NGIR_图标总数 / 64.0)
+    定义 out = AI总线_推理(全局AI总线, "NGIR_布局优化", tensor, 6)
+    定义 moveBias = 0
+    定义 clusterBias = 0
+    如果 (out != 0) {
+        moveBias = Tensor_读(out, 0)   // -1..1
+        clusterBias = Tensor_读(out, 1)
+        Tensor_释放(out)
+    }
+    Tensor_释放(tensor)
+
+    // 根据AI建议微调
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0) {
+            如果 (moveBias > 0.2 && ic.网格列 < NGIR_GRID_COLS - 1) { ic.网格列 = ic.网格列 + 1 }
+            如果 (moveBias < -0.2 && ic.网格列 > 0) { ic.网格列 = ic.网格列 - 1 }
+            如果 (clusterBias > 0.3 && ic.网格行 > 0) { ic.网格行 = ic.网格行 - 1 }
+            ic.x = 22 + ic.网格列 * NGIR_CELL_W
+            ic.y = 48 + ic.网格行 * NGIR_CELL_H
+        }
+        i = i + 1
+    }
+    NGIR_碰撞修复()
+}
+
+// § 动画系统
+
+函数 NGIR_更新动画(delta_ms) {
+    NGIR_动画.时间毫秒 = NGIR_动画.时间毫秒 + delta_ms
+    NGIR_动画.全局相位 = (NGIR_动画.全局相位 + delta_ms) & 1023
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        如果 (ic != 0) {
+            ic.呼吸相位 = (ic.呼吸相位 + delta_ms + i * 3) & 1023
+            如果 (ic.悬停) {
+                ic.高光强度 = NGIR_夹取(ic.高光强度 + 2, 32, 96)
+            } 否则 {
+                ic.高光强度 = NGIR_夹取(ic.高光强度 - 1, 28, 64)
+            }
+            如果 (ic.选中) {
+                ic.阴影强度 = NGIR_夹取(ic.阴影强度 + 1, 8, 20)
+            } 否则 {
+                ic.阴影强度 = NGIR_夹取(ic.阴影强度 - 1, 6, 12)
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 NGIR_呼吸亮度(phase) {
+    // 三角波近似sin
+    定义 p = phase & 511
+    定义 v = 如果(p < 256, p, 511 - p)
+    返回 (v - 128) / 8   // -16..15
+}
+
+// § 渲染主流程
+
+函数 NGIR_渲染单图标(LFB, 行字节, ic, 字体) {
+    如果 (ic == 0 || !ic.可见) { 返回 }
+    定义 pulse = NGIR_呼吸亮度(ic.呼吸相位)
+    定义 br = NGIR_夹取(ic.基色R + pulse, 0, 255)
+    定义 bg = NGIR_夹取(ic.基色G + pulse, 0, 255)
+    定义 bb = NGIR_夹取(ic.基色B + pulse, 0, 255)
+
+    // 选中背景
+    如果 (ic.选中) {
+        定义 sel_fill = NGIR_颜色打包(80, 130, 220)
+        定义 sel_border = NGIR_颜色打包(160, 210, 255)
+        NGIR_带边框矩形(
+            LFB, 行字节,
+            ic.x - NGIR_SELECTION_PAD,
+            ic.y - NGIR_SELECTION_PAD,
+            ic.w + NGIR_SELECTION_PAD * 2,
+            ic.h + 18 + NGIR_SELECTION_PAD * 2,
+            sel_fill,
+            sel_border
+        )
+    }
+
+    // 阴影
+    NGIR_绘制底部阴影(LFB, 行字节, ic.x, ic.y, ic.w, ic.h, ic.阴影强度 + NGIR_当前主题.阴影强度)
+
+    // 玻璃主体
+    定义 alpha = NGIR_当前主题.玻璃透明度
+    如果 (ic.悬停) { alpha = NGIR_夹取(alpha + 24, 0, 255) }
+    NGIR_绘制圆角玻璃(LFB, 行字节, ic.x, ic.y, ic.w, ic.h, 6, br, bg, bb, alpha, NGIR_当前主题)
+
+    // 顶部高光
+    NGIR_绘制高光顶线(LFB, 行字节, ic.x, ic.y, ic.w, 6, ic.高光强度 + NGIR_当前主题.高光强度)
+
+    // 内符号
+    定义 glyph_col = NGIR_颜色打包(255, 255, 255)
+    NGIR_绘制内符号(LFB, 行字节, ic.x + 15, ic.y + 18, ic.符号码, 字体, glyph_col)
+
+    // 标签
+    定义 label_main = NGIR_颜色打包(NGIR_当前主题.标签亮度, NGIR_当前主题.标签亮度, NGIR_当前主题.标签亮度)
+    定义 label_shadow = NGIR_颜色打包(8, 8, 12)
+    NGIR_绘制标签(LFB, 行字节, ic.x, ic.y + ic.h + 4, ic.名称, ic.名称长度, 字体, label_main, label_shadow)
+}
+
+函数 NGIR_渲染全部图标(LFB, 行字节, 字体) {
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        NGIR_渲染单图标(LFB, 行字节, ic, 字体)
+        i = i + 1
+    }
+}
+
+函数 NGIR_切换主题(夜间模式) {
+    如果 (NGIR_当前主题 != 0) { 堆释放(NGIR_当前主题) }
+    如果 (夜间模式) { NGIR_当前主题 = NGIR_创建主题_夜间() }
+    否则 { NGIR_当前主题 = NGIR_创建主题_默认() }
+}
+
+函数 NGIR_帧更新并渲染(LFB, 行字节, 字体, delta_ms, mx, my, 鼠标按下) {
+    NGIR_渲染帧数 = NGIR_渲染帧数 + 1
+    NGIR_动画.鼠标x = mx
+    NGIR_动画.鼠标y = my
+    NGIR_动画.鼠标按下 = 鼠标按下
+
+    NGIR_更新悬停(mx, my)
+    如果 (鼠标按下) {
+        NGIR_点击(mx, my)
+    }
+    NGIR_更新动画(delta_ms)
+
+    // 每120帧执行一次AI布局微调
+    如果 ((NGIR_渲染帧数 % 120) == 0) {
+        NGIR_AI_布局优化()
+    }
+
+    NGIR_渲染全部图标(LFB, 行字节, 字体)
+}
+
+// § 拖拽与持久化布局
+
+函数 NGIR_拖拽开始(mx, my) {
+    定义 idx = NGIR_命中测试(mx, my)
+    NGIR_动画.最近点击图标 = idx
+}
+
+函数 NGIR_拖拽移动(mx, my) {
+    定义 idx = NGIR_动画.最近点击图标
+    如果 (idx < 0) { 返回 }
+    定义 ic = NGIR_获取图标(idx)
+    如果 (ic == 0 || !ic.可拖拽) { 返回 }
+    ic.x = mx - ic.w / 2
+    ic.y = my - ic.h / 2
+    // 预估网格
+    定义 c = (ic.x - 22 + NGIR_CELL_W / 2) / NGIR_CELL_W
+    定义 r = (ic.y - 48 + NGIR_CELL_H / 2) / NGIR_CELL_H
+    ic.网格列 = NGIR_夹取(c, 0, NGIR_GRID_COLS - 1)
+    ic.网格行 = NGIR_夹取(r, 0, NGIR_GRID_ROWS - 1)
+}
+
+函数 NGIR_拖拽结束() {
+    定义 idx = NGIR_动画.最近点击图标
+    如果 (idx < 0) { 返回 }
+    定义 ic = NGIR_获取图标(idx)
+    如果 (ic != 0) {
+        ic.x = 22 + ic.网格列 * NGIR_CELL_W
+        ic.y = 48 + ic.网格行 * NGIR_CELL_H
+    }
+    NGIR_碰撞修复()
+    NGIR_保存布局()
+}
+
+函数 NGIR_保存布局() {
+    // 简化: 写入内核配置缓冲 (伪接口)
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        平台写配置("desktop.icon." + i + ".col", ic.网格列)
+        平台写配置("desktop.icon." + i + ".row", ic.网格行)
+        i = i + 1
+    }
+}
+
+函数 NGIR_加载布局() {
+    定义 可变 i = 0
+    当 (i < NGIR_图标总数) {
+        定义 ic = NGIR_获取图标(i)
+        定义 c = 平台读配置("desktop.icon." + i + ".col", ic.网格列)
+        定义 r = 平台读配置("desktop.icon." + i + ".row", ic.网格行)
+        ic.网格列 = NGIR_夹取(c, 0, NGIR_GRID_COLS - 1)
+        ic.网格行 = NGIR_夹取(r, 0, NGIR_GRID_ROWS - 1)
+        ic.x = 22 + ic.网格列 * NGIR_CELL_W
+        ic.y = 48 + ic.网格行 * NGIR_CELL_H
+        i = i + 1
+    }
+    NGIR_碰撞修复()
+}
+
+// § 缓存与性能监控
+
+结构 NGIR缓存项 {
+    键,
+    值,
+    命中数,
+    最后帧,
+}
+
+定义 可变 NGIR_缓存池 = 0
+定义 可变 NGIR_缓存数 = 0
+
+函数 NGIR_缓存初始化() {
+    NGIR_缓存池 = 堆分配(NGIR_CACHE_MAX * 24)
+    NGIR_缓存数 = 0
+}
+
+函数 NGIR_缓存查询(key) {
+    定义 可变 i = 0
+    当 (i < NGIR_缓存数) {
+        定义 item = NGIR_缓存池 + i * 24
+        如果 (内存读32(item) == key) {
+            内存写32(item + 8, 内存读32(item + 8) + 1) // 命中数
+            内存写32(item + 12, NGIR_渲染帧数)         // 最后帧
+            NGIR_缓存命中 = NGIR_缓存命中 + 1
+            返回 内存读64(item + 4)
+        }
+        i = i + 1
+    }
+    NGIR_缓存未命中 = NGIR_缓存未命中 + 1
+    返回 0
+}
+
+函数 NGIR_缓存写入(key, value) {
+    如果 (NGIR_缓存数 >= NGIR_CACHE_MAX) {
+        // LRU淘汰(简化:淘汰最早帧)
+        定义 可变 oldest_i = 0
+        定义 可变 oldest_f = 内存读32(NGIR_缓存池 + 12)
+        定义 可变 i = 1
+        当 (i < NGIR_缓存数) {
+            定义 f = 内存读32(NGIR_缓存池 + i * 24 + 12)
+            如果 (f < oldest_f) { oldest_f = f; oldest_i = i }
+            i = i + 1
+        }
+        定义 item0 = NGIR_缓存池 + oldest_i * 24
+        内存写32(item0, key)
+        内存写64(item0 + 4, value)
+        内存写32(item0 + 8, 1)
+        内存写32(item0 + 12, NGIR_渲染帧数)
+        返回
+    }
+    定义 item = NGIR_缓存池 + NGIR_缓存数 * 24
+    内存写32(item, key)
+    内存写64(item + 4, value)
+    内存写32(item + 8, 1)
+    内存写32(item + 12, NGIR_渲染帧数)
+    NGIR_缓存数 = NGIR_缓存数 + 1
+}
+
+函数 NGIR_性能统计打印() {
+    定义 hitRate = 0
+    定义 total = NGIR_缓存命中 + NGIR_缓存未命中
+    如果 (total > 0) { hitRate = NGIR_缓存命中 * 100 / total }
+    打印("[NGIR] frame=" + 整数转字符串(NGIR_渲染帧数) +
+         " icons=" + 整数转字符串(NGIR_图标总数) +
+         " aiLayout=" + 整数转字符串(NGIR_AI布局次数) +
+         " reflow=" + 整数转字符串(NGIR_重排次数) +
+         " hitTest=" + 整数转字符串(NGIR_命中测试次数) +
+         " cacheHitRate=" + 整数转字符串(hitRate) + "%")
+}
+
+// § 对外统一入口
+
+函数 NGIR_桌面图标系统启动() {
+    NGIR_初始化()
+    NGIR_缓存初始化()
+    NGIR_加载布局()
+    打印("[NGIR] 桌面图标系统启动完成")
+}
+
+函数 NGIR_桌面图标系统关闭() {
+    NGIR_保存布局()
+    NGIR_性能统计打印()
+    打印("[NGIR] 桌面图标系统已关闭")
+}
+}

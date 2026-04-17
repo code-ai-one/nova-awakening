@@ -1,0 +1,303 @@
+// Nova · 链接器 · Mach-O链接器
+// macOS/iOS Mach-O格式 — Universal Binary/代码签名
+
+导入("../标准库/基础.nova")
+
+函数 MachO_对齐(值, 边界) {
+    定义 可变 余 = 值 % 边界
+    如果 (余 == 0) { 返回 值 }
+    返回 值 + 边界 - 余
+}
+
+函数 MachO_页大小(cpu类型) {
+    如果 (cpu类型 == CPU_TYPE_ARM64) { 返回 16384 }
+    返回 4096
+}
+
+函数 MachO_段命令(名, vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects) {
+    返回 [LC_SEGMENT_64, LC_SEG64_大小 + SECTION64_大小 * nsects,
+           名, vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects]
+}
+
+函数 MachO_节(名, 段名, addr, 大小, offset, 对齐log2, 类型) {
+    返回 [名, 段名, addr, 大小, offset, 对齐log2, 0, 类型]
+}
+
+函数 MachO_入口命令(入口偏移) {
+    返回 [LC_MAIN, 24, 入口偏移, 0]
+}
+
+函数 MachO_符号表命令(symoff, nsyms, stroff, strsize) {
+    返回 [LC_SYMTAB, 24, symoff, nsyms, stroff, strsize]
+}
+
+函数 MachO_动态库命令(名) {
+    返回 [LC_LOAD_DYLIB, 56, 名,x10000, 0x10000]
+}
+
+定义 符号_外部  = 1
+定义 符号_节 = 0x0E
+
+// 统计状态收进容器, 避免编译器将标量累加判成隐式全局
+定义 可变 _MachO_统计 = [0, 0]
+
+函数 MachO_符号(名偏移, 节idx, 值) {
+    返回 [名偏移, 符号_外部 + 符号_节, 节idx, 0, 值]
+}
+
+函数 MachO_字符串表() { 返回 [[""], [0], 1] }
+
+函数 MachO_strtab_加(st, 名) {
+    定义 off = st[2]
+    追加(st[0], 名)
+    追加(st[1], off)
+    st[2] = off + 计数(名) + 1
+    返回 off
+}
+
+函数 MachO_计算布局(代码大小, 数据大小, 符号数, cpu类型) {
+    定义 可变 页 = MachO_页大小(cpu类型)
+    定义 ncmds = 7
+    定义 sizeofcmds = LC_SEG64_大小 * 4 + SECTION64_大小 * 3 + 24 + 24 + 56
+    定义 头总 = MACHO头_大小 + sizeofcmds
+    定义 text_off = MachO_对齐(头总, 页)
+    定义 text_vsz = MachO_对齐(代码大小, 页)
+    定义 data_off = text_off + text_vsz
+    定义 data_vsz = MachO_对齐(数据大小, 页)
+    定义 linkedit_off = data_off + data_vsz
+    定义 symtab_sz = NLIST64_大小 * (符号数 + 1)
+    定义 strtab_sz = 符号数 * 16 + 32
+    定义 linkedit_sz = MachO_对齐(symtab_sz + strtab_sz, 页)
+    定义 可变 总大小 = linkedit_off + linkedit_sz
+    定义 入口偏移 = text_off
+    返回 [text_off, text_vsz, data_off, data_vsz, linkedit_off, 总大小, 页, 入口偏移, ncmds, sizeofcmds]
+}
+
+函数 MachO_Fat头大小(架构数) { 返回 8 + 20 * 架构数 }
+
+函数 MachO_Fat_计算(x86大小, arm大小) {
+    定义 头大小 = MachO_Fat头大小(2)
+    定义 x86偏移 = MachO_对齐(头大小, 0x1000)
+    定义 arm偏移 = MachO_对齐(x86偏移 + x86大小, 0x4000)
+    定义 总大小 = arm偏移 + arm大小
+    返回 [x86偏移, arm偏移, 总大小]
+}
+
+函数 MachO_CPU名(t) {
+    如果 (t == CPU_TYPE_X86_64) { 返回 "x86_64" }
+    如果 (t == CPU_TYPE_ARM64) { 返回 "arm64" }
+    返回 "unknown"
+}
+
+函数 MachO_代码签名大小(文件大小, 页大小) {
+    定义 可变 页数 = 文件大小 / 页大小
+    如果 (文件大小 % 页大小 > 0) { 页数 = 页数 + 1 }
+    定义 估算 = 800 + 页数 * 32
+    返回 MachO_对齐(估算, 16)
+}
+
+函数 MachO_代码签名命令(数据偏移, 数据大小) {
+    返回 [LC_CODE_SIGNATURE, 16, 数据偏移, 数据大小]
+}
+
+函数 MachO_rebase大小(指针数) {
+    返回 MachO_对齐(指针数 * 5 + 8, 8)
+}
+
+函数 MachO_bind大小(导入数) {
+    返回 MachO_对齐(导入数 * 20 + 8, 8)
+}
+
+函数 MachO_ADRP_页(pc, 目标) {
+    定义 pc页 = pc - (pc % 4096)
+    定义 目标页 = 目标 - (目标 % 4096)
+    返回 (目标页 - pc页) / 4096
+}
+
+函数 MachO_ADD_偏移(目标) {
+    返回 目标 % 4096
+}
+
+函数 MachO_签名布局(代码大小, 数据大小, 符号数, cpu类型) {
+    定义 基础 = MachO_计算布局(代码大小, 数据大小, 符号数, cpu类型)
+    定义 页 = 基础[6]
+    定义 签名大小 = MachO_代码签名大小(基础[5], 页)
+    定义 签名偏移 = 基础[5]
+    定义 新总大小 = 基础[5] + MachO_对齐(签名大小, 页)
+    返回 [基础[0], 基础[1], 基础[2], 基础[3], 基础[4], 新总大小, 页, 基础[7], 签名偏移, 签名大小]
+}
+
+函数 MachO_最低OS版本(主版, 次版, 补丁) {
+    返回 主版 * 65536 + 次版 * 256 + 补丁
+}
+
+定义 加载命令_UUID            = 0x1B
+定义 加载命令_最低macOS版本 = 0x24
+定义 加载命令_源版本  = 0x2A
+定义 加载命令_构建版本   = 0x32
+定义 加载命令_仅动态链接信息  = 0x80000022
+定义 加载命令_函数起始 = 0x26
+定义 加载命令_代码中数据    = 0x29
+
+定义 平台_macOS   = 1
+定义 平台_iOS     = 2
+定义 平台_tvOS    = 3
+定义 平台_watchOS = 4
+
+函数 MachO_安全对齐(值, 边界) {
+    如果 (边界 <= 0) { 返回 值 }
+    定义 余 = 值 % 边界
+    如果 (余 == 0) { 返回 值 }
+    返回 值 + 边界 - 余
+}
+
+函数 MachO_有效CPU(cpu) {
+    如果 (cpu == CPU_TYPE_X86_64) { 返回 1 }
+    如果 (cpu == CPU_TYPE_ARM64) { 返回 1 }
+    返回 0
+}
+
+函数 MachO_构建版本命令(平台, 最低版本, sdk版本) {
+    返回 [加载命令_构建版本, 32, 平台, 最低版本, sdk版本, 0]
+}
+
+函数 MachO_UUID命令() {
+    返回 [加载命令_UUID, 24]
+}
+
+函数 MachO_保护(读, 写, 执行) {
+    定义 可变 p = 0
+    如果 (读) { p = p | VM_PROT_READ }
+    如果 (写) { p = p | VM_PROT_WRITE }
+    如果 (执行) { p = p | VM_PROT_EXECUTE }
+    返回 p
+}
+
+函数 MachO_有效段名ID(id) {
+    如果 (id >= 0) { 如果 (id <= 5) { 返回 1 } }
+    返回 0
+}
+
+函数 MachO_stub大小(cpu类型) {
+    如果 (cpu类型 == CPU_TYPE_ARM64) { 返回 12 }
+    返回 6
+}
+
+定义 间接符号大小 = 4
+
+// 注意: WebAssembly 常量已移至 Wasm链接器.nova
+
+// 段构建器
+
+定义 可变 _MachO_段名 = []
+定义 可变 _MachO_段偏移 = []
+定义 可变 _MachO_段大小 = []
+定义 可变 _MachO_段保护 = []
+
+函数 MachO_添加段(名称, 偏移, 大小, 保护) {
+    追加(_MachO_段名, 名称)
+    追加(_MachO_段偏移, 偏移)
+    追加(_MachO_段大小, 大小)
+    追加(_MachO_段保护, 保护)
+}
+
+函数 MachO_查段(名称) {
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_段名)) {
+        如果 (_MachO_段名[i] == 名称) { 返回 [_MachO_段偏移[i], _MachO_段大小[i], _MachO_段保护[i]] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 MachO_段总大小() {
+    定义 可变 总 = 0
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_段大小)) { 总 = 总 + _MachO_段大小[i]  i = i + 1 }
+    返回 总
+}
+
+// 符号表
+
+定义 可变 _MachO_符号名 = []
+定义 可变 _MachO_符号值 = []
+定义 可变 _MachO_符号类型 = []  // 0=本地 1=全局 2=外部
+
+函数 MachO_添加符号(名称, 值, 类型) {
+    追加(_MachO_符号名, 名称)
+    追加(_MachO_符号值, 值)
+    追加(_MachO_符号类型, 类型)
+}
+
+函数 MachO_查符号(名称) {
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_符号名)) {
+        如果 (_MachO_符号名[i] == 名称) { 返回 _MachO_符号值[i] }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 MachO_全局符号() {
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_符号名)) {
+        如果 (_MachO_符号类型[i] == 1) { 追加(结果, [_MachO_符号名[i], _MachO_符号值[i]]) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 MachO_外部符号() {
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_符号名)) {
+        如果 (_MachO_符号类型[i] == 2) { 追加(结果, _MachO_符号名[i]) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+// 重定位
+
+定义 可变 _MachO_重定位_偏移 = []
+定义 可变 _MachO_重定位_符号 = []
+定义 可变 _MachO_重定位_类型 = []
+
+函数 MachO_添加重定位(偏移, 符号名, 类型) {
+    追加(_MachO_重定位_偏移, 偏移)
+    追加(_MachO_重定位_符号, 符号名)
+    追加(_MachO_重定位_类型, 类型)
+}
+
+函数 MachO_应用重定位(代码, 基址) {
+    定义 可变 i = 0
+    当 (i < 计数(_MachO_重定位_偏移)) {
+        定义 符号值 = MachO_查符号(_MachO_重定位_符号[i])
+        如果 (符号值 >= 0) {
+            定义 偏移 = _MachO_重定位_偏移[i]
+            // 写入修正后的地址
+            代码[偏移] = (符号值 + 基址) % 256
+            代码[偏移 + 1] = ((符号值 + 基址) / 256) % 256
+            代码[偏移 + 2] = ((符号值 + 基址) / 65536) % 256
+            代码[偏移 + 3] = ((符号值 + 基址) / 16777216) % 256
+        }
+        i = i + 1
+    }
+}
+
+// Fat Binary
+
+函数 MachO_胖头(架构列表) {
+    // FAT_MAGIC = 0xCAFEBABE
+    定义 可变 头 = [0xCA, 0xFE, 0xBA, 0xBE]
+    定义 n = 计数(架构列表)
+    追加(头, (n / 16777216) % 256)
+    追加(头, (n / 65536) % 256)
+    追加(头, (n / 256) % 256)
+    追加(头, n % 256)
+    返回 头
+}
+
+函数 MachO_记录链接() { _MachO_统计[0] = _MachO_统计[0] + 1 }
+函数 MachO_记录重定位() { _MachO_统计[1] = _MachO_统计[1] + 1 }

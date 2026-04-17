@@ -1,0 +1,197 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("../记忆/文件层文件.nova")
+导入("./视窗打印.nova")
+导入("../中枢/哈希函数.nova")
+导入("../中枢/原生系统块分.nova")
+导入("../中枢/退出调用.nova")
+导入("../中枢/进程组.nova")
+导入("../中枢/读取调用.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/每处理器.nova")
+导入("../中枢/获取进程.nova")
+
+定义 可变 Win32_Last错误 = 0
+
+函数 win32_GetCurrentProcess() { 返回 0xFFFFFFFFFFFFFFFF }  // 伪句柄
+函数 win32_GetCurrentThread() { 返回 0xFFFFFFFFFFFFFFFE }
+函数 win32_GetCurrentProcessId() { 返回 获取当前PID() }
+函数 win32_GetCurrentThreadId() { 返回 获取当前PID() }
+函数 win32_ExitProcess(退出码) { sys_exit(退出码, 0, 0, 0, 0, 0) }
+函数 win32_ExitThread(退出码) { sys_exit(退出码, 0, 0, 0, 0, 0) }
+函数 win32_CreateThread(attr, stack_size, start, param, flags, tid) {
+    // 创建新线程: 分配栈, 调用clone
+    如果 (stack_size < 65536) { stack_size = 65536 }  // 最小64KB栈
+    定义 栈 = Nova内存映射_分配(stack_size)
+    如果 (栈 == 0) { Win32_Last错误 = 14; 返回 0 }  // ERROR_OUTOFMEMORY
+
+    // clone标志: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
+    定义 clone_flags = 0x00010100 | 0x00000200 | 0x00000400 | 0x00000800 | 0x00010000
+    定义 栈顶 = 栈 + stack_size  // 栈向下增长
+
+    // 在栈顶准备线程参数(Windows约定: start函数接受param)
+    栈顶 = 栈顶 - 8
+    内存写64(栈顶, param)    // 参数压栈
+    栈顶 = 栈顶 - 8
+    内存写64(栈顶, 0)        // 返回地址(ExitThread)
+
+    定义 线程ID = sys_clone(clone_flags, 栈顶, 0, 0, 0, start)
+    如果 (线程ID < 0) { Win32_Last错误 = 8; 返回 0 }
+
+    如果 (tid != 0) { 内存写32(tid, 线程ID) }
+    // 返回线程句柄(= 线程ID)
+    返回 线程ID
+}
+函数 win32_Sleep(毫秒) { sys_nanosleep_ms(毫秒) }
+函数 win32_SleepEx(毫秒, alertable) { win32_Sleep(毫秒) }
+
+函数 win32_VirtualAlloc(地址, 大小, 类型, 保护) {
+    返回 Nova内存映射_分配(大小)
+}
+函数 win32_VirtualFree(地址, 大小, 类型) { munmap_释放(地址, 大小); 返回 1 }
+函数 win32_GetProcessHeap() { 返回 1 }
+函数 win32_HeapAlloc(heap, flags, 大小) { 返回 kmalloc(大小) }
+函数 win32_HeapFree(heap, flags, 地址) { kfree(地址); 返回 1 }
+
+函数 win32_CreateFileW(名称, 访问, 共享, 安全, 创建, 标志, 模板) {
+    // 将Windows路径转换为Unix路径
+    // C:\Users\... → /home/...
+    定义 unix_path = 转换Windows路径(名称)
+    定义 fd = vfs_open(unix_path, 0)
+    如果 (fd < 0) { Win32_Last错误 = 2; 返回 0xFFFFFFFF }  // INVALID_HANDLE_VALUE
+    返回 fd
+}
+函数 win32_ReadFile(handle, buf, 数量, 已读, overlapped) {
+    定义 结果 = vfs_read_fd(handle, buf, 数量)
+    如果 (已读 != 0) { 内存写32(已读, 结果) }
+    返回 1
+}
+函数 win32_WriteFile(handle, buf, 数量, 已写, overlapped) {
+    定义 结果 = vfs_write_fd(handle, buf, 数量)
+    如果 (已写 != 0) { 内存写32(已写, 结果) }
+    返回 1
+}
+函数 win32_CloseHandle(handle) { vfs_close(handle); 返回 1 }
+函数 win32_GetFileSize(handle, high) {
+    // 通过fstat获取文件大小
+    定义 statbuf = 分配内存(144)  // sizeof(struct stat)
+    如果 (statbuf == 0) { 返回 0xFFFFFFFF }
+    定义 结果 = sys_fstat(handle, statbuf, 0, 0, 0, 0)
+    如果 (结果 < 0) { 释放内存(statbuf); 返回 0xFFFFFFFF }
+    定义 大小 = 内存读64(statbuf + 48)  // st_size offset
+    如果 (high != 0) { 内存写32(high, (大小 >> 32) & 0xFFFFFFFF) }
+    释放内存(statbuf)
+    返回 大小 & 0xFFFFFFFF  // 低32位
+}
+
+// STD_INPUT_HANDLE=-10, STD_OUTPUT_HANDLE=-11, STD_ERROR_HANDLE=-12
+函数 win32_GetStdHandle(nStdHandle) {
+    如果 (nStdHandle == 0xFFFFFFF6) { 返回 0 }  // stdin
+    如果 (nStdHandle == 0xFFFFFFF5) { 返回 1 }  // stdout
+    如果 (nStdHandle == 0xFFFFFFF4) { 返回 2 }  // stderr
+    返回 0xFFFFFFFF
+}
+函数 win32_WriteConsoleW(handle, buf, 数量, 已写, reserved) {
+    返回 win32_WriteFile(handle, buf, 数量 * 2, 已写, 0)
+}
+函数 win32_ReadConsoleW(handle, buf, 数量, 已读, ctrl) {
+    返回 win32_ReadFile(handle, buf, 数量 * 2, 已读, 0)
+}
+函数 win32_SetConsoleMode(handle, mode) { 返回 1 }
+
+函数 win32_Get模块HandleW(名称) {
+    如果 (名称 == 0) { 返回 PE_已加载模块[0].基地址 }
+    返回 0
+}
+函数 win32_LoadLibraryW(名称) {
+    如果 (名称 == 0) { 返回 0 }
+    // 先在已加载模块中查找
+    定义 dll_name = 读取宽字符串(名称)  // UTF-16LE→UTF-8
+    定义 可变 i = 0
+    当 (i < 计数(PE_已加载模块)) {
+        如果 (字符串比较_不区分大小写(PE_已加载模块[i].名称, dll_name) == 0) {
+            返回 PE_已加载模块[i].基地址
+        }
+        i = i + 1
+    }
+    // 尝试从磁盘加载(Windows路径→Unix路径)
+    定义 unix_path = "/lib/win32/" + dll_name
+    定义 fd = vfs_open(unix_path, 0)
+    如果 (fd < 0) {
+        Win32_Last错误 = 126  // ERROR_MOD_NOT_FOUND
+        返回 0
+    }
+    vfs_close(fd)
+    内核信息("Win32: LoadLibrary " + dll_name + " 从 " + unix_path)
+    返回 0  // 完整PE加载
+}
+函数 win32_GetProcAddress(module, name) { 返回 Win32_查找接口(name) }
+函数 win32_FreeLibrary(handle) { 返回 1 }
+函数 win32_GetLast错误() { 返回 Win32_Last错误 }
+函数 win32_SetLast错误(code) { Win32_Last错误 = code }
+定义 可变 Win32_命令行缓存 = 0
+
+函数 win32_GetCommandLineW() {
+    // 返回宽字符版命令行字符串
+    如果 (Win32_命令行缓存 != 0) { 返回 Win32_命令行缓存 }
+    // 从进程参数构建命令行
+    定义 proc = 获取当前进程()
+    定义 cmdline = ""
+    如果 (proc != 空 && proc.参数列表 != 空) {
+        定义 可变 j = 0
+        当 (j < 计数(proc.参数列表)) {
+            如果 (j > 0) { cmdline = cmdline + " " }
+            cmdline = cmdline + proc.参数列表[j]
+            j = j + 1
+        }
+    } 否则 {
+        cmdline = "program.exe"
+    }
+    // 转换为UTF-16LE
+    Win32_命令行缓存 = UTF8转UTF16(cmdline)
+    返回 Win32_命令行缓存
+}
+函数 win32_GetEnvironmentVariableW(名称, 缓冲, 大小) {
+    如果 (名称 == 0) { 返回 0 }
+    定义 key = 读取宽字符串(名称)
+    // 常见环境变量映射
+    定义 可变 值 = ""
+    如果 (key == "USERPROFILE" || key == "HOMEPATH") { 值 = "/home/user" }
+    否则 如果 (key == "TEMP" || key == "TMP") { 值 = "/tmp" }
+    否则 如果 (key == "SYSTEMROOT" || key == "windir") { 值 = "C:\\Windows" }
+    否则 如果 (key == "PATH") { 值 = "/usr/bin:/bin" }
+    否则 如果 (key == "COMPUTERNAME") { 值 = "NOVAOS" }
+    否则 {
+        // 查找Linux环境变量
+        值 = 获取环境变量(key)
+        如果 (值 == "") { Win32_Last错误 = 203; 返回 0 }  // ERROR_ENVVAR_NOT_FOUND
+    }
+    // 复制到缓冲区(UTF-16LE)
+    定义 utf16 = UTF8转UTF16(值)
+    定义 字符数 = 字符串长度(值)
+    如果 (缓冲 != 0 && 大小 > 字符数) {
+        内存拷贝(缓冲, utf16, (字符数 + 1) * 2)
+    }
+    返回 字符数
+}
+函数 win32_GetTickCount64() { 返回 读取毫秒() }
+函数 win32_QueryPerformanceCounter(counter) { 如果 (counter != 0) { 内存写64(counter, 读取毫秒() * 1000) }; 返回 1 }
+函数 win32_QueryPerformanceFrequency(freq) { 如果 (freq != 0) { 内存写64(freq, 1000000) }; 返回 1 }
+
+定义 可变 AI_视窗进程_负载窗口 = []
+
+函数 AI_视窗进程_负载预测(当前负载) {
+    追加(AI_视窗进程_负载窗口, 当前负载)
+    如果 (计数(AI_视窗进程_负载窗口) > 20) { 列表_移除(AI_视窗进程_负载窗口, 0) }
+    如果 (计数(AI_视窗进程_负载窗口) < 3) { 返回 当前负载 }
+    定义 n = 计数(AI_视窗进程_负载窗口)
+    定义 趋势 = AI_视窗进程_负载窗口[n-1] - AI_视窗进程_负载窗口[n-3]
+    返回 当前负载 + 趋势
+}
+
+函数 AI_视窗进程_迁移建议(源CPU负载, 目标CPU负载) {
+    如果 (源CPU负载 > 目标CPU负载 * 2) { 返回 真 }
+    返回 假
+}

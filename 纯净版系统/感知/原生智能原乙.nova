@@ -1,0 +1,482 @@
+// Nova AI原生渲染引擎: Compositing — 智能合成层管理
+// 【创新突破】传统方案: 固定规则决定哪些层提升为图处合成层
+//   Nova Compositing = NovaOS核心引擎 + 以下AI原生能力:
+//   ① 智能层提升 — AI根据使用模式决定是否提升为图处层
+//   ② 纹理内存智能管理 — 根据可见性动态分配/释放纹理
+//   ③ 瓦片优先级调度 — 先光栅化可见区域瓦片
+//   ④ 合成帧预算 — 预测动画帧提前合成
+// NovaOS实现: Compositing合成层管理
+//       compositing_layer_assigner.cc (~800行)
+//       composited_layer_mapping.cc (~2000行)
+//       paint_layer_compositor.cc (~1500行)
+//       layer_tree_host.cc (~2000行)
+//       layer_impl.cc (~1500行)
+//       tile_manager.cc (~1000行)
+// 合成(Compositing)系统:
+//   1. 将绘制Layer提升为合成层(图处纹理)
+//   2. 独立合成层可以单独repaint/动画,不影响其他层
+//   3. 合成层在图处上合成最终帧
+// 触发合成层创建的条件:
+//   - will-change: transform/opacity/filter
+//   - 3D transform (translateZ/rotateX等)
+//   - position: fixed
+//   - <video>/<canvas>/<iframe>
+//   - opacity动画/transform动画
+//   - overflow: scroll (滚动容器)
+//   - 覆盖已有合成层(squashing)
+// 层树(Layer Tree):
+//   cc::Layer → cc::LayerImpl (commit到合成线程)
+//   瓦片(Tile): 大层分割为256x256瓦片, 按优先级光栅化
+//   帧提交: BeginFrame → commit → activate → draw
+
+导入("./图绘渲染上下.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内核打印.nova")
+导入("../推理/值乘.nova")
+
+// §1 合成原因标志
+
+定义 CR_NONE                = 0x00000000
+定义 CR_3D_TRANSFORM         = 0x00000001
+定义 CR_WILL_CHANGE_TRANSFORM = 0x00000002
+定义 CR_WILL_CHANGE_OPACITY  = 0x00000004
+定义 CR_WILL_CHANGE_FILTER   = 0x00000008
+定义 CR_ANIMATION_TRANSFORM  = 0x00000010
+定义 CR_ANIMATION_OPACITY    = 0x00000020
+定义 CR_ANIMATION_FILTER     = 0x00000040
+定义 CR_FIXED_POSITION       = 0x00000080
+定义 CR_OVERFLOW_SCROLL      = 0x00000100
+定义 CR_VIDEO                = 0x00000200
+定义 CR_CANVAS               = 0x00000400
+定义 CR_IFRAME               = 0x00000800
+定义 CR_BACKFACE_HIDDEN      = 0x00001000
+定义 CR_OVERLAP              = 0x00002000    // 覆盖已有合成层
+定义 CR_ROOT                 = 0x00004000    // 根层(总是合成)
+定义 CR_BLEND_MODE           = 0x00008000    // mix-blend-mode != normal
+定义 CR_MASK                 = 0x00010000    // clip-path / mask
+定义 CR_FILTER               = 0x00020000    // CSS filter
+定义 CR_BACKDROP_FILTER      = 0x00040000    // backdrop-filter
+
+// §2 CompositedLayer — 合成层
+
+结构 CompositedLayer {
+    ID,
+    // 来源
+    paint层,    // u64 绘制Layer*
+    合成原因,    // u32 CR_xxx位掩码
+    // 图处纹理
+    纹理ID,    // u32 图处纹理句柄
+    纹理宽,
+    纹理高,
+    设备像素比,    // u32 ×100
+    // 位置(相对于父合成层)
+    偏移x,    // i32 ×100
+    偏移y,
+    // 变换(直接在图处上应用)
+    变换矩阵,    // u64 Matrix4x4*
+    不透明度,    // u32 0-100
+    // 瓦片
+    瓦片列表,    // u64 Tile*数组
+    瓦片列数,
+    瓦片行数,
+    // 脏区域
+    脏区域,    // u64 SkRect* (需要重绘的区域)
+    需要重绘,
+    // 树结构
+    父,    // u64 CompositedLayer*
+    子列表,    // u64 CompositedLayer*数组
+    子数量,
+    子容量,
+    // 滚动
+    滚动偏移x,
+    滚动偏移y,
+    可滚动,
+    // 标记
+    已激活,
+    需要commit,
+}
+
+// §3 NCLM理论 — Nova合成层管理统一架构
+// NCLM核心公式:
+//   级联合成: Frame = Σ(Layer_i * opacity_i * transform_i)
+//   瓦片优先级: P = visible_area / distance_to_viewport
+//   内存预算: mem = Σ(tile_w * tile_h * 4 * device_ratio)
+//   帧预算: budget(16ms) - raster_time - composit_time > 0
+
+定义 瓦片宽度 = 256
+定义 瓦片高度 = 256
+定义 最大合成层数 = 512
+定义 最大瓦片数 = 4096
+定义 帧预算_毫秒 = 16    // 60fps = 16ms每帧
+
+// 全局统计
+定义 可变 NCLM_合成层数 = 0
+定义 可变 NCLM_瓦片数 = 0
+定义 可变 NCLM_帧计数 = 0
+定义 可变 NCLM_重绘计数 = 0
+定义 可变 NCLM_级联合成计数 = 0
+定义 可变 NCLM_纺理内存字节 = 0
+定义 可变 NCLM_AI检测计数 = 0
+定义 可变 NCLM_AI优化计数 = 0
+
+// §4 瓦片管理
+
+结构 瓦片 {
+    行,
+    列,
+    x,         // i32 像素坐标
+    y,
+    宽,
+    高,
+    纺理ID,    // u32 图处纺理
+    已光栅,
+    优先级,    // u32 越大越优先
+    可见,
+}
+
+函数 瓦片_创建(行, 列, x, y) {
+    定义 t = 堆_分配(瓦片)
+    t.行 = 行; t.列 = 列; t.x = x; t.y = y
+    t.宽 = 瓦片宽度; t.高 = 瓦片高度
+    t.纺理ID = 0; t.已光栅 = 假
+    t.优先级 = 0; t.可见 = 假
+    NCLM_瓦片数 = NCLM_瓦片数 + 1
+    返回 t
+}
+
+函数 瓦片_分配纺理(瓦片) {
+    如果 (瓦片.纺理ID != 0) { 返回 }  // 已分配
+    瓦片.纺理ID = 图处_创建纺理(瓦片.宽, 瓦片.高)
+    NCLM_纺理内存字节 = NCLM_纺理内存字节 + 瓦片.宽 * 瓦片.高 * 4
+}
+
+函数 瓦片_释放纺理(瓦片) {
+    如果 (瓦片.纺理ID == 0) { 返回 }
+    图处_删除纺理(瓦片.纺理ID)
+    NCLM_纺理内存字节 = NCLM_纺理内存字节 - 瓦片.宽 * 瓦片.高 * 4
+    瓦片.纺理ID = 0; 瓦片.已光栅 = 假
+}
+
+// §5 合成层创建与管理
+
+定义 可变 合成层_下一个ID = 1
+
+函数 合成层_创建(paint层, 原因) {
+    如果 (NCLM_合成层数 >= 最大合成层数) { 返回 0 }
+    定义 cl = 堆_分配(CompositedLayer)
+    cl.ID = 合成层_下一个ID; 合成层_下一个ID = 合成层_下一个ID + 1
+    cl.paint层 = paint层
+    cl.合成原因 = 原因
+    cl.纺理ID = 0; cl.纺理宽 = 0; cl.纺理高 = 0
+    cl.设备像素比 = 100
+    cl.偏移x = 0; cl.偏移y = 0
+    cl.变换矩阵 = 0; cl.不透明度 = 100
+    cl.瓦片列表 = 0; cl.瓦片列数 = 0; cl.瓦片行数 = 0
+    cl.脏区域 = 0; cl.需要重绘 = 真
+    cl.父 = 0; cl.子列表 = 0; cl.子数量 = 0; cl.子容量 = 0
+    cl.滚动偏移x = 0; cl.滚动偏移y = 0; cl.可滚动 = 假
+    cl.已激活 = 假; cl.需要commit = 真
+    NCLM_合成层数 = NCLM_合成层数 + 1
+    返回 cl
+}
+
+函数 合成层_初始化瓦片(cl, 宽, 高) {
+    如果 (cl == 0) { 返回 }
+    cl.纺理宽 = 宽; cl.纺理高 = 高
+    cl.瓦片列数 = (宽 + 瓦片宽度 - 1) / 瓦片宽度
+    cl.瓦片行数 = (高 + 瓦片高度 - 1) / 瓦片高度
+    定义 总瓦片 = cl.瓦片列数 * cl.瓦片行数
+    cl.瓦片列表 = 堆_分配_数组(总瓦片 * 8)
+    // 创建每个瓦片
+    定义 可变 r = 0
+    当 (r < cl.瓦片行数) {
+        定义 可变 c = 0
+        当 (c < cl.瓦片列数) {
+            定义 t = 瓦片_创建(r, c, c * 瓦片宽度, r * 瓦片高度)
+            定义 idx = r * cl.瓦片列数 + c
+            内存_写64(cl.瓦片列表 + idx * 8, t)
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+// §6 层提升判定
+
+函数 应提升为合成层(paint层) {
+    如果 (paint层 == 0) { 返回 CR_NONE }
+    定义 可变 原因 = CR_NONE
+    // 3D变换
+    如果 (paint层.有_3D变换) { 原因 = 原因 | CR_3D_TRANSFORM }
+    // will-change
+    如果 (paint层.will_change_transform) { 原因 = 原因 | CR_WILL_CHANGE_TRANSFORM }
+    如果 (paint层.will_change_opacity) { 原因 = 原因 | CR_WILL_CHANGE_OPACITY }
+    如果 (paint层.will_change_filter) { 原因 = 原因 | CR_WILL_CHANGE_FILTER }
+    // 动画
+    如果 (paint层.正在动画_变换) { 原因 = 原因 | CR_ANIMATION_TRANSFORM }
+    如果 (paint层.正在动画_透明) { 原因 = 原因 | CR_ANIMATION_OPACITY }
+    // position: fixed
+    如果 (paint层.固定定位) { 原因 = 原因 | CR_FIXED_POSITION }
+    // 滚动容器
+    如果 (paint层.滚动容器) { 原因 = 原因 | CR_OVERFLOW_SCROLL }
+    // 媒体元素
+    如果 (paint层.是视频) { 原因 = 原因 | CR_VIDEO }
+    如果 (paint层.是画布) { 原因 = 原因 | CR_CANVAS }
+    如果 (paint层.是内嵌帧) { 原因 = 原因 | CR_IFRAME }
+    // CSS滤镜
+    如果 (paint层.有滤镜) { 原因 = 原因 | CR_FILTER }
+    如果 (paint层.有背景滤镜) { 原因 = 原因 | CR_BACKDROP_FILTER }
+    返回 原因
+}
+
+// §7 帧合成流水线
+// NCLM帧流水线: BeginFrame → UpdateLayers → Rasterize → Draw
+
+函数 帧_开始() {
+    NCLM_帧计数 = NCLM_帧计数 + 1
+}
+
+函数 帧_更新层(层树根) {
+    如果 (层树根 == 0) { 返回 }
+    // 遍历所有合成层, 检查是否需要重绘
+    如果 (层树根.需要重绘) {
+        NCLM_重绘计数 = NCLM_重绘计数 + 1
+        层树根.需要重绘 = 假
+    }
+    // 递归更新子层
+    定义 可变 i = 0
+    当 (i < 层树根.子数量) {
+        定义 子 = 内存_读64(层树根.子列表 + i * 8)
+        帧_更新层(子)
+        i = i + 1
+    }
+}
+
+函数 帧_光栅化瓦片(cl) {
+    如果 (cl == 0 || cl.瓦片列表 == 0) { 返回 }
+    定义 总 = cl.瓦片列数 * cl.瓦片行数
+    定义 可变 i = 0
+    当 (i < 总) {
+        定义 t = 内存_读64(cl.瓦片列表 + i * 8)
+        如果 (t != 0 && t.可见 && !t.已光栅) {
+            瓦片_分配纺理(t)
+            // 光栅化瓦片内容
+            t.已光栅 = 真
+        }
+        i = i + 1
+    }
+}
+
+函数 帧_绘制(层树根) {
+    如果 (层树根 == 0) { 返回 }
+    NCLM_级联合成计数 = NCLM_级联合成计数 + 1
+    // 级联合成: 从底层到顶层绘制
+    // 每层应用opacity和transform
+    如果 (层树根.纺理ID != 0 && 层树根.已激活) {
+        图处_绘制纺理(层树根.纺理ID,
+            层树根.偏移x, 层树根.偏移y,
+            层树根.不透明度,
+            层树根.变换矩阵)
+    }
+    // 递归绘制子层
+    定义 可变 i = 0
+    当 (i < 层树根.子数量) {
+        定义 子 = 内存_读64(层树根.子列表 + i * 8)
+        帧_绘制(子)
+        i = i + 1
+    }
+}
+
+// §8 瓦片优先级调度
+// 优先级公式: P = visible_area / (distance + 1)
+
+函数 瓦片_计算优先级(瓦片, 视口x, 视口y, 视口宽, 视口高) {
+    如果 (瓦片 == 0) { 返回 0 }
+    // 检查可见性
+    定义 tx2 = 瓦片.x + 瓦片.宽
+    定义 ty2 = 瓦片.y + 瓦片.高
+    定义 vx2 = 视口x + 视口宽
+    定义 vy2 = 视口y + 视口高
+    // 相交检测
+    如果 (瓦片.x >= vx2 || tx2 <= 视口x || 瓦片.y >= vy2 || ty2 <= 视口y) {
+        瓦片.可见 = 假; 瓦片.优先级 = 0
+        返回 0
+    }
+    瓦片.可见 = 真
+    // 计算可见面积
+    定义 ox1 = 瓦片.x; 如果 (视口x > ox1) { ox1 = 视口x }
+    定义 oy1 = 瓦片.y; 如果 (视口y > oy1) { oy1 = 视口y }
+    定义 ox2 = tx2; 如果 (vx2 < ox2) { ox2 = vx2 }
+    定义 oy2 = ty2; 如果 (vy2 < oy2) { oy2 = vy2 }
+    定义 面积 = (ox2 - ox1) * (oy2 - oy1)
+    // 到视口中心的距离
+    定义 cx = 视口x + 视口宽 / 2
+    定义 cy = 视口y + 视口高 / 2
+    定义 dx = 瓦片.x + 瓦片.宽 / 2 - cx
+    定义 dy = 瓦片.y + 瓦片.高 / 2 - cy
+    如果 (dx < 0) { dx = -dx }
+    如果 (dy < 0) { dy = -dy }
+    定义 距离 = dx + dy + 1
+    瓦片.优先级 = (面积 * 1000) / 距离
+    返回 瓦片.优先级
+}
+
+// §9 AI智能合成优化
+// NCLM-AI: 预测层提升收益, 智能调度瓦片光栅化
+
+函数 NCLM_AI初始化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    定义 t = Tensor_创建(8)
+    Tensor_写(t, 0, NCLM_合成层数)
+    Tensor_写(t, 1, NCLM_瓦片数)
+    Tensor_写(t, 2, NCLM_帧计数)
+    Tensor_写(t, 3, NCLM_重绘计数)
+    Tensor_写(t, 4, NCLM_级联合成计数)
+    Tensor_写(t, 5, NCLM_纺理内存字节)
+    Tensor_写(t, 6, NCLM_AI检测计数)
+    Tensor_写(t, 7, NCLM_AI优化计数)
+    AI总线_推理(bus, "NCLM_模块注册", t)
+    Tensor_释放(t)
+}
+
+函数 NCLM_AI层提升预测(paint层) {
+    NCLM_AI检测计数 = NCLM_AI检测计数 + 1
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+    定义 t = Tensor_创建(4)
+    Tensor_写(t, 0, 应提升为合成层(paint层))
+    Tensor_写(t, 1, NCLM_合成层数)
+    Tensor_写(t, 2, NCLM_纺理内存字节)
+    Tensor_写(t, 3, NCLM_帧计数)
+    定义 收益 = AI总线_推理(bus, "NCLM_提升预测", t)
+    Tensor_释放(t)
+    返回 收益
+}
+
+函数 NCLM_AI帧预算评估() {
+    NCLM_AI优化计数 = NCLM_AI优化计数 + 1
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 0 }
+    定义 t = Tensor_创建(4)
+    Tensor_写(t, 0, NCLM_瓦片数)
+    Tensor_写(t, 1, NCLM_重绘计数)
+    Tensor_写(t, 2, NCLM_级联合成计数)
+    Tensor_写(t, 3, 帧预算_毫秒)
+    定义 结果 = AI总线_推理(bus, "NCLM_帧预算", t)
+    Tensor_释放(t)
+    返回 结果
+}
+
+// §10 诊断与统计
+
+函数 NCLM_获取统计() {
+    定义 s = 堆_分配_数组(64)
+    内存_写64(s + 0, NCLM_合成层数)
+    内存_写64(s + 8, NCLM_瓦片数)
+    内存_写64(s + 16, NCLM_帧计数)
+    内存_写64(s + 24, NCLM_重绘计数)
+    内存_写64(s + 32, NCLM_级联合成计数)
+    内存_写64(s + 40, NCLM_纺理内存字节)
+    内存_写64(s + 48, NCLM_AI检测计数)
+    内存_写64(s + 56, NCLM_AI优化计数)
+    返回 s
+}
+
+函数 NCLM_诊断打印() {
+    内核打印("[NCLM] 合成层=", NCLM_合成层数, " 瓦片=", NCLM_瓦片数)
+    内核打印("[NCLM] 帧=", NCLM_帧计数, " 重绘=", NCLM_重绘计数)
+    内核打印("[NCLM] 级联合成=", NCLM_级联合成计数, " 纺理内存=", NCLM_纺理内存字节)
+    内核打印("[NCLM] AI检测=", NCLM_AI检测计数, " AI优化=", NCLM_AI优化计数)
+}
+
+函数 NCLM_初始化() {
+    内核打印("[NCLM] Nova合成层管理 v1.0 启动")
+    NCLM_AI初始化()
+    内核打印("[NCLM] AI智能合成已加载")
+    返回 真
+}
+
+// §11 层树管理
+
+函数 合成层_添加子层(父, 子) {
+    如果 (父 == 0 || 子 == 0) { 返回 假 }
+    // 扩容子列表
+    如果 (父.子数量 >= 父.子容量) {
+        定义 新容量 = 父.子容量 * 2
+        如果 (新容量 == 0) { 新容量 = 8 }
+        定义 新列表 = 堆_分配_数组(新容量 * 8)
+        如果 (父.子列表 != 0 && 父.子数量 > 0) {
+            内存_拷贝(新列表, 父.子列表, 父.子数量 * 8)
+        }
+        父.子列表 = 新列表
+        父.子容量 = 新容量
+    }
+    内存_写64(父.子列表 + 父.子数量 * 8, 子)
+    父.子数量 = 父.子数量 + 1
+    子.父 = 父
+    返回 真
+}
+
+函数 合成层_移除子层(父, 子ID) {
+    如果 (父 == 0) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < 父.子数量) {
+        定义 c = 内存_读64(父.子列表 + i * 8)
+        如果 (c != 0 && c.ID == 子ID) {
+            // 将最后一个移到这个位置
+            父.子数量 = 父.子数量 - 1
+            如果 (i < 父.子数量) {
+                定义 最后 = 内存_读64(父.子列表 + 父.子数量 * 8)
+                内存_写64(父.子列表 + i * 8, 最后)
+            }
+            c.父 = 0
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+// §12 纺理内存管理
+// 内存管理公式: 当纺理内存 > 阈值, 释放优先级最低的不可见瓦片
+
+定义 纺理内存阈值 = 67108864  // 64MB
+
+函数 纺理内存_检查并清理(cl) {
+    如果 (NCLM_纺理内存字节 <= 纺理内存阈值) { 返回 }
+    如果 (cl == 0 || cl.瓦片列表 == 0) { 返回 }
+    // 释放不可见瓦片的纺理
+    定义 总 = cl.瓦片列数 * cl.瓦片行数
+    定义 可变 i = 0
+    当 (i < 总) {
+        定义 t = 内存_读64(cl.瓦片列表 + i * 8)
+        如果 (t != 0 && !t.可见 && t.纺理ID != 0) {
+            瓦片_释放纺理(t)
+        }
+        i = i + 1
+    }
+}
+
+函数 合成层_标记脏区域(cl, x, y, 宽, 高) {
+    如果 (cl == 0) { 返回 }
+    cl.需要重绘 = 真
+    cl.需要commit = 真
+    // 标记受影响的瓦片
+    如果 (cl.瓦片列表 == 0) { 返回 }
+    定义 c1 = x / 瓦片宽度
+    定义 c2 = (x + 宽 + 瓦片宽度 - 1) / 瓦片宽度
+    定义 r1 = y / 瓦片高度
+    定义 r2 = (y + 高 + 瓦片高度 - 1) / 瓦片高度
+    定义 可变 r = r1
+    当 (r < r2 && r < cl.瓦片行数) {
+        定义 可变 c = c1
+        当 (c < c2 && c < cl.瓦片列数) {
+            定义 idx = r * cl.瓦片列数 + c
+            定义 t = 内存_读64(cl.瓦片列表 + idx * 8)
+            如果 (t != 0) { t.已光栅 = 假 }  // 需要重新光栅化
+            c = c + 1
+        }
+        r = r + 1
+    }
+}

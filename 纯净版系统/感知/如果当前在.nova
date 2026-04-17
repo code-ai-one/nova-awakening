@@ -1,0 +1,102 @@
+
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./布局块级折.nova")
+导入("./样式值解析.nova")
+导入("./内联布局文.nova")
+导入("./弹性布局深度.nova")
+导入("./溢出计算.nova")
+
+        定义 可变 可用宽 = 包含块宽
+        定义 可变 x偏移 = 内容x
+
+        // 如果当前Y在浮动区域内,收缩可用宽度
+        如果 (当前Y < 左浮动底部 && 左浮动边界 > 0) {
+            x偏移 = x偏移 + 左浮动边界
+            可用宽 = 可用宽 - 左浮动边界
+        }
+        如果 (当前Y < 右浮动底部 && 右浮动边界 < 包含块宽) {
+            可用宽 = 可用宽 - (包含块宽 - 右浮动边界)
+        }
+
+        // 如果子元素指定了width,使用指定值; 否则填满可用宽度
+        如果 (子.宽度 == 0 && 子style != 0 && 子style.width == -1) {
+            子.宽度 = 可用宽 - 子.margin_left - 子.margin_right
+                     - 子.border_left - 子.border_right
+                     - 子.padding_left - 子.padding_right
+            如果 (子.宽度 < 0) { 子.宽度 = 0 }
+        }
+
+        子.x = x偏移 + 子.margin_left + 子.border_left + 子.padding_left
+        子.y = 当前Y
+
+        如果 (子.布局类型 == 布局类型_块) {
+            布局块级Flow_布局(子)
+        } 否则 如果 (子.布局类型 == 布局类型_弹性) {
+            布局弹性_布局(子)
+        } 否则 如果 (子.布局类型 == 布局类型_行内) {
+            布局Inline_布局(子)
+        } 否则 如果 (子.布局类型 == 布局类型_文本) {
+            布局Text_布局(子)
+        } 否则 如果 (子.布局类型 == 布局类型_表格) {
+            布局Table_布局(子)
+        } 否则 {
+            布局块级Flow_布局(子)
+        }
+
+        定义 子总高 = 子.高度 + 子.padding_top + 子.padding_bottom
+                     + 子.border_top + 子.border_bottom
+        如果 (子总高 < 0) { 子总高 = 0 }
+
+        // 推进Y
+        当前Y = 子.y + 子总高
+
+        // 记录margin-bottom(用于与下一个兄弟折叠)
+        上一个margin_bottom = 子.margin_bottom
+        如果 (上一个margin_bottom < 0) { 上一个margin_bottom = 0 }
+
+        子 = 子.后一兄弟布局
+    }
+
+    如果 (layout.border_bottom == 0 && layout.padding_bottom == 0 && !布局块级Flow_建立BFC(layout)) {
+        // 向上传播: 取父和最后一个子的margin-bottom较大者
+        定义 父mb = layout.margin_bottom
+        如果 (父mb < 0) { 父mb = 0 }
+        如果 (上一个margin_bottom > 父mb) {
+            layout.margin_bottom = 上一个margin_bottom
+        }
+        // 已传播到父, 从内容高中扣除
+        上一个margin_bottom = 0
+    }
+
+    如果 (!layout.高度已确定) {
+        定义 内容高 = 当前Y - 内容y_起始 + 上一个margin_bottom
+        // 考虑浮动溢出(如果建立BFC,需要包含浮动)
+        如果 (布局块级Flow_建立BFC(layout)) {
+            如果 (内容y_起始 + 内容高 < 左浮动底部) {
+                内容高 = 左浮动底部 - 内容y_起始
+            }
+            如果 (内容y_起始 + 内容高 < 右浮动底部) {
+                内容高 = 右浮动底部 - 内容y_起始
+            }
+        }
+        // min-height / max-height 约束
+        如果 (style.min_height > 0) {
+            定义 最小高 = CSS值_解析为像素(style.min_height, 包含块高)
+            如果 (内容高 < 最小高) { 内容高 = 最小高 }
+        }
+        如果 (style.max_height > 0 && style.max_height != -1) {
+            定义 最大高 = CSS值_解析为像素(style.max_height, 包含块高)
+            如果 (内容高 > 最大高) { 内容高 = 最大高 }
+        }
+        layout.高度 = 内容高
+
+    布局块级Flow_布局定位子元素(layout, 包含块宽, 包含块高)
+
+    布局块级Flow_计算overflow(layout)
+
+// §3 Margin折叠算法 (CSS2.1 §8.3.1)
+// 折叠规则:
+//   - 两个正margin: 取较大者
+//   - 一正一负: 求和
+//   - 两个负margin: 取绝对值较大者(即更负的那个)

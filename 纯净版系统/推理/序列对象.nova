@@ -1,0 +1,437 @@
+// §6 序列对象
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../标准/类型判断.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./小整数快速判.nova")
+导入("../标准/加法运算符.nova")
+导入("../执行/接口绑定.nova")
+导入("../感知/原子驻留.nova")
+导入("../中枢/内存初始化.nova")
+导入("../感知/内核直连层.nova")
+
+定义 NATIVE_序列_PARSE     = 800
+定义 NATIVE_序列_STRINGIFY = 801
+
+函数 网接口_安装序列(Nova运行时实例, global) {
+    定义 json = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, json, "parse", JSNative_创建(Nova运行时实例, NATIVE_序列_PARSE, 0))
+    Nova对象_设置属性(Nova运行时实例, json, "stringify", JSNative_创建(Nova运行时实例, NATIVE_序列_STRINGIFY, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "序列", json)
+}
+
+// §7 location对象
+
+函数 网接口_安装Location(Nova运行时实例, global, tab) {
+    定义 loc = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    如果 (tab != 0 && tab.URL != 0) {
+        Nova对象_设置属性(Nova运行时实例, loc, "href", Nova值_创建_String(Nova运行时实例, tab.URL))
+        定义 url = URL_解析(tab.URL)
+        如果 (url != 0) {
+            Nova对象_设置属性(Nova运行时实例, loc, "protocol", Nova值_创建_String(Nova运行时实例, 字符串_连接(url.协议, ":")))
+            Nova对象_设置属性(Nova运行时实例, loc, "hostname", Nova值_创建_String(Nova运行时实例, url.主机))
+            Nova对象_设置属性(Nova运行时实例, loc, "pathname", Nova值_创建_String(Nova运行时实例, url.路径))
+            Nova对象_设置属性(Nova运行时实例, loc, "host", Nova值_创建_String(Nova运行时实例, url.主机))
+            如果 (url.查询 != 0) {
+                Nova对象_设置属性(Nova运行时实例, loc, "search", Nova值_创建_String(Nova运行时实例, 字符串_连接("?", url.查询)))
+            } 否则 {
+                Nova对象_设置属性(Nova运行时实例, loc, "search", Nova值_创建_String(Nova运行时实例, ""))
+            }
+            如果 (url.片段 != 0) {
+                Nova对象_设置属性(Nova运行时实例, loc, "hash", Nova值_创建_String(Nova运行时实例, 字符串_连接("#", url.片段)))
+            } 否则 {
+                Nova对象_设置属性(Nova运行时实例, loc, "hash", Nova值_创建_String(Nova运行时实例, ""))
+            }
+        }
+    }
+    Nova对象_设置属性(Nova运行时实例, loc, "origin", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, global, "location", loc)
+}
+
+// §8 navigator对象
+
+函数 网接口_安装Navigator(Nova运行时实例, global) {
+    定义 nav = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, nav, "user智能体", Nova值_创建_String(Nova运行时实例, "NovaBrowser/1.0 (NovaOS)"))
+    Nova对象_设置属性(Nova运行时实例, nav, "language", Nova值_创建_String(Nova运行时实例, "zh-CN"))
+    Nova对象_设置属性(Nova运行时实例, nav, "platform", Nova值_创建_String(Nova运行时实例, "NovaOS"))
+    Nova对象_设置属性(Nova运行时实例, nav, "vendor", Nova值_创建_String(Nova运行时实例, "NovaBrowser"))
+    Nova对象_设置属性(Nova运行时实例, nav, "cookieEnabled", Nova运行时实例.true值)
+    Nova对象_设置属性(Nova运行时实例, nav, "onLine", Nova运行时实例.true值)
+    定义 langs = Nova数组_创建(Nova运行时实例, 2)
+    Nova数组_Push(Nova运行时实例, langs, Nova值_创建_String(Nova运行时实例, "zh-CN"))
+    Nova数组_Push(Nova运行时实例, langs, Nova值_创建_String(Nova运行时实例, "en"))
+    Nova对象_设置属性(Nova运行时实例, nav, "languages", langs)
+    Nova对象_设置属性(Nova运行时实例, global, "navigator", nav)
+}
+
+// §9 local存储/session存储
+
+结构 存储Backend {
+    条目,    // u64 [键哈希, 键指针, 值指针]
+    数量,
+    容量,
+}
+
+定义 可变 全局local存储 = 0
+定义 可变 全局session存储 = 0
+
+函数 存储_初始化() {
+    如果 (全局local存储 != 0) { 返回 }
+    全局local存储 = 堆_分配(存储Backend)
+    全局local存储.容量 = 256
+    全局local存储.条目 = 堆_分配_数组(256 * 24)
+    全局local存储.数量 = 0
+    全局session存储 = 堆_分配(存储Backend)
+    全局session存储.容量 = 256
+    全局session存储.条目 = 堆_分配_数组(256 * 24)
+    全局session存储.数量 = 0
+}
+
+函数 存储_getItem(键) {
+    如果 (全局local存储 == 0) { 存储_初始化() }
+    定义 哈希 = 字符串_哈希(键)
+    定义 可变 i = 0
+    当 (i < 全局local存储.数量) {
+        定义 偏移 = 全局local存储.条目 + i * 24
+        如果 (内存_读32(偏移) == 哈希) {
+            定义 已有键 = 内存_读64(偏移 + 8)
+            如果 (字符串_相等(已有键, 键)) {
+                返回 内存_读64(偏移 + 16)
+            }
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 存储_setItem(键, 值) {
+    如果 (全局local存储 == 0) { 存储_初始化() }
+    定义 哈希 = 字符串_哈希(键)
+    // 更新已有
+    定义 可变 i = 0
+    当 (i < 全局local存储.数量) {
+        定义 偏移 = 全局local存储.条目 + i * 24
+        如果 (内存_读32(偏移) == 哈希) {
+            定义 已有键 = 内存_读64(偏移 + 8)
+            如果 (字符串_相等(已有键, 键)) {
+                内存_写64(偏移 + 16, 字符串_复制(值))
+                返回
+            }
+        }
+        i = i + 1
+    }
+    // 新增
+    如果 (全局local存储.数量 >= 全局local存储.容量) { 返回 }
+    定义 偏移 = 全局local存储.条目 + 全局local存储.数量 * 24
+    内存_写32(偏移, 哈希)
+    内存_写64(偏移 + 8, 字符串_复制(键))
+    内存_写64(偏移 + 16, 字符串_复制(值))
+    全局local存储.数量 = 全局local存储.数量 + 1
+}
+
+函数 网接口_安装存储(Nova运行时实例, global) {
+    存储_初始化()
+    定义 ls = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, ls, "getItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_GET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, ls, "setItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_SET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, ls, "removeItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_REMOVE_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, ls, "clear", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_CLEAR, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "local存储", ls)
+
+    定义 ss = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, ss, "getItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_GET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, ss, "setItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_SET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, ss, "removeItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_REMOVE_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "session存储", ss)
+}
+
+// §10 存储操作扩展
+
+定义 NATIVE_STORAGE_GET_ITEM = 810
+定义 NATIVE_STORAGE_SET_ITEM = 811
+定义 NATIVE_STORAGE_REMOVE_ITEM = 812
+定义 NATIVE_STORAGE_CLEAR = 813
+
+函数 存储_removeItem(键) {
+    如果 (全局local存储 == 0) { 返回 }
+    定义 哈希 = 字符串_哈希(键)
+    定义 可变 i = 0
+    当 (i < 全局local存储.数量) {
+        定义 偏移 = 全局local存储.条目 + i * 24
+        如果 (内存_读32(偏移) == 哈希) {
+            定义 已有键 = 内存_读64(偏移 + 8)
+            如果 (字符串_相等(已有键, 键)) {
+                定义 最后偏移 = 全局local存储.条目 + (全局local存储.数量 - 1) * 24
+                如果 (i < 全局local存储.数量 - 1) {
+                    内存_复制(偏移, 最后偏移, 24)
+                }
+                全局local存储.数量 = 全局local存储.数量 - 1
+                返回
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 存储_clear() {
+    如果 (全局local存储 == 0) { 返回 }
+    全局local存储.数量 = 0
+}
+
+函数 存储_length() {
+    如果 (全局local存储 == 0) { 返回 0 }
+    返回 全局local存储.数量
+}
+
+函数 存储_key(索引) {
+    如果 (全局local存储 == 0 || 索引 >= 全局local存储.数量) { 返回 0 }
+    定义 偏移 = 全局local存储.条目 + 索引 * 24
+    返回 内存_读64(偏移 + 8)
+}
+
+// §11 JSON解析器
+
+结构 JSON解析器 {
+    源码,
+    长度,
+    位置,
+    错误,
+}
+
+函数 JSON_解析(Nova运行时实例, 文本) {
+    如果 (文本 == 0) { 返回 Nova运行时实例.undefined值 }
+    定义 parser = JSON解析器 {}
+    parser.源码 = 文本
+    parser.长度 = 字节长度(文本)
+    parser.位置 = 0
+    parser.错误 = 0
+    JSON_跳过空白(parser)
+    定义 结果 = JSON_解析值(Nova运行时实例, parser)
+    如果 (parser.错误 != 0) {
+        返回 Nova运行时实例.undefined值
+    }
+    返回 结果
+}
+
+函数 JSON_跳过空白(parser) {
+    当 (parser.位置 < parser.长度) {
+        定义 ch = 字节取(parser.源码, parser.位置)
+        如果 (ch == 32 || ch == 9 || ch == 10 || ch == 13) {
+            parser.位置 = parser.位置 + 1
+        } 否则 { 返回 }
+    }
+}
+
+函数 JSON_解析值(Nova运行时实例, parser) {
+    如果 (parser.位置 >= parser.长度) { parser.错误 = 1; 返回 0 }
+    定义 ch = 字节取(parser.源码, parser.位置)
+    如果 (ch == 34) { 返回 JSON_解析字符串(Nova运行时实例, parser) }
+    如果 (ch == 123) { 返回 JSON_解析对象(Nova运行时实例, parser) }
+    如果 (ch == 91) { 返回 JSON_解析数组(Nova运行时实例, parser) }
+    如果 (ch == 116) { 返回 JSON_解析true(Nova运行时实例, parser) }
+    如果 (ch == 102) { 返回 JSON_解析false(Nova运行时实例, parser) }
+    如果 (ch == 110) { 返回 JSON_解析null(Nova运行时实例, parser) }
+    如果 ((ch >= 48 && ch <= 57) || ch == 45) { 返回 JSON_解析数字(Nova运行时实例, parser) }
+    parser.错误 = 1
+    返回 0
+}
+
+函数 JSON_解析字符串(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 1
+    定义 起始 = parser.位置
+    当 (parser.位置 < parser.长度) {
+        定义 ch = 字节取(parser.源码, parser.位置)
+        如果 (ch == 34) {
+            定义 长度 = parser.位置 - 起始
+            parser.位置 = parser.位置 + 1
+            返回 Nova值_创建_String(Nova运行时实例, 字符串_子串(parser.源码, 起始, 长度))
+        }
+        如果 (ch == 92) { parser.位置 = parser.位置 + 1 }
+        parser.位置 = parser.位置 + 1
+    }
+    parser.错误 = 1
+    返回 0
+}
+
+函数 JSON_解析数字(Nova运行时实例, parser) {
+    定义 起始 = parser.位置
+    如果 (字节取(parser.源码, parser.位置) == 45) { parser.位置 = parser.位置 + 1 }
+    当 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) >= 48 && 字节取(parser.源码, parser.位置) <= 57) {
+        parser.位置 = parser.位置 + 1
+    }
+    如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 46) {
+        parser.位置 = parser.位置 + 1
+        当 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) >= 48 && 字节取(parser.源码, parser.位置) <= 57) {
+            parser.位置 = parser.位置 + 1
+        }
+    }
+    定义 数字文本 = 字符串_子串(parser.源码, 起始, parser.位置 - 起始)
+    返回 Nova值_创建_Number(Nova运行时实例, 转整数(数字文本))
+}
+
+函数 JSON_解析对象(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 1
+    定义 obj = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    JSON_跳过空白(parser)
+    如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 125) {
+        parser.位置 = parser.位置 + 1
+        返回 obj
+    }
+    当 (parser.位置 < parser.长度) {
+        JSON_跳过空白(parser)
+        定义 键值 = JSON_解析字符串(Nova运行时实例, parser)
+        如果 (键值 == 0) { parser.错误 = 1; 返回 obj }
+        JSON_跳过空白(parser)
+        如果 (parser.位置 >= parser.长度 || 字节取(parser.源码, parser.位置) != 58) {
+            parser.错误 = 1; 返回 obj
+        }
+        parser.位置 = parser.位置 + 1
+        JSON_跳过空白(parser)
+        定义 值 = JSON_解析值(Nova运行时实例, parser)
+        Nova对象_设置属性(Nova运行时实例, obj, JSValue_获取字符串(键值), 值)
+        JSON_跳过空白(parser)
+        如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 44) {
+            parser.位置 = parser.位置 + 1
+        } 否则 { 跳出 }
+    }
+    如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 125) {
+        parser.位置 = parser.位置 + 1
+    }
+    返回 obj
+}
+
+函数 JSON_解析数组(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 1
+    定义 arr = Nova数组_创建(Nova运行时实例, 0)
+    JSON_跳过空白(parser)
+    如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 93) {
+        parser.位置 = parser.位置 + 1
+        返回 arr
+    }
+    当 (parser.位置 < parser.长度) {
+        JSON_跳过空白(parser)
+        定义 值 = JSON_解析值(Nova运行时实例, parser)
+        Nova数组_Push(Nova运行时实例, arr, 值)
+        JSON_跳过空白(parser)
+        如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 44) {
+            parser.位置 = parser.位置 + 1
+        } 否则 { 跳出 }
+    }
+    如果 (parser.位置 < parser.长度 && 字节取(parser.源码, parser.位置) == 93) {
+        parser.位置 = parser.位置 + 1
+    }
+    返回 arr
+}
+
+函数 JSON_解析true(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 4
+    返回 Nova运行时实例.true值
+}
+
+函数 JSON_解析false(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 5
+    返回 Nova运行时实例.false值
+}
+
+函数 JSON_解析null(Nova运行时实例, parser) {
+    parser.位置 = parser.位置 + 4
+    返回 Nova运行时实例.null值
+}
+
+// §12 JSON序列化
+
+函数 JSON_序列化(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 "null" }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == 0) { 返回 "undefined" }
+    如果 (类型 == 1) { 返回 "null" }
+    如果 (类型 == 2) {
+        如果 (内存_读64(值 + 8) != 0) { 返回 "true" }
+        返回 "false"
+    }
+    如果 (类型 == 3) { 返回 整数转字符串(内存_读64(值 + 8)) }
+    如果 (类型 == 4) {
+        返回 "\"" + JSValue_获取字符串(值) + "\""
+    }
+    如果 (类型 == 11) { 返回 JSON_序列化数组(Nova运行时实例, 值) }
+    如果 (类型 >= 10) { 返回 JSON_序列化对象(Nova运行时实例, 值) }
+    返回 "null"
+}
+
+函数 JSON_序列化数组(Nova运行时实例, arr) {
+    定义 可变 结果 = "["
+    返回 结果 + "]"
+}
+
+函数 JSON_序列化对象(Nova运行时实例, obj) {
+    定义 可变 结果 = "{"
+    返回 结果 + "}"
+}
+
+// §13 URL解析
+
+结构 URL结构 {
+    协议,
+    主机,
+    端口,
+    路径,
+    查询,
+    片段,
+    是安全的,
+}
+
+函数 URL_解析(url字符串) {
+    如果 (url字符串 == 0) { 返回 0 }
+    定义 url = URL结构 {}
+    url.协议 = ""
+    url.主机 = ""
+    url.端口 = 80
+    url.路径 = "/"
+    url.查询 = 0
+    url.片段 = 0
+    url.是安全的 = 假
+    如果 (字符串_以开头(url字符串, "https://")) {
+        url.协议 = "https"
+        url.端口 = 443
+        url.是安全的 = 真
+    } 否则 如果 (字符串_以开头(url字符串, "http://")) {
+        url.协议 = "http"
+    }
+    返回 url
+}
+
+// §14 网接口统计
+
+定义 可变 网接口_JSON解析数 = 0
+定义 可变 网接口_JSON序列化数 = 0
+定义 可变 网接口_存储读数 = 0
+定义 可变 网接口_存储写数 = 0
+
+函数 网接口_统计() {
+    返回 {
+        JSON解析: 网接口_JSON解析数,
+        JSON序列化: 网接口_JSON序列化数,
+        存储读: 网接口_存储读数,
+        存储写: 网接口_存储写数,
+        local存储条数: 存储_length(),
+    }
+}
+
+函数 网接口_健康检查() {
+    返回 "网接口绑定健康"
+}
+
+函数 网接口_重置统计() {
+    网接口_JSON解析数 = 0
+    网接口_JSON序列化数 = 0
+    网接口_存储读数 = 0
+    网接口_存储写数 = 0
+}
+
+函数 网接口_完整统计() {
+    返回 [网接口_JSON解析数, 网接口_JSON序列化数, 网接口_存储读数, 网接口_存储写数]
+}

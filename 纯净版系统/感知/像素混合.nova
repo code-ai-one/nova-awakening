@@ -1,0 +1,106 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./图像数据像.nova")
+导入("./画布渲染上.nova")
+导入("../中枢/内存初始化.nova")
+
+// §13 像素混合(合成)
+
+
+函数 Ctx2D_混合像素(ctx, x, y, 源颜色, 合成模式) {
+    如果 (ctx == 0 || x < 0 || y < 0 || x >= ctx.画布宽 || y >= ctx.画布高) { 返回 }
+    定义 偏移 = (y * ctx.画布宽 + x) * 4
+    定义 目标 = 内存_读32(ctx.像素缓冲 + 偏移)
+
+    定义 sa = (源颜色 >> 24) & 0xFF
+    如果 (sa == 0) { 返回 }
+
+    定义 可变 结果 = 源颜色
+
+    如果 (合成模式 == COMP_SOURCE_OVER) {
+        // Porter-Duff source-over: out = src + dst * (1 - srcA)
+        定义 da = (目标 >> 24) & 0xFF
+        如果 (da == 0 || sa == 255) {
+            结果 = 源颜色    // 快速路径
+        } 否则 {
+            定义 inv = 255 - sa
+            定义 sr = (源颜色 >> 16) & 0xFF; 定义 sg = (源颜色 >> 8) & 0xFF; 定义 sb = 源颜色 & 0xFF
+            定义 dr = (目标 >> 16) & 0xFF; 定义 dg = (目标 >> 8) & 0xFF; 定义 db = 目标 & 0xFF
+            定义 or = sr + dr * inv / 255
+            定义 og = sg + dg * inv / 255
+            定义 ob = sb + db * inv / 255
+            定义 oa = sa + da * inv / 255
+            结果 = (oa << 24) | (or << 16) | (og << 8) | ob
+        }
+    } 否则 如果 (合成模式 == COMP_MULTIPLY) {
+        定义 sr = (源颜色 >> 16) & 0xFF; 定义 dr = (目标 >> 16) & 0xFF
+        定义 sg = (源颜色 >> 8) & 0xFF; 定义 dg = (目标 >> 8) & 0xFF
+        定义 sb = 源颜色 & 0xFF; 定义 db = 目标 & 0xFF
+        结果 = (sa << 24) | ((sr * dr / 255) << 16) | ((sg * dg / 255) << 8) | (sb * db / 255)
+    } 否则 如果 (合成模式 == COMP_SCREEN) {
+        定义 sr = (源颜色 >> 16) & 0xFF; 定义 dr = (目标 >> 16) & 0xFF
+        定义 sg = (源颜色 >> 8) & 0xFF; 定义 dg = (目标 >> 8) & 0xFF
+        定义 sb = 源颜色 & 0xFF; 定义 db = 目标 & 0xFF
+        结果 = (sa << 24) | ((sr + dr - sr * dr / 255) << 16) |
+               ((sg + dg - sg * dg / 255) << 8) | (sb + db - sb * db / 255)
+    } 否则 如果 (合成模式 == COMP_COPY) {
+        结果 = 源颜色
+    }
+
+    内存_写32(ctx.像素缓冲 + 偏移, 结果)
+}
+
+// §14 Offscreen画布
+
+结构 Offscreen画布 {
+    宽度,
+    高度,
+    ctx,    // u64 画布渲染ingContext2D*
+}
+
+函数 Offscreen画布_创建(宽度, 高度) {
+    定义 oc = 堆_分配(Offscreen画布)
+    oc.宽度 = 宽度; oc.高度 = 高度
+    oc.ctx = Ctx2D_创建(宽度, 高度)
+    oc.ctx.是离屏 = 真
+    返回 oc
+}
+
+函数 Offscreen画布_transferTo图像Bitmap(oc) {
+    如果 (oc == 0 || oc.ctx == 0) { 返回 0 }
+    // 创建图像Bitmap, 转移像素所有权
+    定义 id = 图像Data_创建(oc.宽度, oc.高度)
+    内存_复制(id.数据, oc.ctx.像素缓冲, oc.宽度 * oc.高度 * 4)
+    返回 id
+}
+
+// §15 辅助
+
+函数 Ctx2D_标记脏区(ctx, x, y, w, h) {
+    如果 (ctx == 0) { 返回 }
+    如果 (!ctx.有脏区) {
+        ctx.脏区x = x; ctx.脏区y = y; ctx.脏区w = w; ctx.脏区h = h
+        ctx.有脏区 = 真
+    } 否则 {
+        // 合并脏区
+        定义 x2 = ctx.脏区x + ctx.脏区w
+        定义 y2 = ctx.脏区y + ctx.脏区h
+        如果 (x < ctx.脏区x) { ctx.脏区x = x }
+        如果 (y < ctx.脏区y) { ctx.脏区y = y }
+        如果 (x + w > x2) { x2 = x + w }
+        如果 (y + h > y2) { y2 = y + h }
+        ctx.脏区w = x2 - ctx.脏区x; ctx.脏区h = y2 - ctx.脏区y
+    }
+}
+
+
+函数 智能_画布_检测模式(ctx) {
+    如果 (ctx == 0) { 返回 }
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    // AI分析绘制调用模式:
+    //   大量fillRect → 可batch合并
+    //   大量draw图像 → 可图处纹理Atlas
+    //   大量路径绘制 → 可转图绘加速
+}

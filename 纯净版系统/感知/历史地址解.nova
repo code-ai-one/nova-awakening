@@ -1,0 +1,102 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+
+// 对应: nova/Nova渲染核心/frame/history.cc 
+//       nova/Nova渲染核心/loader/document_loader.cc 
+//       content/browser/renderer_host/navigation_controller_impl.cc (~5000行)
+//       content/browser/renderer_host/navigator.cc (~2000行)
+// 历史 接口 (HTML5):
+//   history.pushState(state, title, url)   — 添加历史条目
+//   history.replaceState(state, title, url) — 替换当前条目
+//   history.back() / forward() / go(n)     — 导航
+//   window.onpopstate                      — 状态变化事件
+// Location 接口:
+//   location.href / protocol / host / hostname / port / pathname
+//   location.search / hash / origin
+//   location.assign(url) / replace(url) / reload()
+// Navigation流程:
+//   1. 导航请求 → 2. 检查导航守卫(beforeunload) →
+//   3. 卸载旧文档(unload) → 4. 网络请求 →
+//   5. 解析响应 → 6. 提交导航 → 7. 加载新文档
+// 【Nova特色】AI导航优化:
+//   ① AI预测用户下一导航目标, 预取页面
+//   ② AI预测后退概率, 缓存前一页面DOM快照
+
+// §1 URL解析
+
+结构 URL {
+    完整,    // u64 完整URL字符串
+    协议,    // u64 "https:" / "http:" / "file:"
+    主机,    // u64 "example.com"
+    主机名,    // u64 "example.com" (不含端口)
+    端口,    // u64 "443"
+    路径,    // u64 "/path/to/page"
+    查询,    // u64 "?key=value"
+    哈希,    // u64 "#section"
+    源,    // u64 "https://example.com"
+    用户名,
+    密码,
+}
+
+函数 URL_解析(url字符串) {
+    如果 (url字符串 == 0) { 返回 0 }
+    定义 u = 堆_分配(URL)
+    u.完整 = 字符串_复制(url字符串)
+    // URL解析: protocol://[user:pass@]host[:port]/path[?query][#hash]
+    定义 可变 pos = 0
+    定义 len = 字节长度(url字符串)
+
+    // 协议
+    定义 可变 i = 0
+    当 (i < len && 字节取(url字符串, i) != 58) { i = i + 1 }   // ':'
+    如果 (i < len) {
+        u.协议 = 字符串_子串(url字符串, 0, i + 1)
+        pos = i + 1
+        // 跳过 //
+        如果 (pos + 1 < len && 字节取(url字符串, pos) == 47 && 字节取(url字符串, pos + 1) == 47) {
+            pos = pos + 2
+        }
+    }
+
+    // 主机[:端口]
+    定义 host起始 = pos
+    当 (pos < len && 字节取(url字符串, pos) != 47 && 字节取(url字符串, pos) != 63 && 字节取(url字符串, pos) != 35) {
+        pos = pos + 1
+    }
+    u.主机 = 字符串_子串(url字符串, host起始, pos)
+    u.主机名 = u.主机    // 不含端口的主机名(后续可分离端口)
+    u.端口 = ""
+
+    // 路径
+    定义 path起始 = pos
+    当 (pos < len && 字节取(url字符串, pos) != 63 && 字节取(url字符串, pos) != 35) {
+        pos = pos + 1
+    }
+    u.路径 = 字符串_子串(url字符串, path起始, pos)
+    如果 (u.路径 == 0 || 字节长度(u.路径) == 0) { u.路径 = "/" }
+
+    // 查询
+    如果 (pos < len && 字节取(url字符串, pos) == 63) {
+        定义 q起始 = pos
+        pos = pos + 1
+        当 (pos < len && 字节取(url字符串, pos) != 35) { pos = pos + 1 }
+        u.查询 = 字符串_子串(url字符串, q起始, pos)
+    } 否则 { u.查询 = "" }
+
+    // 哈希
+    如果 (pos < len && 字节取(url字符串, pos) == 35) {
+        u.哈希 = 字符串_子串(url字符串, pos, len)
+    } 否则 { u.哈希 = "" }
+
+    // 源
+    u.源 = 字符串_拼接3(u.协议, "//", u.主机)
+    返回 u
+}
+
+函数 URL_相同源(a, b) {
+    如果 (a == 0 || b == 0) { 返回 假 }
+    返回 字符串_相等(a.协议, b.协议) && 字符串_相等(a.主机, b.主机)
+}

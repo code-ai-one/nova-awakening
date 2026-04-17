@@ -1,0 +1,210 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/字符串替换.nova")
+
+//   1. MSR: Model Specific Registers — CPU特殊寄存器(RDMSR/WRMSR)
+//   2. 用途: 系统调用入口/段基址/性能计数器/电源管理/虚拟化
+//   3. EFER: Extended Feature Enable Register (长模式/NX/Nova系统调用)
+//   4. STAR/LSTAR/SFMASK: Nova系统调用/SYSRET配置
+//   5. PAT: Page Attribute Table (内存类型)
+
+// 系统调用相关
+定义 MSR_EFER            = 0xC0000080   // Extended Feature Enable
+定义 MSR_STAR            = 0xC0000081   // Nova系统调用 CS/SS选择子
+定义 MSR_LSTAR           = 0xC0000082   // Nova系统调用入口地址(64位)
+定义 MSR_CSTAR           = 0xC0000083   // Nova系统调用入口(兼容模式)
+定义 MSR_SFMASK          = 0xC0000084   // Nova系统调用 RFLAGS掩码
+
+// 段基址
+定义 MSR_FS_BASE         = 0xC0000100   // FS段基址(用户安全)
+定义 MSR_GS_BASE         = 0xC0000101   // GS段基址(内核per-CPU)
+定义 MSR_KERNEL_GS_BASE  = 0xC0000102   // 内核GS基址(SWAPGS用)
+
+// 接口C
+定义 MSR_接口C_BASE       = 0x0000001B   // 本地接口C基址
+
+// 时间戳
+定义 MSR_TSC             = 0x00000010   // 时间戳计数器
+定义 MSR_TSC_AUX         = 0xC0000103   // TSC辅助(RDTSCP返回)
+定义 MSR_TSC_ADJUST      = 0x0000003B   // TSC调整
+
+// 性能计数器
+定义 MSR_PERF_STATUS     = 0x00000198   // 性能状态
+定义 MSR_PERF_CTL        = 0x00000199   // 性能控制
+定义 MSR_FIXED_CTR0      = 0x00000309   // 固定计数器0(指令数)
+定义 MSR_FIXED_CTR1      = 0x0000030A   // 固定计数器1(周期数)
+定义 MSR_FIXED_CTR2      = 0x0000030B   // 固定计数器2(参考周期)
+
+// 电源管理
+定义 MSR_MPERF           = 0x000000E7   // 实际频率
+定义 MSR_APERF           = 0x000000E8   // 最大频率
+
+// 内存类型
+定义 MSR_PAT             = 0x00000277   // Page Attribute Table
+定义 MSR_MTRRCAP         = 0x000000FE   // MTRR能力
+定义 MSR_MTRR_DEF_TYPE   = 0x000002FF   // MTRR默认类型
+
+// 虚拟化
+定义 MSR_VM_CR           = 0xC0010114   // VM控制
+定义 MSR_VM_HSAVE_PA     = 0xC0010117   // 虚拟机保存区物理地址
+
+定义 EFER_SCE  = (1 << 0)    // Nova系统调用/SYSRET使能
+定义 EFER_LME  = (1 << 8)    // 长模式使能
+定义 EFER_LMA  = (1 << 10)   // 长模式激活(只读)
+定义 EFER_NXE  = (1 << 11)   // NX位使能
+
+// 基础MSR读写 
+
+函数 读MSR(寄存器号) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov ecx, [rbp+16]"
+        "rdmsr"
+        "shl rdx, 32"
+        "or rax, rdx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 写MSR(寄存器号, 值) {
+    汇编 {
+        "mov ecx, [rbp+24]"
+        "mov rax, [rbp+16]"
+        "mov rdx, rax"
+        "shr rdx, 32"
+        "wrmsr"
+    }
+}
+
+函数 读MSR_安全(寄存器号) {
+    // 带异常处理的MSR读取(避免#GP)
+    // M1优化: 直接读取
+    返回 读MSR(寄存器号)
+}
+
+// EFER操作
+
+函数 读EFER() { 返回 读MSR(MSR_EFER) }
+函数 写EFER(值) { 写MSR(MSR_EFER, 值) }
+
+函数 启用NX位() {
+    定义 efer = 读EFER()
+    写EFER(efer | EFER_NXE)
+}
+
+函数 启用Nova系统调用() {
+    定义 efer = 读EFER()
+    写EFER(efer | EFER_SCE)
+}
+
+// 段基址操作 (用户安全 + 内核per-CPU)
+
+函数 设置FS基址(地址) { 写MSR(MSR_FS_BASE, 地址) }
+函数 读取FS基址() { 返回 读MSR(MSR_FS_BASE) }
+函数 设置GS基址(地址) { 写MSR(MSR_GS_BASE, 地址) }
+函数 读取GS基址() { 返回 读MSR(MSR_GS_BASE) }
+函数 设置内核GS基址(地址) { 写MSR(MSR_KERNEL_GS_BASE, 地址) }
+函数 读取内核GS基址() { 返回 读MSR(MSR_KERNEL_GS_BASE) }
+
+// Nova系统调用/SYSRET配置
+
+函数 设置Nova系统调用入口(地址) { 写MSR(MSR_LSTAR, 地址) }
+函数 设置Nova系统调用选择子(内核CS, 用户CS) {
+    // STAR: [63:48]=用户CS/SS基 [47:32]=内核CS/SS基
+    定义 值 = (内核CS << 32) | (用户CS << 48)
+    写MSR(MSR_STAR, 值)
+}
+函数 设置Nova系统调用标志掩码(掩码) { 写MSR(MSR_SFMASK, 掩码) }
+
+函数 Nova系统调用_完整配置(入口地址, 内核CS, 用户CS) {
+    启用Nova系统调用()
+    设置Nova系统调用入口(入口地址)
+    设置Nova系统调用选择子(内核CS, 用户CS)
+    设置Nova系统调用标志掩码(0x200)   // 清除IF(关中断)
+}
+
+// 接口C操作
+
+函数 读接口C基址() { 返回 读MSR(MSR_接口C_BASE) & 0xFFFFF000 }
+函数 接口C_是BSP_MSR() { 返回 (读MSR(MSR_接口C_BASE) & (1 << 8)) != 0 }
+
+// 性能计数器
+
+函数 读取指令计数() { 返回 读MSR(MSR_FIXED_CTR0) }
+函数 读取周期计数() { 返回 读MSR(MSR_FIXED_CTR1) }
+函数 读取CPU实际频率() { 返回 读MSR(MSR_MPERF) }
+函数 读取CPU最大频率() { 返回 读MSR(MSR_APERF) }
+
+// PAT (Page Attribute Table) 配置
+
+定义 PAT_WB  = 0x06  // Write-Back (默认)
+定义 PAT_WT  = 0x04  // Write-Through
+定义 PAT_UC  = 0x00  // Uncacheable
+定义 PAT_WC  = 0x01  // Write-Combining
+定义 PAT_UCM = 0x07  // UC-minus
+
+函数 PAT_初始化() {
+    // Nova默认PAT: WB WT UC- UC WB WT UC- UC
+    定义 pat_值 = PAT_WB | (PAT_WT << 8) | (PAT_UCM << 16) | (PAT_UC << 24) |
+                  (PAT_WB << 32) | (PAT_WT << 40) | (PAT_UCM << 48) | (PAT_UC << 56)
+    写MSR(MSR_PAT, pat_值)
+}
+
+// TSC操作
+
+函数 读取TSC() { 返回 读MSR(MSR_TSC) }
+函数 设置TSC_AUX(值) { 写MSR(MSR_TSC_AUX, 值) }
+函数 读取TSC_AUX() { 返回 读MSR(MSR_TSC_AUX) }
+
+函数 TSC_调整(偏移) {
+    写MSR(MSR_TSC_ADJUST, 偏移)
+}
+
+// CPU频率估算 (通过MPERF/APERF)
+
+函数 CPU_频率比() {
+    定义 mperf = 读MSR(MSR_MPERF)
+    定义 aperf = 读MSR(MSR_APERF)
+    如果 (mperf == 0) { 返回 100 }
+    返回 aperf * 100 / mperf  // >100表示turbo boost
+}
+
+// MSR别名 (兼容其他模块)
+
+函数 读取MSR(寄存器号) { 返回 读MSR(寄存器号) }
+函数 写入MSR(寄存器号, 值) { 写MSR(寄存器号, 值) }
+
+// MSR名称 + PAT类型名 + EFER状态摘要
+
+函数 MSR_名称(寄存器号) {
+    如果 (寄存器号 == MSR_EFER) { 返回 "EFER" }
+    如果 (寄存器号 == MSR_LSTAR) { 返回 "LSTAR" }
+    如果 (寄存器号 == MSR_STAR) { 返回 "STAR" }
+    如果 (寄存器号 == MSR_FS_BASE) { 返回 "FS_BASE" }
+    如果 (寄存器号 == MSR_GS_BASE) { 返回 "GS_BASE" }
+    如果 (寄存器号 == MSR_接口C_BASE) { 返回 "接口C_BASE" }
+    如果 (寄存器号 == MSR_PAT) { 返回 "PAT" }
+    如果 (寄存器号 == MSR_TSC) { 返回 "TSC" }
+    返回 "MSR_0x" + 整数转十六进制(寄存器号)
+}
+
+函数 PAT_类型名(类型) {
+    如果 (类型 == PAT_WB) { 返回 "WB" }
+    如果 (类型 == PAT_WT) { 返回 "WT" }
+    如果 (类型 == PAT_UC) { 返回 "UC" }
+    如果 (类型 == PAT_WC) { 返回 "WC" }
+    如果 (类型 == PAT_UCM) { 返回 "UC-" }
+    返回 "unknown"
+}
+
+函数 EFER_摘要() {
+    定义 efer = 读EFER()
+    返回 [(efer & EFER_SCE) != 0, (efer & EFER_LME) != 0,
+           (efer & EFER_LMA) != 0, (efer & EFER_NXE) != 0]
+}
+
+
+函数 MSR_完整统计() {
+    返回 [MSR_读次数, MSR_写次数]
+}

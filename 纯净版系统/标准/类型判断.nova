@@ -1,0 +1,571 @@
+// NovaOS 类型操作与数组方法 — typeof/类型转换/数组CRUD/对象键枚举
+// 技术: ES2023 typeof (§13.5.3) + Array.prototype + Object.keys
+// 核心: typeof运算, 类型ID系统, 数组get/set/push/pop/splice,
+//       对象键枚举, 类型转换(ToNumber/ToString/ToBoolean)
+// NovaOS创新: AI类型预测缓存 + 数组元素类型特化 + 热属性访问优化
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/内存初始化.nova")
+导入("../执行/底层内存操.nova")
+
+
+// JS值类型ID (内部类型标记)
+定义 JS类型_Undefined   = 0
+定义 JS类型_Null        = 1
+定义 JS类型_Boolean     = 2
+定义 JS类型_Number      = 3
+定义 JS类型_String      = 4
+定义 JS类型_符号        = 5
+定义 JS类型_BigInt      = 6
+定义 JS类型_Object      = 7
+定义 JS类型_Function    = 8
+定义 JS类型_异步Function = 9
+定义 JS类型_Array       = 10
+定义 JS类型_RegExp      = 11
+定义 JS类型_Date        = 12
+定义 JS类型_Error       = 13
+定义 JS类型_Promise     = 14
+定义 JS类型_Map         = 15
+定义 JS类型_Set         = 16
+定义 JS类型_WeakMap     = 17
+定义 JS类型_WeakSet     = 18
+定义 JS类型_TypedArray  = 19
+定义 JS类型_ArrayBuffer = 20
+定义 JS类型_Generator   = 21
+定义 JS类型_Proxy       = 22
+
+// typeof返回字符串缓存ID
+定义 TYPEOF_STR_undefined = 0
+定义 TYPEOF_STR_boolean   = 1
+定义 TYPEOF_STR_number    = 2
+定义 TYPEOF_STR_string    = 3
+定义 TYPEOF_STR_symbol    = 4
+定义 TYPEOF_STR_bigint    = 5
+定义 TYPEOF_STR_object    = 6
+定义 TYPEOF_STR_function  = 7
+
+// 属性特性标志
+定义 属性_可写       = 1
+定义 属性_可枚举     = 2
+定义 属性_可配置     = 4
+
+// 数组配置
+定义 数组_初始容量   = 8
+定义 数组_增长因子   = 2
+定义 数组_最大长度   = 4294967295   // 2^32 - 1
+
+// AI类型预测缓存
+定义 AI_类型缓存大小 = 32
+
+
+结构 AI类型预测缓存 {
+    基址,              // u64 [对象地址哈希:u32][预测类型:u32] 数组
+    容量,
+    命中数,
+    未命中数,
+    总查询数,
+}
+
+
+定义 可变 缓存_undefined = 0
+定义 可变 缓存_boolean = 0
+定义 可变 缓存_number = 0
+定义 可变 缓存_string = 0
+定义 可变 缓存_symbol = 0
+定义 可变 缓存_bigint = 0
+定义 可变 缓存_object = 0
+定义 可变 缓存_function = 0
+
+函数 TypeOf_初始化缓存(Nova运行时实例) {
+    如果 (Nova运行时实例 == 0) { 返回 }
+    缓存_undefined = Nova值_创建_String(Nova运行时实例, "undefined")
+    缓存_boolean = Nova值_创建_String(Nova运行时实例, "boolean")
+    缓存_number = Nova值_创建_String(Nova运行时实例, "number")
+    缓存_string = Nova值_创建_String(Nova运行时实例, "string")
+    缓存_symbol = Nova值_创建_String(Nova运行时实例, "symbol")
+    缓存_bigint = Nova值_创建_String(Nova运行时实例, "bigint")
+    缓存_object = Nova值_创建_String(Nova运行时实例, "object")
+    缓存_function = Nova值_创建_String(Nova运行时实例, "function")
+}
+
+
+函数 JSValue_TypeOf(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined) { 返回 Nova值_创建_String(Nova运行时实例, "undefined") }
+    如果 (类型 == JS类型_Null) { 返回 Nova值_创建_String(Nova运行时实例, "object") }    // 历史原因!
+    如果 (类型 == JS类型_Boolean) { 返回 Nova值_创建_String(Nova运行时实例, "boolean") }
+    如果 (类型 == JS类型_Number) { 返回 Nova值_创建_String(Nova运行时实例, "number") }
+    如果 (类型 == JS类型_String) { 返回 Nova值_创建_String(Nova运行时实例, "string") }
+    如果 (类型 == JS类型_符号) { 返回 Nova值_创建_String(Nova运行时实例, "symbol") }
+    如果 (类型 == JS类型_BigInt) { 返回 Nova值_创建_String(Nova运行时实例, "bigint") }
+    如果 (类型 == JS类型_Function || 类型 == JS类型_异步Function) {
+        返回 Nova值_创建_String(Nova运行时实例, "function")
+    }
+    返回 Nova值_创建_String(Nova运行时实例, "object")
+}
+
+// §10 数组操作 (数组.prototype方法)
+
+函数 Nova数组_获取(Nova运行时实例, arr, 索引) {
+    如果 (arr == 0) { 返回 Nova运行时实例.undefined值 }
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 Nova运行时实例.undefined值 }
+    定义 长度 = 内存_读32(obj数据 + 40)
+    如果 (索引 < 0 || 索引 >= 长度) { 返回 Nova运行时实例.undefined值 }
+    定义 元素 = 内存_读64(obj数据 + 32)
+    返回 内存_读64(元素 + 索引 * 8)
+}
+
+函数 Nova数组_设置(Nova运行时实例, arr, 索引, 值) {
+    如果 (arr == 0) { 返回 }
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 }
+    定义 容量 = 内存_读32(obj数据 + 44)
+
+    // 扩容
+    如果 (索引 >= 容量) {
+        定义 新容量 = 容量
+        当 (新容量 <= 索引) { 新容量 = 新容量 * 2 }
+        定义 旧元素 = 内存_读64(obj数据 + 32)
+        定义 新元素 = 堆_分配_数组(新容量 * 8)
+        内存_复制(新元素, 旧元素, 容量 * 8)
+        堆_释放(旧元素)
+        内存_写64(obj数据 + 32, 新元素)
+        内存_写32(obj数据 + 44, 新容量)
+    }
+
+    定义 元素 = 内存_读64(obj数据 + 32)
+    内存_写64(元素 + 索引 * 8, 值)
+    定义 长度 = 内存_读32(obj数据 + 40)
+    如果 (索引 >= 长度) {
+        内存_写32(obj数据 + 40, 索引 + 1)
+    }
+}
+
+函数 Nova数组_Push(Nova运行时实例, arr, 值) {
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 }
+    定义 长度 = 内存_读32(obj数据 + 40)
+    Nova数组_设置(Nova运行时实例, arr, 长度, 值)
+}
+
+函数 Nova数组_Pop(Nova运行时实例, arr) {
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 Nova运行时实例.undefined值 }
+    定义 长度 = 内存_读32(obj数据 + 40)
+    如果 (长度 == 0) { 返回 Nova运行时实例.undefined值 }
+    定义 元素 = 内存_读64(obj数据 + 32)
+    定义 值 = 内存_读64(元素 + (长度 - 1) * 8)
+    内存_写32(obj数据 + 40, 长度 - 1)
+    返回 值
+}
+
+函数 Nova数组_Length(Nova运行时实例, arr) {
+    定义 obj数据 = 内存_读64(arr + 40)
+    如果 (obj数据 == 0) { 返回 0 }
+    返回 内存_读32(obj数据 + 40)
+}
+
+函数 Nova对象_获取所有键(Nova运行时实例, obj) {
+    如果 (obj == 0) { 返回 Nova数组_创建(Nova运行时实例, 0) }
+    定义 结果 = Nova数组_创建(Nova运行时实例, 8)
+    定义 obj数据 = 内存_读64(obj + 40)
+    如果 (obj数据 == 0) { 返回 结果 }
+    定义 属性数 = 内存_读32(obj数据 + 24)
+    定义 属性存储 = 内存_读64(obj数据 + 16)
+    定义 可变 i = 0
+    当 (i < 属性数) {
+        定义 偏移 = 属性存储 + i * 32
+        定义 特性 = 内存_读32(偏移 + 24)
+        如果 (特性 & 属性_可枚举) {
+            定义 键 = 内存_读64(偏移)
+            Nova数组_Push(Nova运行时实例, 结果, 键)
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+
+// ES2023 §7.1.2 ToBoolean
+函数 JSValue_ToBoolean(Nova运行时实例, 值) {
+    如果 (值 == 0) { 返回 假 }
+    定义 类型 = 内存_读32(值)
+    // undefined → false
+    如果 (类型 == JS类型_Undefined) { 返回 假 }
+    // null → false
+    如果 (类型 == JS类型_Null) { 返回 假 }
+    // Boolean → 直接返回
+    如果 (类型 == JS类型_Boolean) {
+        返回 内存_读32(值 + 8) != 0
+    }
+    // Number → +0, -0, NaN → false, 其他 → true
+    如果 (类型 == JS类型_Number) {
+        定义 数值 = 内存_读64(值 + 8)
+        返回 数值 != 0
+    }
+    // String → "" → false, 其他 → true
+    如果 (类型 == JS类型_String) {
+        定义 长度 = 内存_读32(值 + 8)
+        返回 长度 > 0
+    }
+    // BigInt → 0n → false, 其他 → true
+    如果 (类型 == JS类型_BigInt) {
+        返回 内存_读64(值 + 8) != 0
+    }
+    // Symbol → true
+    如果 (类型 == JS类型_符号) { 返回 真 }
+    // Object/Function/Array/... → true
+    返回 真
+}
+
+// ES2023 §7.1.3 ToNumber
+函数 JSValue_ToNumber(Nova运行时实例, 值) {
+    如果 (值 == 0 || Nova运行时实例 == 0) { 返回 0 }
+    定义 类型 = 内存_读32(值)
+    // undefined → NaN (用0表示)
+    如果 (类型 == JS类型_Undefined) { 返回 0 }
+    // null → 0
+    如果 (类型 == JS类型_Null) { 返回 0 }
+    // Boolean → true=1, false=0
+    如果 (类型 == JS类型_Boolean) {
+        返回 内存_读32(值 + 8)
+    }
+    // Number → 直接返回
+    如果 (类型 == JS类型_Number) {
+        返回 内存_读64(值 + 8)
+    }
+    // String → 解析数字
+    如果 (类型 == JS类型_String) {
+        定义 字符串指针 = 内存_读64(值 + 16)
+        定义 长度 = 内存_读32(值 + 8)
+        返回 字符串_解析数字(字符串指针, 长度)
+    }
+    // BigInt → TypeError (简化: 返回低64位)
+    如果 (类型 == JS类型_BigInt) {
+        返回 内存_读64(值 + 8)
+    }
+    // Object → ToPrimitive → ToNumber
+    返回 0
+}
+
+// ES2023 §7.1.4 ToInteger/ToInt32
+函数 JSValue_ToInt32(Nova运行时实例, 值) {
+    定义 数值 = JSValue_ToNumber(Nova运行时实例, 值)
+    // 截断到32位有符号整数
+    返回 数值 & 0xFFFFFFFF
+}
+
+函数 JSValue_ToUint32(Nova运行时实例, 值) {
+    定义 数值 = JSValue_ToNumber(Nova运行时实例, 值)
+    返回 数值 & 0xFFFFFFFF
+}
+
+// ES2023 §7.1.17 ToString
+函数 JSValue_ToString(Nova运行时实例, 值) {
+    如果 (值 == 0 || Nova运行时实例 == 0) { 返回 "undefined" }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined) { 返回 "undefined" }
+    如果 (类型 == JS类型_Null) { 返回 "null" }
+    如果 (类型 == JS类型_Boolean) {
+        如果 (内存_读32(值 + 8) != 0) { 返回 "true" }
+        返回 "false"
+    }
+    如果 (类型 == JS类型_Number) {
+        返回 转字符串(内存_读64(值 + 8))
+    }
+    如果 (类型 == JS类型_String) {
+        返回 内存_读64(值 + 16)    // 直接返回字符串指针
+    }
+    如果 (类型 == JS类型_符号) { 返回 "Symbol()" }
+    如果 (类型 == JS类型_BigInt) {
+        返回 转字符串(内存_读64(值 + 8))
+    }
+    返回 "[object Object]"
+}
+
+
+函数 Nova值_创建_Undefined(Nova运行时实例) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    返回 Nova运行时实例.undefined值
+}
+
+函数 Nova值_创建_Null(Nova运行时实例) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    返回 Nova运行时实例.null值
+}
+
+函数 Nova值_创建_Boolean(Nova运行时实例, 值) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    如果 (值 == 真) { 返回 Nova运行时实例.true值 }
+    返回 Nova运行时实例.false值
+}
+
+函数 Nova值_创建_Int(Nova运行时实例, 整数值) {
+    // Smi (Small Integer): 直接编码在指针中
+    // Smi编码: 值左移1位, 最低位=0 (与对象指针最低位=1区分)
+    返回 整数值 * 2
+}
+
+函数 Nova值_创建_Number(Nova运行时实例, 数值) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    // 检查是否可以用Smi表示
+    如果 (数值 >= -1073741824 && 数值 <= 1073741823) {
+        返回 数值 * 2    // Smi编码
+    }
+    // 堆分配HeapNumber
+    定义 obj = 堆_分配(16)
+    如果 (obj == 0) { 返回 0 }
+    内存_写32(obj, JS类型_Number)
+    内存_写64(obj + 8, 数值)
+    返回 obj
+}
+
+函数 Nova值_创建_String(Nova运行时实例, 字符串) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    定义 长度 = 字节长度(字符串)
+    定义 obj = 堆_分配(24 + 长度 + 1)
+    如果 (obj == 0) { 返回 0 }
+    内存_写32(obj, JS类型_String)
+    内存_写32(obj + 8, 长度)
+    内存_写64(obj + 16, obj + 24)
+    // 复制字符串数据
+    定义 可变 i = 0
+    当 (i < 长度) {
+        内存_写8(obj + 24 + i, 字节取(字符串, i))
+        i = i + 1
+    }
+    内存_写8(obj + 24 + 长度, 0)    // null终止
+    返回 obj
+}
+
+
+函数 JSValue_IsSmi(值) {
+    返回 (值 & 1) == 0
+}
+
+函数 JSValue_GetSmi(值) {
+    返回 值 / 2
+}
+
+函数 JSValue_IsNull(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Null
+}
+
+函数 JSValue_IsUndefined(值) {
+    如果 (值 == 0) { 返回 真 }
+    返回 内存_读32(值) == JS类型_Undefined
+}
+
+函数 JSValue_IsNumber(值) {
+    如果 (JSValue_IsSmi(值)) { 返回 真 }
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Number
+}
+
+函数 JSValue_IsString(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_String
+}
+
+函数 JSValue_IsBoolean(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Boolean
+}
+
+函数 JSValue_IsObject(值) {
+    如果 (值 == 0) { 返回 假 }
+    定义 类型 = 内存_读32(值)
+    返回 类型 >= JS类型_Object
+}
+
+函数 JSValue_IsFunction(值) {
+    如果 (值 == 0) { 返回 假 }
+    定义 类型 = 内存_读32(值)
+    返回 类型 == JS类型_Function || 类型 == JS类型_异步Function
+}
+
+函数 JSValue_IsArray(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_Array
+}
+
+函数 JSValue_IsBigInt(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_BigInt
+}
+
+函数 JSValue_IsSymbol(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 内存_读32(值) == JS类型_符号
+}
+
+函数 JSValue_IsNullOrUndefined(值) {
+    返回 JSValue_IsNull(值) || JSValue_IsUndefined(值)
+}
+
+
+函数 字符串_解析数字(指针, 长度) {
+    如果 (指针 == 0 || 长度 == 0) { 返回 0 }
+    定义 可变 结果 = 0
+    定义 可变 符号 = 1
+    定义 可变 位置 = 0
+    // 跳过前导空白
+    当 (位置 < 长度) {
+        定义 c = 内存_读8(指针 + 位置)
+        如果 (c != 32 && c != 9 && c != 10 && c != 13) { 跳出 }
+        位置 = 位置 + 1
+    }
+    // 符号
+    如果 (位置 < 长度) {
+        定义 c = 内存_读8(指针 + 位置)
+        如果 (c == 45) { 符号 = -1; 位置 = 位置 + 1 }    // '-'
+        否则 如果 (c == 43) { 位置 = 位置 + 1 }           // '+'
+    }
+    // 数字
+    当 (位置 < 长度) {
+        定义 c = 内存_读8(指针 + 位置)
+        如果 (c >= 48 && c <= 57) {
+            结果 = 结果 * 10 + (c - 48)
+        } 否则 {
+            跳出
+        }
+        位置 = 位置 + 1
+    }
+    返回 结果 * 符号
+}
+
+
+函数 AI类型缓存_创建() {
+    定义 可变 缓存 = 堆_分配(AI类型预测缓存)
+    如果 (缓存 == 0) { 返回 空 }
+    缓存.容量 = AI_类型缓存大小
+    缓存.基址 = 平台_申请内存(缓存.容量 * 8)
+    如果 (缓存.基址 != 0) {
+        内存_清零(缓存.基址, 缓存.容量 * 8)
+    }
+    缓存.命中数 = 0
+    缓存.未命中数 = 0
+    缓存.总查询数 = 0
+    返回 缓存
+}
+
+函数 AI类型缓存_销毁(缓存) {
+    如果 (缓存 == 空) { 返回 }
+    如果 (缓存.基址 != 0) {
+        平台_释放内存(缓存.基址, 缓存.容量 * 8)
+    }
+    堆_释放(缓存)
+}
+
+函数 AI类型缓存_查询(缓存, 对象地址) {
+    如果 (缓存 == 空 || 缓存.基址 == 0) { 返回 -1 }
+    缓存.总查询数 = 缓存.总查询数 + 1
+    定义 哈希 = (对象地址 >> 4) % 缓存.容量
+    定义 偏移 = 缓存.基址 + 哈希 * 8
+    定义 存储地址 = 内存_读32(偏移)
+    如果 (存储地址 == (对象地址 & 0xFFFFFFFF)) {
+        缓存.命中数 = 缓存.命中数 + 1
+        返回 内存_读32(偏移 + 4)
+    }
+    缓存.未命中数 = 缓存.未命中数 + 1
+    返回 -1
+}
+
+函数 AI类型缓存_记录(缓存, 对象地址, 类型) {
+    如果 (缓存 == 空 || 缓存.基址 == 0) { 返回 }
+    定义 哈希 = (对象地址 >> 4) % 缓存.容量
+    定义 偏移 = 缓存.基址 + 哈希 * 8
+    内存_写32(偏移, 对象地址 & 0xFFFFFFFF)
+    内存_写32(偏移 + 4, 类型)
+}
+
+// ES2023 §7.2.16 IsStrictlyEqual
+
+函数 JSValue_StrictEqual(Nova运行时实例, a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 类型a = 内存_读32(a)
+    定义 类型b = 内存_读32(b)
+    如果 (类型a != 类型b) { 返回 假 }
+    // Number比较
+    如果 (类型a == JS类型_Number) {
+        返回 内存_读64(a + 8) == 内存_读64(b + 8)
+    }
+    // String比较
+    如果 (类型a == JS类型_String) {
+        定义 长度a = 内存_读32(a + 8)
+        定义 长度b = 内存_读32(b + 8)
+        如果 (长度a != 长度b) { 返回 假 }
+        定义 数据a = 内存_读64(a + 16)
+        定义 数据b = 内存_读64(b + 16)
+        定义 可变 i = 0
+        当 (i < 长度a) {
+            如果 (内存_读8(数据a + i) != 内存_读8(数据b + i)) { 返回 假 }
+            i = i + 1
+        }
+        返回 真
+    }
+    // Boolean比较
+    如果 (类型a == JS类型_Boolean) {
+        返回 内存_读32(a + 8) == 内存_读32(b + 8)
+    }
+    // 对象: 引用比较(已经在第一行处理)
+    返回 假
+}
+
+
+定义 可变 统计_typeof调用数 = 0
+定义 可变 统计_ToBoolean调用数 = 0
+定义 可变 统计_ToNumber调用数 = 0
+定义 可变 统计_ToString调用数 = 0
+定义 可变 统计_StrictEqual调用数 = 0
+
+函数 类型操作_打印统计() {
+    打印("[类型] ═══════════ 类型操作统计 ═══════════")
+    打印(字符串拼接("  typeof调用数:      ", 转字符串(统计_typeof调用数)))
+    打印(字符串拼接("  ToBoolean调用数:   ", 转字符串(统计_ToBoolean调用数)))
+    打印(字符串拼接("  ToNumber调用数:    ", 转字符串(统计_ToNumber调用数)))
+    打印(字符串拼接("  ToString调用数:    ", 转字符串(统计_ToString调用数)))
+    打印(字符串拼接("  StrictEqual调用数: ", 转字符串(统计_StrictEqual调用数)))
+    打印("[类型] ═══════════════════════════════════════")
+}
+
+函数 AI类型缓存_打印统计(缓存) {
+    如果 (缓存 == 空) { 返回 }
+    打印("[AI类型] ── 类型预测缓存 ──")
+    打印(字符串拼接("  总查询数:   ", 转字符串(缓存.总查询数)))
+    打印(字符串拼接("  命中数:     ", 转字符串(缓存.命中数)))
+    打印(字符串拼接("  未命中数:   ", 转字符串(缓存.未命中数)))
+    如果 (缓存.总查询数 > 0) {
+        定义 命中率 = 缓存.命中数 * 10000 / 缓存.总查询数
+        打印(字符串拼接("  命中率‱:   ", 转字符串(命中率)))
+    }
+}
+
+函数 JSValue_类型名称(值) {
+    如果 (值 == 0) { 返回 "undefined" }
+    定义 类型 = 内存_读32(值)
+    如果 (类型 == JS类型_Undefined) { 返回 "Undefined" }
+    如果 (类型 == JS类型_Null) { 返回 "Null" }
+    如果 (类型 == JS类型_Boolean) { 返回 "Boolean" }
+    如果 (类型 == JS类型_Number) { 返回 "Number" }
+    如果 (类型 == JS类型_String) { 返回 "String" }
+    如果 (类型 == JS类型_符号) { 返回 "Symbol" }
+    如果 (类型 == JS类型_BigInt) { 返回 "BigInt" }
+    如果 (类型 == JS类型_Object) { 返回 "Object" }
+    如果 (类型 == JS类型_Function) { 返回 "Function" }
+    如果 (类型 == JS类型_Array) { 返回 "Array" }
+    如果 (类型 == JS类型_RegExp) { 返回 "RegExp" }
+    如果 (类型 == JS类型_Date) { 返回 "Date" }
+    如果 (类型 == JS类型_Promise) { 返回 "Promise" }
+    如果 (类型 == JS类型_Map) { 返回 "Map" }
+    如果 (类型 == JS类型_Set) { 返回 "Set" }
+    返回 "Unknown"
+}

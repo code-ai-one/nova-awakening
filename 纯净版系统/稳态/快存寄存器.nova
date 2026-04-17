@@ -1,0 +1,122 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+
+// NovaOS NVMe驱动 — 现代SSD的标准接口
+// NVMe(Non-Volatile Memory Express)是现代SSD的标准协议
+// 比AHCI快10倍+: 64K队列深度 vs AHCI的32, 无寄存器锁
+// 所有2015年后的SSD基本都走NVMe(M.2接口)
+// 架构:
+//   文件系统(ext4/VFS)
+//        ↓ 块设备层
+//   NVMe驱动(本文件)
+//        ↓ PCIe MMIO + 门铃寄存器
+//   NVMe SSD
+
+// §1 NVMe寄存器定义 
+
+// 控制器寄存器
+定义 NVME_CAP     = 0x00    // 控制器能力(64位)
+定义 NVME_VS      = 0x08    // 版本
+定义 NVME_INTMS   = 0x0C    // 中断掩码设置
+定义 NVME_INTMC   = 0x10    // 中断掩码清除
+定义 NVME_CC      = 0x14    // 控制器配置
+定义 NVME_CSTS    = 0x1C    // 控制器状态
+定义 NVME_AQA     = 0x24    // 管理队列属性
+定义 NVME_ASQ     = 0x28    // 管理提交队列地址(64位)
+定义 NVME_ACQ     = 0x30    // 管理完成队列地址(64位)
+
+// CC(控制器配置)位定义
+定义 NVME_CC_EN       = 0x01      // 使能
+定义 NVME_CC_CSS_NVM  = 0x00      // NVM命令集
+定义 NVME_CC_MPS_SHIFT = 7        // 内存页大小(2^(12+MPS))
+定义 NVME_CC_IOSQES   = 6 << 16  // IO SQ条目大小 = 64字节(2^6)
+定义 NVME_CC_IOCQES   = 4 << 20  // IO CQ条目大小 = 16字节(2^4)
+
+// CSTS(控制器状态)
+定义 NVME_CSTS_RDY    = 0x01     // 就绪
+定义 NVME_CSTS_Nova公平调度    = 0x02     // 控制器致命状态
+定义 NVME_CSTS_SHST   = 0x0C     // 关机状态
+
+// NVMe Admin命令操作码
+定义 NVME_ADM_DELETE_SQ  = 0x00
+定义 NVME_ADM_CREATE_SQ  = 0x01
+定义 NVME_ADM_DELETE_CQ  = 0x04
+定义 NVME_ADM_CREATE_CQ  = 0x05
+定义 NVME_ADM_IDENTIFY   = 0x06
+定义 NVME_ADM_SET_FEATURES = 0x09
+定义 NVME_ADM_GET_FEATURES = 0x0A
+
+// NVMe IO命令操作码
+定义 NVME_IO_READ     = 0x02
+定义 NVME_IO_WRITE    = 0x01
+定义 NVME_IO_FLUSH    = 0x00
+定义 NVME_IO_DISCARD  = 0x08    // Dataset Management(TRIM)
+
+// Identify CNS值
+定义 NVME_ID_CNS_NS     = 0x00   // 命名空间
+定义 NVME_ID_CNS_CTRL   = 0x01   // 控制器
+
+// §2 数据结构
+
+// NVMe提交队列条目(SQE) — 64字节
+结构 NVMe_SQE {
+    操作码,
+    标志,
+    命令ID,
+    NSID,
+    保留,
+    元数据,
+    PRP1,    // u64 Physical Region Page 1
+    PRP2,    // u64 Physical Region Page 2
+    CDW10,
+    CDW11,
+    CDW12,
+    CDW13,
+    CDW14,
+    CDW15,
+}
+
+// NVMe完成队列条目(CQE) — 16字节
+结构 NVMe_CQE {
+    结果,    // u32 命令特定结果
+    保留,
+    SQ头指针,
+    SQ标识,
+    命令ID,
+    状态,    // u16 bit0=Phase, bit1-15=状态码
+}
+
+结构 NVMe_队列 {
+    ID,
+    深度,
+    SQ地址,    // u64 提交队列直传地址
+    CQ地址,    // u64 完成队列直传地址
+    SQ尾指针,
+    CQ头指针,
+    Phase位,    // u32 完成队列Phase Bit(翻转检测新条目)
+    SQ门铃,    // u64 提交队列门铃寄存器地址
+    CQ门铃,    // u64 完成队列门铃寄存器地址
+    下一个命令ID,
+}
+
+结构 NVMe控制器 {
+    MMIO基址,
+    门铃步长,    // u32 门铃寄存器之间的步长(4字节单位)
+    最大队列深度,
+    版本,
+    序列号,
+    型号,
+    固件版本,
+    管理队列,    // NVMe_队列
+    IO队列,    // [] IO队列列表
+    命名空间,    // [] 命名空间列表
+    已初始化,
+}
+
+结构 NVMe命名空间 {
+    NSID,
+    容量,    // u64 逻辑块数
+    块大小,    // u32 字节(512/4096)
+    格式化LBA大小,
+    名称,    // 字符串 "nvme0n1"
+}

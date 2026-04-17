@@ -1,0 +1,249 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式令牌甲.nova")
+导入("../中枢/辅助存根.nova")
+导入("./样式解析甲.nova")
+导入("../执行/底层内存操.nova")
+
+函数 CSSParser_解析声明(tk, 属性名令牌) {
+    // 解析: property-name: value [!important] ;
+    定义 声明 = 堆_分配(CSS声明)
+    声明.属性ID = CSSParser_属性名转ID(属性名令牌.值, 属性名令牌.值长度)
+    声明.重要 = 假
+
+    // 期望':'
+    定义 令牌 = 堆_分配(CSS令牌)
+    CSS令牌izer_下一个令牌(tk, 令牌)
+    如果 (令牌.类型 != CSS_令牌_冒号) { 返回 0 }
+
+    // 读属性值
+    定义 值 = CSSParser_解析值(tk)
+    声明.值 = 值
+
+    返回 声明
+}
+
+函数 CSSParser_解析值(tk) {
+    定义 值 = 堆_分配(CSSValue)
+    定义 令牌 = 堆_分配(CSS令牌)
+    CSS令牌izer_下一个令牌(tk, 令牌)
+
+    如果 (令牌.类型 == CSS_令牌_尺寸) {
+        值.类型 = CSS值_长度
+        值.数值 = 令牌.数值
+        值.单位 = CSSParser_解析单位(令牌.单位, 令牌.单位长度)
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_百分比) {
+        值.类型 = CSS值_百分比
+        值.数值 = 令牌.数值
+        值.单位 = 单位_百分比
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_数字) {
+        值.类型 = CSS值_数字
+        值.数值 = 令牌.数值
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_哈希) {
+        值.类型 = CSS值_颜色
+        值.颜色 = CSSParser_解析十六进制颜色(令牌.值, 令牌.值长度)
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_标识符) {
+        // 关键字值或命名颜色
+        值.类型 = CSS值_关键字
+        值.字符串值 = 字符串_复制_N(令牌.值, 令牌.值长度)
+        值.关键字ID = CSSParser_关键字转ID(令牌.值, 令牌.值长度)
+        // 检查是否是命名颜色
+        定义 颜色 = CSSParser_命名颜色(令牌.值, 令牌.值长度)
+        如果 (颜色 != 0) {
+            值.类型 = CSS值_颜色
+            值.颜色 = 颜色
+        }
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_函数) {
+        值.类型 = CSS值_函数
+        值.字符串值 = 字符串_复制_N(令牌.值, 令牌.值长度)
+        // 读到')'
+        定义 可变 深度 = 1
+        当 (深度 > 0) {
+            CSS令牌izer_下一个令牌(tk, 令牌)
+            如果 (令牌.类型 == CSS_令牌_左圆括号) { 深度 = 深度 + 1 }
+            如果 (令牌.类型 == CSS_令牌_右圆括号) { 深度 = 深度 - 1 }
+            如果 (令牌.类型 == CSS_令牌_EOF) { 跳出 }
+        }
+        返回 值
+    }
+    如果 (令牌.类型 == CSS_令牌_字符串) {
+        值.类型 = CSS值_字符串
+        值.字符串值 = 字符串_复制_N(令牌.值, 令牌.值长度)
+        返回 值
+    }
+
+    返回 值
+}
+
+// §3 辅助: 属性名→ID / 单位解析 / 颜色解析 / 特异度计算
+
+函数 CSSParser_属性名转ID(名, 长度) {
+    // 将属性名字符串映射到CSS属性ID
+    如果 (字符串_等于N(名, 长度, "display")) { 返回 CSS属性_display }
+    如果 (字符串_等于N(名, 长度, "position")) { 返回 CSS属性_position }
+    如果 (字符串_等于N(名, 长度, "width")) { 返回 CSS属性_width }
+    如果 (字符串_等于N(名, 长度, "height")) { 返回 CSS属性_height }
+    如果 (字符串_等于N(名, 长度, "margin")) { 返回 CSS属性_margin }
+    如果 (字符串_等于N(名, 长度, "margin-top")) { 返回 CSS属性_margin_top }
+    如果 (字符串_等于N(名, 长度, "margin-right")) { 返回 CSS属性_margin_right }
+    如果 (字符串_等于N(名, 长度, "margin-bottom")) { 返回 CSS属性_margin_bottom }
+    如果 (字符串_等于N(名, 长度, "margin-left")) { 返回 CSS属性_margin_left }
+    如果 (字符串_等于N(名, 长度, "padding")) { 返回 CSS属性_padding }
+    如果 (字符串_等于N(名, 长度, "padding-top")) { 返回 CSS属性_padding_top }
+    如果 (字符串_等于N(名, 长度, "padding-right")) { 返回 CSS属性_padding_right }
+    如果 (字符串_等于N(名, 长度, "padding-bottom")) { 返回 CSS属性_padding_bottom }
+    如果 (字符串_等于N(名, 长度, "padding-left")) { 返回 CSS属性_padding_left }
+    如果 (字符串_等于N(名, 长度, "color")) { 返回 CSS属性_color }
+    如果 (字符串_等于N(名, 长度, "background")) { 返回 CSS属性_background }
+    如果 (字符串_等于N(名, 长度, "background-color")) { 返回 CSS属性_background_color }
+    如果 (字符串_等于N(名, 长度, "font-size")) { 返回 CSS属性_font_size }
+    如果 (字符串_等于N(名, 长度, "font-weight")) { 返回 CSS属性_font_weight }
+    如果 (字符串_等于N(名, 长度, "font-family")) { 返回 CSS属性_font_family }
+    如果 (字符串_等于N(名, 长度, "line-height")) { 返回 CSS属性_line_height }
+    如果 (字符串_等于N(名, 长度, "text-align")) { 返回 CSS属性_text_align }
+    如果 (字符串_等于N(名, 长度, "border")) { 返回 CSS属性_border }
+    如果 (字符串_等于N(名, 长度, "border-radius")) { 返回 CSS属性_border_radius }
+    如果 (字符串_等于N(名, 长度, "overflow")) { 返回 CSS属性_overflow }
+    如果 (字符串_等于N(名, 长度, "float")) { 返回 CSS属性_float }
+    如果 (字符串_等于N(名, 长度, "z-index")) { 返回 CSS属性_z_index }
+    如果 (字符串_等于N(名, 长度, "opacity")) { 返回 CSS属性_opacity }
+    如果 (字符串_等于N(名, 长度, "transform")) { 返回 CSS属性_transform }
+    如果 (字符串_等于N(名, 长度, "flex")) { 返回 CSS属性_flex }
+    如果 (字符串_等于N(名, 长度, "flex-direction")) { 返回 CSS属性_flex_direction }
+    如果 (字符串_等于N(名, 长度, "justify-content")) { 返回 CSS属性_justify_content }
+    如果 (字符串_等于N(名, 长度, "align-items")) { 返回 CSS属性_align_items }
+    如果 (字符串_等于N(名, 长度, "gap")) { 返回 CSS属性_gap }
+    如果 (字符串_等于N(名, 长度, "box-shadow")) { 返回 CSS属性_box_shadow }
+    如果 (字符串_等于N(名, 长度, "cursor")) { 返回 CSS属性_cursor }
+    如果 (字符串_等于N(名, 长度, "visibility")) { 返回 CSS属性_visibility }
+    如果 (字符串_等于N(名, 长度, "box-sizing")) { 返回 CSS属性_box_sizing }
+    如果 (字符串_等于N(名, 长度, "max-width")) { 返回 CSS属性_max_width }
+    如果 (字符串_等于N(名, 长度, "min-width")) { 返回 CSS属性_min_width }
+    如果 (字符串_等于N(名, 长度, "top")) { 返回 CSS属性_top }
+    如果 (字符串_等于N(名, 长度, "right")) { 返回 CSS属性_right }
+    如果 (字符串_等于N(名, 长度, "bottom")) { 返回 CSS属性_bottom }
+    如果 (字符串_等于N(名, 长度, "left")) { 返回 CSS属性_left }
+    如果 (字符串_等于N(名, 长度, "font-style")) { 返回 CSS属性_font_style }
+    如果 (字符串_等于N(名, 长度, "text-decoration")) { 返回 CSS属性_text_decoration }
+    如果 (字符串_等于N(名, 长度, "text-transform")) { 返回 CSS属性_text_transform }
+    如果 (字符串_等于N(名, 长度, "text-indent")) { 返回 CSS属性_text_indent }
+    如果 (字符串_等于N(名, 长度, "text-overflow")) { 返回 CSS属性_text_overflow }
+    如果 (字符串_等于N(名, 长度, "text-shadow")) { 返回 CSS属性_text_shadow }
+    如果 (字符串_等于N(名, 长度, "letter-spacing")) { 返回 CSS属性_letter_spacing }
+    如果 (字符串_等于N(名, 长度, "word-spacing")) { 返回 CSS属性_word_spacing }
+    如果 (字符串_等于N(名, 长度, "word-break")) { 返回 CSS属性_word_break }
+    如果 (字符串_等于N(名, 长度, "word-wrap")) { 返回 CSS属性_word_wrap }
+    如果 (字符串_等于N(名, 长度, "overflow-wrap")) { 返回 CSS属性_overflow_wrap }
+    如果 (字符串_等于N(名, 长度, "overflow-x")) { 返回 CSS属性_overflow_x }
+    如果 (字符串_等于N(名, 长度, "overflow-y")) { 返回 CSS属性_overflow_y }
+    如果 (字符串_等于N(名, 长度, "white-space")) { 返回 CSS属性_white_space }
+    如果 (字符串_等于N(名, 长度, "vertical-align")) { 返回 CSS属性_vertical_align }
+    如果 (字符串_等于N(名, 长度, "background-image")) { 返回 CSS属性_background_image }
+    如果 (字符串_等于N(名, 长度, "background-position")) { 返回 CSS属性_background_position }
+    如果 (字符串_等于N(名, 长度, "background-repeat")) { 返回 CSS属性_background_repeat }
+    如果 (字符串_等于N(名, 长度, "background-size")) { 返回 CSS属性_background_size }
+    如果 (字符串_等于N(名, 长度, "background-attachment")) { 返回 CSS属性_background_attachment }
+    如果 (字符串_等于N(名, 长度, "background-clip")) { 返回 CSS属性_background_clip }
+    如果 (字符串_等于N(名, 长度, "background-origin")) { 返回 CSS属性_background_origin }
+    如果 (字符串_等于N(名, 长度, "border-top")) { 返回 CSS属性_border_top }
+    如果 (字符串_等于N(名, 长度, "border-right")) { 返回 CSS属性_border_right2 }
+    如果 (字符串_等于N(名, 长度, "border-bottom")) { 返回 CSS属性_border_bottom }
+    如果 (字符串_等于N(名, 长度, "border-left")) { 返回 CSS属性_border_left2 }
+    如果 (字符串_等于N(名, 长度, "border-width")) { 返回 CSS属性_border_width }
+    如果 (字符串_等于N(名, 长度, "border-style")) { 返回 CSS属性_border_style }
+    如果 (字符串_等于N(名, 长度, "border-color")) { 返回 CSS属性_border_color }
+    如果 (字符串_等于N(名, 长度, "border-top-style")) { 返回 CSS属性_border_top_style }
+    如果 (字符串_等于N(名, 长度, "border-right-style")) { 返回 CSS属性_border_right_style }
+    如果 (字符串_等于N(名, 长度, "border-bottom-style")) { 返回 CSS属性_border_bottom_style }
+    如果 (字符串_等于N(名, 长度, "border-left-style")) { 返回 CSS属性_border_left_style }
+    如果 (字符串_等于N(名, 长度, "border-top-left-radius")) { 返回 CSS属性_border_top_left_radius }
+    如果 (字符串_等于N(名, 长度, "border-top-right-radius")) { 返回 CSS属性_border_top_right_radius }
+    如果 (字符串_等于N(名, 长度, "border-bottom-left-radius")) { 返回 CSS属性_border_bottom_left_radius }
+    如果 (字符串_等于N(名, 长度, "border-bottom-right-radius")) { 返回 CSS属性_border_bottom_right_radius }
+    如果 (字符串_等于N(名, 长度, "border-collapse")) { 返回 CSS属性_border_collapse }
+    如果 (字符串_等于N(名, 长度, "border-spacing")) { 返回 CSS属性_border_spacing }
+    如果 (字符串_等于N(名, 长度, "flex-grow")) { 返回 CSS属性_flex_grow }
+    如果 (字符串_等于N(名, 长度, "flex-shrink")) { 返回 CSS属性_flex_shrink }
+    如果 (字符串_等于N(名, 长度, "flex-basis")) { 返回 CSS属性_flex_basis }
+    如果 (字符串_等于N(名, 长度, "flex-wrap")) { 返回 CSS属性_flex_wrap }
+    如果 (字符串_等于N(名, 长度, "flex-flow")) { 返回 CSS属性_flex_flow }
+    如果 (字符串_等于N(名, 长度, "align-self")) { 返回 CSS属性_align_self }
+    如果 (字符串_等于N(名, 长度, "align-content")) { 返回 CSS属性_align_content }
+    如果 (字符串_等于N(名, 长度, "order")) { 返回 CSS属性_order }
+    如果 (字符串_等于N(名, 长度, "grid-template-columns")) { 返回 CSS属性_grid_template_columns }
+    如果 (字符串_等于N(名, 长度, "grid-template-rows")) { 返回 CSS属性_grid_template_rows }
+    如果 (字符串_等于N(名, 长度, "grid-column")) { 返回 CSS属性_grid_column }
+    如果 (字符串_等于N(名, 长度, "grid-row")) { 返回 CSS属性_grid_row }
+    如果 (字符串_等于N(名, 长度, "grid-gap")) { 返回 CSS属性_grid_gap }
+    如果 (字符串_等于N(名, 长度, "column-gap")) { 返回 CSS属性_column_gap }
+    如果 (字符串_等于N(名, 长度, "row-gap")) { 返回 CSS属性_row_gap }
+    如果 (字符串_等于N(名, 长度, "transform-origin")) { 返回 CSS属性_transform_origin }
+    如果 (字符串_等于N(名, 长度, "transition")) { 返回 CSS属性_transition }
+    如果 (字符串_等于N(名, 长度, "transition-property")) { 返回 CSS属性_transition_property }
+    如果 (字符串_等于N(名, 长度, "transition-duration")) { 返回 CSS属性_transition_duration }
+    如果 (字符串_等于N(名, 长度, "transition-timing-function")) { 返回 CSS属性_transition_timing_function }
+    如果 (字符串_等于N(名, 长度, "transition-delay")) { 返回 CSS属性_transition_delay }
+    如果 (字符串_等于N(名, 长度, "animation")) { 返回 CSS属性_animation }
+    如果 (字符串_等于N(名, 长度, "animation-name")) { 返回 CSS属性_animation_name }
+    如果 (字符串_等于N(名, 长度, "animation-duration")) { 返回 CSS属性_animation_duration }
+    如果 (字符串_等于N(名, 长度, "animation-timing-function")) { 返回 CSS属性_animation_timing_function }
+    如果 (字符串_等于N(名, 长度, "animation-delay")) { 返回 CSS属性_animation_delay }
+    如果 (字符串_等于N(名, 长度, "animation-iteration-count")) { 返回 CSS属性_animation_iteration_count }
+    如果 (字符串_等于N(名, 长度, "animation-direction")) { 返回 CSS属性_animation_direction }
+    如果 (字符串_等于N(名, 长度, "animation-fill-mode")) { 返回 CSS属性_animation_fill_mode }
+    如果 (字符串_等于N(名, 长度, "animation-play-state")) { 返回 CSS属性_animation_play_state }
+    如果 (字符串_等于N(名, 长度, "filter")) { 返回 CSS属性_filter }
+    如果 (字符串_等于N(名, 长度, "backdrop-filter")) { 返回 CSS属性_backdrop_filter }
+    如果 (字符串_等于N(名, 长度, "mix-blend-mode")) { 返回 CSS属性_mix_blend_mode }
+    如果 (字符串_等于N(名, 长度, "object-fit")) { 返回 CSS属性_object_fit }
+    如果 (字符串_等于N(名, 长度, "object-position")) { 返回 CSS属性_object_position }
+    如果 (字符串_等于N(名, 长度, "will-change")) { 返回 CSS属性_will_change }
+    如果 (字符串_等于N(名, 长度, "contain")) { 返回 CSS属性_contain }
+    如果 (字符串_等于N(名, 长度, "clip-path")) { 返回 CSS属性_clip_path }
+    如果 (字符串_等于N(名, 长度, "resize")) { 返回 CSS属性_resize }
+    如果 (字符串_等于N(名, 长度, "table-layout")) { 返回 CSS属性_table_layout }
+    如果 (字符串_等于N(名, 长度, "direction")) { 返回 CSS属性_direction }
+    如果 (字符串_等于N(名, 长度, "writing-mode")) { 返回 CSS属性_writing_mode }
+    如果 (字符串_等于N(名, 长度, "hyphens")) { 返回 CSS属性_hyphens }
+    如果 (字符串_等于N(名, 长度, "tab-size")) { 返回 CSS属性_tab_size }
+    如果 (字符串_等于N(名, 长度, "appearance")) { 返回 CSS属性_appearance }
+    如果 (字符串_等于N(名, 长度, "-nova-appearance")) { 返回 CSS属性_appearance }
+    如果 (字符串_等于N(名, 长度, "scroll-behavior")) { 返回 CSS属性_scroll_behavior }
+    如果 (字符串_等于N(名, 长度, "aspect-ratio")) { 返回 CSS属性_aspect_ratio }
+    如果 (字符串_等于N(名, 长度, "accent-color")) { 返回 CSS属性_accent_color }
+    如果 (字符串_等于N(名, 长度, "color-scheme")) { 返回 CSS属性_color_scheme }
+    如果 (字符串_等于N(名, 长度, "list-style")) { 返回 CSS属性_list_style }
+    如果 (字符串_等于N(名, 长度, "list-style-type")) { 返回 CSS属性_list_style }
+    如果 (字符串_等于N(名, 长度, "outline")) { 返回 CSS属性_outline }
+    如果 (字符串_等于N(名, 长度, "content")) { 返回 CSS属性_content }
+    如果 (字符串_等于N(名, 长度, "clear")) { 返回 CSS属性_clear }
+    如果 (字符串_等于N(名, 长度, "min-height")) { 返回 CSS属性_min_height }
+    如果 (字符串_等于N(名, 长度, "max-height")) { 返回 CSS属性_max_height }
+    如果 (字符串_等于N(名, 长度, "pointer-事件s")) { 返回 CSS属性_pointer_事件s }
+    如果 (字符串_等于N(名, 长度, "user-select")) { 返回 CSS属性_user_select }
+    如果 (字符串_等于N(名, 长度, "-nova-user-select")) { 返回 CSS属性_user_select }
+    返回 0    // 未知属性
+}
+
+定义 可变 AI_样式解析解_样式缓存命中 = 0
+
+函数 AI_样式解析解_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_样式解析解_布局缓存(元素哈希) {
+    AI_样式解析解_样式缓存命中 = AI_样式解析解_样式缓存命中 + 1
+    返回 元素哈希
+}

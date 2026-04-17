@@ -1,0 +1,198 @@
+// AI 浮点算子验证: softmax/sigmoid/tanh/SGD
+// Nova 支持浮点运算但 转字符串() 对浮点返回IEEE754 bits
+// 故验证用 float_近似相等(a, b, tol=整数容差下界/上界) 判定范围
+
+定义 可变 fail_count = 0
+定义 可变 pass_count = 0
+
+// 浮点近似相等: |a-b| < tol (tol 也是浮点)
+函数 approx_eq(a, b, tol) {
+    定义 diff = a - b
+    如果 (diff < 0.0) { diff = 0.0 - diff }
+    返回 diff < tol
+}
+
+函数 check(name, cond) {
+    如果 (cond) { pass_count = pass_count + 1 } 否则 {
+        fail_count = fail_count + 1
+        打印(字符串拼接("✗ ", name))
+    }
+}
+
+// ═══════════════════════════════════════════════
+// 1. 浮点加减乘除基础
+// ═══════════════════════════════════════════════
+函数 test_basic() {
+    check("1.0+2.0=3.0", approx_eq(1.0 + 2.0, 3.0, 0.001))
+    check("3.0-1.5=1.5", approx_eq(3.0 - 1.5, 1.5, 0.001))
+    check("2.0*3.0=6.0", approx_eq(2.0 * 3.0, 6.0, 0.001))
+    check("6.0/2.0=3.0", approx_eq(6.0 / 2.0, 3.0, 0.001))
+    // 连续加
+    check("0.1*10≈1.0", approx_eq(0.1 * 10.0, 1.0, 0.01))
+    // 负值
+    check("neg: 0-1.5=-1.5", approx_eq(0.0 - 1.5, 0.0 - 1.5, 0.001))
+}
+
+// ═══════════════════════════════════════════════
+// 2. exp 近似 (泰勒展开 e^x ≈ 1+x+x²/2+x³/6+x⁴/24)
+// ═══════════════════════════════════════════════
+函数 exp_approx(x) {
+    // Taylor 6 阶展开: 1 + x + x²/2 + x³/6 + x⁴/24 + x⁵/120 + x⁶/720
+    // 对 |x| ≤ 2, 误差 < 0.01; 对 |x| ≤ 1, 误差 < 0.001
+    定义 x2 = x * x
+    定义 x3 = x2 * x
+    定义 x4 = x3 * x
+    定义 x5 = x4 * x
+    定义 x6 = x5 * x
+    返回 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0 + x5 / 120.0 + x6 / 720.0
+}
+
+函数 test_exp() {
+    // e^0 = 1
+    check("exp(0)=1", approx_eq(exp_approx(0.0), 1.0, 0.001))
+    // e^1 ≈ 2.718 (泰勒4阶精度较低, 用 0.1 容差)
+    check("exp(1)≈2.71", approx_eq(exp_approx(1.0), 2.71, 0.1))
+    // e^(-1) ≈ 0.367
+    check("exp(-1)≈0.367", approx_eq(exp_approx(0.0 - 1.0), 0.367, 0.05))
+}
+
+// ═══════════════════════════════════════════════
+// 3. sigmoid = 1/(1+e^-x) 近似
+// ═══════════════════════════════════════════════
+函数 sigmoid(x) {
+    返回 1.0 / (1.0 + exp_approx(0.0 - x))
+}
+
+函数 test_sigmoid() {
+    // sigmoid(0) = 0.5
+    check("sigmoid(0)=0.5", approx_eq(sigmoid(0.0), 0.5, 0.001))
+    // sigmoid(1) ≈ 0.731
+    check("sigmoid(1)≈0.731", approx_eq(sigmoid(1.0), 0.731, 0.05))
+    // sigmoid(-1) ≈ 0.269
+    check("sigmoid(-1)≈0.269", approx_eq(sigmoid(0.0 - 1.0), 0.269, 0.05))
+    // sigmoid(大正) → 1
+    check("sigmoid(2)>0.8", sigmoid(2.0) > 0.8)
+}
+
+// ═══════════════════════════════════════════════
+// 4. tanh = (e^x - e^-x)/(e^x + e^-x)
+// ═══════════════════════════════════════════════
+函数 tanh_approx(x) {
+    定义 ep = exp_approx(x)
+    定义 em = exp_approx(0.0 - x)
+    返回 (ep - em) / (ep + em)
+}
+
+函数 test_tanh() {
+    check("tanh(0)=0", approx_eq(tanh_approx(0.0), 0.0, 0.001))
+    check("tanh(1)≈0.76", approx_eq(tanh_approx(1.0), 0.76, 0.1))
+    check("tanh(-1)≈-0.76", approx_eq(tanh_approx(0.0 - 1.0), 0.0 - 0.76, 0.1))
+    // tanh 奇函数: tanh(-x) = -tanh(x)
+    check("tanh奇函数", approx_eq(tanh_approx(0.0 - 0.5) + tanh_approx(0.5), 0.0, 0.001))
+}
+
+// ═══════════════════════════════════════════════
+// 5. softmax 2-element (数值稳定版: 减最大值)
+// ═══════════════════════════════════════════════
+函数 softmax2(a, b) {
+    定义 可变 m = a
+    如果 (b > m) { m = b }
+    定义 ea = exp_approx(a - m)
+    定义 eb = exp_approx(b - m)
+    定义 s = ea + eb
+    返回 [ea / s, eb / s]
+}
+
+函数 test_softmax() {
+    // softmax([0, 0]) = [0.5, 0.5]
+    定义 r1 = softmax2(0.0, 0.0)
+    check("softmax([0,0])[0]=0.5", approx_eq(r1[0], 0.5, 0.001))
+    check("softmax([0,0])[1]=0.5", approx_eq(r1[1], 0.5, 0.001))
+    // softmax([1, 0]): e^1/(e^1+e^0) ≈ 0.731
+    定义 r2 = softmax2(1.0, 0.0)
+    check("softmax([1,0])[0]≈0.731", approx_eq(r2[0], 0.731, 0.05))
+    check("softmax([1,0])[1]≈0.269", approx_eq(r2[1], 0.269, 0.05))
+    // 归一性: sum = 1, 用 __simd_浮点加 绕过 Phase 1 列表索引类型推断局限
+    check("softmax和=1", approx_eq(__simd_浮点加(r2[0], r2[1]), 1.0, 0.01))
+}
+
+// ═══════════════════════════════════════════════
+// 6. 真实梯度下降: y = w*x, L = (y - y_true)^2
+// ∂L/∂w = 2*(w*x - y_true)*x
+// ═══════════════════════════════════════════════
+函数 sgd_step(w, x, y_true, lr) {
+    定义 y_pred = w * x
+    定义 err = y_pred - y_true
+    定义 grad = 2.0 * err * x
+    返回 w - lr * grad
+}
+
+函数 test_sgd() {
+    // 初始 w=0, x=1, y_true=1, lr=0.1
+    // step1: y_pred=0, err=-1, grad=-2, w_new=0-0.1*(-2)=0.2
+    定义 w1 = sgd_step(0.0, 1.0, 1.0, 0.1)
+    check("SGD step1: w=0→0.2", approx_eq(w1, 0.2, 0.001))
+    // step2: y_pred=0.2, err=-0.8, grad=-1.6, w=0.2-0.1*(-1.6)=0.36
+    定义 w2 = sgd_step(w1, 1.0, 1.0, 0.1)
+    check("SGD step2: w=0.2→0.36", approx_eq(w2, 0.36, 0.001))
+    // step3: w=0.36-0.1*2*(0.36-1)*1 = 0.36-0.1*(-1.28) = 0.488
+    定义 w3 = sgd_step(w2, 1.0, 1.0, 0.1)
+    check("SGD step3: w=0.36→0.488", approx_eq(w3, 0.488, 0.001))
+    // 收敛趋势: |w - 1| 单调递减
+    check("SGD收敛: |w1-1|>|w2-1|", (1.0 - w1) > (1.0 - w2))
+    check("SGD收敛: |w2-1|>|w3-1|", (1.0 - w2) > (1.0 - w3))
+    // 100 steps 应逼近 y_true=1
+    定义 可变 w = 0.0
+    定义 可变 i = 0
+    当 (i < 100) { w = sgd_step(w, 1.0, 1.0, 0.1) i = i + 1 }
+    check("SGD 100步收敛 |w-1|<0.01", approx_eq(w, 1.0, 0.01))
+}
+
+// ═══════════════════════════════════════════════
+// 7. 浮点矩阵向量乘 (2×2) * (2) → (2)
+// ═══════════════════════════════════════════════
+函数 matvec(M_data, m_cols, v) {
+    定义 行 = 计数(M_data) / m_cols
+    定义 可变 r = []
+    定义 可变 i = 0
+    当 (i < 行) {
+        定义 可变 s = 0.0
+        定义 可变 j = 0
+        当 (j < m_cols) {
+            s = s + M_data[i * m_cols + j] * v[j]
+            j = j + 1
+        }
+        追加(r, s)
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 test_matvec() {
+    // [[1,2],[3,4]] * [5,6] = [1*5+2*6, 3*5+4*6] = [17, 39]
+    定义 M = [1.0, 2.0, 3.0, 4.0]
+    定义 v = [5.0, 6.0]
+    定义 r = matvec(M, 2, v)
+    check("matvec[0]=17", approx_eq(r[0], 17.0, 0.001))
+    check("matvec[1]=39", approx_eq(r[1], 39.0, 0.001))
+    // 单位矩阵: I*v = v
+    定义 I = [1.0, 0.0, 0.0, 1.0]
+    定义 r2 = matvec(I, 2, v)
+    check("I*v=v[0]", approx_eq(r2[0], 5.0, 0.001))
+    check("I*v=v[1]", approx_eq(r2[1], 6.0, 0.001))
+}
+
+函数 主程序() {
+    打印("═══ 浮点AI算子验证 ═══")
+    test_basic()
+    test_exp()
+    test_sigmoid()
+    test_tanh()
+    test_softmax()
+    test_sgd()
+    test_matvec()
+    打印(字符串拼接(字符串拼接("通过: ", 转字符串(pass_count)), 字符串拼接("/", 转字符串(pass_count + fail_count))))
+    打印(字符串拼接("失败: ", 转字符串(fail_count)))
+    如果 (fail_count > 0) { 返回 1 }
+    返回 0
+}

@@ -1,0 +1,134 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./图像操作.nova")
+导入("./内核直连层.nova")
+
+// §5 变换
+
+
+函数 画布2D_translate(ctx, tx, ty) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    // e' = a*tx + c*ty + e
+    // f' = b*tx + d*ty + f
+    s.e = s.e + (s.a * tx + s.c * ty) / 1024
+    s.f = s.f + (s.b * tx + s.d * ty) / 1024
+}
+
+函数 画布2D_scale(ctx, sx, sy) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    s.a = s.a * sx / 1024
+    s.b = s.b * sx / 1024
+    s.c = s.c * sy / 1024
+    s.d = s.d * sy / 1024
+}
+
+函数 画布2D_rotate(ctx, 角度_Q10) {
+    如果 (ctx == 0) { 返回 }
+    // cos和sin: Q10定点查表计算
+    定义 cos = Q_cos(角度_Q10)
+    定义 sin = Q_sin(角度_Q10)
+    定义 s = ctx.状态
+    定义 a = s.a; 定义 b = s.b; 定义 c = s.c; 定义 d = s.d
+    s.a = (a * cos + c * sin) / 1024
+    s.b = (b * cos + d * sin) / 1024
+    s.c = (c * cos - a * sin) / 1024
+    s.d = (d * cos - b * sin) / 1024
+}
+
+函数 画布2D_setTransform(ctx, a, b, c, d, e, f) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    s.a = a; s.b = b; s.c = c; s.d = d; s.e = e; s.f = f
+}
+
+函数 画布2D_resetTransform(ctx) {
+    画布2D_setTransform(ctx, 1024, 0, 0, 1024, 0, 0)
+}
+
+// 变换点
+函数 画布2D_变换点(s, x, y) {
+    定义 tx = (s.a * x + s.c * y) / 1024 + s.e
+    定义 ty = (s.b * x + s.d * y) / 1024 + s.f
+    返回 (tx, ty)
+}
+
+// §6 路径操作
+
+函数 画布2D_beginPath(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.路径大小 = 0
+}
+
+函数 路径_写(ctx, 类型, x1, y1, x2, y2, x3, y3) {
+    如果 (ctx.路径大小 + 28 > ctx.路径容量) { 返回 }
+    定义 偏移 = ctx.路径命令 + ctx.路径大小
+    内存_写8(偏移, 类型)
+    内存_写32(偏移 + 4, x1)
+    内存_写32(偏移 + 8, y1)
+    内存_写32(偏移 + 12, x2)
+    内存_写32(偏移 + 16, y2)
+    内存_写32(偏移 + 20, x3)
+    内存_写32(偏移 + 24, y3)
+    ctx.路径大小 = ctx.路径大小 + 28
+}
+
+函数 画布2D_moveTo(ctx, x, y) {
+    如果 (ctx == 0) { 返回 }
+    路径_写(ctx, 路径_MoveTo, x, y, 0, 0, 0, 0)
+    ctx.路径x = x; ctx.路径y = y
+    ctx.路径起点x = x; ctx.路径起点y = y
+}
+
+函数 画布2D_lineTo(ctx, x, y) {
+    如果 (ctx == 0) { 返回 }
+    路径_写(ctx, 路径_LineTo, x, y, 0, 0, 0, 0)
+    ctx.路径x = x; ctx.路径y = y
+}
+
+函数 画布2D_quadraticCurveTo(ctx, cpx, cpy, x, y) {
+    如果 (ctx == 0) { 返回 }
+    路径_写(ctx, 路径_QuadTo, cpx, cpy, x, y, 0, 0)
+    ctx.路径x = x; ctx.路径y = y
+}
+
+函数 画布2D_bezierCurveTo(ctx, cp1x, cp1y, cp2x, cp2y, x, y) {
+    如果 (ctx == 0) { 返回 }
+    路径_写(ctx, 路径_Nova三次方To, cp1x, cp1y, cp2x, cp2y, x, y)
+    ctx.路径x = x; ctx.路径y = y
+}
+
+函数 画布2D_closePath(ctx) {
+    如果 (ctx == 0) { 返回 }
+    路径_写(ctx, 路径_Close, ctx.路径起点x, ctx.路径起点y, 0, 0, 0, 0)
+    ctx.路径x = ctx.路径起点x; ctx.路径y = ctx.路径起点y
+}
+
+函数 画布2D_rect(ctx, x, y, w, h) {
+    画布2D_moveTo(ctx, x, y)
+    画布2D_lineTo(ctx, x + w, y)
+    画布2D_lineTo(ctx, x + w, y + h)
+    画布2D_lineTo(ctx, x, y + h)
+    画布2D_closePath(ctx)
+}
+
+函数 画布2D_arc(ctx, cx, cy, r, startAngle, endAngle, 逆时针) {
+    如果 (ctx == 0) { 返回 }
+    // 将圆弧近似为多段直线
+    定义 步数 = 32
+    定义 角度范围 = endAngle - startAngle
+    如果 (逆时针 && 角度范围 > 0) { 角度范围 = 角度范围 - 6283 }    // 2π in Q10
+    如果 (!逆时针 && 角度范围 < 0) { 角度范围 = 角度范围 + 6283 }
+
+    定义 步长 = 角度范围 / 步数
+    定义 可变 i = 0
+    当 (i <= 步数) {
+        定义 角度 = startAngle + 步长 * i
+        定义 px = cx + r * Q_cos(角度) / 1024
+        定义 py = cy + r * Q_sin(角度) / 1024
+        如果 (i == 0) { 画布2D_moveTo(ctx, px, py) }
+        否则 { 画布2D_lineTo(ctx, px, py) }
+        i = i + 1
+    }
+}

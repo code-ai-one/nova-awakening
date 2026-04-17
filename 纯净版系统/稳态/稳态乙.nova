@@ -1,0 +1,219 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/环形缓冲.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. PTY: 伪终端对(master/slave), 用于终端模拟
+//   2. master端: 终端模拟器/ssh进程持有
+//   3. slave端: 终端/应用程序持有(看起来像真终端)
+//   4. 写master→读slave, 写slave→读master(双向管道)
+//   5. devpts: /dev/pts/N 文件系统
+//   6. 用于: xterm/ssh/tmux/docker exec
+
+结构 pty_对 {
+    master_fd,
+    slave_fd,
+    slave_名称,    // 字符串 "/dev/pts/N"
+    // 双向缓冲
+    master_到_slave,    // u64 环形缓冲(master写→slave读)
+    slave_到_master,    // u64 环形缓冲(slave写→master读)
+    // 等待队列
+    master_等待,
+    slave_等待,
+    // termios (slave端的终端属性)
+    回显,
+    规范模式,
+    // 状态
+    master_打开,
+    slave_打开,
+    索引,    // u32 pts编号
+}
+
+定义 PTY_MAX = 256
+定义 可变 pty_表 = []
+定义 可变 下一个pty索引 = 0
+
+// 创建PTY对 
+
+函数 pty_创建() {
+    如果 (下一个pty索引 >= PTY_MAX) { 返回 空 }
+
+    定义 pty = pty_对 {}
+    pty.索引 = 下一个pty索引
+    下一个pty索引 = 下一个pty索引 + 1
+    pty.slave_名称 = "/dev/pts/" + 整数转字符串(pty.索引)
+    pty.master_到_slave = 环形缓冲_创建(4096)
+    pty.slave_到_master = 环形缓冲_创建(4096)
+    pty.master_等待 = 等待队列_创建()
+    pty.slave_等待 = 等待队列_创建()
+    pty.回显 = 1
+    pty.规范模式 = 1
+    pty.master_打开 = 1
+    pty.slave_打开 = 0
+
+    追加(pty_表, pty)
+    返回 pty
+}
+
+// openpty: 打开PTY master+slave 
+
+函数 sys_openpty() {
+    定义 pty = pty_创建()
+    如果 (pty == 空) { 返回 错误_无空间 }
+    pty.slave_打开 = 1
+    返回 [pty.master_fd, pty.slave_fd, pty.slave_名称]
+}
+
+// master端读写
+
+函数 pty_master_读(pty) {
+    // master读 = 读取slave写入的数据
+    如果 (环形缓冲_为空(pty.slave_到_master)) {
+        // 阻塞等待slave写入
+        当 (环形缓冲_为空(pty.slave_到_master)) {
+            如果 (pty.slave_打开 == 0) { 返回 0 }  // EOF: slave已关闭
+            调度()
+        }
+    }
+    定义 可变 结果 = ""
+    当 (!环形缓冲_为空(pty.slave_到_master)) {
+        定义 c = 环形缓冲_读取(pty.slave_到_master)
+        如果 (c != 空) { 结果 = 结果 + 字符(c) }
+    }
+    返回 结果
+}
+
+函数 pty_master_写(pty, 数据) {
+    // master写 = 写入数据给slave读取
+    定义 可变 i = 0
+    当 (i < 字符串长度(数据)) {
+        定义 c = 编码(字符串取字符(数据, i))
+        环形缓冲_写入(pty.master_到_slave, c)
+        i = i + 1
+    }
+    等待队列_唤醒全部(pty.slave_等待)
+    返回 字符串长度(数据)
+}
+
+// slave端读写 (应用程序看到的"终端")
+
+函数 pty_slave_读(pty) {
+    // slave读 = 读取master写入的数据
+    如果 (环形缓冲_为空(pty.master_到_slave)) {
+        当 (环形缓冲_为空(pty.master_到_slave)) {
+            如果 (pty.master_打开 == 0) { 返回 0 }
+            调度()
+        }
+    }
+    定义 可变 结果 = ""
+    当 (!环形缓冲_为空(pty.master_到_slave)) {
+        定义 c = 环形缓冲_读取(pty.master_到_slave)
+        如果 (c != 空) { 结果 = 结果 + 字符(c) }
+    }
+    返回 结果
+}
+
+函数 pty_slave_写(pty, 数据) {
+    // slave写 = 写入数据给master读取
+    定义 可变 i = 0
+    当 (i < 字符串长度(数据)) {
+        定义 c = 编码(字符串取字符(数据, i))
+        // 回显处理(如果slave端开启了ECHO)
+        如果 (pty.回显 != 0) {
+            环形缓冲_写入(pty.master_到_slave, c)  // 回显到slave自己
+        }
+        环形缓冲_写入(pty.slave_到_master, c)
+        i = i + 1
+    }
+    等待队列_唤醒全部(pty.master_等待)
+    返回 字符串长度(数据)
+}
+
+// 关闭/查询
+
+函数 pty_关闭master(pty) {
+    pty.master_打开 = 0
+    等待队列_唤醒全部(pty.slave_等待)  // 唤醒等待的slave读
+}
+
+函数 pty_关闭slave(pty) {
+    pty.slave_打开 = 0
+    等待队列_唤醒全部(pty.master_等待)  // 唤醒等待的master读
+}
+
+函数 pty_查找(索引) {
+    定义 可变 i = 0
+    当 (i < 计数(pty_表)) {
+        如果 (pty_表[i].索引 == 索引) { 返回 pty_表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 pty_数量() { 返回 计数(pty_表) }
+
+// termios控制 
+
+函数 pty_设置回显(pty, 开启) {
+    如果 (pty == 空) { 返回 }
+    pty.回显 = 如果 (开启) { 1 } 否则 { 0 }
+}
+
+函数 pty_设置规范模式(pty, 开启) {
+    如果 (pty == 空) { 返回 }
+    pty.规范模式 = 如果 (开启) { 1 } 否则 { 0 }
+}
+
+// 窗口大小 
+
+定义 可变 pty_默认行 = 24
+定义 可变 pty_默认列 = 80
+
+函数 pty_设置窗口大小(pty, 行, 列) {
+    如果 (pty == 空) { 返回 }
+    pty_默认行 = 行
+    pty_默认列 = 列
+}
+
+函数 pty_获取窗口大小(pty) {
+    返回 [pty_默认行, pty_默认列]
+}
+
+// poll支持
+
+函数 pty_master_poll(pty) {
+    如果 (pty == 空) { 返回 0 }
+    定义 可变 事件 = 0
+    如果 (!环形缓冲_为空(pty.slave_到_master)) { 事件 = 事件 | 1 }  // POLLIN
+    如果 (!环形缓冲_已满(pty.master_到_slave)) { 事件 = 事件 | 4 }  // POLLOUT
+    如果 (pty.slave_打开 == 0) { 事件 = 事件 | 16 }  // POLLHUP
+    返回 事件
+}
+
+函数 pty_统计() {
+    返回 [计数(pty_表), 下一个pty索引]
+}
+
+// 完整统计
+
+函数 pty_完整统计() {
+    返回 [计数(pty_表), 下一个pty索引, pty_默认行, pty_默认列]
+}
+
+定义 可变 AI_稳态乙_调用数 = 0
+定义 可变 AI_稳态乙_异常数 = 0
+
+函数 AI_稳态乙_监控() {
+    AI_稳态乙_调用数 = AI_稳态乙_调用数 + 1
+    返回 AI_稳态乙_异常数 == 0
+}
+
+函数 AI_稳态乙_健康检查() {
+    如果 (AI_稳态乙_调用数 > 0 && AI_稳态乙_异常数 * 100 / AI_稳态乙_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

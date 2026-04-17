@@ -1,0 +1,569 @@
+// §6 Nova缓冲itmap — 像素缓冲
+
+导入("../稳态/图处显示.nova")
+导入("../推理/值乘.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("../执行/控制台输出.nova")
+导入("../执行/底层内存操.nova")
+
+定义 COLORTYPE_UNKNOWN  = 0
+定义 COLORTYPE_RGBA8888 = 1
+定义 COLORTYPE_BGRA8888 = 2
+定义 COLORTYPE_RGB565   = 3
+定义 COLORTYPE_ALPHA8   = 4
+定义 COLORTYPE_GRAY8    = 5
+
+结构 Nova缓冲itmap {
+    宽,
+    高,
+    行字节,    // u32 rowBytes (bytes per row, may include padding)
+    像素,    // u64 pixel data pointer
+    颜色类型,    // u8 COLORTYPE_xxx
+    是否拥有,    // 布尔 是否需要释放像素
+    引用计数,
+}
+
+
+函数 Nova缓冲itmap_创建(宽, 高, 颜色类型) {
+    定义 bm = 堆_分配(Nova缓冲itmap)
+    bm.宽 = 宽; bm.高 = 高; bm.颜色类型 = 颜色类型
+    定义 bpp = Nova缓冲itmap_bpp(颜色类型)
+    bm.行字节 = 宽 * bpp
+    bm.像素 = 堆_分配(高 * bm.行字节)
+    bm.是否拥有 = 真
+    bm.引用计数 = 1
+    // 清零
+    内存_清零(bm.像素, 高 * bm.行字节)
+    返回 bm
+}
+
+函数 Nova缓冲itmap_bpp(颜色类型) {
+    选择 (颜色类型) {
+        COLORTYPE_RGBA8888: { 返回 4 }
+        COLORTYPE_BGRA8888: { 返回 4 }
+        COLORTYPE_RGB565:   { 返回 2 }
+        COLORTYPE_ALPHA8:   { 返回 1 }
+        COLORTYPE_GRAY8:    { 返回 1 }
+        默认: { 返回 4 }
+    }
+}
+
+函数 Nova缓冲itmap_读像素(bm, x, y) {
+    如果 (bm == 0 || x >= bm.宽 || y >= bm.高) { 返回 0 }
+    定义 偏移 = y * bm.行字节 + x * Nova缓冲itmap_bpp(bm.颜色类型)
+    选择 (bm.颜色类型) {
+        COLORTYPE_RGBA8888: { 返回 内存_读32(bm.像素 + 偏移) }
+        COLORTYPE_BGRA8888: {
+            定义 v = 内存_读32(bm.像素 + 偏移)
+            // BGRA→RGBA: 交换R和B
+            返回 (v & 0xFF00FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF)
+        }
+        COLORTYPE_RGB565: {
+            定义 v = 内存_读16(bm.像素 + 偏移)
+            定义 r = ((v >> 11) & 0x1F) * 255 / 31
+            定义 g = ((v >> 5) & 0x3F) * 255 / 63
+            定义 b = (v & 0x1F) * 255 / 31
+            返回 0xFF000000 | (r << 16) | (g << 8) | b
+        }
+        COLORTYPE_ALPHA8: {
+            定义 a = 字节取(bm.像素, 偏移)
+            返回 (a << 24)
+        }
+        默认: { 返回 0 }
+    }
+}
+
+函数 Nova缓冲itmap_写像素(bm, x, y, rgba) {
+    如果 (bm == 0 || x >= bm.宽 || y >= bm.高) { 返回 }
+    定义 偏移 = y * bm.行字节 + x * Nova缓冲itmap_bpp(bm.颜色类型)
+    选择 (bm.颜色类型) {
+        COLORTYPE_RGBA8888: { 内存_写32(bm.像素 + 偏移, rgba) }
+        COLORTYPE_BGRA8888: {
+            定义 bgra = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF)
+            内存_写32(bm.像素 + 偏移, bgra)
+        }
+        COLORTYPE_RGB565: {
+            定义 r = ((rgba >> 16) & 0xFF) >> 3
+            定义 g = ((rgba >> 8) & 0xFF) >> 2
+            定义 b = (rgba & 0xFF) >> 3
+            内存_写16(bm.像素 + 偏移, (r << 11) | (g << 5) | b)
+        }
+        COLORTYPE_ALPHA8: {
+            字节写(bm.像素, 偏移, (rgba >> 24) & 0xFF)
+        }
+    }
+}
+
+函数 Nova缓冲itmap_释放(bm) {
+    如果 (bm == 0) { 返回 }
+    bm.引用计数 = bm.引用计数 - 1
+    如果 (bm.引用计数 <= 0 && bm.是否拥有 && bm.像素 != 0) {
+        堆_释放(bm.像素)
+        堆_释放(bm)
+    }
+}
+
+// NPBT理论 — Nova像素缓冲传输理论
+// (Nova Pixel Buffer Transfer Theory)
+// 原创像素级高速传输与变换理论
+// 核心创新: 级联传输 + 双线性插值 + Alpha合成 + AI图像优化
+
+定义 NPBT_版本 = 1
+定义 NPBT_AI特征维度 = 10
+
+// 混合模式常量
+定义 BLEND_NORMAL = 0
+定义 BLEND_ADD = 1
+定义 BLEND_MULTIPLY = 2
+定义 BLEND_SCREEN = 3
+定义 BLEND_OVERLAY = 4
+
+// 缩放模式
+定义 SCALE_NEAREST = 0
+定义 SCALE_BILINEAR = 1
+
+// 全局统计
+定义 可变 NPBT_blit总数 = 0
+定义 可变 NPBT_缩放总数 = 0
+定义 可变 NPBT_混合总数 = 0
+定义 可变 NPBT_像素传输总量 = 0
+定义 可变 NPBT_AI推理次数 = 0
+
+// §7 Blit矩形复制
+
+// 矩形区域复制 (同颜色类型快速路径)
+函数 Nova缓冲itmap_blit(目标, 源, 目标x, 目标y, 源x, 源y, 宽, 高) {
+    如果 (目标 == 0 || 源 == 0) { 返回 }
+
+    // 裁剪
+    定义 可变 sx = 源x
+    定义 可变 sy = 源y
+    定义 可变 dx = 目标x
+    定义 可变 dy = 目标y
+    定义 可变 w = 宽
+    定义 可变 h = 高
+
+    如果 (dx < 0) { sx = sx - dx; w = w + dx; dx = 0 }
+    如果 (dy < 0) { sy = sy - dy; h = h + dy; dy = 0 }
+    如果 (sx < 0) { dx = dx - sx; w = w + sx; sx = 0 }
+    如果 (sy < 0) { dy = dy - sy; h = h + sy; sy = 0 }
+    如果 (dx + w > 目标.宽) { w = 目标.宽 - dx }
+    如果 (dy + h > 目标.高) { h = 目标.高 - dy }
+    如果 (sx + w > 源.宽) { w = 源.宽 - sx }
+    如果 (sy + h > 源.高) { h = 源.高 - sy }
+    如果 (w <= 0 || h <= 0) { 返回 }
+
+    定义 bpp = Nova缓冲itmap_bpp(源.颜色类型)
+
+    // 同颜色类型: 按行内存复制
+    如果 (源.颜色类型 == 目标.颜色类型) {
+        定义 每行字节 = w * bpp
+        定义 可变 row = 0
+        当 (row < h) {
+            定义 源偏移 = (sy + row) * 源.行字节 + sx * bpp
+            定义 目标偏移 = (dy + row) * 目标.行字节 + dx * bpp
+            内存_复制(目标.像素 + 目标偏移, 源.像素 + 源偏移, 每行字节)
+            row = row + 1
+        }
+    } 否则 {
+        // 不同颜色类型: 逐像素转换
+        定义 可变 row = 0
+        当 (row < h) {
+            定义 可变 col = 0
+            当 (col < w) {
+                定义 rgba = Nova缓冲itmap_读像素(源, sx + col, sy + row)
+                Nova缓冲itmap_写像素(目标, dx + col, dy + row, rgba)
+                col = col + 1
+            }
+            row = row + 1
+        }
+    }
+
+    NPBT_blit总数 = NPBT_blit总数 + 1
+    NPBT_像素传输总量 = NPBT_像素传输总量 + (w * h)
+}
+
+// §8 Alpha混合引擎
+
+// RGBA通道提取
+函数 NPBT_R(rgba) { 返回 (rgba >> 16) & 0xFF }
+函数 NPBT_G(rgba) { 返回 (rgba >> 8) & 0xFF }
+函数 NPBT_B(rgba) { 返回 rgba & 0xFF }
+函数 NPBT_A(rgba) { 返回 (rgba >> 24) & 0xFF }
+函数 NPBT_RGBA(r, g, b, a) { 返回 (a << 24) | (r << 16) | (g << 8) | b }
+
+// 标准Alpha混合: dst = src*alpha + dst*(1-alpha)
+函数 NPBT_混合像素(源, 目标) {
+    定义 sa = NPBT_A(源)
+    如果 (sa == 0) { 返回 目标 }
+    如果 (sa == 255) { 返回 源 }
+
+    定义 da = 255 - sa
+    定义 r = (NPBT_R(源) * sa + NPBT_R(目标) * da) / 255
+    定义 g = (NPBT_G(源) * sa + NPBT_G(目标) * da) / 255
+    定义 b = (NPBT_B(源) * sa + NPBT_B(目标) * da) / 255
+    定义 a = sa + (NPBT_A(目标) * da) / 255
+    返回 NPBT_RGBA(r, g, b, a)
+}
+
+// 多模式混合
+函数 NPBT_混合像素_模式(源, 目标, 模式) {
+    如果 (模式 == BLEND_NORMAL) { 返回 NPBT_混合像素(源, 目标) }
+
+    定义 sr = NPBT_R(源)
+    定义 sg = NPBT_G(源)
+    定义 sb = NPBT_B(源)
+    定义 dr = NPBT_R(目标)
+    定义 dg = NPBT_G(目标)
+    定义 db = NPBT_B(目标)
+    定义 可变 rr = 0
+    定义 可变 rg = 0
+    定义 可变 rb = 0
+
+    如果 (模式 == BLEND_ADD) {
+        rr = sr + dr; 如果 (rr > 255) { rr = 255 }
+        rg = sg + dg; 如果 (rg > 255) { rg = 255 }
+        rb = sb + db; 如果 (rb > 255) { rb = 255 }
+    } 否则 如果 (模式 == BLEND_MULTIPLY) {
+        rr = (sr * dr) / 255
+        rg = (sg * dg) / 255
+        rb = (sb * db) / 255
+    } 否则 如果 (模式 == BLEND_SCREEN) {
+        rr = 255 - ((255 - sr) * (255 - dr)) / 255
+        rg = 255 - ((255 - sg) * (255 - dg)) / 255
+        rb = 255 - ((255 - sb) * (255 - db)) / 255
+    } 否则 如果 (模式 == BLEND_OVERLAY) {
+        如果 (dr < 128) { rr = (2 * sr * dr) / 255 }
+        否则 { rr = 255 - (2 * (255 - sr) * (255 - dr)) / 255 }
+        如果 (dg < 128) { rg = (2 * sg * dg) / 255 }
+        否则 { rg = 255 - (2 * (255 - sg) * (255 - dg)) / 255 }
+        如果 (db < 128) { rb = (2 * sb * db) / 255 }
+        否则 { rb = 255 - (2 * (255 - sb) * (255 - db)) / 255 }
+    }
+
+    返回 NPBT_RGBA(rr, rg, rb, NPBT_A(源))
+}
+
+// 带Alpha混合的Blit
+函数 Nova缓冲itmap_blit_混合(目标, 源, dx, dy, sx, sy, w, h, 模式) {
+    如果 (目标 == 0 || 源 == 0) { 返回 }
+    如果 (dx + w > 目标.宽) { w = 目标.宽 - dx }
+    如果 (dy + h > 目标.高) { h = 目标.高 - dy }
+    如果 (w <= 0 || h <= 0) { 返回 }
+
+    定义 可变 row = 0
+    当 (row < h) {
+        定义 可变 col = 0
+        当 (col < w) {
+            定义 源像素 = Nova缓冲itmap_读像素(源, sx + col, sy + row)
+            定义 目标像素 = Nova缓冲itmap_读像素(目标, dx + col, dy + row)
+            定义 结果 = NPBT_混合像素_模式(源像素, 目标像素, 模式)
+            Nova缓冲itmap_写像素(目标, dx + col, dy + row, 结果)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    NPBT_混合总数 = NPBT_混合总数 + 1
+}
+
+// §9 像素缩放引擎
+// 最近邻 + 双线性插值
+
+// 最近邻缩放
+函数 Nova缓冲itmap_缩放_最近邻(源, 新宽, 新高) {
+    如果 (源 == 0 || 新宽 <= 0 || 新高 <= 0) { 返回 0 }
+    定义 结果 = Nova缓冲itmap_创建(新宽, 新高, 源.颜色类型)
+
+    定义 x比 = (源.宽 * 65536) / 新宽
+    定义 y比 = (源.高 * 65536) / 新高
+
+    定义 可变 dy = 0
+    当 (dy < 新高) {
+        定义 sy = (dy * y比) >> 16
+        定义 可变 dx = 0
+        当 (dx < 新宽) {
+            定义 sx = (dx * x比) >> 16
+            定义 像素 = Nova缓冲itmap_读像素(源, sx, sy)
+            Nova缓冲itmap_写像素(结果, dx, dy, 像素)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    NPBT_缩放总数 = NPBT_缩放总数 + 1
+    返回 结果
+}
+
+// 双线性插值缩放
+函数 Nova缓冲itmap_缩放_双线性(源, 新宽, 新高) {
+    如果 (源 == 0 || 新宽 <= 0 || 新高 <= 0) { 返回 0 }
+    定义 结果 = Nova缓冲itmap_创建(新宽, 新高, 源.颜色类型)
+
+    定义 x比 = (源.宽 * 65536) / 新宽
+    定义 y比 = (源.高 * 65536) / 新高
+
+    定义 可变 dy = 0
+    当 (dy < 新高) {
+        定义 sy_fixed = dy * y比
+        定义 sy0 = sy_fixed >> 16
+        定义 sy1 = sy0 + 1
+        如果 (sy1 >= 源.高) { sy1 = 源.高 - 1 }
+        定义 fy = sy_fixed & 0xFFFF  // 小数部分
+
+        定义 可变 dx = 0
+        当 (dx < 新宽) {
+            定义 sx_fixed = dx * x比
+            定义 sx0 = sx_fixed >> 16
+            定义 sx1 = sx0 + 1
+            如果 (sx1 >= 源.宽) { sx1 = 源.宽 - 1 }
+            定义 fx = sx_fixed & 0xFFFF
+
+            // 4个相邻像素
+            定义 c00 = Nova缓冲itmap_读像素(源, sx0, sy0)
+            定义 c10 = Nova缓冲itmap_读像素(源, sx1, sy0)
+            定义 c01 = Nova缓冲itmap_读像素(源, sx0, sy1)
+            定义 c11 = Nova缓冲itmap_读像素(源, sx1, sy1)
+
+            // 双线性插值每个通道
+            定义 r = NPBT_双线性通道(NPBT_R(c00), NPBT_R(c10), NPBT_R(c01), NPBT_R(c11), fx, fy)
+            定义 g = NPBT_双线性通道(NPBT_G(c00), NPBT_G(c10), NPBT_G(c01), NPBT_G(c11), fx, fy)
+            定义 b = NPBT_双线性通道(NPBT_B(c00), NPBT_B(c10), NPBT_B(c01), NPBT_B(c11), fx, fy)
+            定义 a = NPBT_双线性通道(NPBT_A(c00), NPBT_A(c10), NPBT_A(c01), NPBT_A(c11), fx, fy)
+
+            Nova缓冲itmap_写像素(结果, dx, dy, NPBT_RGBA(r, g, b, a))
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    NPBT_缩放总数 = NPBT_缩放总数 + 1
+    返回 结果
+}
+
+// 双线性插值单通道计算
+函数 NPBT_双线性通道(c00, c10, c01, c11, fx, fy) {
+    定义 ifx = 65536 - fx
+    定义 ify = 65536 - fy
+    定义 w00 = (ifx * ify) >> 16
+    定义 w10 = (fx * ify) >> 16
+    定义 w01 = (ifx * fy) >> 16
+    定义 w11 = (fx * fy) >> 16
+    定义 结果 = (c00 * w00 + c10 * w10 + c01 * w01 + c11 * w11) >> 16
+    如果 (结果 > 255) { 结果 = 255 }
+    返回 结果
+}
+
+// 统一缩放接口
+函数 Nova缓冲itmap_缩放(源, 新宽, 新高, 模式) {
+    如果 (模式 == SCALE_BILINEAR) {
+        返回 Nova缓冲itmap_缩放_双线性(源, 新宽, 新高)
+    }
+    返回 Nova缓冲itmap_缩放_最近邻(源, 新宽, 新高)
+}
+
+// §10 填充与清除
+
+函数 Nova缓冲itmap_填充矩形(bm, x, y, w, h, rgba) {
+    如果 (bm == 0) { 返回 }
+    定义 可变 x1 = x
+    定义 可变 y1 = y
+    定义 可变 x2 = x + w
+    定义 可变 y2 = y + h
+    如果 (x1 < 0) { x1 = 0 }
+    如果 (y1 < 0) { y1 = 0 }
+    如果 (x2 > bm.宽) { x2 = bm.宽 }
+    如果 (y2 > bm.高) { y2 = bm.高 }
+
+    定义 可变 row = y1
+    当 (row < y2) {
+        定义 可变 col = x1
+        当 (col < x2) {
+            Nova缓冲itmap_写像素(bm, col, row, rgba)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+函数 Nova缓冲itmap_清除(bm, rgba) {
+    如果 (bm == 0) { 返回 }
+    如果 (rgba == 0 && bm.颜色类型 == COLORTYPE_RGBA8888) {
+        // 快速路径: 清零
+        内存_清零(bm.像素, bm.高 * bm.行字节)
+    } 否则 {
+        Nova缓冲itmap_填充矩形(bm, 0, 0, bm.宽, bm.高, rgba)
+    }
+}
+
+// §11 颜色空间转换
+
+// RGBA→灰度 (BT.601权重)
+函数 NPBT_RGBA转灰度(rgba) {
+    定义 r = NPBT_R(rgba)
+    定义 g = NPBT_G(rgba)
+    定义 b = NPBT_B(rgba)
+    // Y = 0.299R + 0.587G + 0.114B (定点: *256)
+    返回 (r * 77 + g * 150 + b * 29) >> 8
+}
+
+// 整张图转灰度
+函数 Nova缓冲itmap_转灰度(源) {
+    如果 (源 == 0) { 返回 0 }
+    定义 结果 = Nova缓冲itmap_创建(源.宽, 源.高, COLORTYPE_GRAY8)
+
+    定义 可变 y = 0
+    当 (y < 源.高) {
+        定义 可变 x = 0
+        当 (x < 源.宽) {
+            定义 rgba = Nova缓冲itmap_读像素(源, x, y)
+            定义 gray = NPBT_RGBA转灰度(rgba)
+            字节写(结果.像素, y * 结果.行字节 + x, gray)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    返回 结果
+}
+
+// Gamma校正 (2.2近似)
+函数 NPBT_gamma校正(通道, gamma_inv_q16) {
+    // 简化的gamma校正: c^(1/gamma)近似为查找表或分段线性近似
+    // 此处使用分段线性近似代替精确幂运算
+    如果 (通道 <= 0) { 返回 0 }
+    如果 (通道 >= 255) { 返回 255 }
+
+    // sRGB近似: 低端线性,高端曲线
+    如果 (通道 < 11) {
+        返回 (通道 * 3295) >> 8  // 线性段
+    }
+    // 近似幂曲线: 使用分段线性近似
+    定义 归一化 = (通道 * 256) / 255  // 0-256
+    定义 结果 = (归一化 * gamma_inv_q16) >> 16
+    如果 (结果 > 255) { 结果 = 255 }
+    返回 结果
+}
+
+// 交换红蓝通道 (RGBA↔BGRA)
+函数 Nova缓冲itmap_交换RB(bm) {
+    如果 (bm == 0) { 返回 }
+    如果 (bm.颜色类型 != COLORTYPE_RGBA8888 && bm.颜色类型 != COLORTYPE_BGRA8888) { 返回 }
+
+    定义 总像素 = bm.宽 * bm.高
+    定义 可变 i = 0
+    当 (i < 总像素) {
+        定义 偏移 = i * 4
+        定义 v = 内存_读32(bm.像素 + 偏移)
+        定义 交换 = (v & 0xFF00FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF)
+        内存_写32(bm.像素 + 偏移, 交换)
+        i = i + 1
+    }
+
+    如果 (bm.颜色类型 == COLORTYPE_RGBA8888) {
+        bm.颜色类型 = COLORTYPE_BGRA8888
+    } 否则 {
+        bm.颜色类型 = COLORTYPE_RGBA8888
+    }
+}
+
+// §12 像素操作工具
+
+// 预乘Alpha (premultiplied alpha)
+函数 NPBT_预乘Alpha(rgba) {
+    定义 a = NPBT_A(rgba)
+    如果 (a == 255) { 返回 rgba }
+    如果 (a == 0) { 返回 0 }
+    定义 r = (NPBT_R(rgba) * a) / 255
+    定义 g = (NPBT_G(rgba) * a) / 255
+    定义 b = (NPBT_B(rgba) * a) / 255
+    返回 NPBT_RGBA(r, g, b, a)
+}
+
+// 反预乘Alpha
+函数 NPBT_反预乘Alpha(rgba) {
+    定义 a = NPBT_A(rgba)
+    如果 (a == 0) { 返回 0 }
+    如果 (a == 255) { 返回 rgba }
+    定义 r = (NPBT_R(rgba) * 255) / a
+    定义 g = (NPBT_G(rgba) * 255) / a
+    定义 b = (NPBT_B(rgba) * 255) / a
+    如果 (r > 255) { r = 255 }
+    如果 (g > 255) { g = 255 }
+    如果 (b > 255) { b = 255 }
+    返回 NPBT_RGBA(r, g, b, a)
+}
+
+// 引用计数复制
+函数 Nova缓冲itmap_引用(bm) {
+    如果 (bm == 0) { 返回 0 }
+    bm.引用计数 = bm.引用计数 + 1
+    返回 bm
+}
+
+// 深复制
+函数 Nova缓冲itmap_克隆(bm) {
+    如果 (bm == 0) { 返回 0 }
+    定义 副本 = Nova缓冲itmap_创建(bm.宽, bm.高, bm.颜色类型)
+    内存_复制(副本.像素, bm.像素, bm.高 * bm.行字节)
+    返回 副本
+}
+
+// §13 AI图像优化
+
+函数 NPBT_AI预测缩放模式(源宽, 源高, 目标宽, 目标高) {
+    定义 特征 = Tensor_创建([NPBT_AI特征维度])
+    Tensor_写(特征, [0], 源宽)
+    Tensor_写(特征, [1], 源高)
+    Tensor_写(特征, [2], 目标宽)
+    Tensor_写(特征, [3], 目标高)
+    // 缩放比例
+    Tensor_写(特征, [4], (目标宽 * 1000) / 源宽)
+    Tensor_写(特征, [5], (目标高 * 1000) / 源高)
+    Tensor_写(特征, [6], NPBT_缩放总数)
+    Tensor_写(特征, [7], NPBT_blit总数)
+    Tensor_写(特征, [8], NPBT_混合总数)
+    Tensor_写(特征, [9], NPBT_像素传输总量)
+
+    定义 预测 = AI总线_推理("NPBT缩放预测", 特征)
+    定义 结果 = Tensor_读(预测, [0])
+    NPBT_AI推理次数 = NPBT_AI推理次数 + 1
+
+    Tensor_释放(特征)
+    Tensor_释放(预测)
+    // 0=最近邻, 1=双线性
+    返回 结果 > 500
+}
+
+函数 NPBT_AI异常检测(bm) {
+    如果 (bm == 0) { 返回 假 }
+    定义 特征 = Tensor_创建([6])
+    Tensor_写(特征, [0], bm.宽)
+    Tensor_写(特征, [1], bm.高)
+    Tensor_写(特征, [2], bm.颜色类型)
+    Tensor_写(特征, [3], bm.引用计数)
+    Tensor_写(特征, [4], NPBT_像素传输总量)
+    Tensor_写(特征, [5], NPBT_混合总数)
+
+    定义 分数 = AI总线_异常检测("NPBT异常", 特征)
+    Tensor_释放(特征)
+    返回 分数 > 750
+}
+
+// §14 诊断接口
+
+函数 NPBT_获取统计() {
+    返回 {
+        版本: NPBT_版本,
+        blit总数: NPBT_blit总数,
+        缩放总数: NPBT_缩放总数,
+        混合总数: NPBT_混合总数,
+        像素传输总量: NPBT_像素传输总量,
+        AI推理次数: NPBT_AI推理次数
+    }
+}
+
+函数 NPBT_重置统计() {
+    NPBT_blit总数 = 0
+    NPBT_缩放总数 = 0
+    NPBT_混合总数 = 0
+    NPBT_像素传输总量 = 0
+    NPBT_AI推理次数 = 0
+}

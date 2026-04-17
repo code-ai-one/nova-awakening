@@ -1,0 +1,237 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("./统一码编码.nova")
+导入("./完整国标码解.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./内核直连层.nova")
+
+// §2 TextEncoder
+
+结构 TextEncoder {
+    编码名,    // u64 总是"utf-8"
+}
+
+函数 TextEncoder_创建() {
+    定义 enc = 堆_分配(TextEncoder)
+    enc.编码名 = "utf-8"
+    返回 enc
+}
+
+// encode(string) → Uint8数组
+函数 TextEncoder_encode(enc, 字符串) {
+    如果 (enc == 0 || 字符串 == 0) { 返回 0 }
+    // 对于已经是UTF-8的内部字符串, 直接复制
+    定义 len = 字节长度(字符串)
+    定义 结果 = 堆_分配(len)
+    内存_复制(结果, 字符串, len)
+    返回 结果
+}
+
+// encodeInto(string, uint8数组) → {read, written}
+结构 EncodeResult {
+    read,    // u32 读取的码元数
+    written,    // u32 写入的字节数
+}
+
+函数 TextEncoder_encodeInto(enc, 字符串, 目标, 目标长度) {
+    如果 (enc == 0 || 字符串 == 0 || 目标 == 0) { 返回 0 }
+    定义 result = 堆_分配(EncodeResult)
+    定义 len = 字节长度(字符串)
+    定义 可变 读位置 = 0
+    定义 可变 写位置 = 0
+
+    当 (读位置 < len && 写位置 < 目标长度) {
+        定义 b0 = 字节取(字符串, 读位置)
+        定义 字节数 = UTF8_字节长度(b0)
+        如果 (写位置 + 字节数 > 目标长度) { 跳出 }    // 空间不足
+        定义 可变 j = 0
+        当 (j < 字节数 && 读位置 + j < len) {
+            字节写(目标, 写位置 + j, 字节取(字符串, 读位置 + j))
+            j = j + 1
+        }
+        读位置 = 读位置 + 字节数
+        写位置 = 写位置 + 字节数
+    }
+
+    result.read = 读位置; result.written = 写位置
+    返回 result
+}
+
+// §3 TextDecoder
+
+定义 ENC_UTF8       = 0
+定义 ENC_UTF16LE    = 1
+定义 ENC_UTF16BE    = 2
+定义 ENC_GBK        = 3
+定义 ENC_GB18030    = 4
+定义 ENC_BIG5       = 5
+定义 ENC_SHIFT_JIS  = 6
+定义 ENC_EUC_JP     = 7
+定义 ENC_EUC_KR     = 8
+定义 ENC_ISO8859_1  = 9
+定义 ENC_WINDOWS1252 = 10
+
+结构 TextDecoder {
+    编码,    // u8 ENC_xxx
+    fatal,    // 布尔 true=解码错误时抛Type错误
+    ignoreBOM,    // 布尔 true=忽略BOM
+    // 流式解码状态
+    残留,    // [4]u8
+    残留长度,
+}
+
+函数 TextDecoder_创建(编码名, fatal, ignoreBOM) {
+    定义 dec = 堆_分配(TextDecoder)
+    dec.编码 = TextDecoder_解析编码名(编码名)
+    dec.fatal = fatal; dec.ignoreBOM = ignoreBOM
+    dec.残留长度 = 0
+    返回 dec
+}
+
+函数 TextDecoder_解析编码名(名称) {
+    如果 (名称 == 0) { 返回 ENC_UTF8 }
+    如果 (字符串_相等(名称, "utf-8") || 字符串_相等(名称, "utf8")) { 返回 ENC_UTF8 }
+    如果 (字符串_相等(名称, "utf-16le") || 字符串_相等(名称, "utf-16")) { 返回 ENC_UTF16LE }
+    如果 (字符串_相等(名称, "utf-16be")) { 返回 ENC_UTF16BE }
+    如果 (字符串_相等(名称, "gbk") || 字符串_相等(名称, "gb2312") || 字符串_相等(名称, "chinese")) { 返回 ENC_GBK }
+    如果 (字符串_相等(名称, "gb18030")) { 返回 ENC_GB18030 }
+    如果 (字符串_相等(名称, "big5")) { 返回 ENC_BIG5 }
+    如果 (字符串_相等(名称, "shift_jis") || 字符串_相等(名称, "shift-jis")) { 返回 ENC_SHIFT_JIS }
+    如果 (字符串_相等(名称, "euc-jp")) { 返回 ENC_EUC_JP }
+    如果 (字符串_相等(名称, "euc-kr")) { 返回 ENC_EUC_KR }
+    如果 (字符串_相等(名称, "iso-8859-1") || 字符串_相等(名称, "latin1")) { 返回 ENC_ISO8859_1 }
+    如果 (字符串_相等(名称, "windows-1252")) { 返回 ENC_WINDOWS1252 }
+    返回 ENC_UTF8    // 默认
+}
+
+// decode(bufferSource) → string
+函数 TextDecoder_decode(dec, 数据, 长度) {
+    如果 (dec == 0 || 数据 == 0 || 长度 == 0) { 返回 "" }
+
+    如果 (dec.编码 == ENC_UTF8) {
+        返回 TextDecoder_UTF8(dec, 数据, 长度)
+    } 否则 如果 (dec.编码 == ENC_UTF16LE) {
+        返回 TextDecoder_UTF16LE(数据, 长度)
+    } 否则 如果 (dec.编码 == ENC_ISO8859_1) {
+        返回 TextDecoder_ISO8859_1(数据, 长度)
+    } 否则 如果 (dec.编码 == ENC_GBK) {
+        返回 TextDecoder_GBK(数据, 长度)
+    }
+    // 其他编码: 类似处理
+    返回 TextDecoder_UTF8(dec, 数据, 长度)
+}
+
+函数 TextDecoder_UTF8(dec, 数据, 长度) {
+    如果 (数据 == 0) { 返回 "" }
+    // UTF-8已经是内部表示, 验证并复制
+    定义 结果 = 堆_分配(长度 + 1)
+    定义 可变 rpos = 0; 定义 可变 wpos = 0
+
+    // BOM检测
+    如果 (!dec.ignoreBOM && 长度 >= 3) {
+        如果 (字节取(数据, 0) == 0xEF && 字节取(数据, 1) == 0xBB && 字节取(数据, 2) == 0xBF) {
+            rpos = 3    // 跳过BOM
+        }
+    }
+
+    当 (rpos < 长度) {
+        定义 b0 = 字节取(数据, rpos)
+        定义 字节数 = UTF8_字节长度(b0)
+        如果 (rpos + 字节数 > 长度) {
+            // 不完整序列
+            如果 (dec.fatal) { 返回 0 }    // Type错误
+            字节写(结果, wpos, 0xEF); 字节写(结果, wpos+1, 0xBF); 字节写(结果, wpos+2, 0xBD)
+            wpos = wpos + 3; rpos = rpos + 1
+            继续
+        }
+        定义 可变 j = 0
+        当 (j < 字节数) {
+            字节写(结果, wpos, 字节取(数据, rpos))
+            rpos = rpos + 1; wpos = wpos + 1; j = j + 1
+        }
+    }
+    字节写(结果, wpos, 0)
+    返回 结果
+}
+
+函数 TextDecoder_UTF16LE(数据, 长度) {
+    如果 (数据 == 0 || 长度 < 2) { 返回 "" }
+    // UTF-16LE → UTF-8
+    定义 结果 = 堆_分配(长度 * 2)    // 最坏情况: 每个UTF-16码元→3字节UTF-8
+    定义 可变 rpos = 0; 定义 可变 wpos = 0
+    当 (rpos + 1 < 长度) {
+        定义 lo = 字节取(数据, rpos)
+        定义 hi = 字节取(数据, rpos + 1)
+        定义 cp = lo | (hi << 8)
+        rpos = rpos + 2
+        // 代理对处理
+        如果 (cp >= 0xD800 && cp <= 0xDBFF && rpos + 1 < 长度) {
+            定义 lo2 = 字节取(数据, rpos)
+            定义 hi2 = 字节取(数据, rpos + 1)
+            定义 trail = lo2 | (hi2 << 8)
+            如果 (trail >= 0xDC00 && trail <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (trail - 0xDC00)
+                rpos = rpos + 2
+            }
+        }
+        wpos = wpos + UTF8_编码码点(cp, 结果, wpos)
+    }
+    字节写(结果, wpos, 0)
+    返回 结果
+}
+
+函数 TextDecoder_ISO8859_1(数据, 长度) {
+    如果 (数据 == 0) { 返回 "" }
+    // ISO-8859-1: 每个字节直接映射到U+0000..U+00FF
+    定义 结果 = 堆_分配(长度 * 2 + 1)
+    定义 可变 rpos = 0; 定义 可变 wpos = 0
+    当 (rpos < 长度) {
+        定义 cp = 字节取(数据, rpos); rpos = rpos + 1
+        wpos = wpos + UTF8_编码码点(cp, 结果, wpos)
+    }
+    字节写(结果, wpos, 0)
+    返回 结果
+}
+
+函数 TextDecoder_GBK(数据, 长度) {
+    如果 (数据 == 0) { 返回 "" }
+    // GBK: 双字节中文编码
+    // 需要GBK→Unicode映射表(无表时回退到替换字符U+FFFD)
+    定义 结果 = 堆_分配(长度 * 3 + 1)
+    定义 可变 rpos = 0; 定义 可变 wpos = 0
+    当 (rpos < 长度) {
+        定义 b0 = 字节取(数据, rpos)
+        如果 (b0 < 0x80) {
+            // ASCII
+            字节写(结果, wpos, b0); wpos = wpos + 1; rpos = rpos + 1
+        } 否则 {
+            // GBK双字节
+            如果 (rpos + 1 < 长度) {
+                // 查GBK→Unicode映射表
+                wpos = wpos + UTF8_编码码点(0xFFFD, 结果, wpos)    // 替换字符
+                rpos = rpos + 2
+            } 否则 {
+                wpos = wpos + UTF8_编码码点(0xFFFD, 结果, wpos)
+                rpos = rpos + 1
+            }
+        }
+    }
+    字节写(结果, wpos, 0)
+    返回 结果
+}
+
+定义 可变 AI_字体扩展编_热点函数 = []
+
+函数 AI_字体扩展编_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_字体扩展编_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_字体扩展编_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

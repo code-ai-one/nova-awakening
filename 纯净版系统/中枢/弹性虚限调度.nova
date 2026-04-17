@@ -1,0 +1,548 @@
+// NovaOS EEVDF调度器 — 觉醒理论·不可绕过的理论架构
+// 原创理论: NovaEEVDF — 自适应弹性虚限调度体系
+// 基础论文: Stoica & Abdel-Wahab (1995, Linux 6.6重新实现)
+// §1 EEVDF核心:
+//   eligible条件: se.vruntime <= rq.min_vruntime (lag >= 0)
+//   选择策略: 在eligible任务中选vdeadline最早的
+//   lag = (V - vi) × wi, 精确追踪公平份额偏差
+//   vdeadline = vruntime + slice/weight × NICE_0_WEIGHT
+// §2 任务分类器:
+//   交互型: 运行占比<30%, 小slice(1ms)低延迟
+//   批处理: 运行占比>80%, 大slice(10ms)高吞吐
+//   实时型: 延迟敏感任务, 最小延迟调度
+//   AI型: 经由AI调度钩子动态决定
+// §3 NUMA感知:
+//   任务亲和性: 记录任务上次运行的NUMA节点
+//   迁移成本: 跨节点迁移时计算延迟惩罚
+//   本地优先: 同等条件下优先在亲和节点调度
+// §4 带宽节流:
+//   每任务CPU配额: quota/period比率控制
+//   超额节流: 超过配额后临时限制调度
+//   突发允许: 短期内允许超额使用空闲带宽
+// §5 诊断统计:
+//   调度延迟分布: 记录任务等待时间的分布
+//   公平性指标: lag方差→测量调度公平程度
+//   抢占频率: 追踪抢占/非抢占调度比例
+// NovaOS创新: AI辅助slice预测 + 神经网络负载感知
+// 四阶段AI演进: NovaEEVDF在阶段2提供智能调度基础设施
+
+导入("./类型定义.nova")
+导入("./进程调度.nova")
+导入("../执行/内核智能.nova")
+导入("./红黑树删除.nova")
+导入("./红黑树创建.nova")
+导入("./公平调度权.nova")
+导入("./新系统张量乙.nova")
+导入("../推理/总线调度.nova")
+
+// EEVDF常量
+
+定义 EEVDF_默认slice = 3000000     // 3ms (纳秒)
+定义 EEVDF_最小slice = 300000      // 0.3ms
+定义 EEVDF_最大slice = 30000000    // 30ms
+定义 EEVDF_min_granularity = 750000 // 0.75ms 最小调度粒度
+定义 EEVDF_唤醒粒度 = 1000000     // 1ms 唤醒抢占粒度
+
+// EEVDF调度实体 — 每个任务的调度状态
+
+结构 EEVDF实体 {
+    // 公平调度核心参数
+    Nova虚拟运行时间,    // i64 虚拟运行时间
+    vdeadline,    // i64 虚拟截止期 = Nova虚拟运行时间 + slice/weight
+    slice,    // u64 请求的时间片(纳秒)
+    slice_剩余,    // i64 当前slice剩余时间
+
+    // 权重(决定CPU份额)
+    权重,    // u64 nice→权重
+    nice,
+    // EEVDF关键: lag(滞后量)
+    // lag > 0: 任务获得CPU少于公平份额(应被优先)
+    // lag < 0: 任务获得CPU多于公平份额(应被延后)
+    // lag = S(vi, V) = (V - vi) * wi  其中V=系统虚拟时间,vi=任务Nova虚拟运行时间
+    lag,
+    // 红黑树节点(按vdeadline排序)
+    树节点,
+    在队列中,
+    // 统计
+    总运行时间,
+    等待时间,
+    调度次数,
+}
+
+// EEVDF运行队列 — 每CPU一个
+
+结构 EEVDF运行队列 {
+    // 红黑树: 按vdeadline排序(最左节点=最早deadline)
+    任务树,    // u64 红黑树根
+    任务数,
+    // 全局虚拟时间(所有任务的加权平均Nova虚拟运行时间)
+    min_Nova虚拟运行时间,    // i64 队列最小Nova虚拟运行时间(单调递增)
+    总权重,    // u64 队列中所有任务权重和
+
+    // 当前运行任务
+    当前实体,    // u64 指向当前运行的EEVDF实体
+
+    // 统计
+    调度次数,
+    抢占次数,
+}
+
+// 初始化
+
+函数 EEVDF_初始化(rq) {
+    rq.任务树 = 红黑树_创建()
+    rq.任务数 = 0
+    rq.min_Nova虚拟运行时间 = 0
+    rq.总权重 = 0
+    rq.当前实体 = 空
+    rq.调度次数 = 0
+    rq.抢占次数 = 0
+}
+
+函数 EEVDF实体_初始化(se, nice) {
+    se.nice = nice
+    se.权重 = nice到权重_Nova公平调度(nice)
+    se.Nova虚拟运行时间 = 0
+    se.vdeadline = 0
+    se.slice = EEVDF_默认slice
+    se.slice_剩余 = EEVDF_默认slice
+    se.lag = 0
+    se.在队列中 = 假
+    se.总运行时间 = 0
+    se.等待时间 = 0
+    se.调度次数 = 0
+}
+
+// 核心: 选择下一个任务 — EEVDF算法
+// 在所有eligible任务中选择vdeadline最早的
+
+函数 EEVDF_选择下一个(rq) {
+    如果 (rq.任务数 == 0) { 返回 空 }
+
+    // 从红黑树中找eligible且vdeadline最小的实体
+    // eligible条件: se.Nova虚拟运行时间 <= rq.min_Nova虚拟运行时间 (即lag >= 0)
+    定义 可变 最佳 = 空
+    定义 可变 最佳deadline = 0x7FFFFFFFFFFFFFFF
+
+    // 遍历红黑树(按vdeadline排序)
+    定义 可变 节点 = 红黑树_最左(rq.任务树)
+    当 (节点 != 空) {
+        定义 se = 红黑树_数据(节点)
+
+        // 资格检查: Nova虚拟运行时间 <= min_Nova虚拟运行时间
+        如果 (EEVDF_是eligible(rq, se)) {
+            // 在eligible中选vdeadline最小的
+            如果 (se.vdeadline < 最佳deadline) {
+                最佳 = se
+                最佳deadline = se.vdeadline
+            }
+        }
+
+        节点 = 红黑树_下一个(节点)
+    }
+
+    // 如果没有eligible任务(所有任务都超额运行),选vdeadline最小的
+    如果 (最佳 == 空) {
+        最佳 = 红黑树_数据(红黑树_最左(rq.任务树))
+    }
+
+    rq.调度次数 = rq.调度次数 + 1
+    返回 最佳
+}
+
+// 资格检查
+函数 EEVDF_是eligible(rq, se) {
+    // eligible ⟺ se.Nova虚拟运行时间 <= rq.min_Nova虚拟运行时间
+    // 等价于 lag >= 0 (任务没有超额运行)
+    返回 se.Nova虚拟运行时间 <= rq.min_Nova虚拟运行时间
+}
+
+// 入队: 计算vdeadline, 插入红黑树
+
+函数 EEVDF_入队(rq, se, 标志) {
+    如果 (se.在队列中) { 返回 }
+
+    // 新任务或长时间睡眠后的Nova虚拟运行时间放置
+    如果 (标志 & 入队_新任务 || se.Nova虚拟运行时间 < rq.min_Nova虚拟运行时间 - EEVDF_最大slice) {
+        se.Nova虚拟运行时间 = rq.min_Nova虚拟运行时间
+        se.lag = 0
+    }
+
+    // 唤醒时恢复lag
+    如果 (标志 & 入队_唤醒) {
+        // 保留lag但限制范围(防止睡眠太久积累过多lag)
+        如果 (se.lag > se.slice * 2) {
+            se.lag = se.slice * 2
+        }
+        // 通过lag调整Nova虚拟运行时间: v = V - lag/w
+        se.Nova虚拟运行时间 = rq.min_Nova虚拟运行时间 - se.lag / se.权重
+    }
+
+    // 计算虚拟截止期: vdeadline = Nova虚拟运行时间 + slice/weight
+    // slice/weight 意味着高权重任务的vdeadline更短(更容易被选中)
+    EEVDF_更新vdeadline(se)
+
+    // AI辅助: 预测最优slice
+    定义 AI建议slice = AI调度_预测slice(se)
+    如果 (AI建议slice > 0) {
+        se.slice = 限制范围(AI建议slice, EEVDF_最小slice, EEVDF_最大slice)
+        EEVDF_更新vdeadline(se)
+    }
+
+    // 插入红黑树(按vdeadline排序)
+    红黑树_插入(rq.任务树, se.vdeadline, se)
+    se.在队列中 = 真
+    rq.任务数 = rq.任务数 + 1
+    rq.总权重 = rq.总权重 + se.权重
+
+    // 更新min_Nova虚拟运行时间
+    EEVDF_更新min_Nova虚拟运行时间(rq)
+}
+
+// 出队: 从红黑树移除, 更新lag
+
+函数 EEVDF_出队(rq, se, 标志) {
+    如果 (!se.在队列中) { 返回 }
+
+    // 保存lag: lag = (V - vi) * wi
+    se.lag = (rq.min_Nova虚拟运行时间 - se.Nova虚拟运行时间) * se.权重
+
+    红黑树_删除(rq.任务树, se.树节点)
+    se.在队列中 = 假
+    rq.任务数 = rq.任务数 - 1
+    rq.总权重 = rq.总权重 - se.权重
+
+    EEVDF_更新min_Nova虚拟运行时间(rq)
+}
+
+// 时钟滴答: 更新Nova虚拟运行时间, 检查slice耗尽
+
+函数 EEVDF_时钟滴答(rq, se, delta_ns) {
+    // 更新Nova虚拟运行时间: Nova虚拟运行时间 += delta * NICE_0_WEIGHT / weight
+    定义 Nova虚拟运行时间_增量 = 计算加权Nova虚拟运行时间增量(delta_ns, se.权重)
+    se.Nova虚拟运行时间 = se.Nova虚拟运行时间 + Nova虚拟运行时间_增量
+
+    // 更新slice剩余
+    se.slice_剩余 = se.slice_剩余 - delta_ns
+    se.总运行时间 = se.总运行时间 + delta_ns
+
+    // 更新min_Nova虚拟运行时间
+    EEVDF_更新min_Nova虚拟运行时间(rq)
+
+    // 检查是否需要重新调度
+    如果 (se.slice_剩余 <= 0) {
+        // slice耗尽 → 重新分配slice并更新vdeadline
+        se.slice_剩余 = se.slice
+        EEVDF_更新vdeadline(se)
+        // 需要重新插入红黑树(vdeadline变了)
+        如果 (se.在队列中) {
+            红黑树_删除(rq.任务树, se.树节点)
+            红黑树_插入(rq.任务树, se.vdeadline, se)
+        }
+        返回 真  // 需要重新调度
+    }
+
+    // 检查是否有更紧迫的eligible任务
+    定义 最佳 = EEVDF_选择下一个(rq)
+    如果 (最佳 != 空 && 最佳 != se) {
+        如果 (最佳.vdeadline < se.vdeadline && EEVDF_是eligible(rq, 最佳)) {
+            rq.抢占次数 = rq.抢占次数 + 1
+            返回 真  // 需要抢占
+        }
+    }
+
+    返回 假
+}
+
+// 辅助函数
+
+函数 EEVDF_更新vdeadline(se) {
+    // vdeadline = Nova虚拟运行时间 + slice / weight * NICE_0_WEIGHT
+    // 高权重任务: slice/weight小 → vdeadline更近 → 更容易被选中
+    定义 虚拟slice = 计算加权Nova虚拟运行时间增量(se.slice, se.权重)
+    se.vdeadline = se.Nova虚拟运行时间 + 虚拟slice
+}
+
+函数 EEVDF_更新min_Nova虚拟运行时间(rq) {
+    // min_Nova虚拟运行时间 = max(当前min_Nova虚拟运行时间, 树中最小Nova虚拟运行时间)
+    // 保持单调递增
+    定义 可变 新min = rq.min_Nova虚拟运行时间
+
+    如果 (rq.当前实体 != 空) {
+        定义 当前vr = rq.当前实体.Nova虚拟运行时间
+        如果 (当前vr > 新min) { 新min = 当前vr }
+    }
+
+    定义 最左 = 红黑树_最左(rq.任务树)
+    如果 (最左 != 空) {
+        定义 最左se = 红黑树_数据(最左)
+        定义 最左vr = 最左se.Nova虚拟运行时间
+        如果 (最左vr < 新min) {
+            新min = (新min + 最左vr) / 2   // 平滑更新
+        }
+    }
+
+    如果 (新min > rq.min_Nova虚拟运行时间) {
+        rq.min_Nova虚拟运行时间 = 新min
+    }
+}
+
+// 唤醒抢占判断
+
+函数 EEVDF_唤醒抢占检查(rq, 当前se, 唤醒se) {
+    // EEVDF抢占条件: 唤醒任务eligible且vdeadline更早
+    如果 (!EEVDF_是eligible(rq, 唤醒se)) { 返回 假 }
+
+    // vdeadline比较(考虑唤醒粒度)
+    如果 (唤醒se.vdeadline + EEVDF_唤醒粒度 < 当前se.vdeadline) {
+        返回 真
+    }
+
+    返回 假
+}
+
+// slice自适应 — 根据任务行为动态调整
+
+函数 EEVDF_自适应slice(se) {
+    // 交互型任务: 频繁睡眠/唤醒 → 小slice(低延迟)
+    // 批处理型任务: 连续运行 → 大slice(高吞吐)
+
+    定义 运行占比 = se.总运行时间 * 100 / (se.总运行时间 + se.等待时间 + 1)
+
+    如果 (运行占比 < 30) {
+        // 交互型: 缩短slice到1ms
+        se.slice = 最大值(EEVDF_最小slice, 1000000)
+    } 否则 如果 (运行占比 > 80) {
+        // 批处理型: 扩大slice到10ms
+        se.slice = 最小值(EEVDF_最大slice, 10000000)
+    } 否则 {
+        // 混合型: 默认3ms
+        se.slice = EEVDF_默认slice
+    }
+}
+
+// 统计查询
+
+函数 EEVDF_获取统计(rq) {
+    返回 [
+        rq.任务数,
+        rq.调度次数,
+        rq.抢占次数,
+        rq.min_Nova虚拟运行时间,
+        rq.总权重
+    ]
+}
+
+函数 EEVDF_获取实体lag(se) {
+    返回 se.lag
+}
+
+函数 限制范围(值, 下限, 上限) {
+    如果 (值 < 下限) { 返回 下限 }
+    如果 (值 > 上限) { 返回 上限 }
+    返回 值
+}
+
+// 任务分类器 — 自动识别任务类型
+
+定义 任务类型_未知 = 0
+定义 任务类型_交互 = 1
+定义 任务类型_批处理 = 2
+定义 任务类型_实时 = 3
+定义 任务类型_AI = 4
+
+函数 EEVDF_分类任务(se) {
+    // 基于运行占比和行为模式自动分类
+    定义 总时间 = se.总运行时间 + se.等待时间 + 1
+    定义 运行占比 = se.总运行时间 * 100 / 总时间
+    定义 调度频率 = 0
+    如果 (se.总运行时间 > 0) {
+        调度频率 = se.调度次数 * 1000000 / se.总运行时间
+    }
+
+    // 交互型: 运行占比低, 调度频率高 (频繁睡眠/唤醒)
+    如果 (运行占比 < 30 && 调度频率 > 100) {
+        返回 任务类型_交互
+    }
+    // 批处理型: 运行占比高, 调度频率低 (连续计算)
+    如果 (运行占比 > 80 && 调度频率 < 50) {
+        返回 任务类型_批处理
+    }
+    // 实时型: nice值很低 (高优先级)
+    如果 (se.nice < -10) {
+        返回 任务类型_实时
+    }
+    返回 任务类型_未知
+}
+
+// NUMA感知 — 亲和性追踪与迁移成本
+
+定义 NUMA_最大节点 = 8
+定义 NUMA_迁移惩罚 = 500000   // 0.5ms 纳秒
+定义 可变 NUMA_节点数 = 1
+
+结构 NUMA亲和信息 {
+    首选节点,    // 任务首选NUMA节点
+    上次节点,    // 上次运行的节点
+    迁移次数,    // 累计迁移次数
+    本地命中,    // 本地节点调度次数
+    远程命中,    // 远程节点调度次数
+}
+
+函数 EEVDF_NUMA初始化(se, 首选节点) {
+    se.NUMA信息 = 堆_分配(NUMA亲和信息)
+    se.NUMA信息.首选节点 = 首选节点
+    se.NUMA信息.上次节点 = 首选节点
+    se.NUMA信息.迁移次数 = 0
+    se.NUMA信息.本地命中 = 0
+    se.NUMA信息.远程命中 = 0
+}
+
+函数 EEVDF_NUMA迁移成本(se, 目标节点) {
+    // 计算从当前节点迁移到目标节点的成本
+    如果 (se.NUMA信息 == 0) { 返回 0 }
+    如果 (se.NUMA信息.上次节点 == 目标节点) { 返回 0 }  // 同节点无成本
+    se.NUMA信息.迁移次数 = se.NUMA信息.迁移次数 + 1
+    se.NUMA信息.远程命中 = se.NUMA信息.远程命中 + 1
+    返回 NUMA_迁移惩罚
+}
+
+函数 EEVDF_NUMA应在本地(se, 当前节点) {
+    如果 (se.NUMA信息 == 0) { 返回 真 }
+    返回 se.NUMA信息.首选节点 == 当前节点
+}
+
+函数 EEVDF_NUMA亲和率(se) {
+    如果 (se.NUMA信息 == 0) { 返回 1000 }
+    定义 总 = se.NUMA信息.本地命中 + se.NUMA信息.远程命中
+    如果 (总 == 0) { 返回 1000 }
+    返回 se.NUMA信息.本地命中 * 1000 / 总
+}
+
+// 带宽节流 — CPU配额控制
+
+结构 带宽控制 {
+    配额,        // 每周期允许的CPU时间(纳秒)
+    周期,        // 配额周期(纳秒)
+    已用,        // 当前周期已使用
+    周期开始,    // 当前周期开始时间
+    被节流次数,  // 被节流总次数
+    突发允许,    // 允许突发模式
+}
+
+函数 EEVDF_带宽_初始化(se, 配额, 周期) {
+    se.带宽 = 堆_分配(带宽控制)
+    se.带宽.配额 = 配额
+    se.带宽.周期 = 周期
+    se.带宽.已用 = 0
+    se.带宽.周期开始 = 0
+    se.带宽.被节流次数 = 0
+    se.带宽.突发允许 = 真
+}
+
+函数 EEVDF_带宽_计费(se, 使用时间, 当前时间) {
+    如果 (se.带宽 == 0) { 返回 }
+    // 检查是否需要开始新周期
+    如果 (当前时间 - se.带宽.周期开始 >= se.带宽.周期) {
+        se.带宽.已用 = 0
+        se.带宽.周期开始 = 当前时间
+    }
+    se.带宽.已用 = se.带宽.已用 + 使用时间
+}
+
+函数 EEVDF_带宽_被节流(se) {
+    如果 (se.带宽 == 0) { 返回 假 }
+    如果 (se.带宽.配额 <= 0) { 返回 假 }  // 无配额限制
+    如果 (se.带宽.已用 >= se.带宽.配额) {
+        // 突发模式: 允许超额50%
+        如果 (se.带宽.突发允许 && se.带宽.已用 < se.带宽.配额 * 3 / 2) {
+            返回 假
+        }
+        se.带宽.被节流次数 = se.带宽.被节流次数 + 1
+        返回 真
+    }
+    返回 假
+}
+
+函数 EEVDF_带宽_使用率(se) {
+    如果 (se.带宽 == 0 || se.带宽.配额 == 0) { 返回 0 }
+    返回 se.带宽.已用 * 1000 / se.带宽.配额
+}
+
+// 调度延迟分布统计
+
+定义 可变 调度_总延迟 = 0
+定义 可变 调度_延迟次数 = 0
+定义 可变 调度_最大延迟 = 0
+定义 可变 调度_延迟P99 = 0
+
+函数 EEVDF_记录延迟(延迟_ns) {
+    调度_总延迟 = 调度_总延迟 + 延迟_ns
+    调度_延迟次数 = 调度_延迟次数 + 1
+    如果 (延迟_ns > 调度_最大延迟) { 调度_最大延迟 = 延迟_ns }
+}
+
+函数 EEVDF_平均延迟() {
+    如果 (调度_延迟次数 == 0) { 返回 0 }
+    返回 调度_总延迟 / 调度_延迟次数
+}
+
+// 公平性指标 — lag方差分析
+
+函数 EEVDF_公平性分析(rq) {
+    // 计算lag方差 — 方差越小越公平
+    如果 (rq.任务数 == 0) { 返回 [0, 0, 0] }
+    定义 可变 lag和 = 0
+    定义 可变 lag平方和 = 0
+    定义 可变 最大lag = 0
+    定义 可变 节点 = 红黑树_最左(rq.任务树)
+    定义 可变 计数 = 0
+    当 (节点 != 空) {
+        定义 se = 红黑树_数据(节点)
+        lag和 = lag和 + se.lag
+        lag平方和 = lag平方和 + se.lag * se.lag / 1000000
+        定义 可变 abs_lag = se.lag
+        如果 (abs_lag < 0) { abs_lag = 0 - abs_lag }
+        如果 (abs_lag > 最大lag) { 最大lag = abs_lag }
+        计数 = 计数 + 1
+        节点 = 红黑树_下一个(节点)
+    }
+    如果 (计数 == 0) { 返回 [0, 0, 0] }
+    定义 lag均值 = lag和 / 计数
+    定义 lag方差 = lag平方和 / 计数 - lag均值 * lag均值 / 1000000
+    返回 [lag均值, lag方差, 最大lag]
+}
+
+// 完整诊断统计
+
+函数 EEVDF_完整诊断(rq) {
+    定义 公平 = EEVDF_公平性分析(rq)
+    返回 {
+        任务数: rq.任务数,
+        调度次数: rq.调度次数,
+        抢占次数: rq.抢占次数,
+        总权重: rq.总权重,
+        min_vruntime: rq.min_Nova虚拟运行时间,
+        平均延迟: EEVDF_平均延迟(),
+        最大延迟: 调度_最大延迟,
+        lag均值: 公平[0],
+        lag方差: 公平[1],
+        最大lag: 公平[2],
+        NUMA节点数: NUMA_节点数
+    }
+}
+
+函数 EEVDF_实体诊断(se) {
+    返回 {
+        vruntime: se.Nova虚拟运行时间,
+        vdeadline: se.vdeadline,
+        slice: se.slice,
+        lag: se.lag,
+        nice: se.nice,
+        权重: se.权重,
+        总运行: se.总运行时间,
+        等待: se.等待时间,
+        调度次数: se.调度次数,
+        任务类型: EEVDF_分类任务(se)
+    }
+}

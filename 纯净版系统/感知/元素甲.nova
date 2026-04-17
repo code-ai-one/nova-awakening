@@ -1,0 +1,128 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档节点.nova")
+导入("./样式解析为.nova")
+导入("./更新活跃样.nova")
+导入("./文档创建.nova")
+导入("./核心布局算.nova")
+
+// §5 get元素sByTagName / get元素sByClassName (文档级)
+
+
+函数 Document_get元素sByTagName(文档, 标签名) {
+    返回 元素_get元素sByTagName(文档, 标签名)
+}
+
+函数 Document_get元素sByClassName(文档, class名) {
+    返回 元素_get元素sByClassName(文档, class名)
+}
+
+函数 Document_querySelector(文档, 选择器) {
+    返回 元素_querySelector(文档, 选择器)
+}
+
+函数 Document_querySelectorAll(文档, 选择器) {
+    返回 元素_querySelectorAll(文档, 选择器)
+}
+
+// §6 文档生命周期 (Document lifecycle)
+
+函数 Document_设置就绪状态(文档, 新状态) {
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 == 0) { 返回 }
+
+ 定义 旧状态 = 扩展.就绪状态
+ 扩展.就绪状态 = 新状态
+
+ // 触发readystatechange事件
+ 如果 (旧状态 != 新状态) {
+ 事件_派发(文档, "readystatechange")
+ }
+
+ // interactive → DOMContentLoaded
+ 如果 (新状态 == 文档状态_交互中 && 旧状态 == 文档状态_加载中) {
+ 事件_派发(文档, "DOMContentLoaded")
+ }
+
+ // complete → load
+ 如果 (新状态 == 文档状态_完成) {
+ 事件_派发(文档, "load")
+ }
+}
+
+函数 Document_完成解析(文档) {
+ // 解析完成后的处理 
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 == 0) { 返回 }
+
+ 扩展.解析状态 = 解析状态_已完成
+
+ // 设置readyState = interactive
+ Document_设置就绪状态(文档, 文档状态_交互中)
+
+ // 执行延迟脚本 (defer scripts)
+ // 执行队列中的defer脚本
+ Script_执行延迟队列(文档)
+
+ // 设置readyState = complete (所有资源加载完成后)
+ Document_设置就绪状态(文档, 文档状态_完成)
+}
+
+// §7 样式更新入口 
+
+函数 Document_更新样式和布局(文档) {
+ // 这是NovaOS渲染管线的入口
+ // 对应 Document::Update样式And布局Tree
+
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 == 0) { 返回 }
+
+ // Step 1: 执行挂起的JS微任务
+ // (在Nova中由事件循环处理)
+
+ // Step 2: 样式重计算 (样式 Recalc)
+ 如果 (扩展.样式引擎 != 0) {
+ 样式Engine_更新活跃样式表(扩展.样式引擎)
+ }
+
+ // 遍历标记为Needs样式Recalc的节点，重新计算样式
+ 如果 (文档.节点标志 & (节点标志_已改样式 | 节点标志_子树已改)) {
+ Document_样式重计算(文档)
+ }
+
+ // Step 3: 布局 (布局 / Reflow)
+ 如果 (文档.节点标志 & 节点标志_已改布局) {
+ Document_布局(文档)
+ }
+}
+
+函数 Document_样式重计算(文档) {
+ // 对应 Document::Update样式
+ // 递归遍历DOM树，为需要重计算的元素解析样式
+ 定义 可变 当前 = 节点_深度优先下一个(文档, 文档)
+ 当 (当前 != 0) {
+ 如果 (当前.节点标志 & 节点标志_是元素) {
+ 如果 (当前.节点标志 & 节点标志_已改样式) {
+ // 调用样式Resolver为该元素计算新的Computed样式
+ 定义 扩展 = Document_获取扩展(文档)
+ 如果 (扩展 != 0 && 扩展.样式引擎 != 0) {
+ 样式Engine_解析元素样式(扩展.样式引擎, 当前)
+ }
+ }
+ }
+ 当前.节点标志 = 当前.节点标志 & (~节点标志_已改样式)
+ 当前.节点标志 = 当前.节点标志 & (~节点标志_子树已改)
+ 当前 = 节点_深度优先下一个(当前, 文档)
+ }
+ 文档.节点标志 = 文档.节点标志 & (~节点标志_已改样式)
+ 文档.节点标志 = 文档.节点标志 & (~节点标志_子树已改)
+}
+
+函数 Document_布局(文档) {
+ // 对应 LocalFrameView::Update布局
+ // 调用布局引擎进行布局计算
+ 如果 (文档.布局对象 != 0) {
+ 布局Object_布局(文档.布局对象)
+ }
+ 文档.节点标志 = 文档.节点标志 & (~节点标志_已改布局)
+}

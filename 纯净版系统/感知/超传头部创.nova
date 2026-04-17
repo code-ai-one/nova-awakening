@@ -1,0 +1,137 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/字符串替换.nova")
+
+// HTTP头部 (net::HttpRequestHeaders / HttpResponseHeaders)
+
+结构 HTTP头部条目 {
+    名,    // u64 头名字符串
+    名长度,
+    值,    // u64 头值字符串
+    值长度,
+}
+
+结构 HTTP头部列表 {
+    条目,    // u64 HTTP头部条目*数组
+    数量,
+    容量,
+}
+
+函数 HTTP头部_创建() {
+    定义 h = 堆_分配(HTTP头部列表)
+    h.容量 = 32
+    h.条目 = 堆_分配_数组(h.容量 * 32)
+    h.数量 = 0
+    返回 h
+}
+
+函数 HTTP头部_添加(h, 名, 值) {
+    如果 (h.数量 >= h.容量) { 返回 }
+    定义 偏移 = h.条目 + h.数量 * 32
+    定义 名复制 = 字符串_复制(名)
+    定义 值复制 = 字符串_复制(值)
+    内存_写64(偏移, 名复制)
+    内存_写32(偏移 + 8, 字符串_长度(名))
+    内存_写64(偏移 + 16, 值复制)
+    内存_写32(偏移 + 24, 字符串_长度(值))
+    h.数量 = h.数量 + 1
+}
+
+函数 HTTP头部_获取(h, 名) {
+    定义 可变 i = 0
+    当 (i < h.数量) {
+        定义 偏移 = h.条目 + i * 32
+        定义 已有名 = 内存_读64(偏移)
+        如果 (字符串_相等_不区分大小写(已有名, 名)) {
+            返回 内存_读64(偏移 + 16)
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 字符串_相等_不区分大小写(a, b) {
+    如果 (a == b) { 返回 1 }
+    如果 (a == 0 || b == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (1) {
+        定义 可变 ca = 内存_读8(a + i)
+        定义 可变 cb = 内存_读8(b + i)
+        如果 (ca >= 0x41 && ca <= 0x5A) { ca = ca + 0x20 }
+        如果 (cb >= 0x41 && cb <= 0x5A) { cb = cb + 0x20 }
+        如果 (ca != cb) { 返回 0 }
+        如果 (ca == 0) { 返回 1 }
+        i = i + 1
+    }
+}
+
+// ResourceRequest — 资源请求 
+
+结构 ResourceRequest {
+ url,    // u64 URL*
+ 方法,    // u32 HTTP_GET等
+ 请求头,    // u64 HTTP头部列表*
+ 请求体,    // u64 POST/PUT的body数据
+ 请求体长度,
+ 资源类型,
+ 优先级,
+ 引荐者,    // u64 Referer URL
+ 来源,    // u64 Origin
+ 缓存模式,    // u32 0=default 1=no-cache 2=no-store 3=force-cache
+ 凭证模式,    // u32 0=omit 1=same-origin 2=include
+ 重定向模式,    // u32 0=follow 1=error 2=manual
+ 完整性,    // u64 integrity (SRI hash)
+ 是导航,
+ 是预取,
+}
+
+函数 ResourceRequest_创建(url字符串, 方法, 资源类型) {
+ 定义 req = 堆_分配(ResourceRequest)
+ req.url = URL_解析(url字符串)
+ req.方法 = 方法
+ req.请求头 = HTTP头部_创建()
+ req.请求体 = 0
+ req.请求体长度 = 0
+ req.资源类型 = 资源类型
+ req.引荐者 = 0
+ req.来源 = 0
+ req.缓存模式 = 0
+ req.凭证模式 = 1 // same-origin
+ req.重定向模式 = 0 // follow
+ req.完整性 = 0
+ req.是导航 = 假
+ req.是预取 = 假
+
+ // 根据资源类型设置优先级
+ 如果 (资源类型 == 资源类型_主文档 || 资源类型 == 资源类型_样式表) {
+ req.优先级 = 优先级_最高
+ } 否则 如果 (资源类型 == 资源类型_脚本) {
+ req.优先级 = 优先级_高
+ } 否则 如果 (资源类型 == 资源类型_字体) {
+ req.优先级 = 优先级_中
+ } 否则 如果 (资源类型 == 资源类型_图片) {
+ req.优先级 = 优先级_低
+ } 否则 {
+ req.优先级 = 优先级_低
+ }
+
+ // 默认请求头
+ HTTP头部_添加(req.请求头, "User-智能体", "NovaBrowser/1.0 (NovaOS)")
+ HTTP头部_添加(req.请求头, "Accept", "*/*")
+ HTTP头部_添加(req.请求头, "Accept-Encoding", "gzip, deflate, br")
+ HTTP头部_添加(req.请求头, "Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+ HTTP头部_添加(req.请求头, "Connection", "keep-alive")
+
+ 如果 (资源类型 == 资源类型_主文档) {
+ HTTP头部_添加(req.请求头, "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+ } 否则 如果 (资源类型 == 资源类型_样式表) {
+ HTTP头部_添加(req.请求头, "Accept", "text/css,*/*;q=0.1")
+ } 否则 如果 (资源类型 == 资源类型_脚本) {
+ HTTP头部_添加(req.请求头, "Accept", "*/*")
+ }
+
+ 返回 req
+}

@@ -1,0 +1,133 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §8 文件上传: File / FileList / FileReader
+
+结构 File {
+    名称,
+    类型,    // u64 MIME类型
+    大小,    // u64 字节
+    最后修改,    // u64 毫秒时间戳
+    数据,    // u64 文件内容(Blob)
+    relativePath,    // u64 目录上传时的相对路径(Nova标准)
+}
+
+结构 FileList {
+    文件,    // [32]u64 File*
+    长度,
+}
+
+定义 可变 文件列表创建数 = 0
+定义 可变 文件读取器创建数 = 0
+定义 可变 IME会话数 = 0
+
+函数 FileList_创建() {
+    定义 列表 = 堆_分配(FileList)
+    列表.文件 = 堆_分配_数组(32 * 8)
+    列表.长度 = 0
+    文件列表创建数 = 文件列表创建数 + 1
+    返回 列表
+}
+
+定义 FR_EMPTY   = 0
+定义 FR_LOADING = 1
+定义 FR_DONE    = 2
+
+结构 FileReader {
+    readyState,    // u8 FR_xxx
+    结果,    // u64 读取结果(数组Buffer/string/dataURL)
+    结果类型,    // u8 0=arrayBuffer 1=text 2=dataURL
+    error,
+    // 事件
+    onload,
+    onerror,
+    onloadstart,
+    onloadend,
+    onprogress,
+    onabort,
+    // 内部
+    已中止,
+}
+
+函数 FileReader_创建() {
+    定义 fr = 堆_分配(FileReader)
+    fr.readyState = FR_EMPTY; fr.结果 = 0; fr.error = 0
+    fr.已中止 = 假
+    文件读取器创建数 = 文件读取器创建数 + 1
+    返回 fr
+}
+
+函数 FileReader_readAsText(fr, file, encoding) {
+    如果 (fr == 0 || file == 0) { 返回 }
+    如果 (fr.readyState == FR_LOADING) { 返回 }    // InvalidState错误
+    fr.readyState = FR_LOADING; fr.结果类型 = 1
+    // 异步读取文件内容, 用encoding解码为字符串
+    // 完成后: fr.readyState = FR_DONE, 触发onload
+}
+
+函数 FileReader_readAs数组Buffer(fr, file) {
+    如果 (fr == 0 || file == 0) { 返回 }
+    如果 (fr.readyState == FR_LOADING) { 返回 }
+    fr.readyState = FR_LOADING; fr.结果类型 = 0
+}
+
+函数 FileReader_readAsDataURL(fr, file) {
+    如果 (fr == 0 || file == 0) { 返回 }
+    如果 (fr.readyState == FR_LOADING) { 返回 }
+    fr.readyState = FR_LOADING; fr.结果类型 = 2
+    // data:MIME;base64,xxxxx
+}
+
+函数 FileReader_abort(fr) {
+    如果 (fr == 0 || fr.readyState != FR_LOADING) { 返回 }
+    fr.已中止 = 真; fr.readyState = FR_DONE; fr.结果 = 0
+    // 触发onabort
+}
+
+// §9 输入法(IME)处理
+
+结构 CompositionState {
+    活跃,    // 布尔 是否正在组合输入
+    文本,    // u64 当前组合文本(如拼音)
+    选区起始,
+    选区长度,
+    // 候选列表(用于显示候选窗口)
+    候选,    // [10]u64
+    候选数,
+}
+
+定义 可变 全局IME状态 = 0
+
+函数 IME_获取状态() {
+    如果 (全局IME状态 == 0) {
+        全局IME状态 = 堆_分配(CompositionState)
+        全局IME状态.活跃 = 假; 全局IME状态.文本 = 0; 全局IME状态.候选数 = 0
+    }
+    返回 全局IME状态
+}
+
+// compositionstart事件
+函数 IME_开始组合(target) {
+    定义 state = IME_获取状态()
+    state.活跃 = 真; state.文本 = ""
+    IME会话数 = IME会话数 + 1
+    // 触发compositionstart事件
+}
+
+// compositionupdate事件
+函数 IME_更新组合(文本) {
+    定义 state = IME_获取状态()
+    如果 (!state.活跃) { 返回 }
+    state.文本 = 文本
+    // 触发compositionupdate事件
+    // 在输入框中显示组合文本(通常带下划线)
+}
+
+// compositionend事件
+函数 IME_结束组合(最终文本) {
+    定义 state = IME_获取状态()
+    state.活跃 = 假
+    // 将最终文本插入到输入框
+    // 触发compositionend事件
+    // 触发input事件
+}

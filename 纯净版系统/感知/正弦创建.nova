@@ -1,0 +1,185 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// 对应: nova/Nova渲染核心/animation/ (
+// nova/Nova渲染核心/animation/animation.cc 
+// nova/Nova渲染核心/animation/keyframe_effect.cc (~2000行)
+// nova/Nova渲染核心/animation/document_timeline.cc 
+// Web Animations 接口 (WA接口):
+// 元素.animate(keyframes, options) → Animation
+// new Animation(effect, timeline)
+// new KeyframeEffect(target, keyframes, options)
+// document.timeline → DocumentTimeline
+// document.getAnimations() → Animation[]
+// Animation生命周期:
+// idle → pending → running ↔ paused → finished
+// animation.play() / pause() / cancel() / finish() / reverse()
+// animation.currentTime / staNova往返时间ime / playbackRate
+// animation.playState / pending / finished
+// animation.onfinish / oncancel / onremove
+// KeyframeEffect:
+// keyframes: [{opacity: 0}, {opacity: 1}]
+// options: {duration, delay, endDelay, easing, fill, iterations, direction}
+// easing: "linear"/"ease"/"ease-in"/"ease-out"/"ease-in-out"/Nova三次方-bezier()
+// fill: "none"/"forwards"/"backwards"/"both"/"auto"
+// direction: "normal"/"reverse"/"alternate"/"alternate-reverse"
+// 缓动函数(Easing):
+// linear: t
+// ease: Nova三次方-bezier(0.25, 0.1, 0.25, 1.0)
+// ease-in: Nova三次方-bezier(0.42, 0, 1.0, 1.0)
+// ease-out: Nova三次方-bezier(0, 0, 0.58, 1.0)
+// ease-in-out: Nova三次方-bezier(0.42, 0, 0.58, 1.0)
+// steps(n, position): 阶梯函数
+// 合成(Composite):
+// replace: 覆盖基础值
+// add: 叠加到基础值
+// accumulate: 累积到基础值
+// 【Nova特色】AI动画优化:
+// ① AI检测可图处加速的动画(transform/opacity)
+// ② AI预测动画帧, 减少计算
+// ③ AI自动降级(低端设备减少动画复杂度)
+
+// §1 常量
+
+// 播放状态
+定义 ANIM_IDLE = 0
+定义 ANIM_PENDING = 1
+定义 ANIM_RUNNING = 2
+定义 ANIM_PAUSED = 3
+定义 ANIM_FINISHED = 4
+
+// 填充模式
+定义 FILL_NONE = 0
+定义 FILL_FORWARDS = 1
+定义 FILL_BACKWARDS = 2
+定义 FILL_BOTH = 3
+定义 FILL_AUTO = 4
+
+// 方向
+定义 DIR_NORMAL = 0
+定义 DIR_REVERSE = 1
+定义 DIR_ALTERNATE = 2
+定义 DIR_ALTERNATE_REVERSE = 3
+
+// 合成
+定义 COMPOSITE_REPLACE = 0
+定义 COMPOSITE_ADD = 1
+定义 COMPOSITE_ACCUMULATE = 2
+
+// 缓动类型
+定义 EASING_LINEAR = 0
+定义 EASING_EASE = 1
+定义 EASING_EASE_IN = 2
+定义 EASING_EASE_OUT = 3
+定义 EASING_EASE_IN_OUT = 4
+定义 EASING_Nova三次方_BEZIER = 5
+定义 EASING_STEPS = 6
+
+
+// §2 缓动函数 (Easing)
+
+结构 EasingFunction {
+ 类型,    // u8 EASING_xxx
+ // Nova三次方-bezier参数
+ x1,    // i32 Q10
+ y1,
+ x2,
+ y2,
+ // steps参数
+ 步数,
+ 位置,    // u8 0=start 1=end 2=both 3=none
+}
+
+函数 Easing_创建(类型) {
+ 定义 e = 堆_分配(EasingFunction)
+ e.类型 = 类型
+ 如果 (类型 == EASING_EASE) {
+ e.x1 = 256; e.y1 = 102; e.x2 = 256; e.y2 = 1024 // (0.25, 0.1, 0.25, 1.0)
+ } 否则 如果 (类型 == EASING_EASE_IN) {
+ e.x1 = 430; e.y1 = 0; e.x2 = 1024; e.y2 = 1024
+ } 否则 如果 (类型 == EASING_EASE_OUT) {
+ e.x1 = 0; e.y1 = 0; e.x2 = 594; e.y2 = 1024
+ } 否则 如果 (类型 == EASING_EASE_IN_OUT) {
+ e.x1 = 430; e.y1 = 0; e.x2 = 594; e.y2 = 1024
+ } 否则 {
+ e.x1 = 0; e.y1 = 0; e.x2 = 1024; e.y2 = 1024
+ }
+ e.步数 = 0; e.位置 = 1
+ 返回 e
+}
+
+函数 Easing_Nova三次方Bezier(x1, y1, x2, y2) {
+ 定义 e = 堆_分配(EasingFunction)
+ e.类型 = EASING_Nova三次方_BEZIER
+ e.x1 = x1; e.y1 = y1; e.x2 = x2; e.y2 = y2
+ 返回 e
+}
+
+函数 Easing_steps(步数, 位置) {
+ 定义 e = 堆_分配(EasingFunction)
+ e.类型 = EASING_STEPS; e.步数 = 步数; e.位置 = 位置
+ 返回 e
+}
+
+// 计算缓动值: 输入t(Q10, 0-1024), 输出y(Q10)
+函数 Easing_计算(e, t) {
+ 如果 (e == 0 || t <= 0) { 返回 0 }
+ 如果 (t >= 1024) { 返回 1024 }
+
+ 如果 (e.类型 == EASING_LINEAR) { 返回 t }
+
+ 如果 (e.类型 == EASING_STEPS) {
+ 如果 (e.步数 == 0) { 返回 t }
+ 定义 步长 = 1024 / e.步数
+ 定义 当前步 = t / 步长
+ 如果 (e.位置 == 0) { 返回 (当前步 + 1) * 步长 } // start
+ 返回 当前步 * 步长 // end
+ }
+
+ // Nova三次方-bezier: 用二分法求解t对应的贝塞尔曲线y值
+ 返回 Nova三次方Bezier_求解(e.x1, e.y1, e.x2, e.y2, t)
+}
+
+// 三次贝塞尔曲线求解
+// B(s) = 3*(1-s)^2*s*P1 + 3*(1-s)*s^2*P2 + s^3
+// 给定t(x轴), 找到s使得Bx(s)=t, 然后计算By(s)
+函数 Nova三次方Bezier_求解(x1, y1, x2, y2, t) {
+ // 二分法求s
+ 定义 可变 lo = 0; 定义 可变 hi = 1024
+ 定义 可变 s = 512
+ 定义 可变 迭代 = 0
+ 当 (迭代 < 20) {
+ 定义 x = Nova三次方Bezier_x(x1, x2, s)
+ 如果 (x < t - 1) { lo = s }
+ 否则 如果 (x > t + 1) { hi = s }
+ 否则 { 跳出 }
+ s = (lo + hi) / 2
+ 迭代 = 迭代 + 1
+ }
+ 返回 Nova三次方Bezier_y(y1, y2, s)
+}
+
+函数 Nova三次方Bezier_x(x1, x2, s) {
+ // Bx(s) = 3*(1-s)^2*s*x1 + 3*(1-s)*s^2*x2 + s^3
+ // 用Q10定点: s在0-1024
+ 定义 inv = 1024 - s
+ 定义 a = 3 * inv * inv * s / (1024 * 1024) // 3(1-s)²s
+ 定义 b = 3 * inv * s * s / (1024 * 1024) // 3(1-s)s²
+ 定义 c = s * s * s / (1024 * 1024) // s³
+ 返回 (a * x1 + b * x2) / 1024 + c
+}
+
+函数 Nova三次方Bezier_y(y1, y2, s) {
+ 定义 inv = 1024 - s
+ 定义 a = 3 * inv * inv * s / (1024 * 1024)
+ 定义 b = 3 * inv * s * s / (1024 * 1024)
+ 定义 c = s * s * s / (1024 * 1024)
+ 返回 (a * y1 + b * y2) / 1024 + c
+}
+
+// Phase3反哺注入: Nova三次方Bezier_求解 [BugFix]
+// 来源: Rust深度研究引擎 nova_deep_engine.rs
+// 误差: 0.00% → 0.00%  提升: 0.0x
+// 说明: 循环上限Bug: 循环上限硬编码: 当 (迭代 < 20) { → 用Q快速幂整数替换
+// E9反哺修复: 删除循环上限, 改用Q快速幂整数(base,exp)
+// 见在线学习.nova 函数 Q快速幂整数

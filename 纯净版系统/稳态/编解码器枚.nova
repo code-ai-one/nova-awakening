@@ -1,0 +1,132 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./软件混音器.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("./脉冲调制流.nova")
+
+// §7 编解码器枚举 
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 声驱_枚举编解码器(card, codec_id) {
+    // 获取Vendor/Device ID
+    定义 vendor = 声驱_发送命令(card, codec_id, 0, 声驱_VERB_GET_PARAM | 声驱_PARAM_VENDOR_ID)
+    定义 vid = (vendor >> 16) & 0xFFFF
+    定义 did = vendor & 0xFFFF
+
+    定义 名称 = "Unknown"
+    如果 (vid == 0x10EC) {
+        名称 = "Realtek ALC" + 整数转字符串(did)
+    } 否则 如果 (vid == 0x8086) {
+        名称 = "Intel HDMI"
+    } 否则 如果 (vid == 0x1002) {
+        名称 = "AMD HDMI"
+    } 否则 如果 (vid == 0x10DE) {
+        名称 = "NVIDIA HDMI"
+    } 否则 如果 (vid == 0x11D4) {
+        名称 = "Analog Devices AD" + 整数转十六进制(did)
+    } 否则 如果 (vid == 0x14F1) {
+        名称 = "Conexant CX" + 整数转十六进制(did)
+    }
+    内核信息("声驱: 编解码器 " + 名称 + " VID=" + 整数转十六进制(vid) + ":" + 整数转十六进制(did))
+
+    // 获取子节点范围
+    定义 节点_info = 声驱_发送命令(card, codec_id, 0, 声驱_VERB_GET_PARAM | 声驱_PARAM_节点_COUNT)
+    定义 起始节点 = (节点_info >> 16) & 0xFF
+    定义 节点数 = 节点_info & 0xFF
+
+    // 遍历widget节点
+    定义 可变 nid = 起始节点
+    当 (nid < 起始节点 + 节点数) {
+        声驱_配置节点(card, codec_id, nid)
+        nid = nid + 1
+    }
+
+    // 创建PCM子设备
+    定义 pcm = PCM子设备 {}
+    pcm.声卡 = card.索引
+    pcm.设备号 = 0
+    pcm.名称 = 名称 + " Analog"
+    pcm.播放 = PCM流_创建(SND_PCM_STREAM_PLAYBACK)
+    pcm.录音 = PCM流_创建(SND_PCM_STREAM_CAPTURE)
+    追加(card.PCM列表, pcm)
+
+    // 创建混音器控件
+    声驱_创建混音器(card, 名称)
+}
+
+函数 声驱_配置节点(card, codec_id, nid) {
+    定义 widget_type = 声驱_发送命令(card, codec_id, nid, 声驱_VERB_GET_PARAM | 声驱_PARAM_AUDIO_WIDGET)
+    定义 类型 = (widget_type >> 20) & 0xF
+    // 0=音频 Output, 1=音频 Input, 2=音频 Mixer, 3=音频 Selector, 4=Pin Complex
+    如果 (类型 == 4) {
+        // Pin Complex — 检查连接类型
+        定义 pin_cap = 声驱_发送命令(card, codec_id, nid, 声驱_VERB_GET_PARAM | 声驱_PARAM_PIN_CAP)
+        定义 可输出 = (pin_cap >> 4) & 1
+        定义 可输入 = (pin_cap >> 5) & 1
+        如果 (可输出 != 0) {
+            // 使能输出: 设置Pin Widget Control
+            声驱_发送命令(card, codec_id, nid, 声驱_VERB_SET_PIN_WIDGET | 0x40)  // OUT_EN
+            // 使能EAPD(外部放大器)
+            声驱_发送命令(card, codec_id, nid, 声驱_VERB_SET_EAPD | 0x02)
+        }
+    }
+    // 设置电源状态为D0(全功率)
+    声驱_发送命令(card, codec_id, nid, 声驱_VERB_SET_POWER | 0x00)
+}
+
+// §8 混音器 
+
+函数 声驱_创建混音器(card, codec名称) {
+    // Master Playback Volume
+    定义 master_vol = 混音器控件 {}
+    master_vol.名称 = "Master Playback Volume"
+    master_vol.类型 = 1    // 整数
+    master_vol.最小值 = 0
+    master_vol.最大值 = 100
+    master_vol.当前值 = 75
+    master_vol.声道数 = 2
+    追加(card.混音器列表, master_vol)
+
+    // Master Playback Switch (静音)
+    定义 master_sw = 混音器控件 {}
+    master_sw.名称 = "Master Playback Switch"
+    master_sw.类型 = 0     // 布尔
+    master_sw.最小值 = 0
+    master_sw.最大值 = 1
+    master_sw.当前值 = 1   // 非静音
+    master_sw.声道数 = 2
+    追加(card.混音器列表, master_sw)
+
+    // PCM Playback Volume
+    定义 pcm_vol = 混音器控件 {}
+    pcm_vol.名称 = "PCM Playback Volume"
+    pcm_vol.类型 = 1
+    pcm_vol.最小值 = 0
+    pcm_vol.最大值 = 100
+    pcm_vol.当前值 = 100
+    pcm_vol.声道数 = 2
+    追加(card.混音器列表, pcm_vol)
+
+    // Capture Volume (录音)
+    定义 cap_vol = 混音器控件 {}
+    cap_vol.名称 = "Capture Volume"
+    cap_vol.类型 = 1
+    cap_vol.最小值 = 0
+    cap_vol.最大值 = 100
+    cap_vol.当前值 = 80
+    cap_vol.声道数 = 2
+    追加(card.混音器列表, cap_vol)
+
+    // Capture Switch
+    定义 cap_sw = 混音器控件 {}
+    cap_sw.名称 = "Capture Switch"
+    cap_sw.类型 = 0
+    cap_sw.最小值 = 0
+    cap_sw.最大值 = 1
+    cap_sw.当前值 = 1
+    cap_sw.声道数 = 2
+    追加(card.混音器列表, cap_sw)
+
+    内核信息("音频: 创建混音器 " + 整数转字符串(计数(card.混音器列表)) + " 个控件")
+}

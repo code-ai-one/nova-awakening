@@ -1,0 +1,1910 @@
+导入("./文档节点.nova")
+导入("./文档事件.nova")
+导入("./全景照.nova")
+导入("../中枢/硬链接.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/辅助存根.nova")
+导入("./历史地址解.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../推理/承诺微任务.nova")
+导入("./历史状态创.nova")
+导入("./导航流程.nova")
+导入("../执行/平台时间.nova")
+导入("../中枢/哈希整数.nova")
+导入("../中枢/时钟中枢.nova")
+导入("../中枢/创建甲.nova")
+
+结构 观察档 {
+    名称,
+    最近动作,
+    最近参数,
+    最近来源,
+    最近结果,
+    最近统计,
+    最近错误,
+    最近健康,
+    是否初始化,
+    性能数,
+    变更数,
+    交叉数,
+    尺寸数,
+    遍历数,
+    令牌数,
+    信号数,
+    成功数,
+    失败数,
+    最近目标,
+    最近阈值,
+    最近尺寸,
+    最近耗时,
+}
+
+结构 观察请求 {
+    动作,
+    目标,
+    参数,
+    选项,
+}
+
+结构 观察回证 {
+    已收,
+    已成,
+    来源,
+    错因,
+    数据,
+    统计,
+}
+
+结构 观察摘要 {
+    名称,
+    性能数,
+    变更数,
+    交叉数,
+    尺寸数,
+    遍历数,
+    令牌数,
+    信号数,
+    成功数,
+    失败数,
+    健康,
+}
+
+结构 观察项 {
+    类型,
+    目标,
+    数据,
+    来源,
+    时间,
+}
+
+定义 可变 观察账本 = []
+定义 可变 观察构建数 = 0
+定义 可变 观察总动作 = 0
+定义 可变 观察总成功 = 0
+定义 可变 观察总失败 = 0
+
+函数 文档观察_建档(名称) {
+    定义 档 = 观察档 {}
+    档.名称 = 名称
+    档.最近动作 = ""
+    档.最近参数 = []
+    档.最近来源 = ""
+    档.最近结果 = 0
+    档.最近统计 = []
+    档.最近错误 = ""
+    档.最近健康 = "未初始化"
+    档.是否初始化 = 假
+    档.性能数 = 0
+    档.变更数 = 0
+    档.交叉数 = 0
+    档.尺寸数 = 0
+    档.遍历数 = 0
+    档.令牌数 = 0
+    档.信号数 = 0
+    档.成功数 = 0
+    档.失败数 = 0
+    档.最近目标 = ""
+    档.最近阈值 = ""
+    档.最近尺寸 = ""
+    档.最近耗时 = 0
+    返回 档
+}
+
+函数 文档观察_登记(档) {
+    追加(观察账本, 档)
+    观察构建数 = 观察构建数 + 1
+    返回 档
+}
+
+函数 文档观察_完整统计() {
+    返回 [
+        观察构建数,
+        观察总动作,
+        观察总成功,
+        观察总失败
+    ]
+}
+
+函数 文档观察_建回证(已收, 已成, 来源, 错因, 数据, 统计) {
+    定义 回证 = 观察回证 {}
+    回证.已收 = 已收
+    回证.已成 = 已成
+    回证.来源 = 来源
+    回证.错因 = 错因
+    回证.数据 = 数据
+    回证.统计 = 统计
+    返回 回证
+}
+
+函数 文档观察_刷新健康(档) {
+    如果 (!档.是否初始化) {
+        档.最近健康 = "未初始化"
+        返回 档.最近健康
+    }
+    如果 (档.失败数 > 档.成功数) {
+        档.最近健康 = "降级"
+        返回 档.最近健康
+    }
+    如果 (档.性能数 > 0 || 档.变更数 > 0 || 档.遍历数 > 0) {
+        档.最近健康 = "运行"
+        返回 档.最近健康
+    }
+    档.最近健康 = "空载"
+    返回 档.最近健康
+}
+
+函数 文档观察_记录(档, 动作, 参数, 来源) {
+    档.最近动作 = 动作
+    档.最近参数 = 参数
+    档.最近来源 = 来源
+    档.最近错误 = ""
+    档.最近统计 = 文档观察_完整统计()
+}
+
+函数 文档观察_成功(档, 来源, 数据) {
+    观察总动作 = 观察总动作 + 1
+    观察总成功 = 观察总成功 + 1
+    如果 (档 == 空) {
+        返回 文档观察_建回证(真, 真, 来源, "", 数据, 文档观察_完整统计())
+    }
+    档.最近来源 = 来源
+    档.最近结果 = 数据
+    档.最近错误 = ""
+    档.成功数 = 档.成功数 + 1
+    档.最近统计 = 文档观察_完整统计()
+    文档观察_刷新健康(档)
+    返回 文档观察_建回证(真, 真, 来源, "", 数据, 档.最近统计)
+}
+
+函数 文档观察_失败(档, 来源, 错因) {
+    观察总动作 = 观察总动作 + 1
+    观察总失败 = 观察总失败 + 1
+    如果 (档 == 空) {
+        返回 文档观察_建回证(真, 假, 来源, 错因, 0, 文档观察_完整统计())
+    }
+    档.最近来源 = 来源
+    档.最近错误 = 错因
+    档.失败数 = 档.失败数 + 1
+    档.最近统计 = 文档观察_完整统计()
+    文档观察_刷新健康(档)
+    返回 文档观察_建回证(真, 假, 来源, 错因, 0, 档.最近统计)
+}
+
+函数 文档观察_初始化(档) {
+    文档节点_创建("观察节点")
+    文档事件_创建("观察事件")
+    档.是否初始化 = 真
+    档.最近动作 = "初始化"
+    档.最近来源 = "文档观察_初始化"
+    档.最近统计 = 文档观察_完整统计()
+    文档观察_刷新健康(档)
+    返回 档
+}
+
+函数 文档观察_创建(名称) {
+    定义 档 = 文档观察_建档(名称)
+    文档观察_初始化(档)
+    返回 文档观察_登记(档)
+}
+
+函数 文档观察_检查档(档) {
+    如果 (档 == 空) { 返回 假 }
+    如果 (!档.是否初始化) { 返回 假 }
+    返回 真
+}
+
+函数 文档观察_建项(类型, 目标, 数据, 来源, 时间) {
+    定义 项 = 观察项 {}
+    项.类型 = 类型
+    项.目标 = 目标
+    项.数据 = 数据
+    项.来源 = 来源
+    项.时间 = 时间
+    返回 项
+}
+
+函数 文档观察_切串(文本, 上限) {
+    如果 (文本 == 空) { 返回 "" }
+    如果 (字符串长度(文本) <= 上限) { 返回 文本 }
+    返回 子字符串(文本, 0, 上限)
+}
+
+函数 文档观察_分词(文本) {
+    定义 结果 = []
+    如果 (文本 == 空) { 返回 结果 }
+    定义 可变 开始 = 0
+    定义 可变 i = 0
+    当 (i < 字符串长度(文本)) {
+        定义 码 = 字符串取字符码(文本, i)
+        如果 (码 == 32 || 码 == 9 || 码 == 10 || 码 == 13) {
+            如果 (i > 开始) {
+                追加(结果, 子字符串(文本, 开始, i - 开始))
+            }
+            开始 = i + 1
+        }
+        i = i + 1
+    }
+    如果 (开始 < 字符串长度(文本)) {
+        追加(结果, 子字符串(文本, 开始, 字符串长度(文本) - 开始))
+    }
+    返回 结果
+}
+
+函数 文档观察_含词(列, 词) {
+    定义 可变 i = 0
+    当 (i < 计数(列)) {
+        如果 (列[i] == 词) { 返回 真 }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 文档观察_性能样本(档, 名称, 数值, 单位) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "性能样本", "观察档不可用") }
+    文档观察_记录(档, "性能样本", [名称, 数值, 单位], "文档观察")
+    档.性能数 = 档.性能数 + 1
+    档.最近目标 = 名称
+    档.最近耗时 = 数值
+    返回 文档观察_成功(档, "性能样本", 文档观察_建项("性能", 名称, 整数转字符串(数值) + 单位, "性能观察", 档.性能数))
+}
+
+函数 文档观察_性能快照(档) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "性能快照", "观察档不可用") }
+    文档观察_记录(档, "性能快照", [], "全景照")
+    定义 照 = 照采()
+    档.性能数 = 档.性能数 + 1
+    档.最近目标 = 照.页题
+    档.最近耗时 = 照.节点数
+    返回 文档观察_成功(档, "性能快照", [
+        ["窗数", 照.窗数],
+        ["节点数", 照.节点数],
+        ["脚本数", 照.脚本数],
+        ["样式数", 照.样式数],
+        ["摘要", 照摘要(照)]
+    ])
+}
+
+函数 文档观察_变更通知(档, 目标, 类型, 值) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "变更通知", "观察档不可用") }
+    文档观察_记录(档, "变更通知", [目标, 类型, 值], "观察器")
+    档.变更数 = 档.变更数 + 1
+    档.最近目标 = 目标
+    返回 文档观察_成功(档, "变更通知", 文档观察_建项("变更", 目标, 类型 + ":" + 值, "Mutation观察", 档.变更数))
+}
+
+函数 文档观察_字符变更(档, 目标, 文本) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "字符变更", "观察档不可用") }
+    文档观察_记录(档, "字符变更", [目标, 文本], "观察器")
+    档.变更数 = 档.变更数 + 1
+    档.最近目标 = 目标
+    返回 文档观察_成功(档, "字符变更", 文档观察_建项("字符", 目标, 文档观察_切串(文本, 48), "Mutation观察", 档.变更数))
+}
+
+函数 文档观察_尺寸观察(档, 目标, 宽, 高) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "尺寸观察", "观察档不可用") }
+    文档观察_记录(档, "尺寸观察", [目标, 宽, 高], "尺寸观察")
+    档.尺寸数 = 档.尺寸数 + 1
+    档.最近目标 = 目标
+    档.最近尺寸 = 整数转字符串(宽) + "x" + 整数转字符串(高)
+    返回 文档观察_成功(档, "尺寸观察", 文档观察_建项("尺寸", 目标, 档.最近尺寸, "Resize观察", 档.尺寸数))
+}
+
+函数 文档观察_交叉观察(档, 目标, 比率, 阈值) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "交叉观察", "观察档不可用") }
+    文档观察_记录(档, "交叉观察", [目标, 比率, 阈值], "交叉观察")
+    档.交叉数 = 档.交叉数 + 1
+    档.最近目标 = 目标
+    档.最近阈值 = 阈值
+    返回 文档观察_成功(档, "交叉观察", 文档观察_建项("交叉", 目标, "可见比:" + 整数转字符串(比率) + "%", "Intersection观察", 档.交叉数))
+}
+
+函数 文档观察_树遍历(档, 词) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "树遍历", "观察档不可用") }
+    文档观察_记录(档, "树遍历", [词], "树Walker")
+    定义 结果 = 点找(词)
+    档.遍历数 = 档.遍历数 + 1
+    档.最近目标 = 词
+    返回 文档观察_成功(档, "树遍历", 结果)
+}
+
+函数 文档观察_节点迭代(档, 编号) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "节点迭代", "观察档不可用") }
+    文档观察_记录(档, "节点迭代", [编号], "节点Iterator")
+    定义 点 = 点号(编号)
+    如果 (点 == 空) {
+        返回 文档观察_失败(档, "节点迭代", "节点不存在")
+    }
+    档.遍历数 = 档.遍历数 + 1
+    返回 文档观察_成功(档, "节点迭代", 点)
+}
+
+函数 文档观察_令牌列(档, 文本) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "令牌列", "观察档不可用") }
+    文档观察_记录(档, "令牌列", [文本], "文档令牌")
+    定义 结果 = 文档观察_分词(文本)
+    档.令牌数 = 档.令牌数 + 1
+    返回 文档观察_成功(档, "令牌列", 结果)
+}
+
+函数 文档观察_令牌含有(档, 文本, 词) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "令牌含有", "观察档不可用") }
+    文档观察_记录(档, "令牌含有", [文本, 词], "文档令牌")
+    定义 结果 = 文档观察_分词(文本)
+    档.令牌数 = 档.令牌数 + 1
+    返回 文档观察_成功(档, "令牌含有", [词, 文档观察_含词(结果, 词)])
+}
+
+函数 文档观察_令牌追加(档, 文本, 词) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "令牌追加", "观察档不可用") }
+    文档观察_记录(档, "令牌追加", [文本, 词], "文档令牌")
+    定义 结果 = 文档观察_分词(文本)
+    如果 (!文档观察_含词(结果, 词)) {
+        追加(结果, 词)
+    }
+    档.令牌数 = 档.令牌数 + 1
+    返回 文档观察_成功(档, "令牌追加", 结果)
+}
+
+函数 文档观察_观察总览(档) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "观察总览", "观察档不可用") }
+    文档观察_记录(档, "观察总览", [], "文档观察")
+    定义 照 = 照采()
+    定义 点串文本 = 点找串("按钮")
+    档.性能数 = 档.性能数 + 1
+    档.遍历数 = 档.遍历数 + 1
+    档.信号数 = 档.信号数 + 1
+    返回 文档观察_成功(档, "观察总览", [
+        照摘要(照),
+        点串文本,
+        照统()
+    ])
+}
+
+函数 文档观察_信号(档, 名称, 值, 来源) {
+    如果 (!文档观察_检查档(档)) { 返回 文档观察_失败(档, "信号", "观察档不可用") }
+    文档观察_记录(档, "信号", [名称, 值, 来源], "文档观察")
+    档.信号数 = 档.信号数 + 1
+    返回 文档观察_成功(档, "信号", 文档观察_建项("信号", 名称, 值, 来源, 档.信号数))
+}
+
+函数 文档观察_摘要(档) {
+    定义 摘要 = 观察摘要 {}
+    摘要.名称 = 档.名称
+    摘要.性能数 = 档.性能数
+    摘要.变更数 = 档.变更数
+    摘要.交叉数 = 档.交叉数
+    摘要.尺寸数 = 档.尺寸数
+    摘要.遍历数 = 档.遍历数
+    摘要.令牌数 = 档.令牌数
+    摘要.信号数 = 档.信号数
+    摘要.成功数 = 档.成功数
+    摘要.失败数 = 档.失败数
+    摘要.健康 = 文档观察_刷新健康(档)
+    返回 摘要
+}
+
+函数 文档观察_自检(档) {
+    如果 (!文档观察_检查档(档)) { 返回 假 }
+    如果 (文档观察_性能样本(档, "首屏", 16, "ms").已成 == 假) { 返回 假 }
+    如果 (文档观察_性能快照(档).已成 == 假) { 返回 假 }
+    如果 (文档观察_变更通知(档, "#app", "attributes", "class=ready").已成 == 假) { 返回 假 }
+    如果 (文档观察_尺寸观察(档, ".白璃窗", 960, 720).已成 == 假) { 返回 假 }
+    如果 (文档观察_交叉观察(档, ".白璃卡", 87, "0.5").已成 == 假) { 返回 假 }
+    如果 (文档观察_令牌列(档, "glass shell pure ai").已成 == 假) { 返回 假 }
+    返回 真
+}
+
+函数 文档观察_处理(档, 请求) {
+    如果 (请求 == 空) { 返回 文档观察_失败(档, "处理", "请求为空") }
+    如果 (请求.动作 == "初始化") {
+        文档观察_初始化(档)
+        返回 文档观察_成功(档, "处理", "已初始化")
+    }
+    如果 (请求.动作 == "性能样本") { 返回 文档观察_性能样本(档, 请求.参数[0], 请求.参数[1], 请求.参数[2]) }
+    如果 (请求.动作 == "性能快照") { 返回 文档观察_性能快照(档) }
+    如果 (请求.动作 == "变更通知") { 返回 文档观察_变更通知(档, 请求.参数[0], 请求.参数[1], 请求.参数[2]) }
+    如果 (请求.动作 == "字符变更") { 返回 文档观察_字符变更(档, 请求.参数[0], 请求.参数[1]) }
+    如果 (请求.动作 == "尺寸观察") { 返回 文档观察_尺寸观察(档, 请求.参数[0], 请求.参数[1], 请求.参数[2]) }
+    如果 (请求.动作 == "交叉观察") { 返回 文档观察_交叉观察(档, 请求.参数[0], 请求.参数[1], 请求.参数[2]) }
+    如果 (请求.动作 == "树遍历") { 返回 文档观察_树遍历(档, 请求.参数[0]) }
+    如果 (请求.动作 == "节点迭代") { 返回 文档观察_节点迭代(档, 请求.参数[0]) }
+    如果 (请求.动作 == "令牌列") { 返回 文档观察_令牌列(档, 请求.参数[0]) }
+    如果 (请求.动作 == "令牌含有") { 返回 文档观察_令牌含有(档, 请求.参数[0], 请求.参数[1]) }
+    如果 (请求.动作 == "令牌追加") { 返回 文档观察_令牌追加(档, 请求.参数[0], 请求.参数[1]) }
+    如果 (请求.动作 == "观察总览") { 返回 文档观察_观察总览(档) }
+    如果 (请求.动作 == "信号") { 返回 文档观察_信号(档, 请求.参数[0], 请求.参数[1], 请求.参数[2]) }
+    如果 (请求.动作 == "摘要") { 返回 文档观察_成功(档, "摘要", 文档观察_摘要(档)) }
+    返回 文档观察_失败(档, "处理", "未知动作")
+}
+
+// merge source: 沙盒批次/批三/待厚/感知/定时超时.nova
+// §2 Timers — setTimeout/setInterval/requestAnimationFrame
+
+结构 Timer {
+    ID,
+    回调,    // u64 JS函数引用
+    延迟,    // u32 毫秒
+    触发时间,    // u64 微秒时间戳
+    是重复,    // 布尔 false=setTimeout, true=setInterval
+    已取消,
+    下一个,    // u64 Timer* (按触发时间排序的链表)
+}
+
+结构 TimerManager {
+    链表头,    // u64 Timer* (最早触发的在前)
+    下一个ID,
+    Nova运行时实例,
+}
+
+函数 TimerManager_创建(Nova运行时实例) {
+    定义 tm = 堆_分配(TimerManager)
+    tm.链表头 = 0
+    tm.下一个ID = 1
+    tm.Nova运行时实例 = Nova运行时实例
+    返回 tm
+}
+
+函数 网接口_setTimeout(tm, 回调, 延迟毫秒) {
+    返回 Timer_添加(tm, 回调, 延迟毫秒, 假)
+}
+
+函数 网接口_setInterval(tm, 回调, 间隔毫秒) {
+    返回 Timer_添加(tm, 回调, 间隔毫秒, 真)
+}
+
+函数 Timer_添加(tm, 回调, 延迟, 是重复) {
+    如果 (tm == 0) { 返回 0 }
+    定义 timer = 堆_分配(Timer)
+    timer.ID = tm.下一个ID
+    tm.下一个ID = tm.下一个ID + 1
+    timer.回调 = 回调
+    timer.延迟 = 延迟
+    timer.触发时间 = 平台_获取高精度时间() + 延迟 * 1000
+    timer.是重复 = 是重复
+    timer.已取消 = 假
+
+    // 插入排序链表(按触发时间)
+    如果 (tm.链表头 == 0 || timer.触发时间 < tm.链表头.触发时间) {
+        timer.下一个 = tm.链表头
+        tm.链表头 = timer
+    } 否则 {
+        定义 可变 当前 = tm.链表头
+        当 (当前.下一个 != 0 && 当前.下一个.触发时间 <= timer.触发时间) {
+            当前 = 当前.下一个
+        }
+        timer.下一个 = 当前.下一个
+        当前.下一个 = timer
+    }
+
+    返回 timer.ID
+}
+
+函数 网接口_clearTimeout(tm, id) {
+    如果 (tm == 0) { 返回 }
+    定义 可变 当前 = tm.链表头
+    当 (当前 != 0) {
+        如果 (当前.ID == id) { 当前.已取消 = 真; 返回 }
+        当前 = 当前.下一个
+    }
+}
+
+函数 网接口_clearInterval(tm, id) { 网接口_clearTimeout(tm, id) }
+
+// 事件循环中调用: 检查并触发到期的Timer
+函数 Timer_处理到期(tm, 当前时间) {
+    如果 (tm == 0) { 返回 }
+    当 (tm.链表头 != 0 && tm.链表头.触发时间 <= 当前时间) {
+        定义 timer = tm.链表头
+        tm.链表头 = timer.下一个
+
+        如果 (!timer.已取消) {
+            // 执行回调
+            Nova_调用函数(tm.Nova运行时实例, timer.回调, 0, 0)
+
+            // setInterval重新入队
+            如果 (timer.是重复 && !timer.已取消) {
+                timer.触发时间 = 当前时间 + timer.延迟 * 1000
+                Timer_添加(tm, timer.回调, timer.延迟, 真)
+            }
+        }
+        堆_释放(timer)
+    }
+}
+
+// requestAnimationFrame
+结构 RAFCallback {
+    ID,
+    回调,
+    已取消,
+    下一个,
+}
+
+定义 全局RAF链 = 0
+定义 全局RAF_ID = 0
+
+函数 网接口_requestAnimationFrame(回调) {
+    定义 raf = 堆_分配(RAFCallback)
+    全局RAF_ID = 全局RAF_ID + 1
+    raf.ID = 全局RAF_ID
+    raf.回调 = 回调
+    raf.已取消 = 假
+    raf.下一个 = 全局RAF链
+    全局RAF链 = raf
+    返回 raf.ID
+}
+
+函数 网接口_cancelAnimationFrame(id) {
+    定义 可变 当前 = 全局RAF链
+    当 (当前 != 0) {
+        如果 (当前.ID == id) { 当前.已取消 = 真; 返回 }
+        当前 = 当前.下一个
+    }
+}
+
+// 每帧VSync时调用
+函数 RAF_执行所有(Nova运行时实例, 时间戳) {
+    定义 可变 当前 = 全局RAF链
+    全局RAF链 = 0
+    当 (当前 != 0) {
+        定义 下一个 = 当前.下一个
+        如果 (!当前.已取消) {
+            Nova_调用函数_带参(Nova运行时实例, 当前.回调, 时间戳)
+            定时器_RAF执行数 = 定时器_RAF执行数 + 1
+        }
+        堆_释放(当前)
+        当前 = 下一个
+    }
+}
+
+// §3 requestIdleCallback
+
+结构 IdleCallback {
+    ID,
+    回调,
+    超时,
+    已取消,
+    下一个,
+}
+
+定义 可变 全局Idle链 = 0
+定义 可变 全局Idle_ID = 0
+
+函数 网接口_requestIdleCallback(回调, 超时ms) {
+    定义 idle = IdleCallback {}
+    全局Idle_ID = 全局Idle_ID + 1
+    idle.ID = 全局Idle_ID
+    idle.回调 = 回调
+    idle.超时 = 超时ms
+    idle.已取消 = 假
+    idle.下一个 = 全局Idle链
+    全局Idle链 = idle
+    返回 idle.ID
+}
+
+函数 网接口_cancelIdleCallback(id) {
+    定义 可变 当前 = 全局Idle链
+    当 (当前 != 0) {
+        如果 (当前.ID == id) { 当前.已取消 = 真; 返回 }
+        当前 = 当前.下一个
+    }
+}
+
+函数 Idle_执行(Nova运行时实例, 剩余时间ms) {
+    定义 可变 当前 = 全局Idle链
+    全局Idle链 = 0
+    当 (当前 != 0 && 剩余时间ms > 0) {
+        定义 下一个 = 当前.下一个
+        如果 (!当前.已取消) {
+            Nova_调用函数_带参(Nova运行时实例, 当前.回调, 剩余时间ms)
+            定时器_Idle执行数 = 定时器_Idle执行数 + 1
+        }
+        堆_释放(当前)
+        当前 = 下一个
+    }
+    如果 (当前 != 0) {
+        定义 可变 尾 = 当前
+        当 (尾.下一个 != 0) { 尾 = 尾.下一个 }
+        尾.下一个 = 全局Idle链
+        全局Idle链 = 当前
+    }
+}
+
+// §4 定时器管理扩展
+
+函数 Timer_数量(tm) {
+    如果 (tm == 0) { 返回 0 }
+    定义 可变 数量 = 0
+    定义 可变 当前 = tm.链表头
+    当 (当前 != 0) {
+        如果 (!当前.已取消) { 数量 = 数量 + 1 }
+        当前 = 当前.下一个
+    }
+    返回 数量
+}
+
+函数 Timer_清理已取消(tm) {
+    如果 (tm == 0) { 返回 }
+    当 (tm.链表头 != 0 && tm.链表头.已取消) {
+        定义 旧 = tm.链表头
+        tm.链表头 = 旧.下一个
+        堆_释放(旧)
+    }
+    定义 可变 当前 = tm.链表头
+    当 (当前 != 0 && 当前.下一个 != 0) {
+        如果 (当前.下一个.已取消) {
+            定义 旧 = 当前.下一个
+            当前.下一个 = 旧.下一个
+            堆_释放(旧)
+        } 否则 {
+            当前 = 当前.下一个
+        }
+    }
+}
+
+函数 Timer_下一个触发时间(tm) {
+    如果 (tm == 0 || tm.链表头 == 0) { 返回 0 }
+    返回 tm.链表头.触发时间
+}
+
+// §5 辅助回调桥
+
+函数 Nova_调用函数(Nova运行时实例, 回调, 参数1, 参数2) {
+    如果 (回调 == 0) { 返回 }
+    定时器_回调执行数 = 定时器_回调执行数 + 1
+    Nova调用(回调, 参数1, 参数2, 2)
+}
+
+函数 Nova_调用函数_带参(Nova运行时实例, 回调, 参数) {
+    如果 (回调 == 0) { 返回 }
+    定时器_回调执行数 = 定时器_回调执行数 + 1
+    Nova调用(回调, 参数, 0, 1)
+}
+
+// §6 定时器统计与健康检查
+
+定义 可变 定时器_创建总数 = 0
+定义 可变 定时器_回调执行数 = 0
+定义 可变 定时器_RAF执行数 = 0
+定义 可变 定时器_Idle执行数 = 0
+定义 可变 定时器_取消数 = 0
+
+函数 定时器_统计() {
+    返回 {
+        创建: 定时器_创建总数,
+        回调执行: 定时器_回调执行数,
+        RAF执行: 定时器_RAF执行数,
+        Idle执行: 定时器_Idle执行数,
+        取消: 定时器_取消数,
+    }
+}
+
+函数 定时器_健康检查() {
+    定义 可变 问题 = []
+    如果 (定时器_创建总数 > 100000 && 定时器_取消数 < 定时器_创建总数 / 2) {
+        追加(问题, "定时器可能泄漏: 创建多取消少")
+    }
+    如果 (计数(问题) == 0) { 返回 "定时器子系统健康" }
+    返回 问题
+}
+
+函数 定时器_重置统计() {
+    定时器_创建总数 = 0
+    定时器_回调执行数 = 0
+    定时器_RAF执行数 = 0
+    定时器_Idle执行数 = 0
+    定时器_取消数 = 0
+}
+
+函数 定时器_完整统计() {
+    返回 [定时器_创建总数, 定时器_回调执行数, 定时器_RAF执行数, 定时器_Idle执行数, 定时器_取消数]
+}
+
+// merge source: 沙盒批次/批三/待厚/感知/交叉观察创.nova
+// 对应: nova/Nova渲染核心/intersection_observer/ (
+// nova/Nova渲染核心/resize_observer/ (
+// nova/Nova渲染核心/dom/mutation_observer.cc (
+// nova/Nova渲染核心/timing/performance_observer.cc (~800行)
+// IntersectionObserver:
+// 监视目标元素与视口(或祖先)的交叉状态
+// 用途: 懒加载/无限滚动/广告曝光/动画触发
+// 阈值: [0, 0.25, 0.5, 0.75, 1.0]
+// rootMargin: "10px 20px 30px 40px"
+// ResizeObserver:
+// 监视元素尺寸变化
+// 用途: 响应式组件/画布自适应/图表重绘
+// 盒模型: content-box / border-box / device-pixel-content-box
+// MutationObserver:
+// 监视DOM树变化
+// 类型: childList / attributes / characterData / subtree
+// 用途: DOM变化追踪/虚拟DOM diff/Web组件
+// PerformanceObserver:
+// 监视性能条目
+// 类型: mark/measure/navigation/resource/paint/longtask/layout-shift
+
+// §1 IntersectionObserver
+
+结构 IntersectionObserverEntry {
+ 时间,    // u64 高精度时间戳
+ // 边界矩形
+ rootBounds_x,
+ rootBounds_y,
+ rootBounds_w,
+ rootBounds_h,
+ boundingClientRect_x,
+ boundingClientRect_y,
+ boundingClientRect_w,
+ boundingClientRect_h,
+ intersectionRect_x,
+ intersectionRect_y,
+ intersectionRect_w,
+ intersectionRect_h,
+ // 交叉比例
+ intersectionRatio,    // i32 Q10 (0-1024)
+ // 是否在视口中
+ isIntersecting,
+ // 目标
+ target,    // u64 元素*
+}
+
+结构 IntersectionObserver {
+ 回调,    // u64 Nova函数*
+ // 选项
+ root,    // u64 元素*或null(=viewport)
+ rootMargin,    // [4]i32 top/right/bottom/left (px Q10)
+ 阈值,    // [16]i32 Q10 (0-1024)
+ 阈值数,
+ // 观察目标
+ 目标列表,    // u64 元素*数组
+ 目标数,
+ 目标容量,
+ // 待通知的entries
+ 待通知,    // u64 IntersectionObserverEntry*数组
+ 待通知数,
+}
+
+函数 IntersectionObserver_创建(回调, root, rootMargin, 阈值, 阈值数) {
+ 定义 io = 堆_分配(IntersectionObserver)
+ io.回调 = 回调; io.root = root
+ io.rootMargin[0] = rootMargin; io.rootMargin[1] = rootMargin
+ io.rootMargin[2] = rootMargin; io.rootMargin[3] = rootMargin
+ 定义 可变 i = 0
+ 当 (i < 阈值数 && i < 16) {
+ io.阈值[i] = 阈值; i = i + 1 // 统一阈值设置
+ }
+ io.阈值数 = 如果(阈值数 > 16, 16, 阈值数)
+ io.目标容量 = 64
+ io.目标列表 = 堆_分配_数组(64 * 8)
+ io.目标数 = 0; io.待通知 = 0; io.待通知数 = 0
+ 返回 io
+}
+
+函数 IntersectionObserver_observe(io, target) {
+ 如果 (io == 0 || target == 0 || io.目标数 >= io.目标容量) { 返回 }
+ // 检查是否已观察
+ 定义 可变 i = 0
+ 当 (i < io.目标数) {
+ 如果 (内存_读64(io.目标列表 + i * 8) == target) { 返回 }
+ i = i + 1
+ }
+ 内存_写64(io.目标列表 + io.目标数 * 8, target)
+ io.目标数 = io.目标数 + 1
+}
+
+函数 IntersectionObserver_unobserve(io, target) {
+ 如果 (io == 0 || target == 0) { 返回 }
+ 定义 可变 i = 0
+ 当 (i < io.目标数) {
+ 如果 (内存_读64(io.目标列表 + i * 8) == target) {
+ 内存_写64(io.目标列表 + i * 8, 内存_读64(io.目标列表 + (io.目标数 - 1) * 8))
+ io.目标数 = io.目标数 - 1
+ 返回
+ }
+ i = i + 1
+ }
+}
+
+函数 IntersectionObserver_disconnect(io) {
+ 如果 (io == 0) { 返回 }
+ io.目标数 = 0; io.待通知数 = 0
+}
+
+// 每帧检查交叉状态(由渲染管线调用)
+函数 IntersectionObserver_检查(io, viewportX, viewportY, viewportW, viewportH) {
+ 如果 (io == 0 || io.目标数 == 0) { 返回 }
+ 定义 可变 i = 0
+ 当 (i < io.目标数) {
+ 定义 target = 内存_读64(io.目标列表 + i * 8)
+ 如果 (target == 0) { i = i + 1; 继续 }
+ // 获取元素的边界矩形(layout计算后)
+ // 计算与viewport(或root)的交叉矩形
+ 定义 交叉面积 = 0 // 后续计算实际交叉面积
+ 定义 元素面积 = 1 // 避免除零
+ 定义 ratio = 交叉面积 * 1024 / 元素面积
+ // 检查是否跨越阈值
+ 定义 可变 t = 0
+ 当 (t < io.阈值数) {
+ 如果 (ratio >= io.阈值[t]) {
+ // 创建entry并添加到待通知队列
+ }
+ t = t + 1
+ }
+ i = i + 1
+ }
+ // 如果有待通知entries, 调用回调
+ 如果 (io.待通知数 > 0 && io.回调 != 0) {
+ io.待通知数 = 0
+ }
+}
+
+// §2 矩形交叉计算
+
+函数 矩形_交叉(ax, ay, aw, ah, bx, by, bw, bh) {
+    定义 左 = 如果(ax > bx, ax, bx)
+    定义 上 = 如果(ay > by, ay, by)
+    定义 右 = 如果(ax + aw < bx + bw, ax + aw, bx + bw)
+    定义 下 = 如果(ay + ah < by + bh, ay + ah, by + bh)
+    如果 (右 <= 左 || 下 <= 上) { 返回 0 }
+    返回 (右 - 左) * (下 - 上)
+}
+
+函数 矩形_面积(w, h) {
+    返回 w * h
+}
+
+函数 矩形_包含(ax, ay, aw, ah, px, py) {
+    返回 px >= ax && px < ax + aw && py >= ay && py < ay + ah
+}
+
+// §3 ResizeObserver
+
+结构 ResizeObserverEntry {
+    target,
+    contentRect_w,
+    contentRect_h,
+    borderBoxSize_w,
+    borderBoxSize_h,
+}
+
+结构 ResizeObserver {
+    回调,
+    目标列表,
+    目标数,
+    目标容量,
+    上次大小,
+}
+
+函数 ResizeObserver_创建(回调) {
+    定义 ro = ResizeObserver {}
+    ro.回调 = 回调
+    ro.目标列表 = []
+    ro.目标数 = 0
+    ro.目标容量 = 64
+    ro.上次大小 = []
+    返回 ro
+}
+
+函数 ResizeObserver_observe(ro, target) {
+    如果 (ro == 0 || target == 0 || ro.目标数 >= ro.目标容量) { 返回 }
+    追加(ro.目标列表, target)
+    追加(ro.上次大小, [0, 0])
+    ro.目标数 = ro.目标数 + 1
+}
+
+函数 ResizeObserver_unobserve(ro, target) {
+    如果 (ro == 0) { 返回 }
+    定义 可变 新列表 = []
+    定义 可变 新大小 = []
+    定义 可变 i = 0
+    当 (i < ro.目标数) {
+        如果 (ro.目标列表[i] != target) {
+            追加(新列表, ro.目标列表[i])
+            追加(新大小, ro.上次大小[i])
+        }
+        i = i + 1
+    }
+    ro.目标列表 = 新列表
+    ro.上次大小 = 新大小
+    ro.目标数 = 计数(新列表)
+}
+
+函数 ResizeObserver_disconnect(ro) {
+    如果 (ro == 0) { 返回 }
+    ro.目标列表 = []
+    ro.上次大小 = []
+    ro.目标数 = 0
+}
+
+// §4 PerformanceObserver
+
+定义 PERF_MARK = 0
+定义 PERF_MEASURE = 1
+定义 PERF_NAVIGATION = 2
+定义 PERF_RESOURCE = 3
+定义 PERF_PAINT = 4
+定义 PERF_LONGTASK = 5
+定义 PERF_LAYOUT_SHIFT = 6
+
+结构 PerformanceEntry {
+    名称,
+    类型,
+    起始时间,
+    持续时间,
+}
+
+定义 可变 性能条目列表 = []
+定义 可变 性能条目数 = 0
+
+函数 Performance_mark(名称) {
+    定义 entry = PerformanceEntry {}
+    entry.名称 = 名称
+    entry.类型 = PERF_MARK
+    entry.起始时间 = 平台_获取高精度时间()
+    entry.持续时间 = 0
+    追加(性能条目列表, entry)
+    性能条目数 = 性能条目数 + 1
+}
+
+函数 Performance_measure(名称, 起始标记, 结束标记) {
+    定义 entry = PerformanceEntry {}
+    entry.名称 = 名称
+    entry.类型 = PERF_MEASURE
+    entry.起始时间 = 0
+    entry.持续时间 = 0
+    追加(性能条目列表, entry)
+    性能条目数 = 性能条目数 + 1
+}
+
+函数 Performance_获取条目(类型) {
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 性能条目数) {
+        如果 (性能条目列表[i].类型 == 类型) { 追加(结果, 性能条目列表[i]) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 Performance_清空() {
+    性能条目列表 = []
+    性能条目数 = 0
+}
+
+函数 PERF类型_名称(类型) {
+    如果 (类型 == PERF_MARK) { 返回 "mark" }
+    如果 (类型 == PERF_MEASURE) { 返回 "measure" }
+    如果 (类型 == PERF_NAVIGATION) { 返回 "navigation" }
+    如果 (类型 == PERF_RESOURCE) { 返回 "resource" }
+    如果 (类型 == PERF_PAINT) { 返回 "paint" }
+    如果 (类型 == PERF_LONGTASK) { 返回 "longtask" }
+    如果 (类型 == PERF_LAYOUT_SHIFT) { 返回 "layout-shift" }
+    返回 "unknown"
+}
+
+// §5 观察者统计与健康检查
+
+定义 可变 IO_总创建数 = 0
+定义 可变 IO_总观察数 = 0
+定义 可变 RO_总创建数 = 0
+定义 可变 RO_总观察数 = 0
+
+函数 观察者_统计() {
+    返回 {
+        IO创建: IO_总创建数,
+        IO观察: IO_总观察数,
+        RO创建: RO_总创建数,
+        RO观察: RO_总观察数,
+        性能条目: 性能条目数,
+    }
+}
+
+函数 观察者_健康检查() {
+    定义 可变 问题 = []
+    如果 (IO_总观察数 > 10000) { 追加(问题, "IO观察目标过多") }
+    如果 (性能条目数 > 100000) { 追加(问题, "性能条目过多") }
+    如果 (计数(问题) == 0) { 返回 "观察者子系统健康" }
+    返回 问题
+}
+
+函数 观察者_重置统计() {
+    IO_总创建数 = 0
+    IO_总观察数 = 0
+    RO_总创建数 = 0
+    RO_总观察数 = 0
+}
+
+函数 观察者_完整统计() {
+    返回 [IO_总创建数, IO_总观察数, RO_总创建数, RO_总观察数, 性能条目数]
+}
+
+// merge source: 沙盒批次/批三/待厚/感知/历史位置对.nova
+// §2 Location对象
+
+结构 Location {
+    当前URL,    // u64 URL*
+    // 关联的浏览上下文
+    浏览上下文,    // u64 BrowsingContext*
+}
+
+函数 Location_创建(url) {
+    定义 loc = 堆_分配(Location)
+    loc.当前URL = URL_解析(url)
+    loc.浏览上下文 = 0
+    返回 loc
+}
+
+函数 Location_assign(loc, url) {
+    如果 (loc == 0) { 返回 }
+    // 导航到新URL(添加历史条目)
+    Navigation_导航(loc.浏览上下文, url, 真)
+}
+
+函数 Location_replace(loc, url) {
+    如果 (loc == 0) { 返回 }
+    // 导航到新URL(替换当前历史条目)
+    Navigation_导航(loc.浏览上下文, url, 假)
+}
+
+函数 Location_reload(loc) {
+    如果 (loc == 0 || loc.当前URL == 0) { 返回 }
+    // 重新加载当前页面
+    Navigation_导航(loc.浏览上下文, loc.当前URL.完整, 假)
+}
+
+// location属性getter
+函数 Location_href(loc) {
+    如果 (loc == 0 || loc.当前URL == 0) { 返回 "" }
+    返回 loc.当前URL.完整
+}
+
+函数 Location_pathname(loc) {
+    如果 (loc == 0 || loc.当前URL == 0) { 返回 "/" }
+    返回 loc.当前URL.路径
+}
+
+函数 Location_search(loc) {
+    如果 (loc == 0 || loc.当前URL == 0) { 返回 "" }
+    返回 loc.当前URL.查询
+}
+
+函数 Location_hash(loc) {
+    如果 (loc == 0 || loc.当前URL == 0) { 返回 "" }
+    返回 loc.当前URL.哈希
+}
+
+// §3 历史条目
+
+结构 历史Entry {
+    URL,    // u64 URL*
+    状态,    // u64 Structured Clone (pushState的state)
+    标题,    // u64 页面标题
+    滚动位置X,
+    滚动位置Y,
+    // DOM快照(可选, 用于bfcache)
+    文档快照,    // u64 Document* (冻结的DOM)
+    有快照,
+}
+
+结构 Session历史 {
+    条目,    // u64 历史Entry*数组
+    条目数,
+    条目容量,
+    当前索引,    // i32 -1=空
+}
+
+// §4 历史对象
+
+结构 历史 {
+    会话,    // u64 Session历史*
+    // 关联
+    浏览上下文,
+    location,    // u64 Location*
+}
+
+函数 历史_创建() {
+    定义 h = 堆_分配(历史)
+    定义 sh = 堆_分配(Session历史)
+    sh.条目容量 = 256
+    sh.条目 = 堆_分配_数组(256 * 8)
+    sh.条目数 = 0; sh.当前索引 = -1
+    h.会话 = sh; h.浏览上下文 = 0; h.location = 0
+    返回 h
+}
+
+// history.length
+函数 历史_length(h) {
+    如果 (h == 0 || h.会话 == 0) { 返回 0 }
+    返回 h.会话.条目数
+}
+
+// history.state
+函数 历史_state(h) {
+    如果 (h == 0 || h.会话 == 0) { 返回 0 }
+    定义 sh = h.会话
+    如果 (sh.当前索引 < 0 || sh.当前索引 >= sh.条目数) { 返回 0 }
+    定义 entry = 内存_读64(sh.条目 + sh.当前索引 * 8)
+    如果 (entry == 0) { 返回 0 }
+    返回 entry.状态
+}
+
+// history.pushState(state, title, url)
+函数 历史_pushState(h, 状态, 标题, url) {
+    如果 (h == 0 || h.会话 == 0) { 返回 }
+    定义 sh = h.会话
+
+    // 同源检查
+    如果 (url != 0 && h.location != 0 && h.location.当前URL != 0) {
+        定义 新url = URL_解析(url)
+        如果 (新url != 0 && !URL_相同源(新url, h.location.当前URL)) {
+            // Security错误: 不允许跨源pushState
+            返回
+        }
+    }
+
+    // 截断当前索引之后的条目(前进历史)
+    sh.条目数 = sh.当前索引 + 1
+
+    // 创建新条目
+    定义 entry = 堆_分配(历史Entry)
+    如果 (url != 0) {
+        entry.URL = URL_解析(url)
+    } 否则 如果 (h.location != 0) {
+        entry.URL = h.location.当前URL
+    }
+    entry.状态 = 状态
+    entry.标题 = 如果(标题 != 0, 字符串_复制(标题), 0)
+    entry.滚动位置X = 0; entry.滚动位置Y = 0
+    entry.文档快照 = 0; entry.有快照 = 假
+
+    // 添加
+    如果 (sh.条目数 < sh.条目容量) {
+        内存_写64(sh.条目 + sh.条目数 * 8, entry)
+        sh.条目数 = sh.条目数 + 1
+        sh.当前索引 = sh.条目数 - 1
+    }
+
+    // 更新Location URL(不触发导航!)
+    如果 (url != 0 && h.location != 0) {
+        h.location.当前URL = entry.URL
+    }
+}
+
+// history.replaceState(state, title, url)
+函数 历史_replaceState(h, 状态, 标题, url) {
+    如果 (h == 0 || h.会话 == 0) { 返回 }
+    定义 sh = h.会话
+    如果 (sh.当前索引 < 0) { 返回 }
+
+    // 同源检查
+    如果 (url != 0 && h.location != 0 && h.location.当前URL != 0) {
+        定义 新url = URL_解析(url)
+        如果 (新url != 0 && !URL_相同源(新url, h.location.当前URL)) { 返回 }
+    }
+
+    定义 entry = 内存_读64(sh.条目 + sh.当前索引 * 8)
+    如果 (entry == 0) { 返回 }
+    entry.状态 = 状态
+    如果 (标题 != 0) { entry.标题 = 字符串_复制(标题) }
+    如果 (url != 0) {
+        entry.URL = URL_解析(url)
+        如果 (h.location != 0) { h.location.当前URL = entry.URL }
+    }
+}
+
+// history.back()
+函数 历史_back(h) { 历史_go(h, -1) }
+
+// history.forward()
+函数 历史_forward(h) { 历史_go(h, 1) }
+
+// history.go(delta)
+函数 历史_go(h, delta) {
+    如果 (h == 0 || h.会话 == 0) { 返回 }
+    如果 (delta == 0) {
+        // go(0) = reload
+        如果 (h.location != 0) { Location_reload(h.location) }
+        返回
+    }
+    定义 sh = h.会话
+    定义 新索引 = sh.当前索引 + delta
+    如果 (新索引 < 0 || 新索引 >= sh.条目数) { 返回 }
+
+    // 保存当前滚动位置
+    如果 (sh.当前索引 >= 0) {
+        定义 当前 = 内存_读64(sh.条目 + sh.当前索引 * 8)
+        如果 (当前 != 0) {
+            // 当前.滚动位置X/Y = document.scrolling元素.scrollLeft/Top
+        }
+    }
+
+    sh.当前索引 = 新索引
+    定义 entry = 内存_读64(sh.条目 + 新索引 * 8)
+    如果 (entry == 0) { 返回 }
+
+    // 更新Location
+    如果 (h.location != 0 && entry.URL != 0) {
+        h.location.当前URL = entry.URL
+    }
+
+    // 触发popstate事件
+    历史_触发popstate(h, entry.状态)
+
+    // 恢复滚动位置
+    // scrollTo(entry.滚动位置X, entry.滚动位置Y)
+}
+
+// merge source: 沙盒批次/批四/待厚/感知/性能获取.nova
+
+定义 PERF_NAVIGATION = 1
+定义 PERF_RESOURCE   = 2
+定义 PERF_MARK       = 3
+定义 PERF_MEASURE    = 4
+定义 PERF_PAINT      = 5
+定义 PERF_LONGTASK   = 6
+
+结构 PerformanceEntry {
+    名称,    // u64, 类型: u32, 开始时间: u64, 持续时间: u64, 扩展: u64
+}
+
+结构 ResourceTiming {
+    initiatorType,    // u64, nextHopProtocol: u64
+    domainLookupStart,    // u64, domainLookupEnd: u64
+    connectStart,    // u64, connectEnd: u64, secureConnectionStart: u64
+    requestStart,    // u64, responseStart: u64, responseEnd: u64
+    transferSize,    // u32, encodedBodySize: u32, decodedBodySize: u32
+}
+
+结构 NavigationTiming {
+    类型,    // u32 0=navigate 1=reload 2=back_forward 3=prerender
+    redirectCount,
+    unload事件Start,    // u64, unload事件End: u64
+    redirectStart,    // u64, redirectEnd: u64
+    fetchStart,    // u64, domInteractive: u64, domContentLoadedStart: u64
+    domContentLoadedEnd,    // u64, domComplete: u64
+    load事件Start,    // u64, load事件End: u64
+}
+
+结构 Performance {
+    时间原点,
+    条目列表,
+    条目数量,
+    条目容量,
+    标记计数,
+    // 观察者
+    观察者列表,
+    观察者数量,
+    // 导航计时
+    导航计时,
+}
+
+定义 可变 全局Performance = 0
+
+函数 Performance_获取() {
+    如果 (全局Performance == 0) {
+        全局Performance = 堆_分配(Performance)
+        全局Performance.时间原点 = 平台_获取高精度时间()
+        全局Performance.条目容量 = 512
+        全局Performance.条目列表 = 堆_分配_数组(512 * 8)
+        全局Performance.条目数量 = 0
+        全局Performance.标记计数 = 0
+        全局Performance.观察者列表 = 堆_分配_数组(32 * 8)
+        全局Performance.观察者数量 = 0
+        全局Performance.导航计时 = 0
+    }
+    返回 全局Performance
+}
+
+函数 Performance_now() {
+    定义 perf = Performance_获取()
+    返回 平台_获取高精度时间() - perf.时间原点
+}
+
+函数 Performance_添加条目(perf, entry) {
+    如果 (perf.条目数量 >= perf.条目容量) { 返回 }
+    内存_写64(perf.条目列表 + perf.条目数量 * 8, entry)
+    perf.条目数量 = perf.条目数量 + 1
+    // 通知观察者
+    Performance_通知观察者(perf, entry)
+}
+
+函数 Performance_查找标记(perf, 名称) {
+    定义 可变 i = perf.条目数量 - 1
+    当 (i >= 0) {
+        定义 e = 内存_读64(perf.条目列表 + i * 8)
+        如果 (e != 0 && e.类型 == PERF_MARK && 字符串_相等(e.名称, 名称)) { 返回 e }
+        i = i - 1
+    }
+    返回 0
+}
+
+函数 Performance_getEntries(perf) {
+    返回 [perf.条目列表, perf.条目数量]
+}
+
+函数 Performance_getEntriesByType(perf, 类型) {
+    定义 结果 = 堆_分配_数组(perf.条目数量 * 8)
+    定义 可变 计数 = 0
+    定义 可变 i = 0
+    当 (i < perf.条目数量) {
+        定义 e = 内存_读64(perf.条目列表 + i * 8)
+        如果 (e != 0 && e.类型 == 类型) {
+            内存_写64(结果 + 计数 * 8, e)
+            计数 = 计数 + 1
+        }
+        i = i + 1
+    }
+    返回 [结果, 计数]
+}
+
+函数 Performance_getEntriesByName(perf, 名称) {
+    定义 结果 = 堆_分配_数组(perf.条目数量 * 8)
+    定义 可变 计数 = 0
+    定义 可变 i = 0
+    当 (i < perf.条目数量) {
+        定义 e = 内存_读64(perf.条目列表 + i * 8)
+        如果 (e != 0 && 字符串_相等(e.名称, 名称)) {
+            内存_写64(结果 + 计数 * 8, e)
+            计数 = 计数 + 1
+        }
+        i = i + 1
+    }
+    返回 [结果, 计数]
+}
+
+函数 Performance_clearMarks(perf, 名称) {
+    如果 (名称 == 0) {
+        Performance_清除类型(perf, PERF_MARK)
+    } 否则 {
+        Performance_清除名称(perf, PERF_MARK, 名称)
+    }
+}
+
+函数 Performance_clearMeasures(perf, 名称) {
+    如果 (名称 == 0) {
+        Performance_清除类型(perf, PERF_MEASURE)
+    } 否则 {
+        Performance_清除名称(perf, PERF_MEASURE, 名称)
+    }
+}
+
+函数 Performance_清除类型(perf, 类型) {
+    定义 可变 写 = 0
+    定义 可变 i = 0
+    当 (i < perf.条目数量) {
+        定义 e = 内存_读64(perf.条目列表 + i * 8)
+        如果 (e != 0 && e.类型 != 类型) {
+            内存_写64(perf.条目列表 + 写 * 8, e)
+            写 = 写 + 1
+        }
+        i = i + 1
+    }
+    perf.条目数量 = 写
+}
+
+函数 Performance_清除名称(perf, 类型, 名称) {
+    定义 可变 写 = 0
+    定义 可变 i = 0
+    当 (i < perf.条目数量) {
+        定义 e = 内存_读64(perf.条目列表 + i * 8)
+        如果 (e != 0 && !(e.类型 == 类型 && 字符串_相等(e.名称, 名称))) {
+            内存_写64(perf.条目列表 + 写 * 8, e)
+            写 = 写 + 1
+        }
+        i = i + 1
+    }
+    perf.条目数量 = 写
+}
+
+// merge source: 沙盒批次/批五/待厚/感知/观察通知.nova
+
+函数 MutationObserver_通知characterData(target, 旧值) {
+    定义 可变 i = 0
+    当 (i < 全局_MO列表_数量) {
+        定义 mo = 内存_读64(全局_MO列表 + i * 8)
+        如果 (mo != 0 && MO_观察了目标(mo, target, MUT_CHARACTER_DATA)) {
+            定义 record = 堆_分配(MutationRecord)
+            record.类型 = "characterData"
+            record.目标 = target
+            如果 (mo.记录旧值) { record.旧值 = 旧值 }
+            MO_入队记录(mo, record)
+        }
+        i = i + 1
+    }
+}
+
+// 微任务队列刷新时调用
+函数 MutationObserver_刷新所有() {
+    定义 可变 i = 0
+    当 (i < 全局_MO列表_数量) {
+        定义 mo = 内存_读64(全局_MO列表 + i * 8)
+        如果 (mo != 0 && mo.队列大小 > 0) {
+            定义 records = MutationObserver_takeRecords(mo)
+            如果 (records != 0 && mo.回调 != 0) {
+                回调_调用2(mo.回调, records, mo)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §4 PerformanceObserver
+
+定义 PERF_TYPE_MARK          = 1
+定义 PERF_TYPE_MEASURE       = 2
+定义 PERF_TYPE_NAVIGATION    = 4
+定义 PERF_TYPE_RESOURCE      = 8
+定义 PERF_TYPE_PAINT         = 16
+定义 PERF_TYPE_LONGTASK      = 32
+定义 PERF_TYPE_LAYOUT_SHIFT  = 64
+定义 PERF_TYPE_LARGEST_CONTENTFUL_PAINT = 128
+定义 PERF_TYPE_FIRST_INPUT   = 256
+定义 PERF_TYPE_元素       = 512
+
+结构 PerformanceObserverEntry {
+    名称,
+    类型,    // u64 "mark"/"measure"/"resource"/...
+    类型掩码,
+    开始时间,
+    持续时间,
+    // resource特有
+    initiatorType,    // u64 "xmlhttprequest"/"fetch"/"img"/...
+    transferSize,
+    // paint特有
+    渲染时间,
+    加载时间,
+    // layout-shift特有
+    值,    // i32 Q10
+    // 链接
+    下一个,
+}
+
+结构 PerformanceObserver {
+    回调,
+    类型过滤,    // u32 PERF_TYPE_xxx 位掩码
+    buffered,    // 布尔 是否接收已有的entries
+    // 待通知队列
+    队列头,
+    队列大小,
+}
+
+函数 PerformanceObserver_创建(回调) {
+    定义 po = 堆_分配(PerformanceObserver)
+    po.回调 = 回调; po.类型过滤 = 0; po.buffered = 假
+    po.队列头 = 0; po.队列大小 = 0
+    返回 po
+}
+
+函数 PerformanceObserver_observe(po, 类型过滤, buffered) {
+    如果 (po == 0) { 返回 }
+    po.类型过滤 = 类型过滤; po.buffered = buffered
+    // 如果buffered=true, 立即推送已有的匹配entries
+}
+
+函数 PerformanceObserver_disconnect(po) {
+    如果 (po == 0) { 返回 }
+    po.类型过滤 = 0; po.队列头 = 0; po.队列大小 = 0
+}
+
+// 性能条目产生时通知所有PerformanceObserver
+函数 PerformanceObserver_通知(entry) {
+    如果 (entry == 0) { 返回 }
+    // 遍历所有PO, 检查类型过滤匹配
+    // 入队, 微任务刷新时调用回调
+}
+
+// Core Web Vitals辅助
+函数 Performance_LCP记录(元素, 渲染时间, 加载时间, 大小) {
+    定义 entry = 堆_分配(PerformanceObserverEntry)
+    entry.类型 = "largest-contentful-paint"
+    entry.类型掩码 = PERF_TYPE_LARGEST_CONTENTFUL_PAINT
+    entry.渲染时间 = 渲染时间; entry.加载时间 = 加载时间
+    PerformanceObserver_通知(entry)
+}
+
+函数 Performance_FID记录(事件类型, 开始时间, 处理时间) {
+    定义 entry = 堆_分配(PerformanceObserverEntry)
+    entry.类型 = "first-input"
+    entry.类型掩码 = PERF_TYPE_FIRST_INPUT
+    entry.开始时间 = 开始时间; entry.持续时间 = 处理时间 - 开始时间
+    PerformanceObserver_通知(entry)
+}
+
+函数 Performance_CLS记录(值) {
+    定义 entry = 堆_分配(PerformanceObserverEntry)
+    entry.类型 = "layout-shift"
+    entry.类型掩码 = PERF_TYPE_LAYOUT_SHIFT
+    entry.值 = 值
+    PerformanceObserver_通知(entry)
+}
+
+// merge source: 沙盒批次/批五/待厚/感知/性能观察.nova
+// §2 PerformanceObserver
+
+结构 PerformanceObserver {
+    回调,
+    观察类型,    // u32 位掩码: bit0=nav bit1=res bit2=mark ...
+    缓冲条目,
+    缓冲数量,
+    缓冲容量,
+    已连接,
+}
+
+函数 Performance_通知观察者(perf, entry) {
+    定义 可变 i = 0
+    当 (i < perf.观察者数量) {
+        定义 o = 内存_读64(perf.观察者列表 + i * 8)
+        如果 (o != 0 && o.已连接) {
+            // 检查类型匹配(按注册的entryTypes过滤)
+            如果 (o.缓冲数量 < o.缓冲容量) {
+                内存_写64(o.缓冲条目 + o.缓冲数量 * 8, entry)
+                o.缓冲数量 = o.缓冲数量 + 1
+            }
+            // 异步调用回调(microtask)
+            如果 (o.回调 != 0) {
+                Microtask_排队_可调用(o.回调, o)
+            }
+        }
+        i = i + 1
+    }
+}
+
+函数 PerformanceObserver_takeRecords(观察者) {
+    如果 (观察者 == 0) { 返回 [0, 0] }
+    定义 结果 = [观察者.缓冲条目, 观察者.缓冲数量]
+    观察者.缓冲条目 = 堆_分配_数组(观察者.缓冲容量 * 8)
+    观察者.缓冲数量 = 0
+    返回 结果
+}
+
+// §3 Resource Timing — 资源加载计时
+
+函数 Performance_记录资源(名称, 启动类型, dns开始, dns结束, 连接开始, 连接结束, 请求开始, 响应开始, 响应结束, 传输大小) {
+    定义 perf = Performance_获取()
+
+    定义 rt = 堆_分配(ResourceTiming)
+    rt.initiatorType = 字符串_复制(启动类型)
+    rt.domainLookupStart = dns开始
+    rt.domainLookupEnd = dns结束
+    rt.connectStart = 连接开始
+    rt.connectEnd = 连接结束
+    rt.requestStart = 请求开始
+    rt.responseStart = 响应开始
+    rt.responseEnd = 响应结束
+    rt.transferSize = 传输大小
+
+    定义 entry = 堆_分配(PerformanceEntry)
+    entry.名称 = 字符串_复制(名称)
+    entry.类型 = PERF_RESOURCE
+    entry.开始时间 = dns开始
+    entry.持续时间 = 响应结束 - dns开始
+    entry.扩展 = rt
+
+    Performance_添加条目(perf, entry)
+}
+
+// §4 绘制 Timing — 首次绘制/首次有内容绘制
+
+函数 Performance_记录首次绘制() {
+    定义 perf = Performance_获取()
+    定义 entry = 堆_分配(PerformanceEntry)
+    entry.名称 = "first-paint"
+    entry.类型 = PERF_PAINT
+    entry.开始时间 = Performance_now()
+    entry.持续时间 = 0
+    Performance_添加条目(perf, entry)
+}
+
+函数 Performance_记录首次有内容绘制() {
+    定义 perf = Performance_获取()
+    定义 entry = 堆_分配(PerformanceEntry)
+    entry.名称 = "first-contentful-paint"
+    entry.类型 = PERF_PAINT
+    entry.开始时间 = Performance_now()
+    entry.持续时间 = 0
+    Performance_添加条目(perf, entry)
+}
+
+// merge source: 沙盒批次/批五/待厚/感知/性能域.nova
+// §10 Performance域
+
+结构 PerformanceEntry {
+    名称,
+    类型,    // u64 "navigation"/"resource"/"mark"/"measure"
+    开始时间,    // u64 高精度时间戳
+    持续时间,
+    下一个,
+}
+
+定义 可变 性能条目头 = 0
+
+函数 DevTools_Performance处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Performance.enable")) {
+        session.performance启用 = 真; msg.结果 = "{}"
+    } 否则 如果 (字符串_相等(方法, "Performance.getMetrics")) {
+        // 返回性能指标
+        // Timestamps, Documents, Frames, JS事件Listeners, 节点s,
+        // 布局Count, Recalc样式Count, 布局Duration, ScriptDuration
+    }
+}
+
+// §11 Emulation域
+
+结构 DeviceMetrics {
+    宽度,
+    高度,
+    设备缩放,    // i32 Q10
+    是移动,
+    // 屏幕方向
+    方向类型,    // u8 0=portrait 1=landscape
+    方向角度,
+}
+
+函数 DevTools_Emulation处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "Emulation.setDeviceMetricsOverride")) {
+        // 设备模拟: 修改viewport尺寸/DPR/移动模式
+    } 否则 如果 (字符串_相等(方法, "Emulation.clearDeviceMetricsOverride")) {
+        // 清除模拟
+    } 否则 如果 (字符串_相等(方法, "Emulation.setGeolocationOverride")) {
+        // 地理位置模拟
+    } 否则 如果 (字符串_相等(方法, "Emulation.setUser智能体Override")) {
+        // UA字符串覆盖
+    } 否则 如果 (字符串_相等(方法, "Emulation.setEmulated媒体")) {
+        // 媒体类型/特性模拟 (prefers-color-scheme等)
+    } 否则 如果 (字符串_相等(方法, "Emulation.setCPUThrottlingRate")) {
+        // CPU节流
+    } 否则 如果 (字符串_相等(方法, "Emulation.setTimezoneOverride")) {
+        // 时区覆盖
+    }
+}
+
+// §12 存储域
+
+函数 DevTools_存储处理(session, msg) {
+    如果 (session == 0 || msg == 0) { 返回 }
+    定义 方法 = msg.方法
+
+    如果 (字符串_相等(方法, "存储.get存储KeyForFrame")) {
+        // 获取frame的存储key
+    } 否则 如果 (字符串_相等(方法, "存储.clearDataForOrigin")) {
+        // 清除源的所有存储数据
+    } 否则 如果 (字符串_相等(方法, "存储.getCookies")) {
+        // 获取cookies
+    } 否则 如果 (字符串_相等(方法, "存储.setCookies")) {
+        // 设置cookies
+    }
+}
+
+// §13 辅助: 参数解析
+
+函数 DevTools_解析参数_int(json, key) {
+    如果 (json == 0 || key == 0) { 返回 0 }
+    定义 位置 = 字符串_查找(json, key)
+    如果 (位置 < 0) { 返回 0 }
+    定义 冒号 = 字符串_查找子(json, ":", 位置)
+    如果 (冒号 < 0) { 返回 0 }
+    返回 字符串转整数(字符串_子串(json, 冒号 + 1, 20))
+}
+
+函数 DevTools_解析参数_str(json, key) {
+    如果 (json == 0 || key == 0) { 返回 "" }
+    定义 位置 = 字符串_查找(json, key)
+    如果 (位置 < 0) { 返回 "" }
+    定义 引号1 = 字符串_查找子(json, "\"", 位置 + 字符串长度(key) + 2)
+    如果 (引号1 < 0) { 返回 "" }
+    定义 引号2 = 字符串_查找子(json, "\"", 引号1 + 1)
+    如果 (引号2 < 0) { 返回 "" }
+    返回 字符串_子串(json, 引号1 + 1, 引号2 - 引号1 - 1)
+}
+
+函数 DevTools_解析参数_bool(json, key) {
+    如果 (json == 0 || key == 0) { 返回 假 }
+    定义 位置 = 字符串_查找(json, key)
+    如果 (位置 < 0) { 返回 假 }
+    定义 冒号 = 字符串_查找子(json, ":", 位置)
+    如果 (冒号 < 0) { 返回 假 }
+    定义 剩余 = 字符串_子串(json, 冒号 + 1, 8)
+    如果 (字符串_查找(剩余, "true") >= 0) { 返回 真 }
+    如果 (字符串_查找(剩余, "false") >= 0) { 返回 假 }
+    如果 (字符串_查找(剩余, "1") >= 0) { 返回 真 }
+    返回 假
+}
+
+// 发送CDP事件
+函数 DevTools_发送事件(session, 方法, 参数json) {
+    如果 (session == 0) { 返回 }
+    定义 msg = 堆_分配(CDPMessage)
+    msg.id = -1    // 事件无id
+    msg.方法 = 方法; msg.参数 = 参数json
+    // 序列化为序列并通过长连接发送
+}
+
+// merge source: 沙盒批次/批五/待厚/感知/智能性能接.nova
+
+定义 最大标记 = 256
+定义 最大度量 = 128
+定义 最大资源 = 512
+定义 长任务阈值 = 50000
+
+结构 性能标记 {
+    名称哈希,
+    时间戳,
+}
+
+结构 性能度量 {
+    名称哈希,
+    起始标记,
+    结束标记,
+    时长,
+}
+
+结构 资源计时 {
+    地址哈希,
+    起始时间,
+    响应结束,
+    传输大小,
+    类型,
+}
+
+定义 可变 标记表 = []
+定义 可变 标记数 = 0
+定义 可变 度量表 = []
+定义 可变 度量数 = 0
+定义 可变 资源表 = []
+定义 可变 资源数 = 0
+定义 可变 长任务数 = 0
+定义 可变 起始时间 = 0
+
+函数 性能_初始化() {
+    标记表 = []
+    标记数 = 0
+    度量表 = []
+    度量数 = 0
+    资源表 = []
+    资源数 = 0
+    起始时间 = 平台_获取高精度时间()
+}
+
+函数 性能_当前时间() {
+    返回 平台_获取高精度时间() - 起始时间
+}
+
+函数 性能_标记(名称) {
+    如果 (标记数 >= 最大标记) { 返回 }
+    定义 标记 = 性能标记 {}
+    标记.名称哈希 = 哈希_字符串(名称)
+    标记.时间戳 = 性能_当前时间()
+    追加(标记表, 标记)
+    标记数 = 标记数 + 1
+}
+
+函数 性能_度量(名称, 起始名, 结束名) {
+    如果 (度量数 >= 最大度量) { 返回 }
+    定义 起始哈希 = 哈希_字符串(起始名)
+    定义 结束哈希 = 哈希_字符串(结束名)
+    定义 可变 起始时 = 0
+    定义 可变 结束时 = 0
+    定义 可变 序号 = 0
+    当 (序号 < 标记数) {
+        如果 (标记表[序号].名称哈希 == 起始哈希) { 起始时 = 标记表[序号].时间戳 }
+        如果 (标记表[序号].名称哈希 == 结束哈希) { 结束时 = 标记表[序号].时间戳 }
+        序号 = 序号 + 1
+    }
+    定义 度量 = 性能度量 {}
+    度量.名称哈希 = 哈希_字符串(名称)
+    度量.起始标记 = 起始时
+    度量.结束标记 = 结束时
+    度量.时长 = 结束时 - 起始时
+    追加(度量表, 度量)
+    度量数 = 度量数 + 1
+}
+
+函数 性能_记录资源(地址, 类型, 起始, 结束, 大小) {
+    如果 (资源数 >= 最大资源) { 返回 }
+    定义 资源 = 资源计时 {}
+    资源.地址哈希 = 哈希_字符串(地址)
+    资源.起始时间 = 起始
+    资源.响应结束 = 结束
+    资源.传输大小 = 大小
+    资源.类型 = 类型
+    追加(资源表, 资源)
+    资源数 = 资源数 + 1
+}
+
+函数 性能_记录长任务(时长) {
+    如果 (时长 > 长任务阈值) { 长任务数 = 长任务数 + 1 }
+}
+
+函数 性能_获取标记(名称) {
+    定义 目标 = 哈希_字符串(名称)
+    定义 可变 序号 = 标记数 - 1
+    当 (序号 >= 0) {
+        如果 (标记表[序号].名称哈希 == 目标) { 返回 标记表[序号].时间戳 }
+        序号 = 序号 - 1
+    }
+    返回 0
+}
+
+函数 性能_获取度量(名称) {
+    定义 目标 = 哈希_字符串(名称)
+    定义 可变 序号 = 0
+    当 (序号 < 度量数) {
+        如果 (度量表[序号].名称哈希 == 目标) { 返回 度量表[序号].时长 }
+        序号 = 序号 + 1
+    }
+    返回 0
+}
+
+函数 性能_清空标记() { 标记表 = []; 标记数 = 0 }
+函数 性能_清空度量() { 度量表 = []; 度量数 = 0 }
+函数 性能_清空资源() { 资源表 = []; 资源数 = 0 }
+
+函数 性能_完整统计() {
+    返回 [标记数, 度量数, 资源数, 长任务数, 性能_当前时间()]
+}
+
+函数 文档观察_统计() {
+    返回 {
+        观察总成功: 观察总成功,
+        观察总失败: 观察总失败,
+        定时器创建总数: 定时器_创建总数,
+        IO总创建数: IO_总创建数,
+        IO总观察数: IO_总观察数,
+        RO总创建数: RO_总创建数,
+        RO总观察数: RO_总观察数
+    }
+}
+
+函数 文档观察_健康评估() {
+    定义 可变 问题 = []
+    如果 (观察总失败 > 观察总成功 / 3 && 观察总成功 > 50) { 追加(问题, "观察总失败过高") }
+    返回 计数(问题) == 0
+}
+
+函数 文档观察_综合报告() {
+    打印("[文档观察] ═══ 综合报告 ═══")
+    打印("  观察总成功: " + 观察总成功)
+    打印("  观察总失败: " + 观察总失败)
+    打印("  定时器_创建总数: " + 定时器_创建总数)
+    打印("  IO_总创建数: " + IO_总创建数)
+    打印("  IO_总观察数: " + IO_总观察数)
+    打印("  RO_总创建数: " + RO_总创建数)
+    打印("  RO_总观察数: " + RO_总观察数)
+    打印("  健康: " + 如果 (文档观察_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 文档观察_全局重置() {
+    观察总成功 = 0
+    观察总失败 = 0
+    定时器_创建总数 = 0
+    IO_总创建数 = 0
+    IO_总观察数 = 0
+    RO_总创建数 = 0
+    RO_总观察数 = 0
+    打印("[文档观察] 统计已重置")
+    返回 0
+}

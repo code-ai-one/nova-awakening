@@ -1,0 +1,218 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+
+// 替换图绘2Complete.nova中ShaderCompiler_语法分析/语义检查/优化/生成代码的空壳
+// GLSL ES 3.00 (图绘 2.0):
+//   递归下降解析器 → AST → 语义检查 → 优化 → SPIR-V/图处字节码
+
+// §1 令牌类型
+
+定义 TOK_EOF       = 0
+定义 TOK_IDENT     = 1
+定义 TOK_INT_LIT   = 2
+定义 TOK_FLOAT_LIT = 3
+定义 TOK_KEYWORD   = 4
+定义 TOK_LPAREN    = 10
+定义 TOK_RPAREN    = 11
+定义 TOK_LBRACE    = 12
+定义 TOK_RBRACE    = 13
+定义 TOK_LBRACKET  = 14
+定义 TOK_RBRACKET  = 15
+定义 TOK_SEMI      = 16
+定义 TOK_COMMA     = 17
+定义 TOK_DOT       = 18
+定义 TOK_EQ        = 19
+定义 TOK_PLUS      = 20
+定义 TOK_MINUS     = 21
+定义 TOK_STAR      = 22
+定义 TOK_SLASH     = 23
+定义 TOK_LT        = 24
+定义 TOK_GT        = 25
+定义 TOK_LE        = 26
+定义 TOK_GE        = 27
+定义 TOK_EQEQ      = 28
+定义 TOK_NEQ       = 29
+定义 TOK_AND       = 30
+定义 TOK_OR        = 31
+定义 TOK_NOT       = 32
+定义 TOK_QUESTION  = 33
+定义 TOK_COLON     = 34
+
+// GLSL类型ID
+定义 TY_VOID   = 0
+定义 TY_BOOL   = 1
+定义 TY_INT    = 2
+定义 TY_UINT   = 3
+定义 TY_FLOAT  = 4
+定义 TY_VEC2   = 5
+定义 TY_VEC3   = 6
+定义 TY_VEC4   = 7
+定义 TY_IVEC2  = 8
+定义 TY_IVEC3  = 9
+定义 TY_IVEC4  = 10
+定义 TY_MAT2   = 11
+定义 TY_MAT3   = 12
+定义 TY_MAT4   = 13
+定义 TY_SAMPLER2D   = 14
+定义 TY_SAMPLER3D   = 15
+定义 TY_SAMPLERCUBE = 16
+定义 TY_STRUCT = 50
+
+// §2 词法分析器
+
+结构 GLSL令牌 {
+    类型,
+    值,    // u64 字符串/数值
+    行号,
+    列号,
+}
+
+结构 GLSLLexer {
+    源码,
+    源码长度,
+    位置,
+    行号,
+    列号,
+    当前令牌,    // GLSL令牌
+}
+
+函数 GLSLLexer_创建(源码, 长度) {
+    定义 lex = 堆_分配(GLSLLexer)
+    lex.源码 = 源码; lex.源码长度 = 长度
+    lex.位置 = 0; lex.行号 = 1; lex.列号 = 1
+    返回 lex
+}
+
+函数 GLSLLexer_下一个(lex) {
+    如果 (lex == 0) { 返回 }
+    // 跳过空白和注释
+    GLSLLexer_跳过空白(lex)
+    如果 (lex.位置 >= lex.源码长度) {
+        lex.当前令牌.类型 = TOK_EOF; 返回
+    }
+    定义 ch = 字节取(lex.源码, lex.位置)
+    lex.当前令牌.行号 = lex.行号; lex.当前令牌.列号 = lex.列号
+
+    // 标识符/关键字
+    如果 ((ch >= 0x61 && ch <= 0x7A) || (ch >= 0x41 && ch <= 0x5A) || ch == 0x5F) {
+        定义 起始 = lex.位置
+        当 (lex.位置 < lex.源码长度) {
+            定义 c = 字节取(lex.源码, lex.位置)
+            如果 ((c>=0x61&&c<=0x7A)||(c>=0x41&&c<=0x5A)||(c>=0x30&&c<=0x39)||c==0x5F) {
+                lex.位置 = lex.位置 + 1; lex.列号 = lex.列号 + 1
+            } 否则 { 跳出 }
+        }
+        定义 长度 = lex.位置 - 起始
+        定义 词 = 堆_分配(长度 + 1)
+        内存_复制(词, lex.源码 + 起始, 长度); 字节写(词, 长度, 0)
+        如果 (GLSLLexer_是关键字(词)) {
+            lex.当前令牌.类型 = TOK_KEYWORD
+        } 否则 {
+            lex.当前令牌.类型 = TOK_IDENT
+        }
+        lex.当前令牌.值 = 词; 返回
+    }
+    // 数字
+    如果 (ch >= 0x30 && ch <= 0x39) {
+        定义 可变 是浮点 = 假
+        定义 起始 = lex.位置
+        当 (lex.位置 < lex.源码长度) {
+            定义 c = 字节取(lex.源码, lex.位置)
+            如果 (c >= 0x30 && c <= 0x39) { lex.位置 = lex.位置+1; lex.列号=lex.列号+1 }
+            否则 如果 (c == 0x2E && !是浮点) { 是浮点 = 真; lex.位置=lex.位置+1; lex.列号=lex.列号+1 }
+            否则 { 跳出 }
+        }
+        lex.当前令牌.类型 = 如果(是浮点, TOK_FLOAT_LIT, TOK_INT_LIT)
+        返回
+    }
+    // 单/双字符运算符
+    lex.位置 = lex.位置 + 1; lex.列号 = lex.列号 + 1
+    如果 (ch == 0x28) { lex.当前令牌.类型 = TOK_LPAREN }
+    否则 如果 (ch == 0x29) { lex.当前令牌.类型 = TOK_RPAREN }
+    否则 如果 (ch == 0x7B) { lex.当前令牌.类型 = TOK_LBRACE }
+    否则 如果 (ch == 0x7D) { lex.当前令牌.类型 = TOK_RBRACE }
+    否则 如果 (ch == 0x5B) { lex.当前令牌.类型 = TOK_LBRACKET }
+    否则 如果 (ch == 0x5D) { lex.当前令牌.类型 = TOK_RBRACKET }
+    否则 如果 (ch == 0x3B) { lex.当前令牌.类型 = TOK_SEMI }
+    否则 如果 (ch == 0x2C) { lex.当前令牌.类型 = TOK_COMMA }
+    否则 如果 (ch == 0x2E) { lex.当前令牌.类型 = TOK_DOT }
+    否则 如果 (ch == 0x2B) { lex.当前令牌.类型 = TOK_PLUS }
+    否则 如果 (ch == 0x2D) { lex.当前令牌.类型 = TOK_MINUS }
+    否则 如果 (ch == 0x2A) { lex.当前令牌.类型 = TOK_STAR }
+    否则 如果 (ch == 0x2F) { lex.当前令牌.类型 = TOK_SLASH }
+    否则 如果 (ch == 0x3F) { lex.当前令牌.类型 = TOK_QUESTION }
+    否则 如果 (ch == 0x3A) { lex.当前令牌.类型 = TOK_COLON }
+    否则 如果 (ch == 0x21) {
+        如果 (lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x3D) {
+            lex.当前令牌.类型=TOK_NEQ; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+        } 否则 { lex.当前令牌.类型 = TOK_NOT }
+    }
+    否则 如果 (ch == 0x3D) {
+        如果 (lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x3D) {
+            lex.当前令牌.类型=TOK_EQEQ; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+        } 否则 { lex.当前令牌.类型 = TOK_EQ }
+    }
+    否则 如果 (ch == 0x3C) {
+        如果 (lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x3D) {
+            lex.当前令牌.类型=TOK_LE; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+        } 否则 { lex.当前令牌.类型 = TOK_LT }
+    }
+    否则 如果 (ch == 0x3E) {
+        如果 (lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x3D) {
+            lex.当前令牌.类型=TOK_GE; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+        } 否则 { lex.当前令牌.类型 = TOK_GT }
+    }
+    否则 如果 (ch == 0x26 && lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x26) {
+        lex.当前令牌.类型=TOK_AND; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+    }
+    否则 如果 (ch == 0x7C && lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)==0x7C) {
+        lex.当前令牌.类型=TOK_OR; lex.位置=lex.位置+1; lex.列号=lex.列号+1
+    }
+    否则 { lex.当前令牌.类型 = TOK_EOF }    // 未知字符
+}
+
+函数 GLSLLexer_跳过空白(lex) {
+    当 (lex.位置 < lex.源码长度) {
+        定义 ch = 字节取(lex.源码, lex.位置)
+        如果 (ch == 0x20 || ch == 0x09) { lex.位置=lex.位置+1; lex.列号=lex.列号+1 }
+        否则 如果 (ch == 0x0A) { lex.位置=lex.位置+1; lex.行号=lex.行号+1; lex.列号=1 }
+        否则 如果 (ch == 0x0D) { lex.位置=lex.位置+1 }
+        // 行注释 //
+        否则 如果 (ch==0x2F && lex.位置+1<lex.源码长度 && 字节取(lex.源码,lex.位置+1)==0x2F) {
+            当 (lex.位置<lex.源码长度 && 字节取(lex.源码,lex.位置)!=0x0A) { lex.位置=lex.位置+1 }
+        }
+        // 块注释 /* */
+        否则 如果 (ch==0x2F && lex.位置+1<lex.源码长度 && 字节取(lex.源码,lex.位置+1)==0x2A) {
+            lex.位置 = lex.位置 + 2
+            当 (lex.位置+1 < lex.源码长度) {
+                如果 (字节取(lex.源码,lex.位置)==0x2A && 字节取(lex.源码,lex.位置+1)==0x2F) {
+                    lex.位置 = lex.位置 + 2; 跳出
+                }
+                如果 (字节取(lex.源码,lex.位置)==0x0A) { lex.行号=lex.行号+1; lex.列号=0 }
+                lex.位置 = lex.位置 + 1
+            }
+        }
+        否则 { 跳出 }
+    }
+}
+
+函数 GLSLLexer_是关键字(词) {
+    如果 (字符串_相等(词,"void")||字符串_相等(词,"bool")||字符串_相等(词,"int")||
+        字符串_相等(词,"uint")||字符串_相等(词,"float")||
+        字符串_相等(词,"vec2")||字符串_相等(词,"vec3")||字符串_相等(词,"vec4")||
+        字符串_相等(词,"ivec2")||字符串_相等(词,"ivec3")||字符串_相等(词,"ivec4")||
+        字符串_相等(词,"mat2")||字符串_相等(词,"mat3")||字符串_相等(词,"mat4")||
+        字符串_相等(词,"sampler2D")||字符串_相等(词,"sampler3D")||字符串_相等(词,"samplerCube")||
+        字符串_相等(词,"in")||字符串_相等(词,"out")||字符串_相等(词,"uniform")||
+        字符串_相等(词,"const")||字符串_相等(词,"if")||字符串_相等(词,"else")||
+        字符串_相等(词,"for")||字符串_相等(词,"while")||字符串_相等(词,"return")||
+        字符串_相等(词,"discard")||字符串_相等(词,"struct")||字符串_相等(词,"layout")||
+        字符串_相等(词,"precision")||字符串_相等(词,"flat")||字符串_相等(词,"smooth")||
+        字符串_相等(词,"break")||字符串_相等(词,"continue")) {
+        返回 真
+    }
+    返回 假
+}

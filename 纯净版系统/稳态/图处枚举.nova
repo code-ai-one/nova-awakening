@@ -1,0 +1,354 @@
+// NovaOS 图处识别 — PCI枚举→厂商/型号/能力探测
+// ★ 核心原理:
+//   图处没有类似CPU的CPUID指令, 图处识别完全通过PCI总线:
+//   1. PCI配置空间: 每个PCI设备有256字节配置头
+//      - 偏移0x00: 厂商ID(2字节) + 设备ID(2字节)
+//      - 偏移0x08: 类代码(显示控制器=0x03)
+//      - 偏移0x10-0x24: BAR(Base Address Register) → MMIO地址
+//   2. 厂商ID是硬件固化的, 不可伪造:
+//      - 0x10DE = NVIDIA
+//      - 0x1002 = AMD/ATI
+//      - 0x8086 = Intel (集成显卡)
+//      - 0x1AE0 = 行业 (TPU)
+//   3. 设备ID + 厂商ID → 查表得到具体型号和能力
+//   4. BAR寄存器 → 获取图处的MMIO基地址(驱动通过这个地址控制图处)
+
+导入("../中枢/日志中枢.nova")
+导入("../推理/总线调度.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §1 PCI类代码定义
+
+定义 PCI_CLASS_显示       = 0x03     // Display Controller
+定义 PCI_SUBCLASS_显基     = 0x00     // 显基兼容
+定义 PCI_SUBCLASS_3D      = 0x02     // 3D控制器(不一定显基兼容)
+
+定义 图处_VENDOR_NVIDIA    = 0x10DE
+定义 图处_VENDOR_AMD       = 0x1002
+定义 图处_VENDOR_INTEL     = 0x8086
+定义 图处_VENDOR_VIRTIO    = 0x1AF4   // QEMU virtio-gpu
+定义 图处_VENDOR_VMWARE    = 0x15AD   // VMware S显基
+定义 图处_VENDOR_QEMU      = 0x1234   // QEMU stdvga (bochs)
+定义 图处_VENDOR_GOOGLE    = 0x1AE0   // 行业 TPU
+
+定义 图处_CAP_2D           = 1 << 0   // 2D加速
+定义 图处_CAP_3D           = 1 << 1   // 3D加速
+定义 图处_CAP_COMPUTE      = 1 << 2   // 通用计算(GP图处)
+定义 图处_CAP_VIDEO_DECODE = 1 << 3   // 视频硬解码
+定义 图处_CAP_VIDEO_ENCODE = 1 << 4   // 视频预设
+定义 图处_CAP_智能_ACCEL     = 1 << 5   // AI推理加速(Tensor Core/Matrix Core)
+定义 图处_CAP_DISPLAY      = 1 << 6   // 显示输出
+定义 图处_CAP_VULKAN       = 1 << 7   // Vulkan支持
+定义 图处_CAP_RAY_TRACE    = 1 << 8   // 光线追踪
+
+// §2 图处设备结构
+
+结构 图处设备 {
+    PCI总线,
+    PCI设备,
+    PCI功能,
+    厂商ID,
+    设备ID,
+    子系统厂商ID,
+    子系统设备ID,
+    修订版本,
+    类代码,
+    子类代码,
+    BAR0_地址,    // u64 主MMIO区域(图处寄存器)
+    BAR0_大小,
+    BAR1_地址,    // u64 帧缓冲/显存映射
+    BAR1_大小,
+    BAR2_地址,    // u64 IO端口或扩展MMIO
+    BAR2_大小,
+    厂商名,
+    型号名,
+    驱动类型,    // 字符串 "nvidia" / "amdgpu" / "i915" / "virtio-gpu"
+    能力,    // u32 图处_CAP_* 位掩码
+    显存大小_MB,
+    计算单元数,    // u32 SM(NVIDIA) / CU(AMD) / EU(Intel)
+    最大时钟_MHz,
+    已初始化,
+    命令队列地址,    // u64 图处命令环形缓冲
+    中断号,    // u32 MSI/MSI-X中断
+}
+
+定义 最大图处数 = 8
+定义 可变 图处列表 = []
+定义 可变 主图处 = 空                // 主显示图处
+定义 可变 计算图处 = 空              // AI计算首选图处
+
+// §3 图处枚举 — 扫描PCI总线发现所有图处
+
+函数 图处_枚举() {
+    内核信息("图处枚举: 扫描PCI总线...")
+    图处列表 = []
+
+    // 遍历PCI总线上的所有设备
+    定义 可变 总线 = 0
+    当 (总线 < 256) {
+        定义 可变 设备号 = 0
+        当 (设备号 < 32) {
+            定义 可变 功能号 = 0
+            当 (功能号 < 8) {
+                // 读取PCI配置空间
+                定义 厂商设备 = PCI_配置读32(总线, 设备号, 功能号, 0x00)
+                定义 厂商ID = 厂商设备 & 0xFFFF
+                定义 设备ID = (厂商设备 >> 16) & 0xFFFF
+
+                如果 (厂商ID == 0xFFFF || 厂商ID == 0) {
+                    功能号 = 功能号 + 1
+                    继续
+                }
+
+                // 读取类代码
+                定义 类信息 = PCI_配置读32(总线, 设备号, 功能号, 0x08)
+                定义 类代码 = (类信息 >> 24) & 0xFF
+                定义 子类 = (类信息 >> 16) & 0xFF
+
+                // ★ 检查是否是显示控制器(类代码0x03)
+                如果 (类代码 == PCI_CLASS_显示) {
+                    定义 gpu = 图处_创建设备(总线, 设备号, 功能号, 厂商ID, 设备ID, 子类)
+                    如果 (gpu != 空) {
+                        追加(图处列表, gpu)
+                        图处_打印信息(gpu)
+                    }
+                }
+
+                功能号 = 功能号 + 1
+            }
+            设备号 = 设备号 + 1
+        }
+        总线 = 总线 + 1
+    }
+
+    // 选择主图处和计算图处
+    图处_选择主设备()
+
+    内核信息("图处枚举: 发现 " + 整数转字符串(计数(图处列表)) + " 个图处设备")
+}
+
+// §4 图处设备创建与识别
+
+函数 图处_创建设备(总线, 设备号, 功能号, 厂商ID, 设备ID, 子类) {
+    定义 gpu = 图处设备 {}
+    gpu.PCI总线 = 总线
+    gpu.PCI设备 = 设备号
+    gpu.PCI功能 = 功能号
+    gpu.厂商ID = 厂商ID
+    gpu.设备ID = 设备ID
+    gpu.类代码 = PCI_CLASS_显示
+    gpu.子类代码 = 子类
+    gpu.已初始化 = 假
+    gpu.命令队列地址 = 0
+    gpu.中断号 = 0
+
+    定义 子系统 = PCI_配置读32(总线, 设备号, 功能号, 0x2C)
+    gpu.子系统厂商ID = 子系统 & 0xFFFF
+    gpu.子系统设备ID = (子系统 >> 16) & 0xFFFF
+    gpu.修订版本 = PCI_配置读32(总线, 设备号, 功能号, 0x08) & 0xFF
+
+    gpu.BAR0_地址 = PCI_读BAR(总线, 设备号, 功能号, 0)
+    gpu.BAR0_大小 = PCI_BAR大小(总线, 设备号, 功能号, 0)
+    gpu.BAR1_地址 = PCI_读BAR(总线, 设备号, 功能号, 1)
+    gpu.BAR1_大小 = PCI_BAR大小(总线, 设备号, 功能号, 1)
+    gpu.BAR2_地址 = PCI_读BAR(总线, 设备号, 功能号, 2)
+    gpu.BAR2_大小 = PCI_BAR大小(总线, 设备号, 功能号, 2)
+
+    图处_识别(gpu)
+    返回 gpu
+}
+
+函数 图处_识别(gpu) {
+    如果 (gpu.厂商ID == 图处_VENDOR_NVIDIA) {
+        gpu.厂商名 = "NVIDIA"
+        gpu.驱动类型 = "nvidia"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_COMPUTE | 图处_CAP_VULKAN | 图处_CAP_VIDEO_DECODE | 图处_CAP_VIDEO_ENCODE | 图处_CAP_DISPLAY
+        图处_识别_NVIDIA(gpu)
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_AMD) {
+        gpu.厂商名 = "AMD"
+        gpu.驱动类型 = "amdgpu"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_COMPUTE | 图处_CAP_VULKAN | 图处_CAP_VIDEO_DECODE | 图处_CAP_DISPLAY
+        图处_识别_AMD(gpu)
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_INTEL) {
+        gpu.厂商名 = "Intel"
+        gpu.驱动类型 = "i915"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_VULKAN | 图处_CAP_VIDEO_DECODE | 图处_CAP_DISPLAY
+        图处_识别_Intel(gpu)
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_VIRTIO) {
+        gpu.厂商名 = "VirtIO"
+        gpu.驱动类型 = "virtio-gpu"
+        gpu.型号名 = "VirtIO GPU"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_DISPLAY
+        gpu.显存大小_MB = 256
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_VMWARE) {
+        gpu.厂商名 = "VMware"
+        gpu.驱动类型 = "vmwgfx"
+        gpu.型号名 = "VMware SVGA"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_DISPLAY
+        gpu.显存大小_MB = 128
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_QEMU) {
+        gpu.厂商名 = "QEMU"
+        gpu.驱动类型 = "bochs-drm"
+        gpu.型号名 = "QEMU Standard VGA"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_DISPLAY
+        gpu.显存大小_MB = 16
+    } 否则 {
+        gpu.厂商名 = "未知(0x" + 十六进制(gpu.厂商ID) + ")"
+        gpu.驱动类型 = "generic"
+        gpu.型号名 = "未知图处"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_DISPLAY
+    }
+}
+
+函数 图处_识别_NVIDIA(gpu) {
+    定义 did = gpu.设备ID
+    如果 (did >= 0x2200 && did <= 0x22FF) { gpu.型号名 = "RTX 4090/4080"; gpu.显存大小_MB = 16384; gpu.计算单元数 = 128; gpu.能力 = gpu.能力 | 图处_CAP_RAY_TRACE | 图处_CAP_智能_ACCEL }
+    否则 如果 (did >= 0x2500 && did <= 0x25FF) { gpu.型号名 = "RTX 3090/3080"; gpu.显存大小_MB = 12288; gpu.计算单元数 = 82; gpu.能力 = gpu.能力 | 图处_CAP_RAY_TRACE | 图处_CAP_智能_ACCEL }
+    否则 如果 (did >= 0x1E00 && did <= 0x1EFF) { gpu.型号名 = "RTX 2080 Ti"; gpu.显存大小_MB = 11264; gpu.计算单元数 = 68; gpu.能力 = gpu.能力 | 图处_CAP_RAY_TRACE }
+    否则 如果 (did >= 0x1B00 && did <= 0x1BFF) { gpu.型号名 = "GTX 1080 Ti"; gpu.显存大小_MB = 11264; gpu.计算单元数 = 28 }
+    否则 { gpu.型号名 = "NVIDIA GPU(0x" + 十六进制(did) + ")"; gpu.显存大小_MB = 4096; gpu.计算单元数 = 16 }
+}
+
+函数 图处_识别_AMD(gpu) {
+    gpu.型号名 = "AMD GPU(0x" + 十六进制(gpu.设备ID) + ")"
+    gpu.显存大小_MB = 4096
+    gpu.计算单元数 = 32
+}
+
+函数 图处_识别_Intel(gpu) {
+    gpu.型号名 = "Intel GPU(0x" + 十六进制(gpu.设备ID) + ")"
+    gpu.显存大小_MB = 0
+    gpu.计算单元数 = 32
+}
+
+// §5 主图处选择
+
+函数 图处_选择主设备() {
+    主图处 = 空
+    计算图处 = 空
+    定义 可变 最大显存 = 0
+    定义 可变 最大计算 = 0
+    定义 可变 i = 0
+    当 (i < 计数(图处列表)) {
+        定义 gpu = 图处列表[i]
+        如果 (gpu.能力 & 图处_CAP_DISPLAY) {
+            如果 (gpu.显存大小_MB > 最大显存) {
+                最大显存 = gpu.显存大小_MB
+                主图处 = gpu
+            }
+        }
+        如果 (gpu.能力 & 图处_CAP_COMPUTE) {
+            如果 (gpu.计算单元数 > 最大计算) {
+                最大计算 = gpu.计算单元数
+                计算图处 = gpu
+            }
+        }
+        i = i + 1
+    }
+    如果 (主图处 == 空 && 计数(图处列表) > 0) { 主图处 = 图处列表[0] }
+    如果 (计算图处 == 空) { 计算图处 = 主图处 }
+}
+
+函数 图处_获取主设备() { 返回 主图处 }
+函数 图处_获取计算设备() { 返回 计算图处 }
+函数 图处_设备数() { 返回 计数(图处列表) }
+
+函数 图处_获取设备(索引) {
+    如果 (索引 < 0 || 索引 >= 计数(图处列表)) { 返回 空 }
+    返回 图处列表[索引]
+}
+
+// §6 PCI辅助函数
+
+函数 PCI_配置读32(总线, 设备, 功能, 偏移) {
+    定义 地址 = 0x80000000 | (总线 << 16) | (设备 << 11) | (功能 << 8) | (偏移 & 0xFC)
+    端口_写32(0xCF8, 地址)
+    返回 端口_读32(0xCFC)
+}
+
+函数 PCI_读BAR(总线, 设备, 功能, BAR号) {
+    定义 偏移 = 0x10 + BAR号 * 4
+    定义 值 = PCI_配置读32(总线, 设备, 功能, 偏移)
+    返回 值 & 0xFFFFFFF0
+}
+
+函数 PCI_BAR大小(总线, 设备, 功能, BAR号) {
+    定义 偏移 = 0x10 + BAR号 * 4
+    定义 原始 = PCI_配置读32(总线, 设备, 功能, 偏移)
+    PCI_配置写32(总线, 设备, 功能, 偏移, 0xFFFFFFFF)
+    定义 掩码 = PCI_配置读32(总线, 设备, 功能, 偏移)
+    PCI_配置写32(总线, 设备, 功能, 偏移, 原始)
+    返回 ~(掩码 & 0xFFFFFFF0) + 1
+}
+
+函数 PCI_配置写32(总线, 设备, 功能, 偏移, 值) {
+    定义 地址 = 0x80000000 | (总线 << 16) | (设备 << 11) | (功能 << 8) | (偏移 & 0xFC)
+    端口_写32(0xCF8, 地址)
+    端口_写32(0xCFC, 值)
+}
+
+// §7 图处信息打印与统计
+
+函数 图处_打印信息(gpu) {
+    如果 (gpu == 空) { 返回 }
+    内核信息("  图处: " + gpu.厂商名 + " " + gpu.型号名)
+    内核信息("    PCI: " + 整数转字符串(gpu.PCI总线) + ":" +
+             整数转字符串(gpu.PCI设备) + "." + 整数转字符串(gpu.PCI功能))
+    内核信息("    ID: " + 十六进制(gpu.厂商ID) + ":" + 十六进制(gpu.设备ID))
+    内核信息("    驱动: " + gpu.驱动类型 + " 显存: " + 整数转字符串(gpu.显存大小_MB) + "MB")
+    内核信息("    BAR0: " + 十六进制(gpu.BAR0_地址) + " (" + 整数转字符串(gpu.BAR0_大小 / 1024 / 1024) + "MB)")
+    内核信息("    能力: " + 图处_能力字符串(gpu.能力))
+}
+
+函数 图处_能力字符串(能力) {
+    定义 可变 s = ""
+    如果 (能力 & 图处_CAP_2D) { s = s + "2D " }
+    如果 (能力 & 图处_CAP_3D) { s = s + "3D " }
+    如果 (能力 & 图处_CAP_COMPUTE) { s = s + "Compute " }
+    如果 (能力 & 图处_CAP_VULKAN) { s = s + "Vulkan " }
+    如果 (能力 & 图处_CAP_VIDEO_DECODE) { s = s + "VideoDec " }
+    如果 (能力 & 图处_CAP_VIDEO_ENCODE) { s = s + "VideoEnc " }
+    如果 (能力 & 图处_CAP_DISPLAY) { s = s + "Display " }
+    如果 (能力 & 图处_CAP_RAY_TRACE) { s = s + "RayTrace " }
+    如果 (能力 & 图处_CAP_智能_ACCEL) { s = s + "AI " }
+    返回 s
+}
+
+函数 图处_厂商名称(厂商ID) {
+    如果 (厂商ID == 图处_VENDOR_NVIDIA) { 返回 "NVIDIA" }
+    如果 (厂商ID == 图处_VENDOR_AMD) { 返回 "AMD" }
+    如果 (厂商ID == 图处_VENDOR_INTEL) { 返回 "Intel" }
+    如果 (厂商ID == 图处_VENDOR_VIRTIO) { 返回 "VirtIO" }
+    如果 (厂商ID == 图处_VENDOR_VMWARE) { 返回 "VMware" }
+    如果 (厂商ID == 图处_VENDOR_QEMU) { 返回 "QEMU" }
+    返回 "未知"
+}
+
+// §8 图处枚举统计与健康检查
+
+函数 图处枚举_健康检查() {
+    定义 可变 问题 = []
+    如果 (计数(图处列表) == 0) { 追加(问题, "未发现图处设备") }
+    如果 (主图处 == 空) { 追加(问题, "无主显示图处") }
+    如果 (计数(问题) == 0) { 返回 "图处枚举健康" }
+    返回 问题
+}
+
+函数 图处枚举_统计() {
+    返回 {
+        设备数: 计数(图处列表),
+        有主图处: 主图处 != 空,
+        有计算图处: 计算图处 != 空,
+        总显存MB: 图处_总显存MB(),
+    }
+}
+
+函数 图处_总显存MB() {
+    定义 可变 总 = 0
+    定义 可变 i = 0
+    当 (i < 计数(图处列表)) {
+        总 = 总 + 图处列表[i].显存大小_MB
+        i = i + 1
+    }
+    返回 总
+}

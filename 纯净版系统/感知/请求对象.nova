@@ -1,0 +1,130 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./资源取数.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/辅助存根.nova")
+导入("../标准/加法运算符.nova")
+
+// §2 Request对象
+
+结构 取数Request {
+    URL,    // u64 URL字符串
+    方法,    // u64 "GET"/"POST"/...
+    头,    // u64 取数Headers*
+    体,    // u64 body数据
+    体长度,
+    模式,    // u32 0=cors 1=no-cors 2=same-origin 3=navigate
+    凭证,    // u32 0=omit 1=same-origin 2=include
+    缓存,    // u32 0=default 1=no-store 2=reload 3=no-cache 4=force-cache
+    重定向,    // u32 0=follow 1=error 2=manual
+    引荐者,
+    引荐者策略,
+    完整性,    // u64 SRI hash
+    信号,    // u64 AbortSignal*
+    保活,    // 布尔 keepalive
+}
+
+函数 取数Request_创建(url, 选项) {
+    定义 req = 堆_分配(取数Request)
+    req.URL = 字符串_复制(url)
+    req.方法 = 字符串_复制("GET")
+    req.头 = 取数Headers_创建()
+    req.体 = 0; req.体长度 = 0
+    req.模式 = 0
+    req.凭证 = 1    // same-origin
+    req.缓存 = 0
+    req.重定向 = 0  // follow
+    req.引荐者 = 0
+    req.完整性 = 0
+    req.信号 = 0
+    req.保活 = 假
+
+    // 从选项对象解析(JS对象)
+    如果 (选项 != 0) {
+        // method
+        定义 method_val = Nova对象_获取属性(0, 选项, "method")
+        如果 (method_val != 0 && !JSValue_IsUndefined(method_val)) {
+            req.方法 = JSValue_获取字符串(JSValue_ToString(0, method_val))
+        }
+        // headers
+        定义 headers_val = Nova对象_获取属性(0, 选项, "headers")
+        如果 (headers_val != 0 && !JSValue_IsUndefined(headers_val)) {
+            // 从JS对象遍历键值对构建Headers
+        }
+        // body
+        定义 body_val = Nova对象_获取属性(0, 选项, "body")
+        如果 (body_val != 0 && !JSValue_IsUndefined(body_val)) {
+            定义 body_str = JSValue_获取字符串(JSValue_ToString(0, body_val))
+            如果 (body_str != 0) {
+                req.体 = body_str
+                req.体长度 = 字符串_长度(body_str)
+            }
+        }
+        // mode
+        定义 mode_val = Nova对象_获取属性(0, 选项, "mode")
+        如果 (mode_val != 0 && !JSValue_IsUndefined(mode_val)) {
+            定义 mode_str = JSValue_获取字符串(JSValue_ToString(0, mode_val))
+            如果 (字符串_相等(mode_str, "no-cors")) { req.模式 = 1 }
+            否则 如果 (字符串_相等(mode_str, "same-origin")) { req.模式 = 2 }
+        }
+        // credentials
+        定义 cred_val = Nova对象_获取属性(0, 选项, "credentials")
+        如果 (cred_val != 0 && !JSValue_IsUndefined(cred_val)) {
+            定义 cred_str = JSValue_获取字符串(JSValue_ToString(0, cred_val))
+            如果 (字符串_相等(cred_str, "omit")) { req.凭证 = 0 }
+            否则 如果 (字符串_相等(cred_str, "include")) { req.凭证 = 2 }
+        }
+        // signal (AbortController)
+        定义 signal_val = Nova对象_获取属性(0, 选项, "signal")
+        如果 (signal_val != 0 && !JSValue_IsUndefined(signal_val)) {
+            req.信号 = signal_val
+        }
+    }
+
+    返回 req
+}
+
+// §3 Response对象
+
+结构 取数Response {
+    状态码,
+    状态文本,
+    头,    // u64 取数Headers*
+    体数据,    // u64 body缓冲区
+    体长度,
+    类型,    // u32 0=basic 1=cors 2=error 3=opaque 4=opaqueredirect
+    URL,    // u64 最终URL(重定向后)
+    是否重定向,
+    OK,    // 布尔 status 200-299
+}
+
+函数 取数Response_创建(状态码, 体数据, 体长度, 响应头) {
+    定义 resp = 堆_分配(取数Response)
+    resp.状态码 = 状态码
+    resp.状态文本 = 字符串_复制("OK")
+    如果 (状态码 == 404) { resp.状态文本 = 字符串_复制("Not Found") }
+    否则 如果 (状态码 == 500) { resp.状态文本 = 字符串_复制("Internal Server 错误") }
+    否则 如果 (状态码 == 301 || 状态码 == 302) { resp.状态文本 = 字符串_复制("Moved") }
+
+    resp.头 = 取数Headers_创建()
+    resp.头.保护级别 = 3    // response
+    // 复制响应头
+    如果 (响应头 != 0) {
+        定义 可变 i = 0
+        当 (i < 响应头.数量) {
+            定义 偏移 = 响应头.条目 + i * 32
+            取数Headers_append(resp.头, 内存_读64(偏移), 内存_读64(偏移 + 16))
+            i = i + 1
+        }
+    }
+
+    resp.体数据 = 体数据
+    resp.体长度 = 体长度
+    resp.类型 = 0
+    resp.URL = 0
+    resp.是否重定向 = 假
+    resp.OK = (状态码 >= 200 && 状态码 <= 299)
+    返回 resp
+}

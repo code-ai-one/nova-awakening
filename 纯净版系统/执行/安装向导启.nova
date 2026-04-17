@@ -1,0 +1,179 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./协议处理.nova")
+
+// NovaOS 安装向导 — 图形化系统安装程序
+// 从ISO启动→分区→复制→引导写入→AI初始化→进入桌面
+// 安装流程:
+//   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+//   │ 1.欢迎  │→│ 2.语言  │→│ 3.磁盘  │→│ 4.分区  │
+//   └─────────┘  └─────────┘  └─────────┘  └─────────┘
+//        ↓
+//   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+//   │ 5.用户  │→│ 6.AI设置│→│ 7.安装  │→│ 8.完成  │
+//   └─────────┘  └─────────┘  └─────────┘  └─────────┘
+
+// §1 安装状态
+
+定义 步骤_欢迎   = 0
+定义 步骤_语言   = 1
+定义 步骤_磁盘   = 2
+定义 步骤_分区   = 3
+定义 步骤_用户   = 4
+定义 步骤_AI设置 = 5
+定义 步骤_安装   = 6
+定义 步骤_完成   = 7
+
+结构 安装配置 {
+    语言,    // 字符串 "zh_CN" / "en_US"
+    时区,    // 字符串 "Asia/Shanghai"
+    键盘布局,    // 字符串 "us" / "cn"
+    目标磁盘,    // 字符串 "/dev/sda" / "/dev/vda"
+    分区方案,    // u32 0=自动 1=手动
+    EFI分区,    // 字符串 "/dev/sda1" 512MB
+    根分区,    // 字符串 "/dev/sda2" 剩余空间
+    交换分区,    // 字符串 "/dev/sda3" 4GB
+    用户名,
+    密码哈希,
+    主机名,
+    AI模式,    // u32 0=云端优先 1=本地优先 2=混合
+    智能_接口密钥,    // 字符串 云端接口密钥(可选)
+    安装进度,    // u32 0-100
+    当前步骤,
+}
+
+定义 可变 安装 = 安装配置 {}
+定义 屏幕宽 = 1920
+定义 屏幕高 = 1080
+
+// §2 安装向导入口
+
+函数 安装向导_启动() {
+    // 默认配置
+    安装.语言 = "zh_CN"
+    安装.时区 = "Asia/Shanghai"
+    安装.键盘布局 = "us"
+    安装.分区方案 = 0
+    安装.AI模式 = 0  // 云端优先(初始阶段)
+    安装.主机名 = "nova-desktop"
+    安装.目标磁盘 = "(未选择)"
+    安装.用户名 = "(未创建)"
+    安装.密码哈希 = ""
+    安装.智能_接口密钥 = ""
+    安装.当前步骤 = 步骤_欢迎
+    安装.安装进度 = 0
+}
+
+函数 安装向导_获取当前步骤名() {
+    如果 (安装.当前步骤 == 步骤_欢迎) { 返回 "欢迎" }
+    如果 (安装.当前步骤 == 步骤_语言) { 返回 "语言" }
+    如果 (安装.当前步骤 == 步骤_磁盘) { 返回 "磁盘" }
+    如果 (安装.当前步骤 == 步骤_分区) { 返回 "分区" }
+    如果 (安装.当前步骤 == 步骤_用户) { 返回 "用户" }
+    如果 (安装.当前步骤 == 步骤_AI设置) { 返回 "AI设置" }
+    如果 (安装.当前步骤 == 步骤_安装) { 返回 "安装中" }
+    如果 (安装.当前步骤 == 步骤_完成) { 返回 "完成" }
+    返回 "未知"
+}
+
+函数 安装向导_下一步() {
+    如果 (安装.当前步骤 < 步骤_完成) {
+        安装.当前步骤 = 安装.当前步骤 + 1
+    }
+}
+
+函数 安装向导_上一步() {
+    如果 (安装.当前步骤 > 步骤_欢迎) {
+        安装.当前步骤 = 安装.当前步骤 - 1
+    }
+}
+
+// §3 界面绘制
+
+函数 安装向导_生成步骤进度NML() {
+    定义 步骤名列表 = ["欢迎", "语言", "磁盘", "分区", "用户", "AI设置", "安装", "完成"]
+    定义 可变 html = "<div class='setup-progress'>"
+    定义 可变 i = 0
+    当 (i < 8) {
+        定义 可变 cls = "setup-step"
+        如果 (i < 安装.当前步骤) { cls = cls + " done" }
+        否则 如果 (i == 安装.当前步骤) { cls = cls + " active" }
+        html = html + "<span class='" + cls + "'>" + 步骤名列表[i] + "</span>"
+        i = i + 1
+    }
+    html = html + "</div>"
+    返回 html
+}
+
+函数 安装向导_生成当前步骤内容NML() {
+    定义 步骤 = 安装.当前步骤
+    定义 可变 html = ""
+    如果 (步骤 == 步骤_欢迎) {
+        html = "<h2>欢迎使用 NovaOS</h2><p>系统即模型 · 模型即浏览器 · 浏览器即桌面</p><p>接下来的步骤将引导你完成 NovaOS 安装，包括磁盘分区、用户创建和 AI 初始化。</p>"
+    } 否则 如果 (步骤 == 步骤_语言) {
+        html = "<h2>语言与区域</h2><p>当前语言: " + 浏览器网络_转义HTML(安装.语言) + "</p><p>时区: " + 浏览器网络_转义HTML(安装.时区) + "</p><p>键盘布局: " + 浏览器网络_转义HTML(安装.键盘布局) + "</p>"
+    } 否则 如果 (步骤 == 步骤_磁盘) {
+        html = "<h2>选择目标磁盘</h2><p>当前目标: " + 浏览器网络_转义HTML(安装.目标磁盘) + "</p><p>将在此磁盘上创建 EFI + 根 + 交换分区。</p>"
+    } 否则 如果 (步骤 == 步骤_分区) {
+        定义 可变 分区模式 = "自动"
+        如果 (安装.分区方案 != 0) { 分区模式 = "手动" }
+        html = "<h2>分区方案</h2><p>模式: " + 分区模式 + "</p><p>EFI: 512MB · 根分区: 剩余 · 交换: 4GB</p>"
+    } 否则 如果 (步骤 == 步骤_用户) {
+        html = "<h2>创建用户</h2><p>用户名: " + 浏览器网络_转义HTML(安装.用户名) + "</p><p>主机名: " + 浏览器网络_转义HTML(安装.主机名) + "</p>"
+    } 否则 如果 (步骤 == 步骤_AI设置) {
+        定义 可变 模式名 = "云端优先"
+        如果 (安装.AI模式 == 1) { 模式名 = "本地优先" }
+        如果 (安装.AI模式 == 2) { 模式名 = "混合" }
+        定义 可变 密钥状态 = "未设置(可选)"
+        如果 (字符串长度(安装.智能_接口密钥) > 0) { 密钥状态 = "已设置" }
+        html = "<h2>AI 初始化</h2><p>推理模式: " + 模式名 + "</p><p>云端 接口 密钥: " + 密钥状态 + "</p>"
+    } 否则 如果 (步骤 == 步骤_安装) {
+        html = "<h2>正在安装</h2><div class='setup-bar'><span style='width:" + 整数转字符串(安装.安装进度) + "%'></span></div><p>进度: " + 整数转字符串(安装.安装进度) + "%</p>"
+    } 否则 如果 (步骤 == 步骤_完成) {
+        html = "<h2>安装完成</h2><p>NovaOS 已就绪。重启后将进入 browser-终端 桌面。</p>"
+    }
+    返回 html
+}
+
+函数 安装向导_生成页面NML() {
+    定义 可变 html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>NovaOS Setup</title>"
+    html = html + "<style>" + 安装向导_生成页面CSS() + "</style></head>"
+    html = html + "<body class='setup-body'>"
+    html = html + "<header class='setup-header'><span class='setup-brand'>NovaOS Setup</span>" + 安装向导_生成步骤进度NML() + "</header>"
+    html = html + "<main class='setup-main'><div class='setup-card'>" + 安装向导_生成当前步骤内容NML() + "</div></main>"
+    如果 (安装.当前步骤 != 步骤_安装) {
+        html = html + "<footer class='setup-footer'>"
+        如果 (安装.当前步骤 > 步骤_欢迎) {
+            html = html + "<button class='setup-btn'>上一步</button>"
+        }
+        如果 (安装.当前步骤 < 步骤_完成) {
+            html = html + "<button class='setup-btn primary'>下一步</button>"
+        }
+        html = html + "</footer>"
+    }
+    html = html + "</body></html>"
+    返回 html
+}
+
+函数 安装向导_生成页面CSS() {
+    定义 可变 css = "*{margin:0;padding:0;box-sizing:border-box;}"
+    css = css + "body.setup-body{background:#060811;color:#e0e4f0;font-family:'Nova Sans',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column;}"
+    css = css + ".setup-header{padding:18px 28px;display:flex;align-items:center;gap:24px;background:rgba(9,11,19,0.82);backdrop-filter:blur(20px);border-bottom:1px solid rgba(255,255,255,0.06);}"
+    css = css + ".setup-brand{font-size:16px;font-weight:700;color:#8b9cff;letter-spacing:0.12em;text-transform:uppercase;}"
+    css = css + ".setup-progress{display:flex;gap:6px;flex-wrap:wrap;}"
+    css = css + ".setup-step{padding:6px 12px;border-radius:999px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);color:#8888aa;}"
+    css = css + ".setup-step.active{background:rgba(124,58,237,0.22);border-color:rgba(124,58,237,0.36);color:#ffffff;}"
+    css = css + ".setup-step.done{background:rgba(34,197,94,0.14);border-color:rgba(34,197,94,0.22);color:#a7f3d0;}"
+    css = css + ".setup-main{flex:1;display:flex;align-items:center;justify-content:center;padding:32px;}"
+    css = css + ".setup-card{max-width:720px;width:100%;padding:36px 40px;border-radius:28px;background:rgba(11,14,24,0.78);border:1px solid rgba(255,255,255,0.07);box-shadow:0 24px 64px rgba(0,0,0,0.32);backdrop-filter:blur(20px);}"
+    css = css + ".setup-card h2{font-size:28px;color:#fbfbff;margin-bottom:16px;}"
+    css = css + ".setup-card p{font-size:14px;line-height:1.7;color:#b8bfd3;margin-bottom:10px;}"
+    css = css + ".setup-bar{height:10px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden;margin:14px 0;}"
+    css = css + ".setup-bar span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#3b82f6,#22c55e);}"
+    css = css + ".setup-footer{padding:18px 28px;display:flex;justify-content:flex-end;gap:12px;background:rgba(9,11,19,0.7);border-top:1px solid rgba(255,255,255,0.06);}"
+    css = css + ".setup-btn{padding:10px 22px;border-radius:14px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:#d5daec;font-size:13px;cursor:pointer;}"
+    css = css + ".setup-btn.primary{background:linear-gradient(135deg,#7c3aed,#2563eb);color:#ffffff;border-color:rgba(124,58,237,0.36);box-shadow:0 8px 20px rgba(76,29,149,0.3);}"
+    返回 css
+}

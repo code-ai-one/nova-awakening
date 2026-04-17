@@ -1,0 +1,168 @@
+导入("./类型.nova")
+导入("../中枢/整数转字符串.nova")
+
+// NovaOS · MIME类型注册表
+// §1 MIME条目结构与内置类型表
+// §2 扩展名→MIME查找
+// §3 MIME→默认打开程序 关联
+// §4 动态注册/注销
+
+
+结构 MIME条目 {
+    扩展名,     // 字符串 (不含点)
+    类型,       // 字符串 (如 "text/plain")
+    描述,
+    默认程序,   // 字符串 (可执行名或空)
+    图标,       // 字符串 (图标路径或空)
+}
+
+定义 可变 _MIME表 = []
+定义 可变 _MIME已初始化 = 假
+
+函数 MIME_初始化() {
+    如果 (_MIME已初始化) { 返回 }
+    _MIME表 = []
+
+    MIME_注册("nova",   "text/x-nova",          "Nova源码",         "龙文",     "")
+    MIME_注册("txt",    "text/plain",            "纯文本",           "龙文",     "")
+    MIME_注册("md",     "text/markdown",         "Markdown文档",     "龙文",     "")
+    MIME_注册("json",   "application/json",      "JSON数据",         "龙文",     "")
+    MIME_注册("xml",    "application/xml",       "XML文档",          "龙文",     "")
+    MIME_注册("csv",    "text/csv",              "逗号分隔值",       "龙文",     "")
+    MIME_注册("conf",   "text/x-config",         "配置文件",         "龙文",     "")
+    MIME_注册("cfg",    "text/x-config",         "配置文件",         "龙文",     "")
+    MIME_注册("log",    "text/x-log",            "日志文件",         "龙文",     "")
+    MIME_注册("sh",     "text/x-shellscript",    "Shell脚本",        "龙文",     "")
+
+    MIME_注册("png",    "image/png",             "PNG图像",          "图片查看", "")
+    MIME_注册("jpg",    "image/jpeg",            "JPEG图像",         "图片查看", "")
+    MIME_注册("jpeg",   "image/jpeg",            "JPEG图像",         "图片查看", "")
+    MIME_注册("gif",    "image/gif",             "GIF动画",          "图片查看", "")
+    MIME_注册("bmp",    "image/bmp",             "BMP位图",          "图片查看", "")
+    MIME_注册("svg",    "image/svg+xml",         "SVG矢量图",       "图片查看", "")
+    MIME_注册("ico",    "image/x-icon",          "图标",             "图片查看", "")
+
+    MIME_注册("mp3",    "audio/mpeg",            "MP3音频",          "音乐播放", "")
+    MIME_注册("wav",    "audio/wav",             "WAV音频",          "音乐播放", "")
+    MIME_注册("ogg",    "audio/ogg",             "OGG音频",          "音乐播放", "")
+    MIME_注册("mp4",    "video/mp4",             "MP4视频",          "视频播放", "")
+    MIME_注册("avi",    "video/x-msvideo",       "AVI视频",          "视频播放", "")
+    MIME_注册("mkv",    "video/x-matroska",      "MKV视频",          "视频播放", "")
+
+    MIME_注册("napp",   "application/x-nova-app", "Nova应用Bundle",  "Bundle加载器", "")
+    MIME_注册("nsvc",   "application/x-nova-svc", "Nova服务Bundle",  "Bundle加载器", "")
+    MIME_注册("nsys",   "application/x-nova-sys", "Nova系统Bundle",  "Bundle加载器", "")
+    MIME_注册("elf",    "application/x-elf",      "ELF可执行",       "",          "")
+    MIME_注册("zip",    "application/zip",         "ZIP压缩包",       "归档管理", "")
+    MIME_注册("tar",    "application/x-tar",       "TAR归档",         "归档管理", "")
+    MIME_注册("gz",     "application/gzip",        "GZIP压缩",       "归档管理", "")
+
+    MIME_注册("ttf",    "font/ttf",              "TrueType字体",    "",          "")
+    MIME_注册("otf",    "font/otf",              "OpenType字体",    "",          "")
+    MIME_注册("woff",   "font/woff",             "Web字体",         "",          "")
+
+    _MIME已初始化 = 真
+}
+
+
+函数 MIME_按扩展名(扩展名) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) { 返回 _MIME表[i].类型 }
+        i = i + 1
+    }
+    返回 "application/octet-stream"
+}
+
+函数 MIME_按文件名(文件名) {
+    // 提取扩展名
+    定义 可变 点位 = -1
+    定义 可变 i = 字串_长度(文件名) - 1
+    当 (i >= 0) {
+        如果 (字串_取(文件名, i) == 46) { 点位 = i; i = -1 }   // '.'=46
+        i = i - 1
+    }
+    如果 (点位 < 0) { 返回 "application/octet-stream" }
+    定义 扩展 = 字串_子串(文件名, 点位 + 1, 字串_长度(文件名))
+    返回 MIME_按扩展名(扩展)
+}
+
+函数 MIME_描述(扩展名) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) { 返回 _MIME表[i].描述 }
+        i = i + 1
+    }
+    返回 "未知文件类型"
+}
+
+函数 MIME_默认程序(扩展名) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) { 返回 _MIME表[i].默认程序 }
+        i = i + 1
+    }
+    返回 ""
+}
+
+函数 MIME_查找条目(扩展名) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) { 返回 _MIME表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+
+函数 MIME_设默认程序(扩展名, 程序) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) {
+            _MIME表[i].默认程序 = 程序
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+
+函数 MIME_注册(扩展名, 类型, 描述, 默认程序, 图标) {
+    定义 条目 = MIME条目 {}
+    条目.扩展名 = 扩展名
+    条目.类型 = 类型
+    条目.描述 = 描述
+    条目.默认程序 = 默认程序
+    条目.图标 = 图标
+    追加(_MIME表, 条目)
+}
+
+函数 MIME_注销(扩展名) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        如果 (_MIME表[i].扩展名 == 扩展名) {
+            列表_移除(_MIME表, i)
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 MIME_总数() { 返回 计数(_MIME表) }
+
+函数 MIME_报告() {
+    定义 可变 r = "═══ MIME类型注册表 ═══\n"
+    r = r + "已注册: " + 整数转字符串(计数(_MIME表)) + " 种\n"
+    定义 可变 i = 0
+    当 (i < 计数(_MIME表)) {
+        r = r + "  ." + _MIME表[i].扩展名 + " → " + _MIME表[i].类型
+        如果 (_MIME表[i].默认程序 != "") {
+            r = r + " [" + _MIME表[i].默认程序 + "]"
+        }
+        r = r + "\n"
+        i = i + 1
+    }
+    返回 r
+}

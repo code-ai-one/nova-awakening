@@ -1,0 +1,139 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./跨域控制请求.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./安全策主机.nova")
+导入("./暴露头过滤.nova")
+导入("./来源解析.nova")
+导入("../外联/发送请求解.nova")
+导入("../外联/域名缓存.nova")
+导入("../中枢/字符串替换.nova")
+
+// §4 预检请求(Preflight)
+
+结构 PreflightRequest {
+    目标URL,
+    源,    // u64 Origin*
+    方法,    // u64 实际请求方法
+    自定义头,    // u64 自定义请求头列表
+    自定义头数,
+}
+
+函数 CORS_发送预检(preflight) {
+    如果 (preflight == 0) { 返回 0 }
+    // 构造OPTIONS请求
+    // Headers:
+    //   Origin: <请求源>
+    //   Access-Control-Request-Method: <实际方法>
+    //   Access-Control-Request-Headers: <自定义头列表>
+    定义 options_request = 堆_分配(64)
+    // ... 构造请求 ...
+
+    // 发送OPTIONS
+    定义 响应 = 取数_完整链路(options_request)
+    如果 (响应 == 0) { 返回 CORS_拒绝("预检请求失败") }
+
+    // 检查预检响应
+    定义 result = CORS_检查响应(preflight.源, 响应, 假)
+    如果 (!result.允许) { 返回 result }
+
+    // 检查 Access-Control-Allow-Methods
+    定义 allow_methods = HTTP_获取响应头(响应, "Access-Control-Allow-Methods")
+    如果 (allow_methods != 0) {
+        如果 (!字符串_包含(allow_methods, preflight.方法) && !字符串_相等(allow_methods, "*")) {
+            result.允许 = 假
+            result.错误 = "方法不在Access-Control-Allow-Methods中"
+            返回 result
+        }
+    }
+
+    // 检查 Access-Control-Allow-Headers
+    定义 allow_headers = HTTP_获取响应头(响应, "Access-Control-Allow-Headers")
+    如果 (allow_headers != 0) {
+        result.允许头 = allow_headers
+    }
+
+    // Access-Control-Max-Age
+    定义 max_age = HTTP_获取响应头(响应, "Access-Control-Max-Age")
+    如果 (max_age != 0) {
+        result.最大缓存秒 = 字符串转整数(max_age)
+    }
+
+    返回 result
+}
+
+// §5 预检缓存
+
+结构 Preflight缓存Entry {
+    源,
+    目标URL,
+    允许方法,
+    允许头,
+    过期时间,
+    下一个,
+}
+
+定义 可变 预检缓存头 = 0
+
+函数 Preflight缓存_查找(源, url) {
+    定义 可变 entry = 预检缓存头
+    定义 现在 = 平台_获取时间ms()
+    当 (entry != 0) {
+        如果 (字符串_相等(entry.目标URL, url) && 现在 < entry.过期时间) {
+            返回 entry
+        }
+        entry = entry.下一个
+    }
+    返回 0
+}
+
+函数 Preflight缓存_存储(源, url, result) {
+    如果 (result == 0) { 返回 }
+    定义 entry = 堆_分配(Preflight缓存Entry)
+    entry.源 = 源; entry.目标URL = url
+    entry.允许方法 = result.允许方法; entry.允许头 = result.允许头
+    定义 ttl = result.最大缓存秒
+    如果 (ttl == 0) { ttl = 5 }    // 默认5秒
+    如果 (ttl > 7200) { ttl = 7200 }    // 最大2小时
+    entry.过期时间 = 平台_获取时间ms() + ttl * 1000
+    entry.下一个 = 预检缓存头; 预检缓存头 = entry
+}
+
+// §6 完整CORS流程
+
+函数 CORS_完整检查(请求URL, 请求方法, 请求头, 头数, 文档URL, 含凭证) {
+    // 1. 解析源
+    定义 请求源 = Origin_解析(文档URL)
+    定义 目标源 = Origin_解析(请求URL)
+
+    // 2. 同源检查
+    如果 (Origin_相等(请求源, 目标源)) {
+        返回 CORS_允许()    // 同源, 无需CORS
+    }
+
+    // 3. 判断是否需要预检
+    如果 (CORS_需要预检(请求方法, 请求头, 头数)) {
+        // 检查预检缓存
+        定义 cached = Preflight缓存_查找(请求源, 请求URL)
+        如果 (cached == 0) {
+            // 发送预检
+            定义 pf = 堆_分配(PreflightRequest)
+            pf.目标URL = 请求URL; pf.源 = 请求源; pf.方法 = 请求方法
+            pf.自定义头 = 请求头; pf.自定义头数 = 头数
+            定义 pf_result = CORS_发送预检(pf)
+            如果 (!pf_result.允许) { 返回 pf_result }
+            Preflight缓存_存储(请求源, 请求URL, pf_result)
+        }
+    }
+
+    // 4. 发送实际请求(附带Origin头)
+    // 5. 检查实际响应的CORS头
+    // (由调用方在收到响应后调用CORS_检查响应)
+    返回 CORS_允许()
+}
+
+函数 CORS_允许() {
+    定义 r = 堆_分配(CORSResult)
+    r.允许 = 真; r.错误 = 0
+    返回 r
+}

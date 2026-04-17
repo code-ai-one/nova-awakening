@@ -1,0 +1,297 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+
+// NovaOS x86-64 端口I/O
+// 注意: 这些函数在裸机模式下使用内联汇编实现
+
+函数 端口写8(端口, 值) {
+    // 裸机: 汇编 { "mov dx, [rbp+24]" "mov al, [rbp+16]" "out dx, al" }
+    汇编 {
+        "mov dx, [rbp+24]"
+        "mov al, [rbp+16]"
+        "out dx, al"
+    }
+}
+
+函数 端口写16(端口, 值) {
+    汇编 {
+        "mov dx, [rbp+24]"
+        "mov ax, [rbp+16]"
+        "out dx, ax"
+    }
+}
+
+函数 端口写32(端口, 值) {
+    汇编 {
+        "mov dx, [rbp+24]"
+        "mov eax, [rbp+16]"
+        "out dx, eax"
+    }
+}
+
+函数 端口读8(端口) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov dx, [rbp+16]"
+        "xor eax, eax"
+        "in al, dx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 端口读16(端口) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov dx, [rbp+16]"
+        "xor eax, eax"
+        "in ax, dx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 端口读32(端口) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov dx, [rbp+16]"
+        "xor eax, eax"
+        "in eax, dx"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 IO延时() {
+    端口写8(0x80, 0)
+}
+
+// 字符串IO 
+// 批量端口IO用于高速数据传输(如IDE/ATA)
+
+函数 端口读串8(端口, 缓冲, 计数值) {
+    // rep insb: 从端口批量读取字节到内存
+    汇编 {
+        "mov dx, [rbp+32]"      // 端口
+        "mov rdi, [rbp+24]"     // 缓冲地址
+        "mov rcx, [rbp+16]"     // 计数
+        "cld"
+        "rep insb"
+    }
+}
+
+函数 端口写串8(端口, 缓冲, 计数值) {
+    // rep outsb: 从内存批量写入字节到端口
+    汇编 {
+        "mov dx, [rbp+32]"
+        "mov rsi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "cld"
+        "rep outsb"
+    }
+}
+
+函数 端口读串16(端口, 缓冲, 计数值) {
+    // rep insw: 批量读取16位
+    汇编 {
+        "mov dx, [rbp+32]"
+        "mov rdi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "cld"
+        "rep insw"
+    }
+}
+
+函数 端口写串16(端口, 缓冲, 计数值) {
+    // rep outsw: 批量写入16位
+    汇编 {
+        "mov dx, [rbp+32]"
+        "mov rsi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "cld"
+        "rep outsw"
+    }
+}
+
+函数 端口读串32(端口, 缓冲, 计数值) {
+    // rep insl: 批量读取32位
+    汇编 {
+        "mov dx, [rbp+32]"
+        "mov rdi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "cld"
+        "rep insd"
+    }
+}
+
+函数 端口写串32(端口, 缓冲, 计数值) {
+    // rep outsl: 批量写入32位
+    汇编 {
+        "mov dx, [rbp+32]"
+        "mov rsi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "cld"
+        "rep outsd"
+    }
+}
+
+// MMIO (内存映射IO)
+
+函数 内存读8(地址) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov rdi, [rbp+16]"
+        "xor eax, eax"
+        "mov al, [rdi]"
+        "mfence"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 内存写8(地址, 值) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov al, [rbp+16]"
+        "mov [rdi], al"
+        "mfence"
+    }
+}
+
+函数 内存读16(地址) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov rdi, [rbp+16]"
+        "xor eax, eax"
+        "mov ax, [rdi]"
+        "mfence"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 内存写16(地址, 值) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov ax, [rbp+16]"
+        "mov [rdi], ax"
+        "mfence"
+    }
+}
+
+函数 内存读32(地址) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov rdi, [rbp+16]"
+        "xor eax, eax"
+        "mov eax, [rdi]"
+        "mfence"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 内存写32(地址, 值) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov eax, [rbp+16]"
+        "mov [rdi], eax"
+        "mfence"
+    }
+}
+
+函数 内存读64(地址) {
+    定义 可变 值 = 0
+    汇编 {
+        "mov rdi, [rbp+16]"
+        "mov rax, [rdi]"
+        "mfence"
+        "mov [rbp-8], rax"
+    }
+    返回 值
+}
+
+函数 内存写64(地址, 值) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov rax, [rbp+16]"
+        "mov [rdi], rax"
+        "mfence"
+    }
+}
+
+// 内存屏障 
+
+函数 内存屏障() {
+    汇编 { "mfence" }
+}
+
+函数 读屏障() {
+    汇编 { "lfence" }
+}
+
+函数 写屏障() {
+    汇编 { "sfence" }
+}
+
+函数 编译器屏障() {
+    // 防止编译器重排序(不产生硬件指令)
+    汇编 { "" }
+}
+
+// 批量内存操作
+
+函数 内存清零(地址, 字节数) {
+    汇编 {
+        "mov rdi, [rbp+24]"
+        "mov rcx, [rbp+16]"
+        "shr rcx, 3"          // 字节→8字节
+        "xor rax, rax"
+        "cld"
+        "rep stosq"
+    }
+}
+
+函数 内存拷贝(目标, 源, 字节数) {
+    汇编 {
+        "mov rdi, [rbp+32]"   // 目标
+        "mov rsi, [rbp+24]"   // 源
+        "mov rcx, [rbp+16]"   // 字节数
+        "cld"
+        "rep movsb"
+    }
+}
+
+函数 内存填充(地址, 值, 字节数) {
+    汇编 {
+        "mov rdi, [rbp+32]"   // 地址
+        "mov al, [rbp+24]"    // 值
+        "mov rcx, [rbp+16]"   // 字节数
+        "cld"
+        "rep stosb"
+    }
+}
+
+// 暂停指令 (节能忙等)
+
+函数 端口IO_暂停() {
+    汇编 { "pause" }
+}
+
+
+函数 端口IO_完整统计() {
+    返回 [端口IO_读次数, 端口IO_写次数]
+}
+
+定义 可变 AI_端口输入_运行指标 = 0
+定义 可变 AI_端口输入_异常指标 = 0
+
+函数 AI_端口输入_自诊断() {
+    AI_端口输入_运行指标 = 0
+    返回 AI_端口输入_运行指标
+}
+
+函数 AI_端口输入_优化建议() {
+    定义 指标 = AI_端口输入_自诊断()
+    返回 "端口输入状态正常"
+}

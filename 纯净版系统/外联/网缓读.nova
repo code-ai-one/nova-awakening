@@ -1,0 +1,109 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/字符串替换.nova")
+导入("./网缓分配.nova")
+导入("../引导/端口输入.nova")
+
+函数 Nova缓冲_读32(Nova缓冲, 偏移) {
+    定义 地址 = Nova缓冲[Nova缓冲_缓冲] + Nova缓冲[Nova缓冲_数据偏移] + 偏移
+    返回 (内存读8(地址) << 24) | (内存读8(地址 + 1) << 16) |
+           (内存读8(地址 + 2) << 8) | 内存读8(地址 + 3)
+}
+
+// 协议头定位
+
+// 设置各层协议头的位置
+函数 Nova缓冲_设置MAC头(Nova缓冲) {
+    设置(Nova缓冲, Nova缓冲_MAC头, Nova缓冲[Nova缓冲_数据偏移])
+}
+
+函数 Nova缓冲_设置网络头(Nova缓冲) {
+    设置(Nova缓冲, Nova缓冲_网络层头, Nova缓冲[Nova缓冲_数据偏移])
+}
+
+函数 Nova缓冲_设置传输头(Nova缓冲) {
+    设置(Nova缓冲, Nova缓冲_传输层头, Nova缓冲[Nova缓冲_数据偏移])
+}
+
+// 获取各层头在缓冲区中的地址
+函数 Nova缓冲_MAC头地址(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_缓冲] + Nova缓冲[Nova缓冲_MAC头] }
+函数 Nova缓冲_网络头地址(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_缓冲] + Nova缓冲[Nova缓冲_网络层头] }
+函数 Nova缓冲_传输头地址(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_缓冲] + Nova缓冲[Nova缓冲_传输层头] }
+
+// 克隆Nova网络缓冲 (共享数据, 独立头部元数据)
+
+函数 Nova缓冲_克隆(Nova缓冲) {
+    如果 (Nova缓冲 == 空) { 返回 空 }
+    定义 新Nova缓冲 = [
+        Nova缓冲[Nova缓冲_缓冲],          // 共享底层缓冲
+        Nova缓冲[Nova缓冲_头偏移],
+        Nova缓冲[Nova缓冲_数据偏移],
+        Nova缓冲[Nova缓冲_尾偏移],
+        Nova缓冲[Nova缓冲_尾端偏移],
+        Nova缓冲[Nova缓冲_长度],
+        Nova缓冲[Nova缓冲_协议],
+        Nova缓冲[Nova缓冲_传输层头],
+        Nova缓冲[Nova缓冲_网络层头],
+        Nova缓冲[Nova缓冲_MAC头],
+        Nova缓冲[Nova缓冲_设备],
+        1,                       // 新的引用计数
+        Nova缓冲[Nova缓冲_优先级],
+        Nova缓冲[Nova缓冲_标记],
+        Nova缓冲[Nova缓冲_时间戳]
+    ]
+    // 增加底层缓冲的引用 (实际应有单独的data refcount)
+    Nova缓冲_克隆次数 = Nova缓冲_克隆次数 + 1
+    返回 新Nova缓冲
+}
+
+// 完整拷贝 (数据也拷贝)
+函数 Nova缓冲_拷贝(Nova缓冲) {
+    如果 (Nova缓冲 == 空) { 返回 空 }
+    定义 新Nova缓冲 = Nova缓冲_分配(Nova缓冲[Nova缓冲_尾端偏移])
+    如果 (新Nova缓冲 == 空) { 返回 空 }
+    // 拷贝元数据
+    设置(新Nova缓冲, Nova缓冲_数据偏移, Nova缓冲[Nova缓冲_数据偏移])
+    设置(新Nova缓冲, Nova缓冲_尾偏移, Nova缓冲[Nova缓冲_尾偏移])
+    设置(新Nova缓冲, Nova缓冲_长度, Nova缓冲[Nova缓冲_长度])
+    设置(新Nova缓冲, Nova缓冲_协议, Nova缓冲[Nova缓冲_协议])
+    设置(新Nova缓冲, Nova缓冲_传输层头, Nova缓冲[Nova缓冲_传输层头])
+    设置(新Nova缓冲, Nova缓冲_网络层头, Nova缓冲[Nova缓冲_网络层头])
+    设置(新Nova缓冲, Nova缓冲_MAC头, Nova缓冲[Nova缓冲_MAC头])
+    // 拷贝数据
+    内存复制(新Nova缓冲[Nova缓冲_缓冲], Nova缓冲[Nova缓冲_缓冲], Nova缓冲[Nova缓冲_尾端偏移])
+    返回 新Nova缓冲
+}
+
+// 查询
+
+函数 Nova缓冲_长度(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_长度] }
+函数 Nova缓冲_协议(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_协议] }
+函数 Nova缓冲_设置协议(Nova缓冲, 协议) { 设置(Nova缓冲, Nova缓冲_协议, 协议) }
+函数 Nova缓冲_设备(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_设备] }
+函数 Nova缓冲_设置设备(Nova缓冲, 设备) { 设置(Nova缓冲, Nova缓冲_设备, 设备) }
+函数 Nova缓冲_headroom(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_数据偏移] - Nova缓冲[Nova缓冲_头偏移] }
+函数 Nova缓冲_tailroom(Nova缓冲) { 返回 Nova缓冲[Nova缓冲_尾端偏移] - Nova缓冲[Nova缓冲_尾偏移] }
+
+// 统计
+
+函数 Nova缓冲_统计() {
+    返回 [Nova缓冲_分配次数, Nova缓冲_释放次数, Nova缓冲_克隆次数]
+}
+
+// Nova网络缓冲队列(被传控/网络设备等引用)
+函数 Nova网络缓冲_队列_创建() { 返回 [] }
+函数 Nova网络缓冲_队列_入队(队列, Nova缓冲) { 追加(队列, Nova缓冲) }
+函数 Nova网络缓冲_队列_出队(队列) {
+    如果 (计数(队列) == 0) { 返回 空 }
+    定义 头 = 队列[0]
+    删除(队列, 0)
+    返回 头
+}
+函数 Nova网络缓冲_队列_为空(队列) { 返回 计数(队列) == 0 }
+函数 Nova网络缓冲_队列_长度(队列) { 返回 计数(队列) }
+函数 Nova网络缓冲_队列_清空(队列) {
+    当 (计数(队列) > 0) { 删除(队列, 0) }
+}
+
+// 别名(被网络缓冲模块引用)
+函数 Nova缓冲_创建(大小) { 返回 Nova缓冲_分配(大小) }

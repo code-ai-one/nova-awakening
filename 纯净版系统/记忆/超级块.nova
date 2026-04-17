@@ -1,0 +1,297 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("./目录项添加.nova")
+导入("../中枢/链表后继.nova")
+导入("../中枢/同步原语.nova")
+
+//   1. 超级块是每个已挂载文件系统的核心元数据
+//   2. super_operations: alloc_Nova文件节点/destroy_Nova文件节点/write_Nova文件节点/sync_fs等
+//   3. 全局超级块链表: 遍历所有已挂载的FS
+//   4. s_root: 挂载点的根Nova路径项
+//   5. s_bdev: 底层块设备
+//   6. 引用计数: 多次挂载同一设备时共享超级块
+
+定义 SB_RDONLY    = 0x0001    // 只读挂载
+定义 SB_NOSUID    = 0x0002    // 忽略setuid/setgid位
+定义 SB_节点V     = 0x0004    // 不允许设备文件
+定义 SB_NOEXEC    = 0x0008    // 不允许执行
+定义 SB_SYNCHRONOUS = 0x0010  // 同步写
+定义 SB_NOATIME   = 0x0400    // 不更新访问时间
+定义 SB_ACTIVE    = 0x8000    // 超级块处于活跃状态
+
+结构 超级块 {
+    s_magic,    // u64 文件系统魔数 (ext4=0xEF53, tmpfs=0x01021994)
+    s_blocksize,    // u32 块大小 (字节, 通常4096)
+    s_blocksize_bits,    // u32 块大小位数 (log2, 通常12)
+    s_maxbytes,    // u64 最大文件大小
+    s_flags,    // u32 SB_* 标志
+    s_count,    // u32 引用计数
+    s_active,    // u32 活跃引用 (挂载数)
+
+    // 存储相关
+    s_dev,    // u64 底层块设备号 (dev_t)
+    s_bdev,    // u64 底层块设备结构指针
+
+    // Nova文件节点管理
+    s_root,    // u64 根Nova路径项
+    s_Nova文件节点s,    // [] 该FS所有Nova文件节点链表
+    s_Nova文件节点_count,    // u64 Nova文件节点总数
+    s_Nova文件节点_next,    // u64 下一个Nova文件节点编号
+
+    // 脏数据管理
+    s_dirty,    // [] 脏Nova文件节点链表 (待回写)
+    s_io,    // [] 正在回写的Nova文件节点
+
+    // 操作表
+    s_op,    // u64 super_operations指针
+    s_type,    // u64 file_system_type指针
+
+    // 限额和容量
+    s_blocks_count,    // u64 总块数
+    s_free_blocks,    // u64 空闲块数
+    s_Nova文件节点s_count,    // u64 总Nova文件节点数
+    s_free_Nova文件节点s,    // u64 空闲Nova文件节点数
+
+    // 同步
+    s_lock,    // u64 超级块互斥锁
+    s_umount,    // u64 卸载信号量
+
+    // 标识
+    s_id,    // 字符串 文件系统名称 (如"ext4")
+    s_uuid,    // 字符串 文件系统UUID
+}
+
+结构 超级块操作 {
+    alloc_Nova文件节点,    // u64 分配Nova文件节点 (特定FS的嵌入式Nova文件节点)
+    destroy_Nova文件节点,    // u64 销毁Nova文件节点
+    write_Nova文件节点,    // u64 写回脏Nova文件节点到磁盘
+    evict_Nova文件节点,    // u64 驱逐Nova文件节点 (删除文件时)
+    put_super,    // u64 释放超级块 (卸载时)
+    sync_fs,    // u64 同步整个文件系统
+    statfs,    // u64 获取文件系统统计信息 (df命令)
+    remount_fs,    // u64 重新挂载 (改变标志)
+    show_options,    // u64 显示挂载选项 (/proc/mounts)
+}
+
+定义 可变 所有超级块 = []
+定义 可变 超级块_总数 = 0
+
+// 创建超级块
+
+函数 超级块_创建(魔数, 块大小, 总块, 类型名) {
+    定义 sb = 超级块 {}
+    sb.s_magic = 魔数
+    sb.s_blocksize = 块大小
+    sb.s_blocksize_bits = 块大小_到_位数(块大小)
+    sb.s_maxbytes = 0x7FFFFFFFFFFFFFFF   // MAX_LFS_FILESIZE
+    sb.s_flags = SB_ACTIVE
+    sb.s_count = 1
+    sb.s_active = 1
+    sb.s_dev = 0
+    sb.s_bdev = 0
+    sb.s_root = 空
+    sb.s_Nova文件节点s = []
+    sb.s_Nova文件节点_count = 0
+    sb.s_Nova文件节点_next = 1       // Nova文件节点编号从1开始(0保留)
+    sb.s_dirty = []
+    sb.s_io = []
+    sb.s_op = 空
+    sb.s_type = 空
+    sb.s_blocks_count = 总块
+    sb.s_free_blocks = 总块
+    sb.s_Nova文件节点s_count = 0
+    sb.s_free_Nova文件节点s = 0
+    sb.s_lock = 互斥锁_创建()
+    sb.s_umount = 0
+    sb.s_id = 类型名
+    sb.s_uuid = ""
+
+    // 加入全局链表
+    追加(所有超级块, sb)
+    超级块_总数 = 超级块_总数 + 1
+
+    返回 sb
+}
+
+// 超级块Nova文件节点分配
+
+函数 超级块_分配Nova文件节点(sb) {
+    定义 编号 = sb.s_Nova文件节点_next
+    sb.s_Nova文件节点_next = sb.s_Nova文件节点_next + 1
+    sb.s_Nova文件节点_count = sb.s_Nova文件节点_count + 1
+
+    // 如果有s_op.alloc_Nova文件节点, 用FS自己的分配器
+    如果 (sb.s_op != 空 && sb.s_op.alloc_Nova文件节点 != 0) {
+        返回 sb.s_op.alloc_Nova文件节点(sb, 编号)
+    }
+
+    // 默认: 通用Nova文件节点分配
+    定义 节点 = Nova文件节点_创建_带编号(编号, 类型_普通文件, 0o644)
+    Nova文件节点_设置超级块(节点, sb)
+    追加(sb.s_Nova文件节点s, 节点)
+    返回 节点
+}
+
+// 脏Nova文件节点管理
+
+函数 超级块_标记脏Nova文件节点(sb, 节点) {
+    // 检查是否已在脏链表中
+    定义 可变 i = 0
+    当 (i < 计数(sb.s_dirty)) {
+        如果 (sb.s_dirty[i] == 节点) { 返回 }
+        i = i + 1
+    }
+    追加(sb.s_dirty, 节点)
+}
+
+函数 超级块_同步脏Nova文件节点s(sb) {
+    如果 (sb.s_op == 空 || sb.s_op.write_Nova文件节点 == 0) { 返回 }
+
+    // 将脏链表移到io链表
+    sb.s_io = sb.s_dirty
+    sb.s_dirty = []
+
+    // 逐个回写
+    定义 可变 i = 0
+    当 (i < 计数(sb.s_io)) {
+        sb.s_op.write_Nova文件节点(sb.s_io[i], 0)
+        i = i + 1
+    }
+    sb.s_io = []
+}
+
+// sync_fs: 同步整个文件系统
+
+函数 超级块_同步(sb) {
+    // 1. 回写所有脏Nova文件节点
+    超级块_同步脏Nova文件节点s(sb)
+
+    // 2. 调用FS的sync_fs
+    如果 (sb.s_op != 空 && sb.s_op.sync_fs != 0) {
+        sb.s_op.sync_fs(sb, 1)   // wait=1: 等待完成
+    }
+}
+
+// statfs: 获取FS统计 
+
+函数 超级块_statfs(sb, buf) {
+    如果 (sb.s_op != 空 && sb.s_op.statfs != 0) {
+        返回 sb.s_op.statfs(sb, buf)
+    }
+    // 默认填充
+    如果 (buf != 空) {
+        设置(buf, 0, sb.s_magic)           // f_type
+        设置(buf, 1, sb.s_blocksize)       // f_bsize
+        设置(buf, 2, sb.s_blocks_count)    // f_blocks
+        设置(buf, 3, sb.s_free_blocks)     // f_bfree
+        设置(buf, 4, sb.s_free_blocks)     // f_bavail
+        设置(buf, 5, sb.s_Nova文件节点s_count)    // f_files
+        设置(buf, 6, sb.s_free_Nova文件节点s)     // f_ffree
+        设置(buf, 7, 255)                  // f_namelen
+    }
+    返回 成功
+}
+
+// 引用计数 / 释放
+
+函数 超级块_增引用(sb) { sb.s_count = sb.s_count + 1 }
+
+函数 超级块_减引用(sb) {
+    sb.s_count = sb.s_count - 1
+    如果 (sb.s_count <= 0) {
+        超级块_释放(sb)
+    }
+}
+
+函数 超级块_释放(sb) {
+    // 调用FS的put_super
+    如果 (sb.s_op != 空 && sb.s_op.put_super != 0) {
+        sb.s_op.put_super(sb)
+    }
+    // 从全局链表移除
+    定义 可变 i = 0
+    当 (i < 计数(所有超级块)) {
+        如果 (所有超级块[i] == sb) {
+            链表_删除(所有超级块, i)
+            超级块_总数 = 超级块_总数 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// 全局操作
+
+函数 同步所有文件系统() {
+    // sync(2)系统调用: 同步所有已挂载的FS
+    定义 可变 i = 0
+    当 (i < 计数(所有超级块)) {
+        如果 ((所有超级块[i].s_flags & SB_RDONLY) == 0) {
+            超级块_同步(所有超级块[i])
+        }
+        i = i + 1
+    }
+}
+
+// 访问器
+
+函数 超级块_根Nova文件节点(sb)     { 定义 d = sb.s_root; 如果 (d != 空) { 返回 目录项_Nova文件节点(d) } 返回 空 }
+函数 超级块_设置根(sb, d)   { sb.s_root = d }
+函数 超级块_块大小(sb)      { 返回 sb.s_blocksize }
+函数 超级块_类型(sb)        { 返回 sb.s_id }
+函数 超级块_只读(sb)        { 返回 (sb.s_flags & SB_RDONLY) != 0 }
+函数 超级块_设置只读(sb)    { sb.s_flags = sb.s_flags | SB_RDONLY }
+函数 超级块_设置读写(sb)    { sb.s_flags = sb.s_flags & ~SB_RDONLY }
+
+// 辅助
+
+函数 块大小_到_位数(块大小) {
+    定义 可变 位数 = 0
+    定义 可变 值 = 块大小
+    当 (值 > 1) { 值 = 值 >> 1; 位数 = 位数 + 1 }
+    返回 位数
+}
+
+
+函数 超级块_完整统计() {
+    返回 [计数(超级块列表)]
+}
+
+// 超级块健康检查
+
+函数 超级块_健康检查() {
+    定义 可变 问题 = []
+    如果 (计数(超级块列表) == 0) { 追加(问题, "无挂载的超级块") }
+    定义 可变 i = 0
+    当 (i < 计数(超级块列表)) {
+        定义 sb = 超级块列表[i]
+        如果 (sb.脏标志) { 追加(问题, "超级块脏: " + sb.设备名) }
+        如果 (sb.冻结) { 追加(问题, "超级块冻结: " + sb.设备名) }
+        i = i + 1
+    }
+    如果 (计数(问题) == 0) { 返回 "超级块健康" }
+    返回 问题
+}
+
+函数 超级块_查找(设备名) {
+    定义 可变 i = 0
+    当 (i < 计数(超级块列表)) {
+        如果 (超级块列表[i].设备名 == 设备名) { 返回 超级块列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+定义 可变 AI_超级块_运行指标 = 0
+定义 可变 AI_超级块_异常指标 = 0
+
+函数 AI_超级块_自诊断() {
+    AI_超级块_运行指标 = 超级块_总数
+    返回 AI_超级块_运行指标
+}
+
+函数 AI_超级块_优化建议() {
+    定义 指标 = AI_超级块_自诊断()
+    如果 (AI_超级块_运行指标 > 10000) { 返回 "超级块负载较高" }
+    返回 "超级块状态正常"
+}

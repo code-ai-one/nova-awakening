@@ -1,0 +1,255 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./握手消息处.nova")
+导入("./安全密钥派.nova")
+导入("../执行/控制台输出.nova")
+导入("./安全发送完.nova")
+导入("./密码学原语.nova")
+导入("./安全发送.nova")
+导入("../感知/内核直连层.nova")
+
+// §3 安全握手: ClientHello构造
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 安全_创建(socket_fd, 主机名) {
+    定义 conn = 堆_分配(安全Connection)
+    如果 (conn == 0) { 返回 0 }
+    conn.socket_fd = socket_fd
+    conn.版本 = 安全_1_3; conn.状态 = 安全_STATE_INIT
+    conn.密码套件 = 0; conn.主机名 = 主机名
+    conn.client_seq = 0; conn.server_seq = 0
+    conn.最后错误 = 0; conn.ticket_长度 = 0; conn.alpn_协议 = 0
+    // 生成随机数
+    平台_随机字节(conn.client_random, 32)
+    // 生成X25519密钥对
+    X25519_生成密钥对(conn.私钥, conn.公钥)
+    返回 conn
+}
+
+函数 安全_握手(conn) {
+    如果 (conn == 0) { 返回 -1 }
+    // 1. 发送ClientHello
+    定义 hello_buf = 堆_分配(512)
+    如果 (hello_buf == 0) { 返回 0 }
+    定义 hello_len = 安全_构造ClientHello(conn, hello_buf, 512)
+    如果 (hello_len <= 0) { 堆_释放(hello_buf); conn.状态 = 安全_STATE_ERROR; 返回 -1 }
+    如果 (安全_发送记录(conn, REC_HANDSHAKE, hello_buf, hello_len) < 0) { 堆_释放(hello_buf); conn.状态 = 安全_STATE_ERROR; 返回 -1 }
+    conn.状态 = 安全_STATE_CLIENT_HELLO
+    // 更新transcript哈希
+    SHA256_更新(conn.transcript_hash, hello_buf, hello_len)
+
+    // 2. 接收ServerHello
+    定义 recv_buf = 堆_分配(16384)
+    如果 (recv_buf == 0) { 返回 0 }
+    定义 recv_len = 安全_接收记录(conn, recv_buf, 16384)
+    如果 (recv_len <= 0) { 堆_释放(hello_buf); 堆_释放(recv_buf); conn.状态 = 安全_STATE_ERROR; 返回 -1 }
+    定义 解析结果 = 安全_解析ServerHello(conn, recv_buf, recv_len)
+    如果 (解析结果 < 0) { 堆_释放(hello_buf); 堆_释放(recv_buf); conn.状态 = 安全_STATE_ERROR; 返回 -1 }
+    SHA256_更新(conn.transcript_hash, recv_buf, recv_len)
+
+    // 3. ECDHE计算共享密钥
+    X25519_计算共享(conn.共享密钥, conn.私钥, conn.对方公钥)
+
+    // 4. 派生握手密钥 (HKDF-Expand-Label)
+    如果 (conn.版本 == 安全_1_3) {
+        安全13_派生握手密钥(conn)
+        conn.状态 = 安全_STATE_ENCRYPTED
+
+        // 5. 接收加密的 EncryptedExtensions + Certificate + CertVerify + Finished
+        recv_len = 安全_接收记录(conn, recv_buf, 16384)
+        如果 (recv_len > 0) {
+            定义 明文 = 堆_分配(recv_len)
+            如果 (明文 == 0) { 返回 0 }
+            定义 明文长 = AES_GCM_解密(conn.server_hs_key, conn.server_hs_iv,
+                                      conn.server_seq, recv_buf, recv_len, 明文)
+            conn.server_seq = conn.server_seq + 1
+            如果 (明文长 > 0) {
+                安全13_处理握手消息(conn, 明文, 明文长)
+            }
+            堆_释放(明文)
+        }
+
+        // 6. 验证服务器证书
+        如果 (conn.服务器证书 != 0) {
+            定义 验证ok = X509_验证证书链(conn.服务器证书, conn.主机名)
+            如果 (!验证ok) {
+                conn.状态 = 安全_STATE_ERROR; conn.最后错误 = ALERT_BAD_CERTIFICATE
+                堆_释放(hello_buf); 堆_释放(recv_buf)
+                返回 -1
+            }
+        }
+
+        // 7. 派生应用密钥
+        安全13_派生应用密钥(conn)
+
+        // 8. 发送Client Finished
+        定义 fin_buf = 堆_分配(64)
+        如果 (fin_buf == 0) { 返回 0 }
+        定义 fin_len = 安全13_构造Finished(conn, fin_buf, 64)
+        定义 加密fin = 堆_分配(fin_len + 16)
+        如果 (加密fin == 0) { 返回 0 }
+        定义 加密长 = AES_GCM_加密(conn.client_hs_key, conn.client_hs_iv,
+                                  conn.client_seq, fin_buf, fin_len, 加密fin)
+        如果 (安全_发送记录(conn, REC_APPLICATION, 加密fin, 加密长) < 0) { 堆_释放(fin_buf); 堆_释放(加密fin); conn.状态 = 安全_STATE_ERROR; 返回 -1 }
+        堆_释放(fin_buf); 堆_释放(加密fin)
+        conn.client_seq = 0    // 切换到应用密钥后重置
+        conn.server_seq = 0
+    } 否则 {
+        // 安全 1.2 握手流程
+        安全12_完成握手(conn, recv_buf, recv_len)
+    }
+    conn.状态 = 安全_STATE_CONNECTED
+    堆_释放(hello_buf)
+    堆_释放(recv_buf)
+    返回 0
+}
+
+// §4 ClientHello / ServerHello 消息
+
+函数 安全_构造ClientHello(conn, buf, 最大) {
+    如果 (conn == 0 || buf == 0) { 返回 0 }
+    定义 可变 pos = 0
+    // Handshake type: ClientHello (1)
+    字节写(buf, pos, HS_CLIENT_HELLO); pos = pos + 1
+    // 长度预留位 (3 bytes)
+    定义 len_pos = pos; pos = pos + 3
+    // Protocol version: 安全 1.2 (0x0303) — 即使安全1.3也用此值
+    字节写(buf, pos, 0x03); 字节写(buf, pos+1, 0x03); pos = pos + 2
+    // Client random (32 bytes)
+    内存_复制(buf + pos, conn.client_random, 32); pos = pos + 32
+    // Session ID length (1) + session_id (安全1.3中兼容模式需非空)
+    字节写(buf, pos, 32); pos = pos + 1
+    平台_随机字节(buf + pos, 32); pos = pos + 32
+    // Cipher suites
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 10); pos = pos + 2  // 5 suites × 2 bytes
+    // 安全 1.3 suites
+    字节写(buf, pos, 0x13); 字节写(buf, pos+1, 0x01); pos = pos + 2  // AES_128_GCM
+    字节写(buf, pos, 0x13); 字节写(buf, pos+1, 0x02); pos = pos + 2  // AES_256_GCM
+    字节写(buf, pos, 0x13); 字节写(buf, pos+1, 0x03); pos = pos + 2  // CHACHA20
+    // 安全 1.2 fallback
+    字节写(buf, pos, 0xC0); 字节写(buf, pos+1, 0x2F); pos = pos + 2  // ECDHE_RSA_AES128
+    字节写(buf, pos, 0xC0); 字节写(buf, pos+1, 0x30); pos = pos + 2  // ECDHE_RSA_AES256
+    // Compression: null only
+    字节写(buf, pos, 1); 字节写(buf, pos+1, 0); pos = pos + 2
+
+    // Extensions
+    定义 ext_start = pos; pos = pos + 2  // 扩展长度预留位
+
+    // SNI extension (type=0x0000)
+    如果 (conn.主机名 != 0) {
+        定义 host_len = 字节长度(conn.主机名)
+        字节写(buf, pos, 0); 字节写(buf, pos+1, 0); pos = pos + 2  // type
+        定义 sni_len = host_len + 5
+        字节写(buf, pos, sni_len >> 8); 字节写(buf, pos+1, sni_len & 0xFF); pos = pos + 2
+        字节写(buf, pos, (sni_len-2) >> 8); 字节写(buf, pos+1, (sni_len-2) & 0xFF); pos = pos + 2
+        字节写(buf, pos, 0); pos = pos + 1  // host_name type
+        字节写(buf, pos, host_len >> 8); 字节写(buf, pos+1, host_len & 0xFF); pos = pos + 2
+        内存_复制(buf + pos, conn.主机名, host_len); pos = pos + host_len
+    }
+
+    // Supported Versions extension (type=0x002B) — 必须用于安全 1.3
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x2B); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 5); pos = pos + 2  // length
+    字节写(buf, pos, 4); pos = pos + 1  // list length
+    字节写(buf, pos, 0x03); 字节写(buf, pos+1, 0x04); pos = pos + 2  // 安全 1.3
+    字节写(buf, pos, 0x03); 字节写(buf, pos+1, 0x03); pos = pos + 2  // 安全 1.2
+
+    // Supported Groups (type=0x000A)
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x0A); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 6); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 4); pos = pos + 2
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x1D); pos = pos + 2  // X25519
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x17); pos = pos + 2  // P-256
+
+    // Key Share (type=0x0033) — X25519公钥
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x33); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 38); pos = pos + 2  // length
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 36); pos = pos + 2  // client shares len
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x1D); pos = pos + 2  // X25519
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 32); pos = pos + 2  // key len
+    内存_复制(buf + pos, conn.公钥, 32); pos = pos + 32
+
+    // Signature Algorithms (type=0x000D)
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x0D); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 8); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 6); pos = pos + 2
+    字节写(buf, pos, 0x08); 字节写(buf, pos+1, 0x04); pos = pos + 2  // RSA-PSS-SHA256
+    字节写(buf, pos, 0x04); 字节写(buf, pos+1, 0x03); pos = pos + 2  // ECDSA-SHA256
+    字节写(buf, pos, 0x08); 字节写(buf, pos+1, 0x07); pos = pos + 2  // Ed25519
+
+    // ALPN (type=0x0010)
+    字节写(buf, pos, 0x00); 字节写(buf, pos+1, 0x10); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 11); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 9); pos = pos + 2
+    字节写(buf, pos, 2); pos = pos + 1  // "h2" length
+    字节写(buf, pos, 0x68); 字节写(buf, pos+1, 0x32); pos = pos + 2
+    字节写(buf, pos, 8); pos = pos + 1  // "http/1.1" length
+    内存_复制(buf + pos, "http/1.1", 8); pos = pos + 8
+
+    // 填充extensions长度
+    定义 ext_len = pos - ext_start - 2
+    字节写(buf, ext_start, ext_len >> 8); 字节写(buf, ext_start+1, ext_len & 0xFF)
+    // 填充握手消息长度
+    定义 msg_len = pos - 4
+    字节写(buf, len_pos, (msg_len >> 16) & 0xFF)
+    字节写(buf, len_pos+1, (msg_len >> 8) & 0xFF)
+    字节写(buf, len_pos+2, msg_len & 0xFF)
+    返回 pos
+}
+
+函数 安全_解析ServerHello(conn, buf, len) {
+    如果 (conn==0 || buf==0 || len<38) { 返回 -1 }
+    如果 (字节取(buf, 0) != HS_SERVER_HELLO) { 返回 -1 }
+    // msg_len(3) + version(2) + random(32) + session_id_len(1)...
+    定义 可变 pos = 4
+    // server version
+    pos = pos + 2
+    // server_random
+    内存_复制(conn.server_random, buf + pos, 32); pos = pos + 32
+    // session_id
+    定义 sid_len = 字节取(buf, pos); pos = pos + 1 + sid_len
+    // cipher suite
+    如果 (pos + 2 > len) { 返回 -1 }
+    conn.密码套件 = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+    // compression
+    pos = pos + 1
+    // extensions
+    如果 (pos + 2 <= len) {
+        定义 ext_len = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+        定义 ext_end = pos + ext_len
+        当 (pos + 4 <= ext_end && pos + 4 <= len) {
+            定义 ext_type = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+            定义 ext_data_len = (字节取(buf, pos) << 8) | 字节取(buf, pos+1); pos = pos + 2
+            // supported_versions → 确定安全版本
+            如果 (ext_type == 0x002B && ext_data_len >= 2) {
+                conn.版本 = (字节取(buf, pos) << 8) | 字节取(buf, pos+1)
+            }
+            // key_share → 提取服务器公钥
+            如果 (ext_type == 0x0033 && ext_data_len >= 36) {
+                定义 group = (字节取(buf, pos) << 8) | 字节取(buf, pos+1)
+                定义 key_len = (字节取(buf, pos+2) << 8) | 字节取(buf, pos+3)
+                如果 (group == GROUP_X25519 && key_len == 32 && pos+4+32 <= len) {
+                    内存_复制(conn.对方公钥, buf + pos + 4, 32)
+                }
+            }
+            pos = pos + ext_data_len
+        }
+    }
+    返回 0
+}
+
+定义 可变 AI_安全握手项_威胁计数 = 0
+
+函数 AI_安全握手项_风险评分(操作类型, 权限级别, 来源可信度) {
+    定义 可变 风险 = 0
+    如果 (权限级别 > 500) { 风险 = 风险 + 300 }
+    如果 (来源可信度 < 200) { 风险 = 风险 + 400 }
+    如果 (风险 > 500) { AI_安全握手项_威胁计数 = AI_安全握手项_威胁计数 + 1 }
+    返回 风险
+}
+
+函数 AI_安全握手项_异常行为检测(操作频率, 基线频率) {
+    如果 (基线频率 > 0 && 操作频率 > 基线频率 * 5) { 返回 真 }
+    返回 假
+}

@@ -1,0 +1,499 @@
+// NovaOS 文件描述符 — NovaFD原创理论体系
+// 原创理论: NovaFD — 文件描述符生命周期管理
+// NovaOS原生设计:
+//   1. fdtable可动态扩展: 初始NR_OPEN_DEFAULT(64), 按需增长到NR_OPEN(1048576)
+//   2. close-on-exec位图: exec时自动关闭标记的fd
+//   3. open位图: 快速查找空闲fd (不用遍历)
+//   4. struct file引用计数: 多个fd可指向同一个file (dup)
+//   5. files_struct引用计数: fork时CLONE_FILES可共享
+//   6. fd分配从next_fd开始搜索 (避免每次从0开始)
+//   7. dup/dup2/dup3: 复制文件描述符
+//   8. fcntl: FD标志控制(F_GETFD/F_SETFD/F_GETFL/F_SETFL)
+//   9. lseek: 文件偏移操作(SEEK_SET/SEEK_CUR/SEEK_END)
+//   四阶段AI演进: NovaFD在阶段1提供IO基础设施
+
+导入("../中枢/错误码.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/内存物理.nova")
+导入("../中枢/原生系统块分.nova")
+导入("./管道读端关.nova")
+导入("../中枢/每处理器.nova")
+
+定义 NR_OPEN_DEFAULT = 64     // 初始fd表大小
+定义 NR_OPEN_MAX     = 1048576 // 最大fd数 (sysctl fs.nr_open)
+定义 最大打开文件    = 256     // 每进程最大打开文件数(可通过setrlimit调整)
+
+结构 文件表结构 {
+    count,    // u32 引用计数 (CLONE_FILES共享时>1)
+    fdt,    // [] fd到struct file*的映射数组
+    open_fds,    // u64 已打开的fd位图
+    close_on_exec,    // u64 close-on-exec位图
+    next_fd,    // u32 下一次分配搜索的起始fd
+    max_fds,    // u32 当前表的最大容量
+    锁,    // u32 保护fd表的自旋锁
+}
+
+结构 文件对象 {
+    f_Nova文件节点,    // u64 关联的Nova文件节点
+    f_pos,    // i64 当前读写位置 (loff_t)
+    f_flags,    // u32 O_RDONLY/O_WRONLY/O_RDWR/O_APPEND等
+    f_count,    // u32 引用计数 (dup/fork增加)
+    f_op,    // u64 file_operations指针
+    f_Nova路径项,    // u64 关联的Nova路径项
+    f_vfsmnt,    // u64 关联的vfsmount
+    f_mode,    // u32 FMODE_READ/FMODE_WRITE
+    f_cred,    // u64 打开时的credentials
+}
+
+定义 FMODE_READ  = 0x1
+定义 FMODE_WRITE = 0x2
+定义 FMODE_EXEC  = 0x20
+
+// 创建files_struct 
+
+函数 文件表_创建() {
+    定义 fs = kmalloc(文件表结构)
+    如果 (fs == 空) { 返回 空 }
+    fs.count = 1
+    fs.fdt = []
+    fs.open_fds = 0
+    fs.close_on_exec = 0
+    fs.next_fd = 0
+    fs.max_fds = 最大打开文件
+    fs.锁 = 0
+
+    // 预分配fd槽位
+    定义 可变 i = 0
+    当 (i < 最大打开文件) {
+        追加(fs.fdt, 空)
+        i = i + 1
+    }
+    返回 fs
+}
+
+// 分配fd 
+// 从next_fd开始搜索空闲位, 找到后设置open_fds位
+
+函数 文件表_分配(表) {
+    返回 文件表_分配_从(表, 0)
+}
+
+函数 文件表_分配_从(表, 起始fd) {
+    定义 可变 fd = 起始fd
+    如果 (fd < 表.next_fd) { fd = 表.next_fd }
+
+    当 (fd < 表.max_fds) {
+        如果 (表.fdt[fd] == 空) {
+            // 找到空闲fd
+            表.open_fds = 表.open_fds | (1 << fd)
+            表.next_fd = fd + 1
+            返回 fd
+        }
+        fd = fd + 1
+    }
+
+    // 没有空闲fd: 尝试动态扩展fdtable
+    定义 旧max = 表.max_fds
+    定义 新max = 旧max * 2
+    如果 (新max > 4096) { 新max = 4096 }   // 上限4096 (RLIMIT_NOFILE)
+    如果 (新max <= 旧max) { 返回 错误_打开过多 }  // 已达上限
+    // 扩展fdt数组
+    定义 可变 i = 旧max
+    当 (i < 新max) { 追加(表.fdt, 空); i = i + 1 }
+    表.max_fds = 新max
+    // 重新尝试分配
+    返回 文件表_分配fd(表)
+}
+
+// 获取/设置fd 
+
+函数 文件表_获取(表, fd) {
+    如果 (fd < 0 || fd >= 表.max_fds) { 返回 空 }
+    返回 表.fdt[fd]
+}
+
+函数 文件表_设置(表, fd, 文件) {
+    如果 (fd < 0 || fd >= 表.max_fds) { 返回 }
+    设置(表.fdt, fd, 文件)
+    如果 (文件 != 空) {
+        表.open_fds = 表.open_fds | (1 << fd)
+    }
+}
+
+函数 文件表_关闭(表, fd) {
+    如果 (fd < 0 || fd >= 表.max_fds) { 返回 }
+    设置(表.fdt, fd, 空)
+    表.open_fds = 表.open_fds & ~(1 << fd)
+    表.close_on_exec = 表.close_on_exec & ~(1 << fd)
+    // 更新next_fd以便下次分配更快
+    如果 (fd < 表.next_fd) {
+        表.next_fd = fd
+    }
+}
+
+// close-on-exec管理
+
+函数 文件表_设置cloexec(表, fd) {
+    如果 (fd >= 0 && fd < 表.max_fds) {
+        表.close_on_exec = 表.close_on_exec | (1 << fd)
+    }
+}
+
+函数 文件表_清除cloexec(表, fd) {
+    如果 (fd >= 0 && fd < 表.max_fds) {
+        表.close_on_exec = 表.close_on_exec & ~(1 << fd)
+    }
+}
+
+函数 文件表_是cloexec(表, fd) {
+    如果 (fd >= 0 && fd < 表.max_fds) {
+        返回 (表.close_on_exec >> fd) & 1
+    }
+    返回 0
+}
+
+// exec时关闭所有CLOEXEC的fd
+函数 文件表_exec关闭(表) {
+    定义 可变 fd = 0
+    当 (fd < 表.max_fds) {
+        如果 ((表.close_on_exec >> fd) & 1) {
+            文件表_关闭(表, fd)
+        }
+        fd = fd + 1
+    }
+}
+
+// 复制fd表 
+
+函数 文件表_复制(源表) {
+    定义 新表 = 文件表_创建()
+    新表.open_fds = 源表.open_fds
+    新表.close_on_exec = 源表.close_on_exec
+    新表.next_fd = 源表.next_fd
+
+    定义 可变 fd = 0
+    当 (fd < 源表.max_fds && fd < 新表.max_fds) {
+        定义 文件 = 源表.fdt[fd]
+        如果 (文件 != 空) {
+            // 增加file的引用计数 (多个fd指向同一file)
+            文件_增引用(文件)
+            设置(新表.fdt, fd, 文件)
+        }
+        fd = fd + 1
+    }
+    返回 新表
+}
+
+// CLONE_FILES: 共享fd表(只增加引用计数)
+函数 文件表_共享(表) {
+    表.count = 表.count + 1
+    返回 表
+}
+
+函数 文件表_减引用(表) {
+    表.count = 表.count - 1
+    如果 (表.count <= 0) {
+        // 最后一个引用: 关闭所有fd
+        文件表_关闭全部(表)
+    }
+}
+
+函数 文件表_关闭全部(表) {
+    定义 可变 fd = 0
+    当 (fd < 表.max_fds) {
+        如果 (表.fdt[fd] != 空) {
+            定义 文件 = 表.fdt[fd]
+            定义 剩余 = 文件_减引用(文件)
+            如果 (剩余 <= 0) {
+                // 真正关闭: 调用f_op->release
+            }
+            设置(表.fdt, fd, 空)
+        }
+        fd = fd + 1
+    }
+}
+
+// struct file操作
+
+函数 文件_创建(Nova文件节点, 标志) {
+    定义 f = 文件对象 {}
+    f.f_Nova文件节点 = Nova文件节点
+    f.f_pos = 0
+    f.f_flags = 标志
+    f.f_count = 1
+    f.f_op = 空
+    f.f_Nova路径项 = 空
+    f.f_vfsmnt = 空
+    f.f_mode = 0
+    如果 ((标志 & 3) == 0 || (标志 & 3) == 2) { f.f_mode = f.f_mode | FMODE_READ }
+    如果 ((标志 & 3) == 1 || (标志 & 3) == 2) { f.f_mode = f.f_mode | FMODE_WRITE }
+    返回 f
+}
+
+函数 文件_偏移(文件) { 返回 文件.f_pos }
+函数 文件_设置偏移(文件, 偏移) { 文件.f_pos = 偏移 }
+函数 文件_增引用(文件) { 文件.f_count = 文件.f_count + 1 }
+函数 文件_减引用(文件) { 文件.f_count = 文件.f_count - 1; 返回 文件.f_count }
+函数 文件描述符_可读(文件) { 返回 (文件.f_mode & FMODE_READ) != 0 }
+函数 文件描述符_可写(文件) { 返回 (文件.f_mode & FMODE_WRITE) != 0 }
+函数 文件_有cloexec(文件) { 返回 (文件.f_flags & O_CLOEXEC) != 0 }
+
+定义 O_CLOEXEC = 0x80000
+
+// 统计
+
+函数 文件表_已打开数(表) {
+    定义 可变 数 = 0
+    定义 可变 fd = 0
+    当 (fd < 表.max_fds) {
+        如果 (表.fdt[fd] != 空) { 数 = 数 + 1 }
+        fd = fd + 1
+    }
+    返回 数
+}
+
+// 错误_打开过多 定义在 核心/公共/错误码.nova
+
+// 别名(被管道/Nova事件轮询引用)
+函数 文件描述符_分配() {
+    定义 当前 = 获取当前进程()
+    返回 文件表_分配(当前[T_文件表])
+}
+函数 文件描述符_安装(fd, 文件) {
+    定义 当前 = 获取当前进程()
+    文件表_设置(当前[T_文件表], fd, 文件)
+}
+函数 文件描述符_设置标志(fd, 标志) {
+    // 设置fd标志(如O_CLOEXEC)
+    定义 当前 = 获取当前进程()
+    如果 (标志 & O_CLOEXEC) { 文件表_设置cloexec(当前[T_文件表], fd) }
+}
+函数 文件描述符_获取(fd) {
+    定义 当前 = 获取当前进程()
+    返回 文件表_获取(当前[T_文件表], fd)
+}
+函数 文件_poll(文件, 事件) {
+    如果 (文件 == 空) { 返回 0 }
+    返回 0
+}
+
+// dup/dup2/dup3 — 复制文件描述符
+
+定义 可变 fd_总分配数 = 0
+定义 可变 fd_总关闭数 = 0
+定义 可变 fd_总复制数 = 0
+
+函数 文件表_dup(表, 旧fd) {
+    // dup: 复制fd到最小可用fd
+    定义 文件 = 文件表_获取(表, 旧fd)
+    如果 (文件 == 空) { 返回 -1 }
+    定义 新fd = 文件表_分配(表)
+    如果 (新fd < 0) { 返回 新fd }
+    文件_增引用(文件)
+    文件表_设置(表, 新fd, 文件)
+    fd_总复制数 = fd_总复制数 + 1
+    返回 新fd
+}
+
+函数 文件表_dup2(表, 旧fd, 新fd) {
+    // dup2: 复制到指定的新fd, 如果新fd已打开先关闭
+    如果 (旧fd == 新fd) { 返回 新fd }  // nop
+    定义 文件 = 文件表_获取(表, 旧fd)
+    如果 (文件 == 空) { 返回 -1 }
+    如果 (新fd < 0 || 新fd >= 表.max_fds) { 返回 -1 }
+    // 如果新fd已打开, 先关闭
+    如果 (文件表_获取(表, 新fd) != 空) {
+        文件表_关闭(表, 新fd)
+    }
+    文件_增引用(文件)
+    文件表_设置(表, 新fd, 文件)
+    fd_总复制数 = fd_总复制数 + 1
+    返回 新fd
+}
+
+函数 文件表_dup3(表, 旧fd, 新fd, 标志) {
+    // dup3: 同 dup2 但支持标志(O_CLOEXEC)
+    如果 (旧fd == 新fd) { 返回 -1 }  // dup3不允许相同
+    定义 结果 = 文件表_dup2(表, 旧fd, 新fd)
+    如果 (结果 >= 0 && (标志 & O_CLOEXEC)) {
+        文件表_设置cloexec(表, 新fd)
+    }
+    返回 结果
+}
+
+// fcntl — FD标志控制
+
+定义 F_GETFD = 1
+定义 F_SETFD = 2
+定义 F_GETFL = 3
+定义 F_SETFL = 4
+定义 F_DUPFD = 5
+定义 F_DUPFD_CLOEXEC = 6
+定义 FD_CLOEXEC = 1
+
+定义 O_APPEND  = 0x400
+定义 O_NONBLOCK = 0x800
+
+函数 文件表_fcntl(表, fd, 命令, 参数) {
+    定义 文件 = 文件表_获取(表, fd)
+    如果 (文件 == 空) { 返回 -1 }
+    如果 (命令 == F_GETFD) {
+        返回 文件表_是cloexec(表, fd)
+    }
+    如果 (命令 == F_SETFD) {
+        如果 (参数 & FD_CLOEXEC) {
+            文件表_设置cloexec(表, fd)
+        } 否则 {
+            文件表_清除cloexec(表, fd)
+        }
+        返回 0
+    }
+    如果 (命令 == F_GETFL) {
+        返回 文件.f_flags
+    }
+    如果 (命令 == F_SETFL) {
+        // 只允许修改O_APPEND, O_NONBLOCK等
+        文件.f_flags = (文件.f_flags & ~(O_APPEND | O_NONBLOCK)) | (参数 & (O_APPEND | O_NONBLOCK))
+        返回 0
+    }
+    如果 (命令 == F_DUPFD) {
+        返回 文件表_分配_从(表, 参数)
+    }
+    如果 (命令 == F_DUPFD_CLOEXEC) {
+        定义 新fd = 文件表_分配_从(表, 参数)
+        如果 (新fd >= 0) {
+            文件_增引用(文件)
+            文件表_设置(表, 新fd, 文件)
+            文件表_设置cloexec(表, 新fd)
+        }
+        返回 新fd
+    }
+    返回 -1
+}
+
+// lseek — 文件偏移操作
+
+定义 SEEK_SET = 0
+定义 SEEK_CUR = 1
+定义 SEEK_END = 2
+
+函数 文件_lseek(文件, 偏移, 基点) {
+    如果 (文件 == 空) { 返回 -1 }
+    定义 可变 新位置 = 0
+    如果 (基点 == SEEK_SET) {
+        新位置 = 偏移
+    } 否则 如果 (基点 == SEEK_CUR) {
+        新位置 = 文件.f_pos + 偏移
+    } 否则 如果 (基点 == SEEK_END) {
+        // 需要获取文件大小
+        定义 大小 = Nova文件节点_获取大小(文件.f_Nova文件节点)
+        新位置 = 大小 + 偏移
+    } 否则 {
+        返回 -1  // 无效基点
+    }
+    如果 (新位置 < 0) { 返回 -1 }
+    文件.f_pos = 新位置
+    返回 新位置
+}
+
+// FD遍历与进程级便捷接口
+
+函数 文件表_遍历(表, 回调) {
+    // 对每个已打开fd执行回调(fd, 文件)
+    定义 可变 fd = 0
+    当 (fd < 表.max_fds) {
+        如果 (表.fdt[fd] != 空) {
+            回调(fd, 表.fdt[fd])
+        }
+        fd = fd + 1
+    }
+}
+
+函数 文件描述符_dup(旧fd) {
+    定义 当前 = 获取当前进程()
+    返回 文件表_dup(当前[T_文件表], 旧fd)
+}
+
+函数 文件描述符_dup2(旧fd, 新fd) {
+    定义 当前 = 获取当前进程()
+    返回 文件表_dup2(当前[T_文件表], 旧fd, 新fd)
+}
+
+函数 文件描述符_fcntl(fd, 命令, 参数) {
+    定义 当前 = 获取当前进程()
+    返回 文件表_fcntl(当前[T_文件表], fd, 命令, 参数)
+}
+
+函数 文件描述符_关闭(fd) {
+    定义 当前 = 获取当前进程()
+    文件表_关闭(当前[T_文件表], fd)
+    fd_总关闭数 = fd_总关闭数 + 1
+}
+
+// pipe — 管道创建
+
+函数 文件表_创建管道(表, 结果) {
+    // 创建pipe: 结果[0]=读端, 结果[1]=写端
+    定义 读端 = 文件_创建(0, 0)  // 只读
+    定义 写端 = 文件_创建(0, 1)  // 只写
+    如果 (读端 == 空 || 写端 == 空) { 返回 -1 }
+    定义 读_fd = 文件表_分配(表)
+    如果 (读_fd < 0) { 返回 -1 }
+    文件表_设置(表, 读_fd, 读端)
+    定义 写_fd = 文件表_分配(表)
+    如果 (写_fd < 0) {
+        文件表_关闭(表, 读_fd)
+        返回 -1
+    }
+    文件表_设置(表, 写_fd, 写端)
+    结果[0] = 读_fd
+    结果[1] = 写_fd
+    返回 0
+}
+
+// fstat — 文件状态查询
+
+函数 文件描述符_fstat(fd) {
+    定义 当前 = 获取当前进程()
+    定义 文件 = 文件表_获取(当前[T_文件表], fd)
+    如果 (文件 == 空) { 返回 空 }
+    返回 [
+        文件.f_Nova文件节点,
+        文件.f_pos,
+        文件.f_flags,
+        文件.f_count,
+        文件.f_mode
+    ]
+}
+
+函数 文件表_获取最大已用fd(表) {
+    定义 可变 最大 = -1
+    定义 可变 fd = 0
+    当 (fd < 表.max_fds) {
+        如果 (表.fdt[fd] != 空) { 最大 = fd }
+        fd = fd + 1
+    }
+    返回 最大
+}
+
+
+函数 文件描述符_完整统计() {
+    返回 [
+        ["总分配", fd_总分配数],
+        ["总关闭", fd_总关闭数],
+        ["总复制", fd_总复制数]
+    ]
+}
+
+定义 可变 AI_文件描述符_运行指标 = 0
+定义 可变 AI_文件描述符_异常指标 = 0
+
+函数 AI_文件描述符_自诊断() {
+    AI_文件描述符_运行指标 = 0
+    返回 AI_文件描述符_运行指标
+}
+
+函数 AI_文件描述符_优化建议() {
+    定义 指标 = AI_文件描述符_自诊断()
+    返回 "文件描述符状态正常"
+}

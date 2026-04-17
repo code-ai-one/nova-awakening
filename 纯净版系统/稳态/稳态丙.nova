@@ -1,0 +1,125 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/高级中控设置.nova")
+导入("./原生系统图处.nova")
+导入("./原生系统总线.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/中断请求管理.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §13 IH (中断处理)
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 AMD_IH_初始化() {
+    定义 mmio = AMD状态.mmio
+    AMD状态.IH环_大小 = 65536  // 64KB中断环
+
+    AMD状态.IH环_地址 = 图处内存_分配(AMD状态.IH环_大小, GTT, 用途_命令缓冲)
+    如果 (AMD状态.IH环_地址 == 空) { 返回 }
+
+    定义 基地址 = AMD状态.IH环_地址.物理地址
+    MMIO写32(mmio + mmIH_RB_BASE, (基地址 >> 8) & 0xFFFFFFFF)
+    MMIO写32(mmio + mmIH_RB_CNTL, 12)  // 64KB
+    MMIO写32(mmio + mmIH_RB_RPTR, 0)
+    MMIO写32(mmio + mmIH_RB_WPTR, 0)
+    // 使能中断
+    MMIO写32(mmio + mmIH_CNTL, 0x03)  // 使能 + RPTR自动回写
+
+    内核信息("AMD驱动: IH初始化 64KB中断环")
+}
+
+函数 AMD_中断初始化() {
+    定义 gpu = AMD状态.gpu
+    gpu.中断号 = PCI_配置MSI(gpu.PCI总线, gpu.PCI设备, gpu.PCI功能)
+    如果 (gpu.中断号 > 0) {
+        IRQ_注册(gpu.中断号, "AMD-" + gpu.型号名, AMD_中断处理)
+    }
+}
+
+函数 AMD_中断处理(中断号) {
+    定义 mmio = AMD状态.mmio
+    // 从IH环读取中断条目(每条目16字节: [source_id, data, ...])
+    定义 wptr = MMIO读32(mmio + mmIH_RB_WPTR)
+    定义 rptr = MMIO读32(mmio + mmIH_RB_RPTR)
+
+    当 (rptr != wptr) {
+        定义 条目地址 = AMD状态.IH环_地址.CPU地址 + rptr
+        定义 源ID = 内存读32(条目地址) & 0xFF
+        定义 数据 = 内存读32(条目地址 + 4)
+
+        如果 (源ID == 1) {
+            // GFX管线完成
+        } 否则如果 (源ID == 2) {
+            // VBlank
+        } 否则如果 (源ID == 176) {
+            // CP EOP(End of Pipe) — 命令完成
+        } 否则如果 (源ID == 224) {
+            // S直传完成
+        } 否则如果 (源ID == 0xE0) {
+            // 图处页面故障
+            内核警告("AMD驱动: 图处页面故障 地址=0x" + 整数转十六进制(数据))
+        }
+
+        rptr = (rptr + 16) % AMD状态.IH环_大小
+    }
+    MMIO写32(mmio + mmIH_RB_RPTR, rptr)
+}
+
+// §14 DCN显示引擎
+
+函数 AMD_DCN_初始化() {
+    AMD状态.OTG数 = 4  // 大多数RDNA支持4个显示输出
+    内核信息("AMD驱动: DCN" + 整数转字符串(AMD状态.DCN版本) +
+             " OTG=" + 整数转字符串(AMD状态.OTG数))
+}
+
+函数 AMD_设置显示模式(OTG索引, 宽, 高, 刷新率) {
+    如果 (!AMD状态.已初始化 || OTG索引 >= AMD状态.OTG数) { 返回 }
+    定义 mmio = AMD状态.mmio
+    定义 基 = mmDCN_OTG0_CONTROL + OTG索引 * mmDCN_OTG_OFFSET
+
+    // CVT时序计算
+    定义 h_front = 48
+    定义 h_sync = 32
+    定义 h_back = 80
+    定义 h_total = 宽 + h_front + h_sync + h_back
+
+    定义 v_front = 3
+    定义 v_sync = 5
+    定义 v_back = 33
+    定义 v_total = 高 + v_front + v_sync + v_back
+
+    // 像素时钟
+    定义 像素时钟_kHz = h_total * v_total * 刷新率 / 1000
+
+    // 配置OTG时序
+    MMIO写32(mmio + 基, 1)  // OTG使能
+    MMIO写32(mmio + 基 + 4, h_total)
+    MMIO写32(mmio + 基 + 8, v_total)
+    MMIO写32(mmio + 基 + 12, 宽)   // H_ACTIVE
+    MMIO写32(mmio + 基 + 16, 高)   // V_ACTIVE
+
+    // 配置HUBP(帧缓冲表面)
+    定义 hubp基 = mmDCN_HUBP0_SURFACE_ADDR + OTG索引 * 0x40
+    如果 (AMD状态.GFX环_地址 != 空) {
+        MMIO写32(mmio + hubp基, AMD状态.gpu.BAR1_地址 & 0xFFFFFFFF)
+        MMIO写32(mmio + hubp基 + 4, (高 << 16) | 宽)
+    }
+
+    // 配置PLL(DCCG: Display Clock Controller)
+    AMD_配置显示PLL(像素时钟_kHz)
+
+    内核信息("AMD驱动: OTG" + 整数转字符串(OTG索引) + " " +
+             整数转字符串(宽) + "×" + 整数转字符串(高) + "@" + 整数转字符串(刷新率) + "Hz" +
+             " 像素时钟=" + 整数转字符串(像素时钟_kHz) + "kHz")
+}
+
+函数 AMD_配置显示PLL(目标_kHz) {
+    // AMD DCCG PLL: 参考100MHz
+    // 输出 = 参考 × FBDIV / REFDIV / POSTDIV
+    定义 参考_kHz = 100000
+    如果 (目标_kHz == 0) { 返回 }
+    定义 FBDIV = 目标_kHz / (参考_kHz / 10)
+    如果 (FBDIV > 511) { FBDIV = 511 }
+}

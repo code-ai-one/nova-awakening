@@ -1,0 +1,135 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内存管理纹.nova")
+导入("../中枢/字符串替换.nova")
+
+// §3 Tile — 瓦片(大层分割为小块)
+
+定义 TILE_SIZE = 256    // 256×256像素
+
+定义 TILE_STATE_IDLE      = 0
+定义 TILE_STATE_SCHEDULED = 1
+定义 TILE_STATE_RASTERIZED = 2
+定义 TILE_STATE_图处_READY = 3
+
+结构 Tile {
+    列,
+    行,
+    x,    // i32 瓦片左上角x
+    y,
+    宽,
+    高,
+    状态,    // u32 TILE_STATE_xxx
+    像素数据,    // u64 RGBA像素缓冲区
+    纹理ID,    // u32 图处子纹理
+    优先级,    // u32 光栅化优先级(可见性+距离)
+    需要光栅化,
+}
+
+// §4 LayerTreeHost — 层树管理器
+
+结构 LayerTreeHost {
+    根层,    // u64 CompositedLayer*
+    // 所有合成层(平面列表)
+    层列表,    // u64 CompositedLayer*数组
+    层数量,
+    层容量,
+    // 帧状态
+    帧序号,
+    最后commit时间,
+    // 设备参数
+    视口宽,
+    视口高,
+    设备像素比,    // u32 ×100
+    // 调度
+    需要commit,
+    需要重绘,
+    正在动画,
+    // 瓦片管理
+    光栅化队列,    // u64 Tile*优先队列
+    光栅化队列大小,
+    // 内存限制
+    纹理内存使用,    // u64 字节
+    纹理内存限制,    // u64 字节(默认256MB)
+    下一个层ID,
+}
+
+定义 可变 全局层树 = 0
+
+函数 LayerTreeHost_获取() {
+    如果 (全局层树 == 0) {
+        全局层树 = 堆_分配(LayerTreeHost)
+        全局层树.层容量 = 256
+        全局层树.层列表 = 堆_分配_数组(256 * 8)
+        全局层树.层数量 = 0
+        全局层树.帧序号 = 0
+        全局层树.需要commit = 假
+        全局层树.需要重绘 = 假
+        全局层树.正在动画 = 假
+        全局层树.纹理内存使用 = 0
+        全局层树.纹理内存限制 = 256 * 1024 * 1024
+        全局层树.光栅化队列 = 堆_分配_数组(1024 * 8)
+        全局层树.光栅化队列大小 = 0
+        全局层树.下一个层ID = 1
+        全局层树.根层 = 0
+    }
+    返回 全局层树
+}
+
+// §5 层提升决策 — 哪些绘制Layer需要成为合成层
+// (对应 CompositingLayerAssigner)
+
+函数 Compositing_分析层(paint层) {
+    如果 (paint层 == 0) { 返回 CR_NONE }
+    定义 可变 原因 = CR_NONE
+    定义 样式 = paint层.计算样式
+
+    如果 (样式 == 0) { 返回 CR_NONE }
+
+    // will-change
+    定义 wc = 样式.will_change
+    如果 (wc != 0) {
+        如果 (字符串_包含(wc, "transform")) { 原因 = 原因 | CR_WILL_CHANGE_TRANSFORM }
+        如果 (字符串_包含(wc, "opacity")) { 原因 = 原因 | CR_WILL_CHANGE_OPACITY }
+        如果 (字符串_包含(wc, "filter")) { 原因 = 原因 | CR_WILL_CHANGE_FILTER }
+    }
+
+    // 3D变换
+    如果 (样式.transform != 0) {
+        如果 (Transform_是3D(样式.transform)) { 原因 = 原因 | CR_3D_TRANSFORM }
+    }
+
+    // 活跃动画
+    如果 (paint层.有transform动画) { 原因 = 原因 | CR_ANIMATION_TRANSFORM }
+    如果 (paint层.有opacity动画) { 原因 = 原因 | CR_ANIMATION_OPACITY }
+
+    // position: fixed
+    如果 (样式.position == 5) { 原因 = 原因 | CR_FIXED_POSITION }    // fixed=5
+
+    // overflow: scroll
+    如果 (样式.overflow_x == 3 || 样式.overflow_y == 3) {    // scroll=3
+        如果 (paint层.可滚动) { 原因 = 原因 | CR_OVERFLOW_SCROLL }
+    }
+
+    // 视频/canvas
+    如果 (paint层.是video) { 原因 = 原因 | CR_VIDEO }
+    如果 (paint层.是canvas) { 原因 = 原因 | CR_CANVAS }
+
+    // backdrop-filter
+    如果 (样式.backdrop_filter != 0) { 原因 = 原因 | CR_BACKDROP_FILTER }
+
+    // filter
+    如果 (样式.filter != 0) { 原因 = 原因 | CR_FILTER }
+
+    // mix-blend-mode
+    如果 (样式.mix_blend_mode != 0) { 原因 = 原因 | CR_BLEND_MODE }
+
+    // backface-visibility: hidden
+    如果 (样式.backface_visibility == 1) { 原因 = 原因 | CR_BACKFACE_HIDDEN }
+
+    返回 原因
+}
+
+函数 Compositing_需要合成层(原因) {
+    返回 原因 != CR_NONE
+}

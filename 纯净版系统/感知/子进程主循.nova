@@ -1,0 +1,294 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/内存管理封.nova")
+导入("./内核直连层.nova")
+导入("../执行/平台时间.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §9 子进程主循环(消息分发)
+
+函数 渲染er_主循环(pipe, port_idx) {
+    // 接收Browser发来的IPC消息并处理
+    当 (真) {
+        定义 msg = MojoPipe_接收(pipe, port_idx)
+        如果 (msg == 0) { 继续 }
+        // 根据消息类型分发
+        如果 (msg.类型 == 1) { /* 导航请求 */ }
+        如果 (msg.类型 == 2) { /* JS执行请求 */ }
+        如果 (msg.类型 == 3) { /* 资源加载响应 */ }
+        如果 (msg.类型 == 0xFFFF) { 跳出 }    // 退出信号
+    }
+}
+
+函数 图处_主循环(pipe, port_idx) {
+    当 (真) {
+        定义 msg = MojoPipe_接收(pipe, port_idx)
+        如果 (msg == 0) { 继续 }
+        如果 (msg.类型 == 100) { /* 合成请求 */ }
+        如果 (msg.类型 == 101) { /* 图绘命令 */ }
+        如果 (msg.类型 == 0xFFFF) { 跳出 }
+    }
+}
+
+// §10 平台适配
+
+函数 平台_unshare(flags) {
+    // flags: CLONE_NEWUSER=0x10000000 CLONE_NEWPID=0x20000000 CLONE_NEWNET=0x40000000
+    返回 系统调用(SYS_unshare, flags, 0, 0, 0, 0, 0)
+}
+函数 平台_prctl_no_new_privs() {
+    // prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+    // 禁止子进程获取新特权(execve不提升)
+    定义 PR_SET_NO_NEW_PRIVS = 38
+    返回 系统调用(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0)
+}
+函数 平台_drop_capabilities() {
+    // 清除进程所有capabilities
+    // capset(&header, &data) 将 effective/permitted/inheritable 全部清零
+    定义 hdr = 堆_分配(8)
+    内存_写32(hdr, 0x20080522)   // _LINUX_CAPABILITY_VERSION_3
+    内存_写32(hdr + 4, 0)        // pid=0 (当前进程)
+    定义 data = 堆_分配(24)
+    内存_置零(data, 24)           // effective=0, permitted=0, inheritable=0
+    定义 ret = 系统调用(SYS_capset, hdr, data, 0, 0, 0, 0)
+    堆_释放(hdr); 堆_释放(data)
+    返回 ret
+}
+函数 平台_remount_readonly() {
+    // mount("", "/", "", MS_REMOUNT|MS_RDONLY, NULL)
+    定义 MS_REMOUNT = 0x20
+    定义 MS_RDONLY = 0x01
+    返回 系统调用(SYS_mount, "", "/", "", MS_REMOUNT | MS_RDONLY, 0, 0)
+}
+函数 平台_seccomp_install(prog) {
+    // prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
+    定义 PR_SET_SECCOMP = 22
+    定义 SECCOMP_MODE_FILTER = 2
+    返回 系统调用(SYS_prctl, PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog, 0, 0, 0)
+}
+函数 平台_setrlimit_memory(bytes) {
+    // setrlimit(RLIMIT_AS, &{bytes,bytes})
+    定义 RLIMIT_AS = 9
+    定义 rlim = 堆_分配(16)
+    内存_写64(rlim, bytes)       // rlim_cur
+    内存_写64(rlim + 8, bytes)   // rlim_max
+    定义 ret = 系统调用(SYS_setrlimit, RLIMIT_AS, rlim, 0, 0, 0, 0)
+    堆_释放(rlim)
+    返回 ret
+}
+函数 平台_setrlimit_nofile(n) {
+    // setrlimit(RLIMIT_NOFILE, &{n,n})
+    定义 RLIMIT_NOFILE = 7
+    定义 rlim = 堆_分配(16)
+    内存_写64(rlim, n)
+    内存_写64(rlim + 8, n)
+    定义 ret = 系统调用(SYS_setrlimit, RLIMIT_NOFILE, rlim, 0, 0, 0, 0)
+    堆_释放(rlim)
+    返回 ret
+}
+函数 平台_socketpair(fds) {
+    // socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fds)
+    定义 AF_UNIX = 1
+    定义 SOCK_SEQPACKET = 5
+    返回 系统调用(SYS_socketpair, AF_UNIX, SOCK_SEQPACKET, 0, fds, 0, 0)
+}
+函数 平台_sendmsg_with_fds(fd, buf, len, fds, nfds) {
+    定义 iov = 堆_分配(16)
+    内存_写64(iov, buf); 内存_写64(iov + 8, len)
+    定义 cmsg_len = 16 + nfds * 4
+    定义 cmsg = 堆_分配(cmsg_len)
+    内存_写64(cmsg, cmsg_len)    // cmsg_len
+    内存_写32(cmsg + 8, 1)       // SOL_SOCKET
+    内存_写32(cmsg + 12, 1)      // SCM_RIGHTS
+    内存_复制(cmsg + 16, fds, nfds * 4)
+    定义 msg = 堆_分配(56)
+    内存_写64(msg, 0); 内存_写32(msg + 8, 0)  // name
+    内存_写64(msg + 16, iov); 内存_写64(msg + 24, 1)  // iov
+    内存_写64(msg + 32, cmsg); 内存_写64(msg + 40, cmsg_len)
+    定义 ret = 系统调用_sendmsg(fd, msg, 0)
+    堆_释放(cmsg); 堆_释放(iov); 堆_释放(msg)
+    返回 ret
+}
+函数 平台_recvmsg_with_fds(fd, buf, max, fds, nfds) {
+    定义 iov = 堆_分配(16)
+    内存_写64(iov, buf); 内存_写64(iov + 8, max)
+    定义 cmsg_buf = 堆_分配(64)
+    定义 msg = 堆_分配(56)
+    内存_写64(msg, 0); 内存_写32(msg + 8, 0)
+    内存_写64(msg + 16, iov); 内存_写64(msg + 24, 1)
+    内存_写64(msg + 32, cmsg_buf); 内存_写64(msg + 40, 64)
+    定义 ret = 系统调用_recvmsg(fd, msg, 0)
+    // 提取传递的fd
+    如果 (ret > 0 && nfds != 0) {
+        定义 cmsg_data = cmsg_buf + 16
+        定义 可变 i = 0
+        当 (i < 8) {
+            内存_写32(fds + i * 4, 内存_读32(cmsg_data + i * 4))
+            i = i + 1
+        }
+    }
+    堆_释放(cmsg_buf); 堆_释放(iov); 堆_释放(msg)
+    返回 ret
+}
+函数 平台_memfd_create(size) {
+    定义 fd = 系统调用_memfd_create("nova_shm", 0)
+    如果 (fd < 0) { 返回 -1 }
+    // 设置大小
+    系统调用_ftruncate(fd, size)
+    返回 fd
+}
+函数 平台_Nova内存映射(fd, size) {
+    返回 系统调用_Nova内存映射(0, size, 3, 1, fd, 0)
+}
+函数 平台_fork() {
+    返回 系统调用_fork()
+}
+函数 平台_kill(pid, sig) { 系统调用_kill(pid, sig) }
+函数 平台_exit(code) { 系统调用_exit(code) }
+
+// §11 IPC消息类型常量
+
+定义 MSG_导航请求 = 1
+定义 MSG_JS执行 = 2
+定义 MSG_资源响应 = 3
+定义 MSG_DOM更新 = 4
+定义 MSG_布局完成 = 5
+定义 MSG_合成请求 = 100
+定义 MSG_绘制命令 = 101
+定义 MSG_纹理上传 = 102
+定义 MSG_退出 = 0xFFFF
+
+函数 MSG_类型名(类型) {
+    如果 (类型 == MSG_导航请求) { 返回 "NAVIGATE" }
+    如果 (类型 == MSG_JS执行) { 返回 "JS_EXEC" }
+    如果 (类型 == MSG_资源响应) { 返回 "RESOURCE" }
+    如果 (类型 == MSG_DOM更新) { 返回 "DOM_UPDATE" }
+    如果 (类型 == MSG_合成请求) { 返回 "COMPOSITE" }
+    如果 (类型 == MSG_绘制命令) { 返回 "PAINT" }
+    如果 (类型 == MSG_退出) { 返回 "EXIT" }
+    返回 "MSG_" + 整数转字符串(类型)
+}
+
+// §12 MojoPipe后备通道
+
+结构 MojoMessage {
+    类型,
+    数据,
+    长度,
+}
+
+定义 可变 MojoPipe_待收队列表 = []
+
+函数 MojoPipe_获取待收队列(pipe, port) {
+    定义 可变 i = 0
+    当 (i < 计数(MojoPipe_待收队列表)) {
+        如果 (MojoPipe_待收队列表[i][0] == pipe && MojoPipe_待收队列表[i][1] == port) {
+            返回 MojoPipe_待收队列表[i][2]
+        }
+        i = i + 1
+    }
+    定义 队列 = []
+    追加(MojoPipe_待收队列表, [pipe, port, 队列])
+    返回 队列
+}
+
+函数 MojoPipe_接收(pipe, port) {
+    如果 (pipe == 0) { 返回 0 }
+    定义 队列 = MojoPipe_获取待收队列(pipe, port)
+    如果 (计数(队列) == 0) { 返回 0 }
+    IPC_接收总数 = IPC_接收总数 + 1
+    定义 msg = 队列[0]
+    删除(队列, 0)
+    返回 msg
+}
+
+函数 MojoPipe_发送(pipe, port, msg) {
+    如果 (pipe == 0 || msg == 0) { 返回 -1 }
+    定义 目标端口 = 0
+    如果 (port == 0) { 目标端口 = 1 }
+    定义 队列 = MojoPipe_获取待收队列(pipe, 目标端口)
+    追加(队列, msg)
+    IPC_发送总数 = IPC_发送总数 + 1
+    返回 0
+}
+
+函数 MojoMessage_创建(类型, 数据, 长度) {
+    定义 msg = MojoMessage {}
+    msg.类型 = 类型
+    msg.数据 = 数据
+    msg.长度 = 长度
+    返回 msg
+}
+
+// §13 进程模型统计与健康检查
+
+定义 可变 IPC_发送总数 = 0
+定义 可变 IPC_接收总数 = 0
+定义 可变 沙箱_创建总数 = 0
+定义 可变 沙箱_销毁总数 = 0
+
+函数 进程模型_统计() {
+    返回 {
+        IPC发送: IPC_发送总数,
+        IPC接收: IPC_接收总数,
+        沙箱创建: 沙箱_创建总数,
+        沙箱销毁: 沙箱_销毁总数,
+    }
+}
+
+函数 进程模型_健康检查() {
+    定义 可变 问题 = []
+    如果 (沙箱_创建总数 > 沙箱_销毁总数 + 100) {
+        追加(问题, "沙箱进程可能泄漏")
+    }
+    如果 (计数(问题) == 0) { 返回 "进程模型健康" }
+    返回 问题
+}
+
+函数 进程模型_重置() {
+    IPC_发送总数 = 0
+    IPC_接收总数 = 0
+    沙箱_创建总数 = 0
+    沙箱_销毁总数 = 0
+}
+
+函数 进程模型_完整统计() {
+    返回 [IPC_发送总数, IPC_接收总数, 沙箱_创建总数, 沙箱_销毁总数]
+}
+
+函数 子进程主循_统计() {
+    返回 {
+        IPC发送总数: IPC_发送总数,
+        IPC接收总数: IPC_接收总数,
+        沙箱创建总数: 沙箱_创建总数,
+        沙箱销毁总数: 沙箱_销毁总数
+    }
+}
+
+函数 子进程主循_健康评估() {
+    定义 可变 问题 = []
+    如果 (IPC_发送总数 > 100000) { 追加(问题, "IPC_发送总数异常增长") }
+    如果 (IPC_接收总数 > 100000) { 追加(问题, "IPC_接收总数异常增长") }
+    如果 (沙箱_创建总数 > 100000) { 追加(问题, "沙箱_创建总数异常增长") }
+    如果 (沙箱_销毁总数 > 100000) { 追加(问题, "沙箱_销毁总数异常增长") }
+    返回 计数(问题) == 0
+}
+
+函数 子进程主循_综合报告() {
+    打印("[子进程主循] ═══ 综合报告 ═══")
+    打印("  IPC_发送总数: " + IPC_发送总数)
+    打印("  IPC_接收总数: " + IPC_接收总数)
+    打印("  沙箱_创建总数: " + 沙箱_创建总数)
+    打印("  沙箱_销毁总数: " + 沙箱_销毁总数)
+    打印("  健康: " + 如果 (子进程主循_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 子进程主循_全局重置() {
+    IPC_发送总数 = 0
+    IPC_接收总数 = 0
+    沙箱_创建总数 = 0
+    沙箱_销毁总数 = 0
+    打印("[子进程主循] 统计已重置")
+    返回 0
+}

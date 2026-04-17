@@ -1,0 +1,516 @@
+// [循环导入已解耦] 导入("./FFI桥接.nova") — 函数由链接器全局解析
+导入("../../../标准库/基础.nova")
+
+// Nova · 平台层 · GPU设备管理器
+// 统一抽象层 — 屏蔽NVIDIA/AMD/Intel差异
+// 真实设备枚举/初始化/能力查询/上下文管理
+// Win11 + 全Linux发行版完美兼容
+
+// GPU厂商
+定义 GPU_厂商_未知 = 0
+定义 GPU_厂商_NVIDIA = 1
+定义 GPU_厂商_AMD = 2
+定义 GPU_厂商_INTEL = 3
+定义 GPU_厂商_APPLE = 4 // Metal (macOS)
+
+// GPU能力等级
+定义 GPU_能力_无 = 0 // 无GPU或不支持计算
+定义 GPU_能力_基础 = 1 // 仅基础计算 (老卡/集显)
+定义 GPU_能力_标准 = 2 // FP32 + 共享内存 + 多SM
+定义 GPU_能力_高级 = 3 // FP16/BF16 + Tensor Core / Matrix Core
+定义 GPU_能力_旗舰 = 4 // FP8 + Transformer Engine / AI加速器
+
+// 设备状态
+定义 GPU_状态_未初始化 = 0
+定义 GPU_状态_就绪 = 1
+定义 GPU_状态_忙碌 = 2
+定义 GPU_状态_错误 = 3
+
+// GPU设备描述符
+// 真实映射底层驱动返回的设备信息
+// [ID, 厂商, 名称, 计算能力, 显存总量MB, 显存可用MB,
+// SM数/CU数, 核心频率MHz, 显存带宽GB/s,
+// 最大线程/块, 最大共享内存KB, 支持FP16, 支持BF16,
+// 支持Tensor/Matrix Core, 驱动版本, 状态, 上下文句柄,
+// PCIe总线ID, 温度, 功耗W, 利用率%]
+函数 GPU设备_创建(ID, 厂商) { 返回 [ID, 厂商, "", GPU_能力_无, 0, 0
+, 0, 0
+, 假, 假,
+ 假, "", GPU_状态_未初始化, 0,
+ "", 0, 0]
+}
+
+函数 GPU设备_ID(dev)
+{ 返回 dev[0] }
+函数 GPU设备_厂商(dev)
+{ 返回 dev[1] }
+函数 GPU设备_名称(dev)
+{ 返回 dev[2] }
+函数 GPU设备_能力(dev)
+{ 返回 dev[3] }
+函数 GPU设备_显存总量(dev) { 返回 dev[4] }
+函数 GPU设备_显存可用(dev) { 返回 dev[5] }
+函数 GPU设备_核心数(dev)
+{ 返回 dev[6] }
+函数 GPU设备_频率(dev)
+{ 返回 dev[7] }
+函数 GPU设备_带宽(dev)
+{ 返回 dev[8] }
+函数 GPU设备_状态(dev)
+{ 返回 dev[15] }
+函数 GPU设备_上下文(dev)
+{ 返回 dev[16] }
+函数 GPU设备_温度(dev)
+{ 返回 dev[18] }
+函数 GPU设备_功耗(dev)
+{ 返回 dev[19] }
+函数 GPU设备_利用率(dev)
+{ 返回 dev[20] }
+函数 GPU设备_支持FP16(dev) { 返回 dev[11] }
+函数 GPU设备_支持BF16(dev) { 返回 dev[12] }
+函数 GPU设备_有TensorCore(dev) { 返回 dev[13] }
+
+// GPU管理器
+// [设备列表, 当前设备ID, 驱动类型, 初始化状态, 错误信息]
+函数 GPU管理器_创建() { 返回 [[], -1, GPU_厂商_未知, 假, ""]
+}
+
+// 设备枚举 (真实系统调用)
+// Win11: 通过LoadLibrary加载nvcuda.dll/amdhip64.dll
+// Linux: 通过dlopen加载libcuda.so/libamdhip64.so
+函数 GPU管理器_枚举设备(管理器) { 定义 可变 设备数 = 0
+ 管理器[0] = []
+
+ // 试 NVIDIA (CUDA)
+ 如果 (cuda_lib != 0) {
+ // cuInit()
+ 定义 初始化结果 = 外部调用(cuda_lib,  "cuInit", 0, 0, 0, 0, 0)
+ 如果 (初始化结果 == 0) {
+ // cuDeviceGetCount(&count)
+ 定义 nvidia数 = 外部调用(cuda_lib,  "cuDeviceGetCount", 0, 0, 0, 0, 0)
+ 定义 可变 i = 0
+ 当 (i < nvidia数) { 定义 dev = GPU设备_创建(设备数, GPU_厂商_NVIDIA)
+ GPU_填充NVIDIA信息(cuda_lib, dev, i)
+ 追加(管理器[0], dev)
+ 设备数 = 设备数 + 1
+ i = i + 1
+ }
+ }
+ }
+
+ // 试 AMD (HIP/ROCm)
+ 如果 (hip_lib != 0) { 定义 hip_init = 外部调用(hip_lib,  "hipInit", 0, 0, 0, 0, 0)
+ 如果 (hip_init == 0) { 定义 amd数 = 外部调用(hip_lib,  "hipGetDeviceCount", 0, 0, 0, 0, 0)
+ 定义 可变 j = 0
+ 当 (j < amd数) { 定义 dev = GPU设备_创建(设备数, GPU_厂商_AMD)
+ GPU_填充AMD信息(hip_lib, dev, j)
+ 追加(管理器[0], dev)
+ 设备数 = 设备数 + 1
+ j = j + 1
+ }
+ }
+ }
+
+ // 试 Intel (Level Zero / oneAPI)
+ 如果 (ze_lib != 0) { 定义 ze_init = 外部调用(ze_lib,  "zeInit", 0, 0, 0, 0, 0)
+ 如果 (ze_init == 0) {
+ // Intel GPU枚举
+ 定义 intel数 = GPU_枚举Intel设备(ze_lib)
+ 定义 可变 k = 0
+ 当 (k < intel数) { 定义 dev = GPU设备_创建(设备数, GPU_厂商_INTEL)
+ GPU_填充Intel信息(ze_lib, dev, k)
+ 追加(管理器[0], dev)
+ 设备数 = 设备数 + 1
+ k = k + 1
+ }
+ }
+ }
+
+ 管理器[3] = 设备数 > 0
+ 如果 (设备数 > 0) {
+ 管理器[1] = 0 // 默认使用第一个设备
+ 管理器[2] = GPU设备_厂商(管理器[0][0])
+ }
+
+ 返回 设备数
+}
+
+函数 GPU_字符串非空(s) { 返回 s != 空 且 字节长度(s) > 0
+}
+
+函数 GPU_路径连接(目录, 文件名) {
+    如果 (!GPU_字符串非空(目录)) { 返回 文件名
+}
+ 如果 (!GPU_字符串非空(文件名)) { 返回 目录 }
+ 定义 末字节 = 字节取(目录, 字节长度(目录) - 1)
+ 如果 (末字节 == 47 或 末字节 == 92) { 返回 字符串拼接(目录, 文件名) }
+ 返回 字符串拼接(字符串拼接(目录, "/"), 文件名), 文件名
+}
+
+函数 GPU_目录追加(目录列表, 目录) {
+    如果 (!GPU_字符串非空(目录)) { 返回
+}
+ 定义 可变 i = 0
+ 当 (i < 计数(目录列表)) { 如果 (目录列表[i] == 目录) { 返回 }
+ i = i + 1
+ }
+ 追加(目录列表, 目录)
+}
+
+函数 GPU_尝试加载候选(候选) { 定义 可变 i = 0
+ 当 (i < 计数(候选)) { 如果 (GPU_字符串非空(候选[i])) { 定义 句柄 = 加载动态库(候选[i])
+ 如果 (句柄 != 0) { 返回 句柄 }
+ }
+ i = i + 1
+ }
+ 返回 0
+}
+
+函数 GPU_加载库候选(名称列表, 目录列表) { 定义 可变 候选 = []
+ 定义 可变 i = 0
+ 当 (i < 计数(名称列表)) { 如果 (GPU_字符串非空(名称列表[i])) {
+ 追加(候选, 名称列表[i])
+ 定义 可变 j = 0
+ 当 (j < 计数(目录列表)) {
+ 追加(候选, GPU_路径连接(目录列表[j], 名称列表[i]))
+ j = j + 1
+ }
+ }
+ i = i + 1
+ }
+ 返回 GPU_尝试加载候选(候选)
+}
+
+函数 GPU_CUDA目录列表() { 定义 可变 目录 = []
+ GPU_目录追加(目录, GPU_路径连接(获取环境("CUDA_HOME"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("CUDA_HOME"), "lib64"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("CUDA_PATH"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("CUDA_PATH"), "lib/x64"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("NVIDIA_CUDA_ROOT"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("NVIDIA_CUDA_ROOT"), "lib64"))
+ GPU_目录追加(目录, "/usr/local/cuda/lib64")
+ GPU_目录追加(目录, "/usr/lib/x86_64-linux-gnu")
+ GPU_目录追加(目录, "/usr/lib64")
+ 返回 目录
+}
+
+函数 GPU_ROCm目录列表() { 定义 可变 目录 = []
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ROCM_HOME"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ROCM_HOME"), "lib"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ROCM_PATH"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ROCM_PATH"), "lib"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("HIP_PATH"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("HIP_PATH"), "lib"))
+ GPU_目录追加(目录, "/opt/rocm/lib")
+ GPU_目录追加(目录, "/usr/lib")
+ GPU_目录追加(目录, "/usr/lib64")
+ 返回 目录
+}
+
+函数 GPU_Intel目录列表() { 定义 可变 目录 = []
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ONEAPI_ROOT"), "bin"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ONEAPI_ROOT"), "lib"))
+ GPU_目录追加(目录, GPU_路径连接(获取环境("ONEAPI_ROOT"), "lib64"))
+ GPU_目录追加(目录, "/usr/lib/x86_64-linux-gnu")
+ GPU_目录追加(目录, "/usr/lib64")
+ GPU_目录追加(目录, "/opt/intel/oneapi/lib")
+ GPU_目录追加(目录, "/opt/intel/oneapi/lib64")
+ 返回 目录
+}
+
+函数 GPU_加载CUDA候选(名称列表) { 返回 GPU_加载库候选(名称列表, GPU_CUDA目录列表())
+}
+
+函数 GPU_加载ROCm候选(名称列表) { 返回 GPU_加载库候选(名称列表, GPU_ROCm目录列表())
+}
+
+函数 GPU_加载Intel候选(名称列表) { 返回 GPU_加载库候选(名称列表, GPU_Intel目录列表())
+}
+
+// 驱动库加载 (跨平台)
+函数 GPU_加载驱动库(厂商) { 如果 (厂商 == GPU_厂商_NVIDIA) { 返回 GPU_加载CUDA候选(["nvcuda.dll", "libcuda.so.1", "libcuda.so"])
+ }
+
+ 如果 (厂商 == GPU_厂商_AMD) { 返回 GPU_加载ROCm候选(["amdhip64.dll", "hip64.dll", "libamdhip64.so", "libhip_hcc.so"])
+ }
+
+ 如果 (厂商 == GPU_厂商_INTEL) { 返回 GPU_加载Intel候选(["ze_loader.dll", "libze_loader.so.1", "libze_loader.so"])
+ }
+
+ 返回 0
+}
+
+// NVIDIA设备信息填充 (真实CUDA API调用)
+函数 GPU_填充NVIDIA信息(cuda_lib, dev, 设备序号) {
+ // cuDeviceGetName
+ dev[2] = 外部调用字符串(cuda_lib, "cuDeviceGetName", 256, 设备序号)
+ // cuDeviceTotalMem
+ 定义 显存 = 外部调用(cuda_lib,  "cuDeviceTotalMem_v2",  设备序号, 0, 0, 0, 0)
+ dev[4] = 显存 / 1048576 // 转MB
+ dev[5] = dev[4] // 初始可用=总量
+ // cuDeviceGetAttribute系列
+ // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16
+ dev[6] = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  16,  设备序号, 0, 0, 0)
+ // CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 13 (kHz→MHz)
+ dev[7] = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  13,  设备序号, 0, 0, 0) / 1000
+ // CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 36
+ 定义 显存频率 = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  36,  设备序号, 0, 0, 0) / 1000
+ // CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH = 37
+ 定义 总线宽度 = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  37,  设备序号, 0, 0, 0)
+ dev[8] = 显存频率 * 总线宽度 * 2 / 8000 // GB/s
+ // CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1
+ dev[9] = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  1,  设备序号, 0, 0, 0)
+ // CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8
+ dev[10] = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  8,  设备序号, 0, 0, 0) / 1024
+ // 计算能力
+ 定义 major = 外部调用(cuda_lib,  "cuDeviceGetAttribute",  75,  设备序号, 0, 0, 0)
+ 外部调用(cuda_lib,  "cuDeviceGetAttribute",  76,  设备序号, 0, 0, 0)
+ // SM >= 7.0: FP16, >= 7.0 with Tensor Core
+ dev[11] = major >= 6 // FP16从Pascal开始
+ dev[12] = major >= 8 // BF16从Ampere开始
+ dev[13] = major >= 7 // Tensor Core从Volta开始
+ 如果 (major >= 9) { dev[3] = GPU_能力_旗舰 } // Hopper+
+ 否则 如果 (major >= 7) { dev[3] = GPU_能力_高级 } // Volta/Turing/Ampere
+ 否则 如果 (major >= 5) { dev[3] = GPU_能力_标准 } // Maxwell/Pascal
+ 否则 { dev[3] = GPU_能力_基础 }
+ // 创建CUDA上下文
+ dev[16] = 外部调用(cuda_lib,  "cuCtxCreate_v2",  0,  设备序号, 0, 0, 0)
+ dev[15] = GPU_状态_就绪
+ // 驱动版本
+ dev[14] = 转字符串(外部调用(cuda_lib,  "cuDriverGetVersion", 0, 0, 0, 0, 0))
+}
+
+// AMD设备信息填充 (真实HIP API调用)
+函数 GPU_填充AMD信息(hip_lib, dev, 设备序号) {
+ // hipSetDevice
+ 外部调用(hip_lib,  "hipSetDevice",  设备序号, 0, 0, 0, 0)
+ // hipDeviceGetName (名称256字节)
+ dev[2] = 外部调用字符串(hip_lib, "hipDeviceGetName", 256, 设备序号)
+ // hipDeviceTotalMem
+ 定义 显存 = 外部调用(hip_lib,  "hipDeviceTotalMem",  设备序号, 0, 0, 0, 0)
+ dev[4] = 显存 / 1048576
+ dev[5] = dev[4]
+ // hipDeviceGetAttribute
+ // hipDeviceAttributeMultiprocessorCount = 16
+ dev[6] = 外部调用(hip_lib,  "hipDeviceGetAttribute",  16,  设备序号, 0, 0, 0)
+ // hipDeviceAttributeClockRate = 13
+ dev[7] = 外部调用(hip_lib,  "hipDeviceGetAttribute",  13,  设备序号, 0, 0, 0) / 1000
+ // 显存带宽
+ 定义 显存频率 = 外部调用(hip_lib,  "hipDeviceGetAttribute",  36,  设备序号, 0, 0, 0) / 1000
+ 定义 总线宽度 = 外部调用(hip_lib,  "hipDeviceGetAttribute",  37,  设备序号, 0, 0, 0)
+ dev[8] = 显存频率 * 总线宽度 * 2 / 8000
+ // 最大线程/块
+ dev[9] = 外部调用(hip_lib,  "hipDeviceGetAttribute",  1,  设备序号, 0, 0, 0)
+ // 共享内存
+ dev[10] = 外部调用(hip_lib,  "hipDeviceGetAttribute",  8,  设备序号, 0, 0, 0) / 1024
+ // AMD GCN架构: gfx9xx+ 支持FP16, CDNA/RDNA3+ 支持BF16 Matrix Core
+ 定义 gcn_arch = 外部调用(hip_lib,  "hipDeviceGetAttribute",  2000,  设备序号, 0, 0, 0)
+ dev[11] = gcn_arch >= 900 // FP16从Vega开始
+ dev[12] = gcn_arch >= 940 // BF16: MI200+
+ dev[13] = gcn_arch >= 908 // Matrix Core: MI100+
+ 如果 (gcn_arch >= 940) { dev[3] = GPU_能力_旗舰 } // MI300+
+ 否则 如果 (gcn_arch >= 908) { dev[3] = GPU_能力_高级 } // MI100/MI200
+ 否则 如果 (gcn_arch >= 900) { dev[3] = GPU_能力_标准 } // Vega/RDNA
+ 否则 { dev[3] = GPU_能力_基础 }
+
+ dev[15] = GPU_状态_就绪
+ 定义 版本 = 外部调用(hip_lib,  "hipDriverGetVersion", 0, 0, 0, 0, 0)
+ dev[14] = 字符串拼接("ROCm ", 转字符串(版本))
+}
+
+// Intel设备信息填充
+函数 GPU_枚举Intel设备(ze_lib) { 返回 外部调用(ze_lib,  "zeDeviceGet", 0, 0, 0, 0, 0)
+}
+
+函数 GPU_填充Intel信息(_ze_lib, dev, _设备序号) {
+ dev[2] = "Intel GPU"
+ dev[3] = GPU_能力_标准
+ dev[15] = GPU_状态_就绪
+ dev[14] = "oneAPI"
+}
+
+// 设备选择
+函数 GPU管理器_选择设备(管理器, 设备ID) { 如果 (设备ID < 0 或 设备ID >= 计数(管理器[0])) {
+ 管理器[4] = "设备ID超出范围"
+ 返回 假
+ }
+ 管理器[1] = 设备ID
+ 定义 dev = 管理器[0][设备ID]
+ // 激活对应上下文
+如果 (GPU设备_厂商(dev) == GPU_厂商_NVIDIA) {
+ 外部调用(cuda_lib,  "cuCtxSetCurrent",  GPU设备_上下文(dev), 0, 0, 0, 0)
+} 否则 如果 (GPU设备_厂商(dev) == GPU_厂商_AMD) {
+ 外部调用(hip_lib,  "hipSetDevice",  设备ID, 0, 0, 0, 0)
+ }
+ 返回 真
+}
+
+函数 GPU管理器_当前设备(管理器) {
+    如果 (管理器[1] < 0) { 返回 空
+}
+ 返回 管理器[0][管理器[1]]
+}
+
+函数 GPU管理器_设备数(管理器) { 返回 计数(管理器[0]) }
+
+// 自动选最优设备
+函数 GPU管理器_自动选择(管理器) { 定义 可变 最优 = -1
+ 定义 可变 最优分数 = 0
+ 定义 可变 i = 0
+ 当 (i < 计数(管理器[0])) { 定义 dev = 管理器[0][i]
+ // 评分: 显存×能力等级×核心数
+ 定义 分数 = GPU设备_显存总量(dev) * (GPU设备_能力(dev) + 1) * (GPU设备_核心数(dev) + 1)
+ 如果 (分数 > 最优分数) {
+ 最优分数 = 分数
+ 最优 = i
+ }
+ i = i + 1
+ }
+ 如果 (最优 >= 0) { GPU管理器_选择设备(管理器, 最优) }
+ 返回 最优
+}
+
+// 设备信息报告
+函数 GPU管理器_报告(管理器) {
+ 打印("═══ Nova GPU 设备管理器 ═══")
+ 打印(字符串拼接(" 检测到 ", 字符串拼接(转字符串(计数(管理器[0])), " 个GPU设备:")))
+
+ 定义 厂商名 = ["unknown", "NVIDIA", "AMD", "Intel", "Apple"]
+ 定义 能力名 = ["无", "基础", "标准", "高级", "旗舰"]
+
+ 定义 可变 i = 0
+ 当 (i < 计数(管理器[0])) { 定义 dev = 管理器[0][i]
+ 定义 可变 标记 = " "
+ 如果 (i == 管理器[1]) { 标记 = "▸ " }
+ 打印(字符串拼接(标记, 字符串拼接("[", 字符串拼接(转字符串(i), 字符串拼接("] ", GPU设备_名称(dev))))))
+ 打印(字符串拼接(" 厂商: ", 字符串拼接(厂商名[GPU设备_厂商(dev)], 字符串拼接(" 驱动: ", dev[14]))))
+ 打印(字符串拼接(" 显存: ", 字符串拼接(转字符串(GPU设备_显存总量(dev)), 字符串拼接("MB 带宽: ", 字符串拼接(转字符串(GPU设备_带宽(dev)), "GB/s")))))
+ 打印(字符串拼接(" 核心: ", 字符串拼接(转字符串(GPU设备_核心数(dev)), 字符串拼接(" SM/CU 频率: ", 字符串拼接(转字符串(GPU设备_频率(dev)), "MHz")))))
+ 打印(字符串拼接(" 能力: ", 字符串拼接(能力名[GPU设备_能力(dev)], 字符串拼接(" FP16:", 字符串拼接(转字符串(dev[11]), 字符串拼接(" BF16:", 字符串拼接(转字符串(dev[12]), 字符串拼接(" TensorCore:", 转字符串(dev[13])))))))))
+ i = i + 1
+ }
+}
+
+// 设备选择
+
+函数 GPU_最佳设备(设备列表) {
+    如果 (计数(设备列表) == 0) { 返回 -1
+}
+ 定义 可变 最佳 = 0
+ 定义 可变 最佳分 = 0
+ 定义 可变 i = 0
+ 当 (i < 计数(设备列表)) { 定义 dev = 设备列表[i]
+ 定义 分 = GPU设备_显存总量(dev) * 10 + GPU设备_核心数(dev) * 5 + GPU设备_频率(dev)
+ 如果 (分 > 最佳分) { 最佳分 = 分 最佳 = i }
+ i = i + 1
+ }
+ 返回 最佳
+}
+
+函数 GPU_满足需求(dev, 最小显存, 最小核心) {
+    如果 (GPU设备_显存总量(dev) < 最小显存) { 返回 假
+}
+ 如果 (GPU设备_核心数(dev) < 最小核心) { 返回 假 }
+ 返回 真
+}
+
+函数 GPU_显存利用率(dev, 已用) { 定义 总 = GPU设备_显存总量(dev)
+ 如果 (总 == 0) { 返回 0 }
+ 返回 已用 * 100 / 总
+}
+
+函数 GPU_理论算力(dev) {
+ // TFLOPS ≈ 核心数 * 频率 * 2 / 1000000
+ 返回 GPU设备_核心数(dev) * GPU设备_频率(dev) * 2 / 1000000
+}
+
+函数 GPU_带宽利用率(dev, 实际带宽) { 定义 峰值 = GPU设备_带宽(dev)
+ 如果 (峰值 == 0) { 返回 0 }
+ 返回 实际带宽 * 100 / 峰值
+}
+
+函数 GPU_功耗估算(dev) { 定义 核心 = GPU设备_核心数(dev)
+ 如果 (核心 > 10000) { 返回 350 }
+ 如果 (核心 > 5000) { 返回 250 }
+ 如果 (核心 > 2000) { 返回 150 }
+ 返回 75
+}
+
+// 多GPU调度
+
+函数 GPU_负载均衡(设备列表, 任务大小) { 定义 n = 计数(设备列表)
+ 如果 (n == 0) { 返回 [] }
+ 定义 可变 总算力 = 0
+ 定义 可变 i = 0
+ 当 (i < n) {
+ 总算力 = 总算力 + GPU_理论算力(设备列表[i])
+ i = i + 1
+ }
+ 如果 (总算力 == 0) { 总算力 = 1 }
+ 定义 可变 分配 = []
+ i = 0
+ 当 (i < n) { 定义 份额 = 任务大小 * GPU_理论算力(设备列表[i]) / 总算力
+ 追加(分配, 份额)
+ i = i + 1
+ }
+ 返回 分配
+}
+
+定义 可变 _GPU_查询次数 = 0
+定义 可变 _GPU_分配次数 = 0
+定义 可变 _GPU_错误次数 = 0
+
+函数 GPU_记录查询() { _GPU_查询次数 = _GPU_查询次数 + 1 }
+函数 GPU_记录分配() { _GPU_分配次数 = _GPU_分配次数 + 1 }
+函数 GPU_记录错误() { _GPU_错误次数 = _GPU_错误次数 + 1 }
+
+函数 GPU_稳定性() {
+    如果 (_GPU_错误次数 > _GPU_分配次数 / 10) { 返回 "不稳定(检查驱动)"
+}
+ 如果 (_GPU_错误次数 > 0) { 返回 "偶有错误" }
+ 返回 "稳定"
+}
+
+函数 GPU_重置() { _GPU_查询次数 = 0 _GPU_分配次数 = 0 _GPU_错误次数 = 0 }
+
+// 显存管理
+
+函数 GPU_显存池_创建(总量) { 返回 [总量, 0, []] // [总量, 已用, 分配记录]
+}
+
+函数 GPU_显存池_分配(池, 大小) {
+    如果 (池[1] + 大小 > 池[0]) { 返回 -1
+}
+ 定义 地址 = 池[1]
+ 池[1] = 池[1] + 大小
+ 追加(池[2], [地址, 大小])
+ 返回 地址
+}
+
+函数 GPU_显存池_释放(池, 地址) { 定义 可变 i = 0
+ 当 (i < 计数(池[2])) { 如果 (池[2][i][0] == 地址) {
+ 池[1] = 池[1] - 池[2][i][1]
+ 返回 真
+ }
+ i = i + 1
+ }
+ 返回 假
+}
+
+函数 GPU_显存池_利用率(池) {
+    如果 (池[0] == 0) { 返回 0
+}
+ 返回 池[1] * 100 / 池[0]
+}
+
+函数 GPU_推荐批大小(dev, 模型大小) { 定义 可用 = GPU设备_显存总量(dev) - 模型大小
+ 如果 (可用 <= 0) { 返回 1 }
+ 定义 可变 每样本 = 模型大小 / 10
+ 如果 (每样本 == 0) { 每样本 = 1 }
+ 定义 批大小 = 可用 / 每样本
+ 如果 (批大小 > 256) { 返回 256 }
+ 如果 (批大小 < 1) { 返回 1 }
+ 返回 批大小
+}
+
+函数 GPU_是否可用() { 返回 _GPU_错误次数 == 0 }

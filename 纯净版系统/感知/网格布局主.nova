@@ -1,0 +1,216 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./布局未知计算.nova")
+导入("./内核直连层.nova")
+导入("./轨道大小型.nova")
+导入("./样式值解析.nova")
+导入("./网格布局创.nova")
+导入("../中枢/内存初始化.nova")
+
+// §3 网格布局主算法
+
+函数 布局网格_布局(layout) {
+    如果 (layout == 0) { 返回 }
+    定义 grid = 网格布局_创建(layout)
+
+    // Step 1: 收集网格项
+    定义 可变 子 = layout.第一子
+    当 (子 != 0) {
+        如果 (子.样式 != 0 && 子.样式.display != 0) {
+            布局Box_计算盒模型(子, layout.宽度, layout.高度)
+            网格布局_添加项(grid, 子)
+        }
+        子 = 子.后一兄弟布局
+    }
+
+    // Step 2: 隐式行扩展
+    如果 (grid.行数 == 0) {
+        // 自动确定行数: 项数量 / 列数 (向上取整)
+        grid.行数 = (grid.项数量 + grid.列数 - 1) / grid.列数
+        如果 (grid.行数 == 0) { grid.行数 = 1 }
+        // 创建auto行轨道
+        定义 可变 i = 0
+        当 (i < grid.行数) {
+            定义 偏移 = grid.行轨道 + i * 32
+            内存_写32(偏移, 轨道_auto)
+            i = i + 1
+        }
+    }
+
+    // Step 3: 放置显式项 (有grid-column/grid-row的)
+    网格布局_放置显式项(grid)
+
+    // Step 4: 自动放置剩余项
+    网格布局_自动放置(grid)
+
+    // Step 5: 轨道大小计算
+    网格布局_计算列大小(grid, layout.宽度)
+    网格布局_计算行大小(grid, layout.高度)
+
+    // Step 6: 定位每个项
+    定义 可变 列位置 = 堆_分配_数组(grid.列数 * 4)
+    定义 可变 行位置 = 堆_分配_数组(grid.行数 * 4)
+
+    // 计算列位置
+    定义 可变 x = 0
+    定义 可变 ci = 0
+    当 (ci < grid.列数) {
+        内存_写32(列位置 + ci * 4, x)
+        定义 列偏移 = grid.列轨道 + ci * 32
+        x = x + 内存_读32(列偏移 + 4)    // 基础大小
+        如果 (ci < grid.列数 - 1) { x = x + grid.列间距 }
+        ci = ci + 1
+    }
+
+    // 计算行位置
+    定义 可变 y = 0
+    定义 可变 ri = 0
+    当 (ri < grid.行数) {
+        内存_写32(行位置 + ri * 4, y)
+        定义 行偏移 = grid.行轨道 + ri * 32
+        y = y + 内存_读32(行偏移 + 4)
+        如果 (ri < grid.行数 - 1) { y = y + grid.行间距 }
+        ri = ri + 1
+    }
+
+    // 定位项
+    定义 可变 pi = 0
+    当 (pi < grid.项数量) {
+        定义 item偏移 = grid.项列表 + pi * 48
+        定义 item_layout = 内存_读64(item偏移)
+        定义 col_start = 内存_读32(item偏移 + 8) - 1    // 1-based → 0-based
+        定义 row_start = 内存_读32(item偏移 + 16) - 1
+        定义 col_end = 内存_读32(item偏移 + 12) - 1
+        定义 row_end = 内存_读32(item偏移 + 20) - 1
+        如果 (col_start < 0) { col_start = 0 }
+        如果 (row_start < 0) { row_start = 0 }
+        如果 (col_end < col_start) { col_end = col_start + 1 }
+        如果 (row_end < row_start) { row_end = row_start + 1 }
+
+        // 计算项的位置和大小
+        定义 item_x = 内存_读32(列位置 + col_start * 4)
+        定义 item_y = 内存_读32(行位置 + row_start * 4)
+        定义 可变 item_w = 0
+        定义 可变 ci2 = col_start
+        当 (ci2 < col_end && ci2 < grid.列数) {
+            item_w = item_w + 内存_读32(grid.列轨道 + ci2 * 32 + 4)
+            如果 (ci2 > col_start) { item_w = item_w + grid.列间距 }
+            ci2 = ci2 + 1
+        }
+        定义 可变 item_h = 0
+        定义 可变 ri2 = row_start
+        当 (ri2 < row_end && ri2 < grid.行数) {
+            item_h = item_h + 内存_读32(grid.行轨道 + ri2 * 32 + 4)
+            如果 (ri2 > row_start) { item_h = item_h + grid.行间距 }
+            ri2 = ri2 + 1
+        }
+
+        如果 (item_layout != 0) {
+            item_layout.x = item_x + layout.padding_left + layout.border_left + item_layout.margin_left
+            item_layout.y = item_y + layout.padding_top + layout.border_top + item_layout.margin_top
+            item_layout.宽度 = item_w - item_layout.margin_left - item_layout.margin_right
+                              - item_layout.padding_left - item_layout.padding_right
+                              - item_layout.border_left - item_layout.border_right
+            如果 (item_layout.宽度 < 0) { item_layout.宽度 = 0 }
+            // 递归布局子项
+            布局块级Flow_布局(item_layout)
+            如果 (item_layout.高度 == 0) {
+                item_layout.高度 = item_h - item_layout.margin_top - item_layout.margin_bottom
+                                  - item_layout.padding_top - item_layout.padding_bottom
+                                  - item_layout.border_top - item_layout.border_bottom
+            }
+        }
+        pi = pi + 1
+    }
+
+    // 更新容器高度
+    如果 (!layout.高度已确定) { layout.高度 = y }
+
+    堆_释放(列位置); 堆_释放(行位置)
+}
+
+函数 网格布局_添加项(grid, 子) {
+    如果 (grid.项数量 >= grid.项容量) { 返回 }
+    定义 偏移 = grid.项列表 + grid.项数量 * 48
+    内存_写64(偏移, 子)
+    // 从样式读取grid-column/grid-row
+    如果 (子.样式 != 0) {
+        内存_写32(偏移 + 8, 子.样式.grid_column_start)
+        内存_写32(偏移 + 12, 子.样式.grid_column_end)
+        内存_写32(偏移 + 16, 子.样式.grid_row_start)
+        内存_写32(偏移 + 20, 子.样式.grid_row_end)
+    } 否则 {
+        内存_写32(偏移 + 8, -1); 内存_写32(偏移 + 12, -1)
+        内存_写32(偏移 + 16, -1); 内存_写32(偏移 + 20, -1)
+    }
+    grid.项数量 = grid.项数量 + 1
+}
+
+函数 网格布局_放置显式项(grid) {
+    定义 可变 i = 0
+    当 (i < grid.项数量) {
+        定义 偏移 = grid.项列表 + i * 48
+        定义 col_s = 内存_读32(偏移 + 8)
+        定义 row_s = 内存_读32(偏移 + 16)
+        如果 (col_s > 0 && row_s > 0) {
+            定义 col_e = 内存_读32(偏移 + 12)
+            定义 row_e = 内存_读32(偏移 + 20)
+            如果 (col_e <= col_s) { col_e = col_s + 1; 内存_写32(偏移 + 12, col_e) }
+            如果 (row_e <= row_s) { row_e = row_s + 1; 内存_写32(偏移 + 20, row_e) }
+            // 标记占用
+            网格布局_标记占用(grid, row_s - 1, col_s - 1, row_e - 1, col_e - 1)
+        }
+        i = i + 1
+    }
+}
+
+函数 网格布局_自动放置(grid) {
+    定义 可变 当前行 = 0
+    定义 可变 当前列 = 0
+    定义 可变 i = 0
+    当 (i < grid.项数量) {
+        定义 偏移 = grid.项列表 + i * 48
+        定义 col_s = 内存_读32(偏移 + 8)
+        定义 row_s = 内存_读32(偏移 + 16)
+        如果 (col_s > 0 && row_s > 0) { i = i + 1; 继续 }    // 已显式放置
+
+        // 找到下一个空位
+        当 (当前行 < grid.占用行数) {
+            当 (当前列 < grid.列数) {
+                如果 (!网格布局_是否占用(grid, 当前行, 当前列)) {
+                    // 放置在此
+                    内存_写32(偏移 + 8, 当前列 + 1)
+                    内存_写32(偏移 + 12, 当前列 + 2)
+                    内存_写32(偏移 + 16, 当前行 + 1)
+                    内存_写32(偏移 + 20, 当前行 + 2)
+                    网格布局_标记占用(grid, 当前行, 当前列, 当前行 + 1, 当前列 + 1)
+                    当前列 = 当前列 + 1
+                    跳出
+                }
+                当前列 = 当前列 + 1
+            }
+            如果 (当前列 >= grid.列数) {
+                当前列 = 0; 当前行 = 当前行 + 1
+            } 否则 { 跳出 }
+        }
+
+        // 如果超出行数,扩展隐式行
+        如果 (当前行 >= grid.行数) {
+            grid.行数 = 当前行 + 1
+        }
+
+        i = i + 1
+    }
+}
+
+函数 网格布局_标记占用(grid, 行起, 列起, 行终, 列终) {
+    定义 可变 r = 行起
+    当 (r < 行终 && r < grid.占用行数) {
+        定义 可变 c = 列起
+        当 (c < 列终 && c < grid.占用列数) {
+            内存_写8(grid.占用网格 + r * grid.占用列数 + c, 1)
+            c = c + 1
+        }
+        r = r + 1
+    }
+}

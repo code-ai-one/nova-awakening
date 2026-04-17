@@ -1,0 +1,437 @@
+// §4 ResourceLoader — 资源加载器主控
+// (对应 ResourceLoader + URLLoader)
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./资源响应创.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../执行/核心接口堆.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/字符串替换.nova")
+
+结构 ResourceLoader {
+ 请求,    // u64 ResourceRequest*
+ 响应,    // u64 ResourceResponse*
+ 状态,    // u32 请求状态
+
+ // 接收缓冲区
+ 接收缓冲,
+ 接收缓冲大小,
+ 已接收字节,
+ // 回调
+ 完成回调,    // u64 函数指针: (loader, 数据, 长度)
+ 进度回调,    // u64 函数指针: (loader, 已接收, 总量)
+ 错误回调,    // u64 函数指针: (loader, 错误码)
+
+ // 用户数据
+ 用户数据,
+ // 网络连接
+ 套接字,
+ 是安全,
+ // 缓存
+ 缓存键,    // u64 缓存查找键
+}
+
+函数 ResourceLoader_创建(url字符串, 资源类型) {
+ 定义 loader = 堆_分配(ResourceLoader)
+ loader.请求 = ResourceRequest_创建(url字符串, HTTP_GET, 资源类型)
+ loader.响应 = ResourceResponse_创建()
+ loader.状态 = 请求状态_未发送
+ loader.接收缓冲大小 = 64 * 1024 // 64KB初始缓冲
+ loader.接收缓冲 = 堆_分配(loader.接收缓冲大小)
+ loader.已接收字节 = 0
+ loader.完成回调 = 0
+ loader.进度回调 = 0
+ loader.错误回调 = 0
+ loader.用户数据 = 0
+ loader.套接字 = -1
+ loader.是安全 = 假
+ loader.缓存键 = 0
+ 返回 loader
+}
+
+函数 ResourceLoader_开始加载(loader) {
+ // 异步启动网络请求
+ 定义 url = loader.请求.url
+ 如果 (url == 0) { loader.状态 = 请求状态_失败; 返回 }
+
+ // Step 1: 域名解析
+ 定义 ip = 网络_域名解析(url.主机)
+ 如果 (ip == 0) {
+ loader.状态 = 请求状态_失败
+ 如果 (loader.错误回调 != 0) { 调用(loader.错误回调, loader, -1) }
+ 返回
+ }
+
+ // Step 2: 传控连接
+ loader.套接字 = 网络_传控连接(ip, url.端口)
+ 如果 (loader.套接字 < 0) {
+ loader.状态 = 请求状态_失败
+ 如果 (loader.错误回调 != 0) { 调用(loader.错误回调, loader, -2) }
+ 返回
+ }
+
+ // Step 3: 安全握手(https)
+ loader.是安全 = url.是安全的
+ 如果 (loader.是安全) {
+ 定义 tls结果 = 网络_安全连接(loader.套接字, url.主机)
+ 如果 (tls结果 < 0) {
+ loader.状态 = 请求状态_失败
+ 网络_关闭(loader.套接字)
+ 如果 (loader.错误回调 != 0) { 调用(loader.错误回调, loader, -3) }
+ 返回
+ }
+ }
+
+ // Step 4: 发送HTTP请求
+ 定义 报文 = HTTP_构建请求报文(loader.请求)
+ 定义 报文长度 = 字符串_长度(报文)
+ loader.状态 = 请求状态_发送中
+ 定义 发送结果 = 网络_发送(loader.套接字, 报文, 报文长度, loader.是安全)
+ 如果 (发送结果 <= 0) { loader.状态 = 请求状态_失败; 网络_关闭(loader.套接字); 返回 }
+
+ // Step 5: 接收响应
+ loader.状态 = 请求状态_接收头
+ 定义 头缓冲 = 堆_分配(8192)
+ 定义 头已读 = 网络_接收(loader.套接字, 头缓冲, 8192, loader.是安全)
+ 如果 (头已读 <= 0) {
+ loader.状态 = 请求状态_失败
+ 网络_关闭(loader.套接字)
+ 返回
+ }
+
+ // Step 6: 解析响应头
+ 定义 body开始 = HTTP_解析响应头(头缓冲, 头已读, loader.响应)
+
+ // 将头缓冲中的body部分复制到接收缓冲
+ 定义 头中body长度 = 头已读 - body开始
+ 如果 (头中body长度 > 0) {
+ 内存_复制(loader.接收缓冲, 头缓冲 + body开始, 头中body长度)
+ loader.已接收字节 = 头中body长度
+ }
+
+ // Step 7: 继续接收body
+ loader.状态 = 请求状态_接收体
+ 定义 可变 内容长度 = loader.响应.内容长度
+ 如果 (内容长度 < 0) { 内容长度 = 1024 * 1024 } // 未知长度: 最多1MB
+
+ 当 (loader.已接收字节 < 内容长度) {
+ // 扩缓冲
+ 如果 (loader.已接收字节 + 8192 > loader.接收缓冲大小) {
+ 定义 新大小 = loader.接收缓冲大小 * 2
+ 定义 新缓冲 = 堆_重分配(loader.接收缓冲, 新大小)
+ 如果 (新缓冲 == 0) { 跳出 }
+ loader.接收缓冲 = 新缓冲
+ loader.接收缓冲大小 = 新大小
+ }
+
+ 定义 本次读 = 网络_接收(loader.套接字, loader.接收缓冲 + loader.已接收字节, 8192, loader.是安全)
+ 如果 (本次读 <= 0) { 跳出 }
+ loader.已接收字节 = loader.已接收字节 + 本次读
+
+ // 进度回调
+ 如果 (loader.进度回调 != 0) {
+ 调用(loader.进度回调, loader, loader.已接收字节, 内容长度)
+ }
+ }
+
+ // Step 8: 完成
+ loader.状态 = 请求状态_完成
+ 网络_关闭(loader.套接字)
+
+ // 以0结尾(方便字符串处理)
+ 如果 (loader.已接收字节 < loader.接收缓冲大小) {
+ 内存_写8(loader.接收缓冲 + loader.已接收字节, 0)
+ }
+
+ // 完成回调
+ 如果 (loader.完成回调 != 0) {
+ 调用(loader.完成回调, loader, loader.接收缓冲, loader.已接收字节)
+ }
+}
+
+// §5 请求状态常量
+
+定义 请求状态_未发送 = 0
+定义 请求状态_发送中 = 1
+定义 请求状态_接收头 = 2
+定义 请求状态_接收体 = 3
+定义 请求状态_完成 = 4
+定义 请求状态_失败 = 5
+定义 请求状态_已取消 = 6
+定义 请求状态_超时 = 7
+
+定义 HTTP_GET = 0
+定义 HTTP_POST = 1
+定义 HTTP_PUT = 2
+定义 HTTP_DELETE = 3
+定义 HTTP_HEAD = 4
+定义 HTTP_OPTIONS = 5
+定义 HTTP_PATCH = 6
+
+定义 资源类型_文档 = 0
+定义 资源类型_脚本 = 1
+定义 资源类型_样式表 = 2
+定义 资源类型_图片 = 3
+定义 资源类型_字体 = 4
+定义 资源类型_媒体 = 5
+定义 资源类型_XHR = 6
+定义 资源类型_Fetch = 7
+定义 资源类型_WebSocket = 8
+
+函数 请求状态_名称(状态) {
+    如果 (状态 == 请求状态_未发送) { 返回 "UNSENT" }
+    如果 (状态 == 请求状态_发送中) { 返回 "SENDING" }
+    如果 (状态 == 请求状态_接收头) { 返回 "HEADERS_RECEIVED" }
+    如果 (状态 == 请求状态_接收体) { 返回 "LOADING" }
+    如果 (状态 == 请求状态_完成) { 返回 "DONE" }
+    如果 (状态 == 请求状态_失败) { 返回 "FAILED" }
+    如果 (状态 == 请求状态_已取消) { 返回 "CANCELLED" }
+    如果 (状态 == 请求状态_超时) { 返回 "TIMEOUT" }
+    返回 "UNKNOWN"
+}
+
+函数 HTTP方法_名称(方法) {
+    如果 (方法 == HTTP_GET) { 返回 "GET" }
+    如果 (方法 == HTTP_POST) { 返回 "POST" }
+    如果 (方法 == HTTP_PUT) { 返回 "PUT" }
+    如果 (方法 == HTTP_DELETE) { 返回 "DELETE" }
+    如果 (方法 == HTTP_HEAD) { 返回 "HEAD" }
+    如果 (方法 == HTTP_OPTIONS) { 返回 "OPTIONS" }
+    如果 (方法 == HTTP_PATCH) { 返回 "PATCH" }
+    返回 "UNKNOWN"
+}
+
+函数 资源类型_名称(类型) {
+    如果 (类型 == 资源类型_文档) { 返回 "document" }
+    如果 (类型 == 资源类型_脚本) { 返回 "script" }
+    如果 (类型 == 资源类型_样式表) { 返回 "stylesheet" }
+    如果 (类型 == 资源类型_图片) { 返回 "image" }
+    如果 (类型 == 资源类型_字体) { 返回 "font" }
+    如果 (类型 == 资源类型_媒体) { 返回 "media" }
+    如果 (类型 == 资源类型_XHR) { 返回 "xhr" }
+    如果 (类型 == 资源类型_Fetch) { 返回 "fetch" }
+    返回 "unknown"
+}
+
+// §6 ResourceRequest / ResourceResponse 结构
+
+结构 ResourceRequest {
+    url,
+    方法,
+    资源类型,
+    头部列表,
+    头部数,
+    body,
+    body长度,
+    超时ms,
+    凭证模式,
+    缓存模式,
+    重定向模式,
+    referrer,
+    优先级,
+}
+
+结构 ResourceResponse {
+    状态码,
+    状态文本,
+    内容类型,
+    内容长度,
+    头部列表,
+    头部数,
+    重定向URL,
+    是缓存命中,
+}
+
+函数 ResourceRequest_创建(url字符串, 方法, 资源类型) {
+    定义 req = 堆_分配(ResourceRequest)
+    req.url = url字符串
+    req.方法 = 方法
+    req.资源类型 = 资源类型
+    req.头部列表 = []
+    req.头部数 = 0
+    req.body = 0
+    req.body长度 = 0
+    req.超时ms = 30000
+    req.凭证模式 = 0
+    req.缓存模式 = 0
+    req.重定向模式 = 0
+    req.referrer = 0
+    req.优先级 = 0
+    返回 req
+}
+
+函数 ResourceResponse_创建() {
+    定义 resp = 堆_分配(ResourceResponse)
+    resp.状态码 = 0
+    resp.状态文本 = ""
+    resp.内容类型 = ""
+    resp.内容长度 = -1
+    resp.头部列表 = []
+    resp.头部数 = 0
+    resp.重定向URL = 0
+    resp.是缓存命中 = 假
+    返回 resp
+}
+
+函数 ResourceRequest_添加头部(req, 名, 值) {
+    如果 (req == 0) { 返回 }
+    追加(req.头部列表, { 名称: 名, 值: 值 })
+    req.头部数 = req.头部数 + 1
+}
+
+函数 ResourceResponse_获取头部(resp, 名) {
+    如果 (resp == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < resp.头部数) {
+        如果 (字符串_相等(resp.头部列表[i].名称, 名)) {
+            返回 resp.头部列表[i].值
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+// §7 HTTP报文构建与解析
+
+函数 HTTP_构建请求报文(req) {
+    如果 (req == 0) { 返回 "" }
+    定义 可变 报文 = HTTP方法_名称(req.方法) + " / HTTP/1.1\r\n"
+    报文 = 报文 + "Host: " + req.url + "\r\n"
+    报文 = 报文 + "User-Agent: NovaOS/1.0\r\n"
+    报文 = 报文 + "Accept: */*\r\n"
+    报文 = 报文 + "Connection: keep-alive\r\n"
+    定义 可变 i = 0
+    当 (i < req.头部数) {
+        报文 = 报文 + req.头部列表[i].名称 + ": " + req.头部列表[i].值 + "\r\n"
+        i = i + 1
+    }
+    报文 = 报文 + "\r\n"
+    返回 报文
+}
+
+函数 HTTP_解析响应头(缓冲, 长度, resp) {
+    如果 (resp == 0) { 返回 0 }
+    定义 可变 位置 = 0
+    当 (位置 < 长度 - 3) {
+        如果 (字节取(缓冲, 位置) == 13 && 字节取(缓冲, 位置 + 1) == 10 &&
+            字节取(缓冲, 位置 + 2) == 13 && 字节取(缓冲, 位置 + 3) == 10) {
+            返回 位置 + 4
+        }
+        位置 = 位置 + 1
+    }
+    返回 长度
+}
+
+函数 HTTP_状态码_名称(码) {
+    如果 (码 == 200) { 返回 "OK" }
+    如果 (码 == 201) { 返回 "Created" }
+    如果 (码 == 204) { 返回 "No Content" }
+    如果 (码 == 301) { 返回 "Moved Permanently" }
+    如果 (码 == 302) { 返回 "Found" }
+    如果 (码 == 304) { 返回 "Not Modified" }
+    如果 (码 == 400) { 返回 "Bad Request" }
+    如果 (码 == 401) { 返回 "Unauthorized" }
+    如果 (码 == 403) { 返回 "Forbidden" }
+    如果 (码 == 404) { 返回 "Not Found" }
+    如果 (码 == 500) { 返回 "Internal Server Error" }
+    如果 (码 == 502) { 返回 "Bad Gateway" }
+    如果 (码 == 503) { 返回 "Service Unavailable" }
+    返回 "Unknown"
+}
+
+函数 HTTP_是成功(码) { 返回 码 >= 200 && 码 < 300 }
+函数 HTTP_是重定向(码) { 返回 码 >= 300 && 码 < 400 }
+函数 HTTP_是客户端错误(码) { 返回 码 >= 400 && 码 < 500 }
+函数 HTTP_是服务器错误(码) { 返回 码 >= 500 }
+
+// §8 Loader管理与取消
+
+函数 ResourceLoader_取消(loader) {
+    如果 (loader == 0) { 返回 }
+    loader.状态 = 请求状态_已取消
+    如果 (loader.套接字 >= 0) {
+        网络_关闭(loader.套接字)
+        loader.套接字 = -1
+    }
+}
+
+函数 ResourceLoader_销毁(loader) {
+    如果 (loader == 0) { 返回 }
+    ResourceLoader_取消(loader)
+    如果 (loader.接收缓冲 != 0) { 堆_释放(loader.接收缓冲) }
+    堆_释放(loader)
+}
+
+函数 ResourceLoader_是完成(loader) {
+    如果 (loader == 0) { 返回 假 }
+    返回 loader.状态 == 请求状态_完成
+}
+
+函数 ResourceLoader_是失败(loader) {
+    如果 (loader == 0) { 返回 真 }
+    返回 loader.状态 == 请求状态_失败 || loader.状态 == 请求状态_超时
+}
+
+函数 ResourceLoader_获取数据(loader) {
+    如果 (loader == 0) { 返回 0 }
+    返回 loader.接收缓冲
+}
+
+函数 ResourceLoader_获取大小(loader) {
+    如果 (loader == 0) { 返回 0 }
+    返回 loader.已接收字节
+}
+
+// §9 资源加载统计
+
+定义 可变 加载_总请求数 = 0
+定义 可变 加载_成功数 = 0
+定义 可变 加载_失败数 = 0
+定义 可变 加载_取消数 = 0
+定义 可变 加载_总字节数 = 0
+定义 可变 加载_缓存命中数 = 0
+
+函数 资源加载_统计() {
+    返回 {
+        总请求: 加载_总请求数,
+        成功: 加载_成功数,
+        失败: 加载_失败数,
+        取消: 加载_取消数,
+        总字节: 加载_总字节数,
+        缓存命中: 加载_缓存命中数,
+    }
+}
+
+函数 资源加载_健康检查() {
+    定义 可变 问题 = []
+    如果 (加载_失败数 > 加载_总请求数 / 3 && 加载_总请求数 > 50) {
+        追加(问题, "资源加载失败率过高: " + 整数转字符串(加载_失败数 * 100 / 加载_总请求数) + "%")
+    }
+    如果 (计数(问题) == 0) { 返回 "资源加载器健康" }
+    返回 问题
+}
+
+函数 资源加载_重置统计() {
+    加载_总请求数 = 0
+    加载_成功数 = 0
+    加载_失败数 = 0
+    加载_取消数 = 0
+    加载_总字节数 = 0
+    加载_缓存命中数 = 0
+}
+
+函数 资源加载_完整统计() {
+    返回 [加载_总请求数, 加载_成功数, 加载_失败数, 加载_取消数, 加载_总字节数, 加载_缓存命中数]
+}
+
+函数 ResourceLoader_诊断(loader) {
+    如果 (loader == 0) { 返回 "loader为空" }
+    返回 {
+        状态: 请求状态_名称(loader.状态),
+        已接收: loader.已接收字节,
+        缓冲大小: loader.接收缓冲大小,
+        是安全: loader.是安全,
+        套接字: loader.套接字,
+    }
+}

@@ -1,0 +1,240 @@
+// Nova · 编译器 · WASM后端 · WASM编码
+// 职责: WebAssembly二进制格式编码(MVP+扩展)
+// 层级: M8 — 多目标ABI
+
+// WASM魔数与版本
+
+导入("../../../../标准库/基础.nova")
+
+定义 WASM_魔数 = [0x00, 0x61, 0x73, 0x6D]  // \0asm
+定义 WASM大写_WASM_版本 = [0x01, 0x00, 0x00, 0x00]  // version 1
+
+// Section ID
+定义 节_TYPE     = 1
+定义 节_IMPORT   = 2
+定义 节_FUNCTION = 3
+定义 节_TABLE    = 4
+定义 节_MEMORY   = 5
+定义 节_GLOBAL   = 6
+定义 节_EXPORT   = 7
+定义 节_START    = 8
+定义 节_ELEMENT  = 9
+定义 节_CODE     = 10
+定义 节_DATA     = 11
+
+// 值类型
+定义 WASM_整32 = 0x7F
+定义 WASM_整64 = 0x7E
+定义 WASM_浮32 = 0x7D
+定义 WASM_浮64 = 0x7C
+定义 WASM_空 = 0x40
+
+// 操作码
+// 控制流
+定义 指令_UNREACHABLE  = 0x00
+定义 WASM大写_指令_空操作          = 0x01
+定义 指令_BLOCK        = 0x02
+定义 指令_LOOP         = 0x03
+定义 指令_IF           = 0x04
+定义 指令_ELSE         = 0x05
+定义 指令_END          = 0x0B
+定义 指令_BR           = 0x0C
+定义 指令_BR_IF        = 0x0D
+定义 指令_BR_TABLE     = 0x0E
+定义 指令_RETURN       = 0x0F
+定义 WASM大写_指令_调用         = 0x10
+定义 指令_CALL_INDIRECT = 0x11
+
+// 局部/全局变量
+定义 指令_LOCAL_GET  = 0x20
+定义 指令_LOCAL_SET  = 0x21
+定义 指令_LOCAL_TEE  = 0x22
+定义 指令_GLOBAL_GET = 0x23
+定义 指令_GLOBAL_SET = 0x24
+
+// 内存操作
+定义 指令_I32_LOAD     = 0x28
+定义 指令_I64_LOAD     = 0x29
+定义 指令_F32_LOAD     = 0x2A
+定义 指令_F64_LOAD     = 0x2B
+定义 指令_I32_STORE    = 0x36
+定义 指令_I64_STORE    = 0x37
+定义 指令_F32_STORE    = 0x38
+定义 指令_F64_STORE    = 0x39
+定义 指令_MEMORY_SIZE  = 0x3F
+定义 指令_MEMORY_GROW  = 0x40
+
+// 常量
+定义 指令_I32_CONST = 0x41
+定义 指令_I64_CONST = 0x42
+定义 指令_F32_CONST = 0x43
+定义 指令_F64_CONST = 0x44
+
+// I32算术
+定义 指令_I32_EQZ   = 0x45
+定义 指令_I32_EQ    = 0x46
+定义 指令_I32_NE    = 0x47
+定义 指令_I32_LT_S  = 0x48
+定义 指令_I32_GT_S  = 0x4A
+定义 指令_I32_LE_S  = 0x4C
+定义 指令_I32_GE_S  = 0x4E
+定义 指令_I32_ADD   = 0x6A
+定义 指令_I32_SUB   = 0x6B
+定义 指令_I32_MUL   = 0x6C
+定义 指令_I32_DIV_S = 0x6D
+定义 指令_I32_REM_S = 0x6F
+定义 指令_I32_AND   = 0x71
+定义 指令_I32_OR    = 0x72
+定义 指令_I32_XOR   = 0x73
+定义 指令_I32_SHL   = 0x74
+定义 指令_I32_SHR_S = 0x75
+
+// I64算术
+定义 指令_I64_ADD   = 0x7C
+定义 指令_I64_SUB   = 0x7D
+定义 指令_I64_MUL   = 0x7E
+定义 指令_I64_DIV_S = 0x7F
+定义 指令_I64_AND   = 0x83
+定义 指令_I64_OR    = 0x84
+定义 指令_I64_XOR   = 0x85
+定义 指令_I64_SHL   = 0x86
+
+// F64算术
+定义 指令_F64_ADD   = 0xA0
+定义 指令_F64_SUB   = 0xA1
+定义 指令_F64_MUL   = 0xA2
+定义 指令_F64_DIV   = 0xA3
+
+// 类型转换
+定义 指令_I32_WRAP_I64     = 0xA7
+定义 指令_I64_EXTEND_I32_S = 0xAC
+定义 指令_F64_CONVERT_I32_S = 0xB7
+定义 指令_I32_TRUNC_F64_S  = 0xAA
+
+// 其他
+定义 指令_DROP   = 0x1A
+定义 指令_SELECT = 0x1B
+
+// LEB128编码
+函数 wasm_编码_uleb128(值) {
+    定义 可变 字节 = []
+    定义 可变 v = 值
+    循环 {
+        定义 b = v & 0x7F
+        v = v >> 7
+        如果 (v > 0) {
+            追加(字节, b | 0x80)
+        } 否则 {
+            追加(字节, b)
+            返回 字节
+        }
+    }
+}
+
+函数 wasm_编码_sleb128(值) {
+    定义 可变 字节 = []
+    定义 可变 v = 值
+    定义 可变 更多 = 真
+    当 (更多) {
+        定义 b = v & 0x7F
+        v = v >> 7
+        如果 ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
+            更多 = 假
+            追加(字节, b)
+        } 否则 {
+            追加(字节, b | 0x80)
+        }
+    }
+    返回 字节
+}
+
+// Section编码
+函数 wasm_编码_section(id, 内容) {
+    定义 可变 结果 = [id]
+    定义 长度编码 = wasm_编码_uleb128(计数(内容))
+    定义 可变 i = 0
+    当 (i < 计数(长度编码)) { 追加(结果, 长度编码[i])  i = i + 1 }
+    i = 0
+    当 (i < 计数(内容)) { 追加(结果, 内容[i])  i = i + 1 }
+    返回 结果
+}
+
+// 函数类型编码
+// type = 0x60 [参数类型...] [返回类型...]
+函数 wasm_编码_函数类型(参数类型, 返回类型) {
+    定义 可变 结果 = [0x60]
+    // 参数
+    定义 参数len = wasm_编码_uleb128(计数(参数类型))
+    定义 可变 i = 0
+    当 (i < 计数(参数len)) { 追加(结果, 参数len[i])  i = i + 1 }
+    i = 0
+    当 (i < 计数(参数类型)) { 追加(结果, 参数类型[i])  i = i + 1 }
+    // 返回
+    定义 返回len = wasm_编码_uleb128(计数(返回类型))
+    i = 0
+    当 (i < 计数(返回len)) { 追加(结果, 返回len[i])  i = i + 1 }
+    i = 0
+    当 (i < 计数(返回类型)) { 追加(结果, 返回类型[i])  i = i + 1 }
+    返回 结果
+}
+
+// 导出编码
+// 导出 = [名称UTF8] [类别: 0=func 1=table 2=mem 3=global] [index]
+函数 wasm_编码_导出(名称, 类别, 索引) {
+    定义 可变 结果 = []
+    定义 名称字节 = 名称  // 假设已是UTF8字节列表
+    定义 名称len = wasm_编码_uleb128(计数(名称字节))
+    定义 可变 i = 0
+    当 (i < 计数(名称len)) { 追加(结果, 名称len[i])  i = i + 1 }
+    i = 0
+    当 (i < 计数(名称字节)) { 追加(结果, 名称字节[i])  i = i + 1 }
+    追加(结果, 类别)
+    定义 索引编码 = wasm_编码_uleb128(索引)
+    i = 0
+    当 (i < 计数(索引编码)) { 追加(结果, 索引编码[i])  i = i + 1 }
+    返回 结果
+}
+
+// 内存限制编码
+函数 wasm_编码_内存(最小页, 最大页) {
+    如果 (最大页 > 0) {
+        定义 可变 结果 = [0x01]  // has_max
+        定义 min编码 = wasm_编码_uleb128(最小页)
+        定义 max编码 = wasm_编码_uleb128(最大页)
+        定义 可变 i = 0
+        当 (i < 计数(min编码)) { 追加(结果, min编码[i])  i = i + 1 }
+        i = 0
+        当 (i < 计数(max编码)) { 追加(结果, max编码[i])  i = i + 1 }
+        返回 结果
+    }
+    定义 可变 结果 = [0x00]
+    定义 min编码 = wasm_编码_uleb128(最小页)
+    定义 可变 i = 0
+    当 (i < 计数(min编码)) { 追加(结果, min编码[i])  i = i + 1 }
+    返回 结果
+}
+
+// 完整模块头
+函数 wasm_模块头() {
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 4) { 追加(结果, WASM_魔数[i])  i = i + 1 }
+    i = 0
+    当 (i < 4) { 追加(结果, WASM大写_WASM_版本[i])  i = i + 1 }
+    返回 结果
+}
+
+// WASI导入
+定义 WASI_文件写  = "fd_write"
+定义 WASI_文件读   = "fd_read"
+定义 WASI_进程退出 = "proc_exit"
+
+// 报告
+函数 wasm_打印报告() {
+    打印("═══ WASM后端报告 ═══")
+    打印("  目标: wasm32-wasi")
+    打印("  Section支持: Type/Import/Function/Memory/Export/Code/Data")
+    打印("  操作码: I32/I64/F64 算术+控制流+内存")
+    打印("  编码: LEB128/Section/FuncType/Export")
+    打印("  WASI: fd_write/fd_read/proc_exit")
+}

@@ -1,0 +1,212 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./每处理器.nova")
+
+//   1. 命名空间: 容器化的基础 — 隔离进程对系统资源的视图
+//   2. 6种命名空间: PID/Mount/Network/UTS/IPC/User
+//   3. clone(CLONE_NEWPID): 创建新PID命名空间
+//   4. unshare(): 当前进程脱离共享命名空间
+//   5. setns(): 加入已有命名空间
+//   6. nsproxy: 每个进程持有, 指向各个命名空间
+
+定义 CLONE_NEWPID    = 0x20000000   // 新PID命名空间
+定义 CLONE_NEWNS     = 0x00020000   // 新Mount命名空间
+定义 CLONE_NEWNET    = 0x40000000   // 新Network命名空间
+定义 CLONE_NEWUTS    = 0x04000000   // 新UTS命名空间(hostname)
+定义 CLONE_NEWIPC    = 0x08000000   // 新IPC命名空间
+定义 CLONE_NEWUSER   = 0x10000000   // 新User命名空间
+
+结构 PID命名空间 {
+    级别,    // u32 嵌套级别(0=初始)
+    父,    // u64 父PID命名空间
+    PID计数,    // u32 当前命名空间内的进程数
+    init_pid,    // u32 命名空间内的init进程PID
+}
+
+结构 UTS命名空间 {
+    sysname,    // 字符串 "NovaOS"
+    节点name,    // 字符串 hostname
+    release,    // 字符串 "0.1.0"
+    version,    // 字符串 "#1 SMP"
+    machine,    // 字符串 "x86_64"
+    domainname,    // 字符串 "(none)"
+}
+
+结构 命名空间代理 {
+    pid_ns,    // u64 PID命名空间
+    mnt_ns,    // u64 Mount命名空间
+    net_ns,    // u64 Network命名空间
+    uts_ns,    // u64 UTS命名空间
+    Nova通信_ns,    // u64 IPC命名空间
+    user_ns,    // u64 User命名空间
+    引用计数,
+}
+
+定义 可变 初始PID命名空间 = 空
+定义 可变 初始UTS命名空间 = 空
+定义 可变 初始命名空间代理 = 空
+
+// 初始化
+
+函数 命名空间_初始化() {
+    // 创建初始PID命名空间
+    初始PID命名空间 = PID命名空间 {}
+    初始PID命名空间.级别 = 0
+    初始PID命名空间.父 = 空
+    初始PID命名空间.PID计数 = 0
+    初始PID命名空间.init_pid = 1
+
+    // 创建初始UTS命名空间
+    初始UTS命名空间 = UTS命名空间 {}
+    初始UTS命名空间.sysname = "NovaOS"
+    初始UTS命名空间.节点name = "novaos"
+    初始UTS命名空间.release = "0.1.0"
+    初始UTS命名空间.version = "#1 Nova"
+    初始UTS命名空间.machine = "x86_64"
+    初始UTS命名空间.domainname = "(none)"
+
+    // 创建初始nsproxy
+    初始命名空间代理 = 命名空间代理 {}
+    初始命名空间代理.pid_ns = 初始PID命名空间
+    初始命名空间代理.uts_ns = 初始UTS命名空间
+    初始命名空间代理.mnt_ns = 空
+    初始命名空间代理.net_ns = 空
+    初始命名空间代理.Nova通信_ns = 空
+    初始命名空间代理.user_ns = 空
+    初始命名空间代理.引用计数 = 1
+
+    内核信息("命名空间: 初始化 (PID/UTS/Mount/Net/IPC/User)")
+}
+
+// 创建新命名空间 
+
+函数 创建新命名空间(标志, 旧代理) {
+    定义 新代理 = 命名空间代理 {}
+    新代理.引用计数 = 1
+
+    // 按标志决定是创建新的还是共享旧的
+    如果 ((标志 & CLONE_NEWPID) != 0) {
+        新代理.pid_ns = 创建PID命名空间(旧代理.pid_ns)
+    } 否则 {
+        新代理.pid_ns = 旧代理.pid_ns
+    }
+
+    如果 ((标志 & CLONE_NEWUTS) != 0) {
+        新代理.uts_ns = 复制UTS命名空间(旧代理.uts_ns)
+    } 否则 {
+        新代理.uts_ns = 旧代理.uts_ns
+    }
+
+    // 其他命名空间类似处理
+    新代理.mnt_ns = 旧代理.mnt_ns
+    新代理.net_ns = 旧代理.net_ns
+    新代理.Nova通信_ns = 旧代理.Nova通信_ns
+    新代理.user_ns = 旧代理.user_ns
+
+    返回 新代理
+}
+
+函数 创建PID命名空间(父ns) {
+    定义 ns = PID命名空间 {}
+    ns.级别 = 父ns.级别 + 1
+    ns.父 = 父ns
+    ns.PID计数 = 0
+    ns.init_pid = 1
+    返回 ns
+}
+
+函数 复制UTS命名空间(旧ns) {
+    定义 ns = UTS命名空间 {}
+    ns.sysname = 旧ns.sysname
+    ns.节点name = 旧ns.节点name
+    ns.release = 旧ns.release
+    ns.version = 旧ns.version
+    ns.machine = 旧ns.machine
+    ns.domainname = 旧ns.domainname
+    返回 ns
+}
+
+// unshare: 当前进程脱离共享命名空间
+
+函数 sys_unshare(标志) {
+    定义 当前 = 获取当前进程()
+    如果 (当前 == 空) { 返回 错误_无效参数 }
+    定义 旧代理 = 进程_获取命名空间(当前)
+    如果 (旧代理 == 空) { 旧代理 = 初始命名空间代理 }
+    定义 新代理 = 创建新命名空间(标志, 旧代理)
+    进程_设置命名空间(当前, 新代理)
+    返回 成功
+}
+
+// UTS查询 (uname系统调用使用)
+
+函数 获取hostname() {
+    如果 (初始UTS命名空间 != 空) { 返回 初始UTS命名空间.节点name }
+    返回 "novaos"
+}
+
+函数 设置hostname(名称) {
+    如果 (初始UTS命名空间 != 空) { 初始UTS命名空间.节点name = 名称 }
+}
+
+函数 获取uname() {
+    如果 (初始UTS命名空间 == 空) { 返回 空 }
+    返回 [初始UTS命名空间.sysname, 初始UTS命名空间.节点name,
+          初始UTS命名空间.release, 初始UTS命名空间.version,
+          初始UTS命名空间.machine]
+}
+
+// 引用计数
+
+函数 命名空间代理_获取(代理) {
+    如果 (代理 != 空) { 代理.引用计数 = 代理.引用计数 + 1 }
+    返回 代理
+}
+
+函数 命名空间代理_释放(代理) {
+    如果 (代理 == 空) { 返回 }
+    代理.引用计数 = 代理.引用计数 - 1
+    如果 (代理.引用计数 <= 0) {
+        // 释放各个命名空间
+    }
+}
+
+函数 进程_获取命名空间(进程) {
+    如果 (进程 == 空) { 返回 初始命名空间代理 }
+    如果 (进程.nsproxy != 空) { 返回 进程.nsproxy }
+    返回 初始命名空间代理
+}
+
+函数 进程_设置命名空间(进程, 代理) {
+    如果 (进程 == 空 || 代理 == 空) { 返回 }
+    // 释放旧代理引用
+    如果 (进程.nsproxy != 空) {
+        命名空间代理_释放(进程.nsproxy)
+    }
+    // 获取新代理引用
+    进程.nsproxy = 命名空间代理_获取(代理)
+}
+
+// 命名空间类型名称 + PID翻译
+
+函数 命名空间_类型名(标志) {
+    如果 (标志 == CLONE_NEWPID) { 返回 "pid" }
+    如果 (标志 == CLONE_NEWNS) { 返回 "mnt" }
+    如果 (标志 == CLONE_NEWNET) { 返回 "net" }
+    如果 (标志 == CLONE_NEWUTS) { 返回 "uts" }
+    如果 (标志 == CLONE_NEWIPC) { 返回 "ipc" }
+    如果 (标志 == CLONE_NEWUSER) { 返回 "user" }
+    返回 "unknown"
+}
+
+函数 PID命名空间_进程数(ns) {
+    如果 (ns == 空) { 返回 0 }
+    返回 ns.PID计数
+}
+
+函数 命名空间_统计() {
+    定义 pid进程数 = 0
+    如果 (初始PID命名空间 != 空) { pid进程数 = 初始PID命名空间.PID计数 }
+    返回 [pid进程数]
+}
+

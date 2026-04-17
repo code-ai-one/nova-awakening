@@ -1,0 +1,111 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./属性自定义属.nova")
+导入("./文本绘制将.nova")
+导入("./字体扩展渲.nova")
+导入("./绘制画布绘.nova")
+导入("./字形光栅乙.nova")
+导入("../中枢/字符串替换.nova")
+
+// §6 文本
+
+
+函数 画布2D_fillText(ctx, 文本, x, y, 最大宽度) {
+    定义 face = 字体Face_创建(ctx.当前状态.字体族, ctx.当前状态.字号 / 100)
+    定义 px = x / 100; 定义 py = y / 100
+
+    // 文本对齐调整
+    如果 (ctx.当前状态.文本对齐 == 4) {    // center
+        定义 m = Text渲染er_度量(face, 文本, 字符串_长度(文本))
+        px = px - m.宽度 / 2
+    } 否则 如果 (ctx.当前状态.文本对齐 == 3 || ctx.当前状态.文本对齐 == 1) {    // right/end
+        定义 m = Text渲染er_度量(face, 文本, 字符串_长度(文本))
+        px = px - m.宽度
+    }
+
+    // 基线调整
+    如果 (ctx.当前状态.文本基线 == 0) { py = py + face.上升 / 64 }           // top
+    否则 如果 (ctx.当前状态.文本基线 == 2) { py = py + (face.上升 + face.下降) / 128 }  // middle
+
+    // 应用全局透明度
+    定义 可变 颜色 = ctx.当前状态.填充颜色
+    如果 (ctx.当前状态.全局透明度 < 10000) {
+        定义 a = SkColor_A(颜色) * ctx.当前状态.全局透明度 / 10000
+        颜色 = SkColor(a, SkColor_R(颜色), SkColor_G(颜色), SkColor_B(颜色))
+    }
+
+    Text渲染er_绘制(ctx.位图, face, 文本, 字符串_长度(文本), px, py, 颜色)
+}
+
+函数 画布2D_strokeText(ctx, 文本, x, y, 最大宽度) {
+    // 描边文本: 用描边颜色替代填充颜色进行文本渲染
+    定义 保存填充 = ctx.当前状态.填充颜色
+    ctx.当前状态.填充颜色 = ctx.当前状态.描边颜色
+    画布2D_fillText(ctx, 文本, x, y, 最大宽度)
+    ctx.当前状态.填充颜色 = 保存填充
+}
+
+函数 画布2D_measureText(ctx, 文本) {
+    定义 face = 字体Face_创建(ctx.当前状态.字体族, ctx.当前状态.字号 / 100)
+    定义 m = Text渲染er_度量(face, 文本, 字符串_长度(文本))
+    // 返回TextMetrics对象
+    返回 m
+}
+
+// §7 图像绘制 (draw图像)
+// 三种调用形式:
+//   draw图像(image, dx, dy)
+//   draw图像(image, dx, dy, dw, dh)
+//   draw图像(image, sx, sy, sw, sh, dx, dy, dw, dh)
+
+函数 画布2D_draw图像_3(ctx, 源位图, dx, dy) {
+    如果 (源位图 == 0) { 返回 }
+    画布2D_draw图像_9(ctx, 源位图, 0, 0, 源位图.宽 * 100, 源位图.高 * 100, dx, dy, 源位图.宽 * 100, 源位图.高 * 100)
+}
+
+函数 画布2D_draw图像_5(ctx, 源位图, dx, dy, dw, dh) {
+    如果 (源位图 == 0) { 返回 }
+    画布2D_draw图像_9(ctx, 源位图, 0, 0, 源位图.宽 * 100, 源位图.高 * 100, dx, dy, dw, dh)
+}
+
+函数 画布2D_draw图像_9(ctx, 源位图, sx, sy, sw, sh, dx, dy, dw, dh) {
+    如果 (源位图 == 0) { 返回 }
+    定义 目标 = ctx.位图
+
+    // 源区域(像素)
+    定义 src_x = sx / 100; 定义 src_y = sy / 100
+    定义 src_w = sw / 100; 定义 src_h = sh / 100
+    // 目标区域(像素)
+    定义 dst_x = dx / 100; 定义 dst_y = dy / 100
+    定义 dst_w = dw / 100; 定义 dst_h = dh / 100
+
+    如果 (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) { 返回 }
+
+    // 逐像素复制(带缩放)
+    定义 可变 y = 0
+    当 (y < dst_h) {
+        定义 可变 x = 0
+        当 (x < dst_w) {
+            // 源采样坐标
+            定义 sample_x = src_x + x * src_w / dst_w
+            定义 sample_y = src_y + y * src_h / dst_h
+
+            如果 (sample_x >= 0 && sample_x < 源位图.宽 && sample_y >= 0 && sample_y < 源位图.高) {
+                定义 颜色 = Nova缓冲itmap_获取像素(源位图, sample_x, sample_y)
+                // 应用全局透明度
+                如果 (ctx.当前状态.全局透明度 < 10000) {
+                    定义 a = SkColor_A(颜色) * ctx.当前状态.全局透明度 / 10000
+                    颜色 = (颜色 & 0x00FFFFFF) | (a << 24)
+                }
+                如果 (颜色 != 0x00000000) {
+                    定义 px = dst_x + x; 定义 py = dst_y + y
+                    如果 (px >= 0 && px < 目标.宽 && py >= 0 && py < 目标.高) {
+                        Sk画布_混合像素(目标, px, py, 颜色, 混合_SrcOver)
+                    }
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}

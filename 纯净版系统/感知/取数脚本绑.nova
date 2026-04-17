@@ -1,0 +1,160 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./资源取数.nova")
+导入("../中枢/辅助存根.nova")
+
+// 对应: nova/Nova渲染核心/fetch/ (
+// nova/renderer/modules/fetch/ (
+//  (
+// 取数 接口:
+// fetch(url|request, init) → 承诺<Response>
+// Request: url/method/headers/body/mode/credentials/cache/redirect
+// Response: status/statusText/ok/headers/body/type/url
+// Headers: append/delete/get/has/set/entries/keys/values
+// Body mixin: arrayBuffer()/blob()/formData()/json()/text()
+// AbortController/AbortSignal: 取消fetch
+// ReadableStream (Streams 接口基础):
+// response.body → ReadableStream
+// reader = stream.getReader()
+// reader.read() → {value, done}
+// response.body.pipeTo(writableStream)
+// response.body.pipeThrough(transformStream)
+// 缓存策略:
+// default/no-store/reload/no-cache/force-cache/only-if-cached
+// CORS:
+// mode: cors/no-cors/same-origin/navigate
+// 预检: OPTIONS请求(Access-Control-xxx头)
+// 【Nova特色】AI网络优化:
+// ① AI预测请求优先级
+// ② AI智能重试策略(指数退避+抖动)
+
+// §1 常量
+
+// 请求方法
+定义 METHOD_GET = 0
+定义 METHOD_POST = 1
+定义 METHOD_PUT = 2
+定义 METHOD_DELETE = 3
+定义 METHOD_PATCH = 4
+定义 METHOD_HEAD = 5
+定义 METHOD_OPTIONS = 6
+
+// 请求模式
+定义 MODE_CORS = 0
+定义 MODE_NO_CORS = 1
+定义 MODE_SAME_ORIGIN = 2
+定义 MODE_NAVIGATE = 3
+
+// 凭据模式
+定义 CRED_OMIT = 0
+定义 CRED_SAME_ORIGIN = 1
+定义 CRED_INCLUDE = 2
+
+// 缓存模式
+定义 CACHE_DEFAULT = 0
+定义 CACHE_NO_STORE = 1
+定义 CACHE_RELOAD = 2
+定义 CACHE_NO_CACHE = 3
+定义 CACHE_FORCE_CACHE = 4
+定义 CACHE_ONLY_IF_CACHED = 5
+
+// 重定向模式
+定义 REDIRECT_FOLLOW = 0
+定义 REDIRECT_ERROR = 1
+定义 REDIRECT_MANUAL = 2
+
+// 响应类型
+定义 RESP_BASIC = 0
+定义 RESP_CORS = 1
+定义 RESP_OPAQUE = 2
+定义 RESP_OPAQUE_REDIRECT = 3
+定义 RESP_ERROR = 4
+
+// 优先级
+定义 PRIORITY_HIGH = 0
+定义 PRIORITY_LOW = 1
+定义 PRIORITY_AUTO = 2
+
+// §2 Headers
+
+结构 HeaderEntry {
+ 名称,    // u64 小写字符串
+ 值,
+ 下一个,    // u64 HeaderEntry*
+}
+
+结构 Headers {
+ 头,    // u64 HeaderEntry*
+ 数量,
+ guard,    // u8 0=none 1=immutable 2=request 3=request-no-cors 4=response
+}
+
+
+函数 Headers_创建() {
+ 定义 h = 堆_分配(Headers)
+ h.头 = 0; h.数量 = 0; h.guard = 0
+ 返回 h
+}
+
+函数 Headers_append(h, 名称, 值) {
+ 如果 (h == 0 || 名称 == 0 || 值 == 0) { 返回 }
+ 如果 (h.guard == 1) { 返回 } // immutable
+ 定义 entry = 堆_分配(HeaderEntry)
+ entry.名称 = 字符串_小写化(字符串_复制(名称))
+ entry.值 = 字符串_复制(值)
+ entry.下一个 = h.头; h.头 = entry
+ h.数量 = h.数量 + 1
+}
+
+函数 Headers_set(h, 名称, 值) {
+ 如果 (h == 0 || 名称 == 0 || 值 == 0) { 返回 }
+ 如果 (h.guard == 1) { 返回 }
+ 定义 小写名 = 字符串_小写化(字符串_复制(名称))
+ // 先删除已有同名
+ Headers_delete(h, 小写名)
+ // 再添加
+ Headers_append(h, 名称, 值)
+}
+
+函数 Headers_get(h, 名称) {
+ 如果 (h == 0 || 名称 == 0) { 返回 0 }
+ 定义 小写名 = 字符串_小写化(字符串_复制(名称))
+ 定义 可变 entry = h.头
+ 当 (entry != 0) {
+ 如果 (字符串_相等(entry.名称, 小写名)) { 返回 entry.值 }
+ entry = entry.下一个
+ }
+ 返回 0
+}
+
+函数 Headers_has(h, 名称) {
+ 返回 Headers_get(h, 名称) != 0
+}
+
+函数 Headers_delete(h, 名称) {
+ 如果 (h == 0 || 名称 == 0) { 返回 }
+ 如果 (h.guard == 1) { 返回 }
+ 定义 小写名 = 字符串_小写化(字符串_复制(名称))
+ 定义 可变 prev = 0
+ 定义 可变 entry = h.头
+ 当 (entry != 0) {
+ 如果 (字符串_相等(entry.名称, 小写名)) {
+ 如果 (prev == 0) { h.头 = entry.下一个 }
+ 否则 { prev.下一个 = entry.下一个 }
+ h.数量 = h.数量 - 1
+ entry = 如果(prev == 0, h.头, prev.下一个)
+ 继续
+ }
+ prev = entry; entry = entry.下一个
+ }
+}
+
+函数 Headers_遍历(h, 回调) {
+ 如果 (h == 0 || 回调 == 0) { 返回 }
+ 定义 可变 entry = h.头
+ 当 (entry != 0) {
+ // 回调(entry.名称, entry.值)
+ entry = entry.下一个
+ }
+}

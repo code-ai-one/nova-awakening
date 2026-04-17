@@ -1,0 +1,180 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+
+// §3 Sk绘制 结构
+
+结构 Sk绘制 {
+    // 基本属性
+    颜色,    // SkColor4f
+    样式,    // u8 PAINT_STYLE_xxx
+    抗锯齿,
+    抖动,
+    // 描边属性
+    描边宽度,    // i32 Q10
+    描边端点,    // u8 STROKE_CAP_xxx
+    描边连接,    // u8 STROKE_JOIN_xxx
+    斜接限制,    // i32 Q10 (默认4.0 = 4096)
+
+    // 混合
+    混合模式,    // u8 BLEND_xxx
+
+    // 滤波
+    滤波质量,    // u8 FILTER_xxx
+
+    // 关联效果(可选)
+    着色器,    // u64 SkShader*
+    颜色滤镜,    // u64 SkColorFilter*
+    图像滤镜,    // u64 Sk图像Filter*
+    遮罩滤镜,    // u64 SkMaskFilter*
+    路径效果,    // u64 SkPathEffect*
+}
+
+
+函数 Sk绘制_创建() {
+    定义 p = 堆_分配(Sk绘制)
+    p.颜色.r = 0; p.颜色.g = 0; p.颜色.b = 0; p.颜色.a = 1024    // 不透明黑
+    p.样式 = PAINT_STYLE_FILL
+    p.抗锯齿 = 真
+    p.抖动 = 假
+    p.描边宽度 = 0
+    p.描边端点 = STROKE_CAP_BUTT
+    p.描边连接 = STROKE_JOIN_MITER
+    p.斜接限制 = 4096    // 4.0 in Q10
+    p.混合模式 = BLEND_SRC_OVER
+    p.滤波质量 = FILTER_LOW
+    p.着色器 = 0; p.颜色滤镜 = 0; p.图像滤镜 = 0; p.遮罩滤镜 = 0; p.路径效果 = 0
+    返回 p
+}
+
+函数 Sk绘制_复制(src) {
+    如果 (src == 0) { 返回 Sk绘制_创建() }
+    定义 p = 堆_分配(Sk绘制)
+    内存_复制(p, src, 大小of(Sk绘制))
+    返回 p
+}
+
+函数 Sk绘制_设颜色(p, r, g, b, a) {
+    如果 (p == 0) { 返回 }
+    p.颜色.r = r; p.颜色.g = g; p.颜色.b = b; p.颜色.a = a
+}
+
+函数 Sk绘制_设颜色32(p, argb) {
+    如果 (p == 0) { 返回 }
+    p.颜色.a = ((argb >> 24) & 0xFF) * 4
+    p.颜色.r = ((argb >> 16) & 0xFF) * 4
+    p.颜色.g = ((argb >> 8) & 0xFF) * 4
+    p.颜色.b = (argb & 0xFF) * 4
+}
+
+函数 Sk绘制_设透明度(p, alpha_Q10) {
+    如果 (p == 0) { 返回 }
+    p.颜色.a = alpha_Q10
+}
+
+函数 Sk绘制_是不透明(p) {
+    如果 (p == 0) { 返回 真 }
+    如果 (p.颜色.a < 1024) { 返回 假 }
+    如果 (p.着色器 != 0) { 返回 假 }    // 着色器可能半透明
+    返回 真
+}
+
+// §4 Porter-Duff混合计算
+// 所有分量为Q10(0-1024), 预乘alpha
+// result = Fs * Sc + Fd * Dc
+
+函数 Nova缓冲lend_计算(模式, Sc, Dc, Sa, Da) {
+    // Sc/Dc/Sa/Da 都是Q10预乘值
+    选择 (模式) {
+        BLEND_CLEAR: { 返回 0 }
+        BLEND_SRC: { 返回 Sc }
+        BLEND_DST: { 返回 Dc }
+        BLEND_SRC_OVER: {
+            // Sc + (1 - Sa) * Dc
+            返回 Sc + Dc * (1024 - Sa) / 1024
+        }
+        BLEND_DST_OVER: {
+            返回 Dc + Sc * (1024 - Da) / 1024
+        }
+        BLEND_SRC_IN: {
+            返回 Sc * Da / 1024
+        }
+        BLEND_DST_IN: {
+            返回 Dc * Sa / 1024
+        }
+        BLEND_SRC_OUT: {
+            返回 Sc * (1024 - Da) / 1024
+        }
+        BLEND_DST_OUT: {
+            返回 Dc * (1024 - Sa) / 1024
+        }
+        BLEND_SRC_ATOP: {
+            返回 Sc * Da / 1024 + Dc * (1024 - Sa) / 1024
+        }
+        BLEND_XOR: {
+            返回 Sc * (1024 - Da) / 1024 + Dc * (1024 - Sa) / 1024
+        }
+        BLEND_PLUS: {
+            定义 v = Sc + Dc
+            如果 (v > 1024) { v = 1024 }
+            返回 v
+        }
+        BLEND_MULTIPLY: {
+            // Sc*Dc + Sc*(1-Da) + Dc*(1-Sa)
+            返回 Sc * Dc / 1024 + Sc * (1024 - Da) / 1024 + Dc * (1024 - Sa) / 1024
+        }
+        BLEND_SCREEN: {
+            返回 Sc + Dc - Sc * Dc / 1024
+        }
+        BLEND_OVERLAY: {
+            // if 2*Dc <= Da: 2*Sc*Dc
+            // else: Sa*Da - 2*(Da-Dc)*(Sa-Sc)
+            如果 (2 * Dc <= Da) {
+                返回 2 * Sc * Dc / 1024
+            }
+            返回 Sa * Da / 1024 - 2 * (Da - Dc) * (Sa - Sc) / 1024
+        }
+        BLEND_DARKEN: {
+            定义 s = Sc + Dc * (1024 - Sa) / 1024
+            定义 d = Dc + Sc * (1024 - Da) / 1024
+            如果 (s < d) { 返回 s }
+            返回 d
+        }
+        BLEND_LIGHTEN: {
+            定义 s = Sc + Dc * (1024 - Sa) / 1024
+            定义 d = Dc + Sc * (1024 - Da) / 1024
+            如果 (s > d) { 返回 s }
+            返回 d
+        }
+        默认: { 返回 Sc + Dc * (1024 - Sa) / 1024 }    // fallback: SRC_OVER
+    }
+}
+
+// 完整RGBA混合(4通道)
+函数 Nova缓冲lend_像素(模式, src_rgba, dst_rgba) {
+    定义 Sa = (src_rgba >> 24) & 0xFF
+    定义 Sr = (src_rgba >> 16) & 0xFF
+    定义 Sg = (src_rgba >> 8) & 0xFF
+    定义 Sb = src_rgba & 0xFF
+    定义 Da = (dst_rgba >> 24) & 0xFF
+    定义 Dr = (dst_rgba >> 16) & 0xFF
+    定义 Dg = (dst_rgba >> 8) & 0xFF
+    定义 Db = dst_rgba & 0xFF
+
+    // 转Q10
+    定义 sa = Sa * 4; 定义 sr = Sr * 4; 定义 sg = Sg * 4; 定义 sb = Sb * 4
+    定义 da = Da * 4; 定义 dr = Dr * 4; 定义 dg = Dg * 4; 定义 db = Db * 4
+
+    定义 oa = Nova缓冲lend_计算(模式, sa, da, sa, da)
+    定义 or_ = Nova缓冲lend_计算(模式, sr, dr, sa, da)
+    定义 og = Nova缓冲lend_计算(模式, sg, dg, sa, da)
+    定义 ob = Nova缓冲lend_计算(模式, sb, db, sa, da)
+
+    // Q10→u8, clamp
+    oa = oa / 4; 如果 (oa > 255) { oa = 255 }; 如果 (oa < 0) { oa = 0 }
+    or_ = or_ / 4; 如果 (or_ > 255) { or_ = 255 }; 如果 (or_ < 0) { or_ = 0 }
+    og = og / 4; 如果 (og > 255) { og = 255 }; 如果 (og < 0) { og = 0 }
+    ob = ob / 4; 如果 (ob > 255) { ob = 255 }; 如果 (ob < 0) { ob = 0 }
+
+    返回 (oa << 24) | (or_ << 16) | (og << 8) | ob
+}

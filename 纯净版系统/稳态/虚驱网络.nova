@@ -1,0 +1,300 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../外联/网缓读.nova")
+导入("./虚驱通用.nova")
+导入("../外联/网缓分配.nova")
+导入("../外联/网络设备启.nova")
+导入("../中枢/链表后继.nova")
+导入("../中枢/字符串替换.nova")
+导入("../外联/网络设备分.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. virtio-net是QEMU/KVM虚拟化环境的标准网络设备
+//   2. 两个virtqueue: RX(接收)和TX(发送)
+//   3. virtqueue: 共享内存环形缓冲区, 零拷贝, 通知机制
+//   4. MAC地址从virtio配置空间读取
+//   5. N接口: 中断→轮询模式切换, 减少中断开销
+
+定义 VIRTIO_NET_F_CSUM       = (1 << 0)   // 硬件校验和
+定义 VIRTIO_NET_F_MAC        = (1 << 5)   // 配置空间有MAC地址
+定义 VIRTIO_NET_F_MRG_RXBUF  = (1 << 15)  // 合并接收缓冲区
+定义 VIRTIO_NET_F_STATUS     = (1 << 16)  // 链路状态通知
+定义 VIRTIO_NET_F_MTU        = (1 << 23)  // 配置空间有MTU
+
+定义 VIRTIO_NET_HDR_SIZE = 12
+结构 virtio_net_hdr {
+    flags,    // u8 VIRTIO_NET_HDR_F_*
+    gso_type,    // u8 VIRTIO_NET_HDR_GSO_*
+    hdr_len,    // u16 以太网+IP+传控头总长
+    gso_size,    // u16 GSO段大小
+    csum_start,    // u16 校验和起始偏移
+    csum_offset,    // u16 校验和字段偏移
+}
+
+结构 virtio_net_设备 {
+    // virtqueue
+    rx_vq,    // u64 接收virtqueue
+    tx_vq,    // u64 发送virtqueue
+    ctrl_vq,    // u64 控制virtqueue
+
+    // 缓冲区
+    rx_缓冲区,    // [] 预分配的接收缓冲区
+    rx_缓冲区数,
+    // MAC地址
+    mac,    // [] 6字节MAC地址
+
+    // 网络设备
+    net_dev,    // u64 关联的net_device
+
+    // 统计
+    rx_packets,
+    tx_packets,
+    rx_bytes,
+    tx_bytes,
+    rx_errors,
+    tx_errors,
+    // 状态
+    链路状态,    // u32 0=down, 1=up
+}
+
+定义 可变 virtio_net_dev = 空
+
+// 初始化 
+
+函数 virtio网络_初始化() {
+    定义 dev = virtio_net_设备 {}
+
+    // 1. 读取MAC地址(从virtio配置空间或默认)
+    dev.mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]  // QEMU默认MAC
+
+    // 2. 创建virtqueue (RX + TX)
+    dev.rx_vq = virtqueue_创建(0, 256, "rx")    // queue 0, 256 entries
+    dev.tx_vq = virtqueue_创建(1, 256, "tx")    // queue 1, 256 entries
+
+    // 3. 预分配接收缓冲区
+    dev.rx_缓冲区 = []
+    dev.rx_缓冲区数 = 64
+    定义 可变 i = 0
+    当 (i < dev.rx_缓冲区数) {
+        定义 buf = Nova缓冲_创建(1514 + VIRTIO_NET_HDR_SIZE)  // MTU+头
+        如果 (buf != 空) {
+            追加(dev.rx_缓冲区, buf)
+            // 将缓冲区提交到RX virtqueue
+            virtqueue_添加缓冲(dev.rx_vq, buf, 1514 + VIRTIO_NET_HDR_SIZE, 假)
+        }
+        i = i + 1
+    }
+    virtqueue_通知(dev.rx_vq, 空)   // 通知后端有新缓冲区
+
+    // 4. 初始化统计
+    dev.rx_packets = 0
+    dev.tx_packets = 0
+    dev.rx_bytes = 0
+    dev.tx_bytes = 0
+    dev.rx_errors = 0
+    dev.tx_errors = 0
+    dev.链路状态 = 1
+
+    // 5. 注册网络设备
+    定义 mac_str = mac_格式化(dev.mac)
+    网络设备_注册("eth0", virtio网络_发送, dev.mac)
+    dev.net_dev = 网络设备_查找("eth0")
+
+    virtio_net_dev = dev
+
+    内核信息("virtio-net: " + mac_str + " (2个virtqueue, " + 整数转字符串(dev.rx_缓冲区数) + "个RX缓冲)")
+    返回 成功
+}
+
+// 发送 
+
+函数 virtio网络_发送(Nova缓冲) {
+    如果 (virtio_net_dev == 空) { 返回 错误_未初始化 }
+    定义 dev = virtio_net_dev
+
+    // 1. 添加virtio-net头 (在数据前面push)
+    定义 头ptr = Nova缓冲_push(Nova缓冲, VIRTIO_NET_HDR_SIZE)
+    // 清零头部
+    内存清零(头ptr, VIRTIO_NET_HDR_SIZE)
+
+    // 2. 将Nova缓冲提交到TX virtqueue
+    定义 结果 = virtqueue_添加缓冲(dev.tx_vq, Nova缓冲, Nova缓冲_长度(Nova缓冲), 真)
+    如果 (结果 < 0) {
+        dev.tx_errors = dev.tx_errors + 1
+        返回 结果
+    }
+
+    // 3. 通知后端(kick)
+    virtqueue_通知(dev.tx_vq, 空)
+
+    // 4. 更新统计
+    dev.tx_packets = dev.tx_packets + 1
+    dev.tx_bytes = dev.tx_bytes + Nova缓冲_长度(Nova缓冲)
+
+    返回 成功
+}
+
+// 接收中断 
+
+函数 virtio网络_接收中断() {
+    如果 (virtio_net_dev == 空) { 返回 }
+    定义 dev = virtio_net_dev
+
+    // 从RX virtqueue取出已完成的缓冲区
+    定义 可变 处理数 = 0
+    循环 {
+        定义 buf = virtqueue_取出缓冲(dev.rx_vq)
+        如果 (buf == 空) { 中断 }
+
+        定义 Nova缓冲 = buf
+        定义 长度 = virtqueue_缓冲长度(dev.rx_vq)
+
+        // 跳过virtio-net头
+        Nova缓冲_pull(Nova缓冲, VIRTIO_NET_HDR_SIZE)
+
+        // 设置协议 (解析以太网头)
+        Nova缓冲_设置mac头(Nova缓冲)
+        定义 eth_type = (缓冲读(Nova缓冲_数据(Nova缓冲), 12) << 8) | 缓冲读(Nova缓冲_数据(Nova缓冲), 13)
+        Nova缓冲_设置协议(Nova缓冲, eth_type)
+
+        // 交给网络栈处理
+        网络设备_接收(Nova缓冲)
+
+        dev.rx_packets = dev.rx_packets + 1
+        dev.rx_bytes = dev.rx_bytes + 长度
+        处理数 = 处理数 + 1
+
+        // 补充新的接收缓冲区
+        定义 新buf = Nova缓冲_创建(1514 + VIRTIO_NET_HDR_SIZE)
+        如果 (新buf != 空) {
+            virtqueue_添加缓冲(dev.rx_vq, 新buf, 1514 + VIRTIO_NET_HDR_SIZE, 假)
+        }
+    }
+
+    如果 (处理数 > 0) {
+        virtqueue_通知(dev.rx_vq, 空)
+    }
+}
+
+// virtqueue操作 (简化,
+
+函数 virtqueue_创建_网络(索引, 大小, 名称) {    // 网络专用版(通用版在virtio通用.nova)
+    返回 [索引, 大小, 名称, [], 0, 0]  // [idx, size, name, buffers, head, tail]
+}
+
+函数 virtqueue_添加缓冲_网络(vq, buf, 长度, 写) {
+    追加(vq[3], [buf, 长度, 写])
+    返回 成功
+}
+
+函数 virtqueue_取出缓冲(vq) {
+    如果 (计数(vq[3]) == 0) { 返回 空 }
+    定义 项 = vq[3][0]
+    链表_删除(vq[3], 0)
+    返回 项[0]
+}
+
+函数 virtqueue_缓冲长度(vq) {
+    // 获取virtqueue中已使用缓冲区的数据长度
+    如果 (vq == 空) { 返回 0 }
+    如果 (vq.已使用环 != 空 && vq.已使用索引 < 计数(vq.已使用环)) {
+        返回 vq.已使用环[vq.已使用索引]
+    }
+    返回 0
+}
+
+函数 virtqueue_通知_网络(vq) {
+    // 写MMIO通知寄存器(告诉后端有新描述符)
+    如果 (virtnet_设备 != 空) {
+        virtqueue_通知(vq, virtnet_设备)
+    }
+}
+
+// 辅助
+
+函数 mac_格式化(mac) {
+    定义 可变 s = ""
+    定义 可变 i = 0
+    当 (i < 6) {
+        如果 (i > 0) { s = s + ":" }
+        定义 b = mac[i]
+        定义 高 = b / 16
+        定义 低 = b % 16
+        s = s + hex_字符(高) + hex_字符(低)
+        i = i + 1
+    }
+    返回 s
+}
+
+函数 hex_字符(v) {
+    如果 (v < 10) { 返回 字符(48 + v) }
+    返回 字符(87 + v)
+}
+
+函数 virtio网络_统计() {
+    如果 (virtio_net_dev == 空) { 返回 空 }
+    定义 dev = virtio_net_dev
+    返回 [dev.rx_packets, dev.tx_packets, dev.rx_bytes, dev.tx_bytes, dev.rx_errors, dev.tx_errors]
+}
+
+// 错误_未初始化 定义在 核心/公共/错误码.nova
+
+
+函数 virtio网络_完整统计() {
+    如果 (virtio_net_dev == 空) { 返回 [0, 0, 0, 0, 0, 0] }
+    定义 dev = virtio_net_dev
+    返回 [dev.rx_packets, dev.tx_packets, dev.rx_bytes, dev.tx_bytes, dev.rx_errors, dev.tx_errors]
+}
+
+// virtio网络健康检查
+
+函数 virtio网络_健康检查() {
+    定义 可变 问题 = []
+    如果 (virtio_net_dev == 空) { 追加(问题, "virtio网络设备未初始化"); 返回 问题 }
+    定义 dev = virtio_net_dev
+    如果 (dev.rx_errors > dev.rx_packets / 10 && dev.rx_packets > 100) {
+        追加(问题, "接收错误率过高")
+    }
+    如果 (dev.tx_errors > dev.tx_packets / 10 && dev.tx_packets > 100) {
+        追加(问题, "发送错误率过高")
+    }
+    如果 (计数(问题) == 0) { 返回 "virtio网络健康" }
+    返回 问题
+}
+
+函数 virtio网络_重置统计() {
+    如果 (virtio_net_dev == 空) { 返回 }
+    virtio_net_dev.rx_packets = 0
+    virtio_net_dev.tx_packets = 0
+    virtio_net_dev.rx_bytes = 0
+    virtio_net_dev.tx_bytes = 0
+    virtio_net_dev.rx_errors = 0
+    virtio_net_dev.tx_errors = 0
+}
+
+函数 virtio网络_链接状态() {
+    如果 (virtio_net_dev == 空) { 返回 "断开" }
+    如果 (virtio_net_dev.链路状态) { 返回 "连接" }
+    返回 "断开"
+}
+
+函数 virtio网络_是否就绪() {
+    返回 virtio_net_dev != 空 && virtio_net_dev.链路状态
+}
+
+定义 可变 AI_虚驱网络_风暴阈值 = 10000
+定义 可变 AI_虚驱网络_预测IRQ = 0
+
+函数 AI_虚驱网络_风暴检测(触发频率) {
+    如果 (触发频率 > AI_虚驱网络_风暴阈值) {
+        AI_虚驱网络_风暴阈值 = AI_虚驱网络_风暴阈值 * 3 / 2
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_虚驱网络_自适应合并(当前延迟) {
+    如果 (当前延迟 < 100) { 返回 16 }
+    如果 (当前延迟 < 500) { 返回 8 }
+    返回 1
+}

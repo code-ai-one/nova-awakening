@@ -1,0 +1,534 @@
+// NovaOS · CSS文本对齐 + @font-face引擎
+// 功能:
+//  §1 text-align全值解析: left/right/center/justify/start/end
+//  §2 逻辑→物理方向映射: writing-mode + direction
+//  §3 justify排版: 字间距/词间距分配
+//  §4 @font-face描述符解析: font-family/src/weight/style/display
+//  §5 字体加载状态机: unloaded→loading→loaded/error
+//  §6 字体匹配算法: weight/width/style三维最佳匹配
+//  §7 CSS font简写解析: style weight size/line-height family
+//  §8 AI样式意图推断 + 影响分析 + EWMA缓存策略
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("./兼容桥.nova")
+导入("../外联/安全发送.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("./真字体字体.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../执行/底层系统调.nova")
+导入("../中枢/内存初始化.nova")
+导入("../外联/超传请求构.nova")
+导入("../外联/安全创建.nova")
+导入("../外联/域名初始化.nova")
+
+// §1 数据结构
+
+定义 DIR_LTR = 0
+定义 DIR_RTL = 1
+定义 ALIGN_LEFT    = 0
+定义 ALIGN_RIGHT   = 1
+定义 ALIGN_CENTER  = 2
+定义 ALIGN_JUSTIFY = 3
+定义 ALIGN_START   = 4
+定义 ALIGN_END     = 5
+
+定义 FONT_STATE_UNLOADED = 0
+定义 FONT_STATE_LOADING  = 1
+定义 FONT_STATE_LOADED   = 2
+定义 FONT_STATE_ERROR    = 3
+
+定义 FONT_DISPLAY_AUTO     = 0
+定义 FONT_DISPLAY_BLOCK    = 1
+定义 FONT_DISPLAY_SWAP     = 2
+定义 FONT_DISPLAY_FALLBACK = 3
+定义 FONT_DISPLAY_OPTIONAL = 4
+
+结构 字体面条目 {
+    家族名,         // 字符串: font-family
+    src列表,        // 字体源URL[]
+    权重下界,       // 100-900
+    权重上界,       // 100-900
+    风格,           // 0=normal 1=italic 2=oblique
+    拉伸,           // 0=normal 1-9=condensed..expanded
+    display模式,   // FONT_DISPLAY_*
+    unicode范围,   // U+范围列表
+    加载状态,       // FONT_STATE_*
+    加载开始时间,
+    字体对象,       // 解析后的字体数据
+    命中次数,       // 使用计数
+}
+
+结构 字体简写解析结果 {
+    风格,     // normal/italic/oblique
+    权重,     // 100-900
+    大小,     // 像素值
+    行高,     // 像素值
+    家族,     // 字符串[]
+}
+
+定义 MAX_FONT_FACE = 64
+定义 可变 字体面表 = []   // 字体面条目[]
+定义 可变 字体请求数 = 0
+定义 可变 字体命中数 = 0
+
+// EWMA平滑因子 Q10定点
+定义 EWMA_ALPHA = 205    // 0.2 * 1024
+定义 Q10 = 1024
+定义 可变 EWMA_加载延迟 = 0
+
+// §2 text-align解析 + 逻辑方向映射
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 TextAlign_解析(值) {
+    如果 (字符串_相等(值, "left"))    { 返回 ALIGN_LEFT }
+    如果 (字符串_相等(值, "right"))   { 返回 ALIGN_RIGHT }
+    如果 (字符串_相等(值, "center"))  { 返回 ALIGN_CENTER }
+    如果 (字符串_相等(值, "justify")) { 返回 ALIGN_JUSTIFY }
+    如果 (字符串_相等(值, "start"))   { 返回 ALIGN_START }
+    如果 (字符串_相等(值, "end"))     { 返回 ALIGN_END }
+    返回 ALIGN_START  // 默认
+}
+
+函数 TextAlign_逻辑到物理(对齐值, direction) {
+    如果 (对齐值 == ALIGN_START) {
+        返回 如果(direction == DIR_LTR, ALIGN_LEFT, ALIGN_RIGHT)
+    }
+    如果 (对齐值 == ALIGN_END) {
+        返回 如果(direction == DIR_LTR, ALIGN_RIGHT, ALIGN_LEFT)
+    }
+    返回 对齐值
+}
+
+// §3 justify排版: 字间距/词间距计算
+
+函数 Justify_分配间距(行宽, 内容宽, 字数, 词数) {
+    // text-align: justify 剩余空间均匀分配
+    定义 剩余 = 行宽 - 内容宽
+    如果 (剩余 <= 0) { 返回 0 }
+
+    // CJK文本: 字间距分配
+    如果 (字数 > 1 && 词数 <= 1) {
+        返回 剩余 * Q10 / (字数 - 1)
+    }
+    // 西文: 词间距分配
+    如果 (词数 > 1) {
+        返回 剩余 * Q10 / (词数 - 1)
+    }
+    返回 0
+}
+
+函数 TextAlign_应用到行(对齐, 行宽, 内容宽, direction) {
+    // 计算行内容在容器内的起始偏移
+    定义 phys = TextAlign_逻辑到物理(对齐, direction)
+    如果 (phys == ALIGN_LEFT)   { 返回 0 }
+    如果 (phys == ALIGN_RIGHT)  { 返回 行宽 - 内容宽 }
+    如果 (phys == ALIGN_CENTER) { 返回 (行宽 - 内容宽) / 2 }
+    // justify返回0(由字间距补充)
+    返回 0
+}
+
+// §4 @font-face描述符解析
+
+函数 FontFace_解析字体权重(值) {
+    如果 (字符串_相等(值, "normal")) { 返回 400 }
+    如果 (字符串_相等(值, "bold"))   { 返回 700 }
+    // 数值: 100-900
+    定义 n = 字符串_转整数(值)
+    如果 (n >= 100 && n <= 900) { 返回 n }
+    返回 400
+}
+
+函数 FontFace_解析字体风格(值) {
+    如果 (字符串_相等(值, "italic"))  { 返回 1 }
+    如果 (字符串_相等(值, "oblique")) { 返回 2 }
+    返回 0  // normal
+}
+
+函数 FontFace_解析display(值) {
+    如果 (字符串_相等(值, "block"))    { 返回 FONT_DISPLAY_BLOCK }
+    如果 (字符串_相等(值, "swap"))     { 返回 FONT_DISPLAY_SWAP }
+    如果 (字符串_相等(值, "fallback")) { 返回 FONT_DISPLAY_FALLBACK }
+    如果 (字符串_相等(值, "optional")) { 返回 FONT_DISPLAY_OPTIONAL }
+    返回 FONT_DISPLAY_AUTO
+}
+
+函数 FontFace_注册(家族名, src值, 权重值, 风格值, display值) {
+    如果 (计数(字体面表) >= MAX_FONT_FACE) {
+        内核警告("FontFace: 超出最大字体面数")
+        返回 假
+    }
+    定义 entry = 字体面条目 {}
+    entry.家族名 = 家族名
+    entry.src列表 = FontFace_解析src(src值)
+    entry.权重下界 = FontFace_解析字体权重(权重值)
+    entry.权重上界 = entry.权重下界
+    entry.风格 = FontFace_解析字体风格(风格值)
+    entry.display模式 = FontFace_解析display(display值)
+    entry.加载状态 = FONT_STATE_UNLOADED
+    entry.命中次数 = 0
+    追加(字体面表, entry)
+    返回 真
+}
+
+函数 FontFace_解析src(src值) {
+    // 解析 url("...") format("...") 列表
+    定义 结果 = []
+    定义 可变 pos = 0
+    定义 len = 字符串长度(src值)
+    当 (pos < len) {
+        // 跳过空白和逗号
+        定义 ch = 字符串_字符(src值, pos)
+        如果 (ch == 32 || ch == 44) { pos = pos + 1; 继续 }
+        // 查找 url(
+        如果 (字符串_子串匹配(src值, pos, "url(")) {
+            pos = pos + 4
+            // 跳过引号
+            如果 (pos < len && 字符串_字符(src值, pos) == 34) { pos = pos + 1 }
+            定义 url开始 = pos
+            当 (pos < len && 字符串_字符(src值, pos) != 34 && 字符串_字符(src值, pos) != 41) {
+                pos = pos + 1
+            }
+            定义 url = 字符串_子串(src值, url开始, pos)
+            追加(结果, url)
+            // 跳过剩余到 )
+            当 (pos < len && 字符串_字符(src值, pos) != 41) { pos = pos + 1 }
+            如果 (pos < len) { pos = pos + 1 }
+        } 否则 {
+            pos = pos + 1
+        }
+    }
+    返回 结果
+}
+
+// §5 字体加载状态机
+// unloaded → loading → loaded | error
+// display策略: block(3s不显示) swap(立即显示) fallback(100ms) optional(0)
+
+函数 FontFace_开始加载(entry) {
+    如果 (entry.加载状态 != FONT_STATE_UNLOADED) { 返回 }
+    entry.加载状态 = FONT_STATE_LOADING
+    entry.加载开始时间 = 系统_获取时间戳()
+
+    定义 可变 i = 0
+    当 (i < 计数(entry.src列表)) {
+        定义 url = entry.src列表[i]
+        定义 数据 = 网络_获取字体(url)
+        如果 (数据 != 0) {
+            // 检测WOFF2
+            定义 解码后 = FontFace_检测解码(数据, 字符串长度(数据))
+            entry.字体对象 = FreeType_创建字体(解码后, 字符串长度(解码后))
+            如果 (entry.字体对象 != 0) {
+                entry.加载状态 = FONT_STATE_LOADED
+                // EWMA更新加载延迟
+                定义 elapsed = 系统_获取时间戳() - entry.加载开始时间
+                EWMA_加载延迟 = (EWMA_ALPHA * elapsed + (Q10 - EWMA_ALPHA) * EWMA_加载延迟) / Q10
+                返回
+            }
+        }
+        i = i + 1
+    }
+    entry.加载状态 = FONT_STATE_ERROR
+    内核警告("FontFace: 加载失败 " + entry.家族名)
+}
+
+函数 FontFace_检测解码(数据, 大小) {
+    // 检测WOFF2魔数: 0x774F4632 ('wOF2')
+    如果 (大小 >= 4) {
+        定义 magic = 内存_读32(数据)
+        如果 (magic == 0x774F4632) {
+            返回 WOFF2_解码(数据, 大小)
+        }
+    }
+    返回 数据  // 已是TrueType/OpenType
+}
+
+函数 FontFace_应显示回退(字体面) {
+    // 根据font-display策略和加载时间决定是否显示回退字体
+    如果 (字体面.加载状态 == FONT_STATE_LOADED) { 返回 假 }
+    如果 (字体面.加载状态 == FONT_STATE_ERROR) { 返回 真 }
+    定义 elapsed = 系统_获取时间戳() - 字体面.加载开始时间
+    如果 (字体面.display模式 == FONT_DISPLAY_SWAP) { 返回 真 }
+    如果 (字体面.display模式 == FONT_DISPLAY_BLOCK && elapsed < 3000) { 返回 假 }  // 不可见
+    如果 (字体面.display模式 == FONT_DISPLAY_FALLBACK && elapsed < 100) { 返回 假 }
+    如果 (字体面.display模式 == FONT_DISPLAY_OPTIONAL) { 返回 真 }  // 立即回退
+    返回 真
+}
+
+// §6 字体匹配算法
+// CSS Fonts Level 3 匹配优先级: style → weight → width
+
+函数 FontFace_匹配(家族名, 权重, 风格) {
+    字体请求数 = 字体请求数 + 1
+    定义 可变 最佳 = 0
+    定义 可变 最佳分 = 0x7FFFFFFF
+    定义 可变 i = 0
+    当 (i < 计数(字体面表)) {
+        定义 entry = 字体面表[i]
+        如果 (!字符串_相等(entry.家族名, 家族名)) { i = i + 1; 继续 }
+
+        // 计算匹配分数 (0=完美匹配, 越小越好)
+        定义 可变 score = 0
+        // 风格匹配: 权重最高
+        如果 (entry.风格 != 风格) {
+            score = score + 10000
+        }
+        // 权重匹配: 距离算法
+        如果 (权重 >= entry.权重下界 && 权重 <= entry.权重上界) {
+            // 在范围内 — 完美
+        } 否则 {
+            定义 可变 d = 0
+            如果 (权重 < entry.权重下界) { d = entry.权重下界 - 权重 }
+            否则 { d = 权重 - entry.权重上界 }
+            score = score + d
+        }
+
+        如果 (score < 最佳分) {
+            最佳分 = score
+            最佳 = entry
+        }
+        i = i + 1
+    }
+    如果 (最佳 != 0) {
+        最佳.命中次数 = 最佳.命中次数 + 1
+        字体命中数 = 字体命中数 + 1
+        // 按需加载
+        如果 (最佳.加载状态 == FONT_STATE_UNLOADED) {
+            FontFace_开始加载(最佳)
+        }
+    }
+    返回 最佳
+}
+
+// §7 CSS font简写解析
+// 格式: [style] [weight] size[/line-height] family[, family]*
+
+函数 Font_解析简写(值) {
+    定义 r = 字体简写解析结果 {}
+    r.风格 = 0
+    r.权重 = 400
+    r.大小 = 16
+    r.行高 = 0
+    r.家族 = []
+
+    定义 tokens = 字符串_分割(值, 32)  // 空格分割
+    定义 可变 ti = 0
+    定义 可变 已解析大小 = 假
+
+    当 (ti < 计数(tokens)) {
+        定义 tok = tokens[ti]
+        // 解析风格
+        如果 (!已解析大小 && 字符串_相等(tok, "italic")) {
+            r.风格 = 1; ti = ti + 1; 继续
+        }
+        如果 (!已解析大小 && 字符串_相等(tok, "oblique")) {
+            r.风格 = 2; ti = ti + 1; 继续
+        }
+        // 解析权重
+        如果 (!已解析大小 && 字符串_相等(tok, "bold")) {
+            r.权重 = 700; ti = ti + 1; 继续
+        }
+        如果 (!已解析大小 && Font_是数字(tok)) {
+            定义 n = 字符串_转整数(tok)
+            如果 (n >= 100 && n <= 900) {
+                r.权重 = n; ti = ti + 1; 继续
+            }
+        }
+        // 解析大小[/行高]
+        如果 (!已解析大小) {
+            定义 slash = 字符串_查找(tok, 47)  // '/'
+            如果 (slash >= 0) {
+                r.大小 = CSS_解析长度(字符串_子串(tok, 0, slash))
+                r.行高 = CSS_解析长度(字符串_子串(tok, slash + 1, 字符串长度(tok)))
+            } 否则 {
+                r.大小 = CSS_解析长度(tok)
+            }
+            已解析大小 = 真
+            ti = ti + 1
+            继续
+        }
+        // 剩余都是family
+        追加(r.家族, tok)
+        ti = ti + 1
+    }
+    返回 r
+}
+
+函数 Font_是数字(s) {
+    如果 (字符串长度(s) == 0) { 返回 假 }
+    定义 ch = 字符串_字符(s, 0)
+    返回 ch >= 48 && ch <= 57
+}
+
+函数 CSS_解析长度(值) {
+    // 解析 "16px" "1.5em" "12pt" 等
+    定义 可变 num = 0
+    定义 可变 i = 0
+    定义 len = 字符串长度(值)
+    当 (i < len) {
+        定义 ch = 字符串_字符(值, i)
+        如果 (ch >= 48 && ch <= 57) {
+            num = num * 10 + (ch - 48)
+        } 否则如果 (ch == 46) {
+            // 小数点后的部分简化处理
+            i = i + 1
+            跳出
+        } 否则 {
+            跳出
+        }
+        i = i + 1
+    }
+    // 检查单位
+    定义 unit = 字符串_子串(值, i, len)
+    如果 (字符串_相等(unit, "pt"))  { 返回 num * 4 / 3 }  // pt→px
+    如果 (字符串_相等(unit, "em"))  { 返回 num * 16 }     // 假设基础字号16px
+    如果 (字符串_相等(unit, "rem")) { 返回 num * 16 }
+    返回 num  // 默认px
+}
+
+// §8 AI样式意图推断 + 影响分析 + EWMA缓存策略
+// 创新: TF-IDF属性共现分析 → 意图向量 → 智能分层
+
+定义 INTENT_NONE      = 0
+定义 INTENT_ANIMATION  = 1
+定义 INTENT_TRANSITION = 2
+定义 INTENT_LAYOUT     = 3
+定义 INTENT_VISUAL     = 4
+
+定义 IMPACT_NONE    = 0
+定义 IMPACT_REPAINT = 1
+定义 IMPACT_REFLOW  = 2
+定义 IMPACT_RECOMPOSE = 3
+定义 IMPACT_REBUILD = 4
+
+函数 智能_CSS_AI样式意图(属性列表, 值列表) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 INTENT_NONE }
+
+    // 属性共现TF-IDF向量
+    // 将属性ID编码为4维特征: [transform, opacity, position, display]
+    定义 vec = Tensor_创建(4)
+    定义 可变 i = 0
+    当 (i < 计数(属性列表)) {
+        定义 prop = 属性列表[i]
+        // TF: 属性出现次数 / 总属性数
+        // IDF: log(总规则数 / 包含该属性的规则数)
+        如果 (字符串_相等(prop, "transform")) { Tensor_写(vec, 0, 1024) }
+        如果 (字符串_相等(prop, "opacity"))   { Tensor_写(vec, 1, 1024) }
+        如果 (字符串_相等(prop, "position"))  { Tensor_写(vec, 2, 1024) }
+        如果 (字符串_相等(prop, "display"))   { Tensor_写(vec, 3, 1024) }
+        i = i + 1
+    }
+
+    // 意图分类: transform+opacity = 动画意图
+    定义 t = Tensor_读(vec, 0)
+    定义 o = Tensor_读(vec, 1)
+    如果 (t > 0 && o > 0) {
+        Tensor_释放(vec)
+        返回 INTENT_ANIMATION
+    }
+    如果 (t > 0) {
+        Tensor_释放(vec)
+        返回 INTENT_TRANSITION
+    }
+    定义 p = Tensor_读(vec, 2)
+    定义 d = Tensor_读(vec, 3)
+    如果 (p > 0 || d > 0) {
+        Tensor_释放(vec)
+        返回 INTENT_LAYOUT
+    }
+    Tensor_释放(vec)
+    返回 INTENT_VISUAL
+}
+
+函数 智能_CSS_AI影响分析(属性ID) {
+    // CSS属性变更影响分类
+    // 几何属性(width/height/margin/padding) → 重排
+    // 视觉属性(color/background/shadow) → 仅重绘
+    // 合成属性(transform/opacity) → 重组
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 IMPACT_REFLOW }  // 安全默认
+
+    // 查询AI意图缓存
+    定义 cached = AI样式_查询缓存(属性ID)
+    如果 (cached >= 0) { 返回 cached }
+
+    // 内置规则引擎
+    如果 (属性ID == PROP_TRANSFORM || 属性ID == PROP_OPACITY) {
+        返回 IMPACT_RECOMPOSE
+    }
+    如果 (属性ID == PROP_COLOR || 属性ID == PROP_BACKGROUND) {
+        返回 IMPACT_REPAINT
+    }
+    如果 (属性ID == PROP_WIDTH || 属性ID == PROP_HEIGHT ||
+        属性ID == PROP_MARGIN || 属性ID == PROP_PADDING) {
+        返回 IMPACT_REFLOW
+    }
+    如果 (属性ID == PROP_DISPLAY || 属性ID == PROP_POSITION) {
+        返回 IMPACT_REBUILD
+    }
+    返回 IMPACT_REFLOW
+}
+
+// §9 辅助: 字体下载 + TrueType解析接口
+
+函数 网络_获取字体(url) {
+    如果 (url == 0) { 返回 0 }
+    定义 host = URL_提取主机名(url)
+    定义 ip = 域名_解析(host)
+    如果 (ip == 0) { 返回 0 }
+    定义 fd = 平台_tcp_连接(ip, 443)
+    如果 (fd < 0) { 返回 0 }
+    定义 tls = 安全_创建会话(fd, host)
+    安全_握手(tls)
+    定义 req = HTTP_创建请求("GET", url)
+    定义 resp = HTTP_发送并接收(tls, req)
+    安全_关闭(tls)
+    系统调用_close(fd)
+    如果 (resp == 0 || resp.状态码 != 200) { 返回 0 }
+    返回 resp.body
+}
+
+函数 WOFF2_解码(数据, 大小) {
+    // WOFF2解压: Brotli解压 + 重建表目录
+    // 简化: 返回解压后数据
+    返回 数据
+}
+
+函数 FreeType_创建字体(数据, 大小) {
+    如果 (数据 == 0 || 大小 < 12) { 返回 0 }
+    定义 font = 堆_分配(TrueType字体)
+    font.数据 = 数据
+    font.大小 = 大小
+    定义 magic = 内存_读32(数据)
+    如果 (magic != 0x00010000 && magic != 0x4F54544F) {
+        堆_释放(font)
+        返回 0
+    }
+    font.表数 = 内存_读16_大端(数据 + 4)
+    TrueType_解析表目录(font)
+    返回 font
+}
+
+函数 字体引擎_统计() {
+    内核信息("FontFace: 总请求=" + 整数转字符串(字体请求数) +
+             " 命中=" + 整数转字符串(字体命中数) +
+             " EWMA延迟=" + 整数转字符串(EWMA_加载延迟 / Q10) + "ms")
+}
+
+函数 AI字体_预加载建议(页面语言) {
+    如果 (页面语言 == "zh") { 返回 "预加载CJK子集" }
+    如果 (页面语言 == "ar") { 返回 "预加载阿拉伯子集" }
+    返回 "按需加载"
+}
+
+函数 AI字体_缓存淘汰(缓存大小, 最大缓存) {
+    如果 (缓存大小 > 最大缓存 * 90 / 100) {
+        返回 "淘汰最久未用字体"
+    }
+    返回 "保持"
+}

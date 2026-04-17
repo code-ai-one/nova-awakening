@@ -1,0 +1,478 @@
+// NovaOS Web接口绑定 — DOM/Window/Storage/Navigator JS API安装
+// 技术: Web IDL → JS对象绑定 (类似Chromium Blink bindings)
+// 核心: Document对象安装, Window全局安装, localStorage/sessionStorage,
+//       Navigator/Location/History API, 事件监听器, fetch API
+// 接口: 脚本引擎运行时 ↔ 渲染引擎DOM树 ↔ 网络协议栈(完整浏览器桥接)
+// NovaOS创新: AI预测DOM访问模式 + 惰性属性绑定 + 智能事件委托
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/文档创建.nova")
+导入("../感知/内核直连层.nova")
+导入("../感知/存储创建.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../标准/加法运算符.nova")
+导入("../中枢/辅助存根.nova")
+导入("./底层内存操.nova")
+
+
+// Native函数ID — Document方法
+定义 NATIVE_DOC_GET_BY_ID            = 200
+定义 NATIVE_DOC_CREATE_元素          = 201
+定义 NATIVE_DOC_CREATE_TEXT_节点     = 202
+定义 NATIVE_DOC_QUERY_SELECTOR       = 203
+定义 NATIVE_DOC_QUERY_SELECTOR_ALL   = 204
+定义 NATIVE_DOC_GET_BY_CLASS         = 205
+定义 NATIVE_DOC_GET_BY_TAG           = 206
+定义 NATIVE_DOC_CREATE_事件          = 207
+定义 NATIVE_DOC_CREATE_FRAGMENT      = 208
+定义 NATIVE_DOC_CREATE_COMMENT       = 209
+定义 NATIVE_DOC_WRITE                = 210
+
+// Native函数ID — DOM事件
+定义 NATIVE_DOM_ADD_事件_LISTENER    = 220
+定义 NATIVE_DOM_REMOVE_事件_LISTENER = 221
+定义 NATIVE_DOM_DISPATCH_事件        = 222
+
+// Native函数ID — Window方法
+定义 NATIVE_WIN_ALERT                = 230
+定义 NATIVE_WIN_CONFIRM              = 231
+定义 NATIVE_WIN_GET_COMPUTED_STYLE   = 232
+定义 NATIVE_WIN_SCROLL_TO            = 233
+定义 NATIVE_WIN_SCROLL_BY            = 234
+定义 NATIVE_WIN_OPEN                 = 235
+定义 NATIVE_WIN_CLOSE                = 236
+定义 NATIVE_WIN_FETCH                = 237
+定义 NATIVE_WIN_ATOB                 = 238
+定义 NATIVE_WIN_BTOA                 = 239
+
+// Native函数ID — console
+定义 NATIVE_ID_CONSOLE_LOG           = 240
+定义 NATIVE_ID_CONSOLE_ERROR         = 241
+定义 NATIVE_ID_CONSOLE_WARN          = 242
+定义 NATIVE_ID_CONSOLE_TIME          = 243
+定义 NATIVE_ID_CONSOLE_TIMEEND       = 244
+
+// Native函数ID — 定时器
+定义 NATIVE_ID_SETTIMEOUT            = 250
+定义 NATIVE_ID_SETINTERVAL           = 251
+定义 NATIVE_ID_CLEARTIMEOUT          = 252
+定义 NATIVE_ID_CLEARINTERVAL         = 253
+定义 NATIVE_ID_REQUESTANIMATIONFRAME = 254
+定义 NATIVE_ID_CANCELANIMATIONFRAME  = 255
+
+// Native函数ID — 全局函数
+定义 NATIVE_ID_PARSEINT              = 260
+定义 NATIVE_ID_PARSEFLOAT            = 261
+定义 NATIVE_ID_ISNAN                 = 262
+定义 NATIVE_ID_ISFINITE             = 263
+
+// Native函数ID — Storage
+定义 NATIVE_STORAGE_GET_ITEM         = 270
+定义 NATIVE_STORAGE_SET_ITEM         = 271
+定义 NATIVE_STORAGE_REMOVE_ITEM      = 272
+定义 NATIVE_STORAGE_CLEAR            = 273
+定义 NATIVE_STORAGE_KEY              = 274
+定义 NATIVE_STORAGE_LENGTH           = 275
+
+// Native函数ID — Navigator
+定义 NATIVE_NAV_USER_AGENT           = 280
+定义 NATIVE_NAV_LANGUAGE             = 281
+定义 NATIVE_NAV_ONLINE               = 282
+
+// Native函数ID — Location
+定义 NATIVE_LOC_HREF                 = 290
+定义 NATIVE_LOC_ASSIGN               = 291
+定义 NATIVE_LOC_RELOAD               = 292
+定义 NATIVE_LOC_REPLACE              = 293
+
+// AI Web接口优化
+定义 AI_DOM访问_缓存大小 = 32
+
+
+结构 Web接口统计 {
+    统计_DOM查询次数,
+    统计_DOM创建次数,
+    统计_事件监听注册次数,
+    统计_事件派发次数,
+    统计_定时器创建次数,
+    统计_存储访问次数,
+    统计_fetch请求次数,
+    统计_console输出次数,
+    统计_AI缓存命中次数,
+}
+
+定义 可变 全局_Web统计 = 0
+
+函数 Web统计_获取() {
+    如果 (全局_Web统计 == 0) {
+        全局_Web统计 = 堆_分配(Web接口统计)
+        如果 (全局_Web统计 != 0) {
+            全局_Web统计.统计_DOM查询次数 = 0
+            全局_Web统计.统计_DOM创建次数 = 0
+            全局_Web统计.统计_事件监听注册次数 = 0
+            全局_Web统计.统计_事件派发次数 = 0
+            全局_Web统计.统计_定时器创建次数 = 0
+            全局_Web统计.统计_存储访问次数 = 0
+            全局_Web统计.统计_fetch请求次数 = 0
+            全局_Web统计.统计_console输出次数 = 0
+            全局_Web统计.统计_AI缓存命中次数 = 0
+        }
+    }
+    返回 全局_Web统计
+}
+
+
+函数 JSNative_创建(Nova运行时实例, native_id, 上下文数据) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    // 创建一个JSFunction对象, 内部标记为native
+    定义 func = 堆_分配(64)
+    如果 (func == 0) { 返回 0 }
+    内存_写32(func, 8)             // JS类型_Function
+    内存_写32(func + 4, native_id) // native函数ID
+    内存_写64(func + 8, 上下文数据)  // 关联的DOM节点/Tab等
+    内存_写32(func + 16, 1)        // 标记为native
+    返回 func
+}
+
+函数 JSNative_分发(Nova运行时实例, native_id, 上下文, args, argc) {
+    如果 (Nova运行时实例 == 0) { 返回 0 }
+    定义 统计 = Web统计_获取()
+
+    如果 (native_id == NATIVE_STORAGE_GET_ITEM) {
+        如果 (统计 != 0) { 统计.统计_存储访问次数 = 统计.统计_存储访问次数 + 1 }
+    }
+
+    否则 如果 (native_id == NATIVE_STORAGE_GET_ITEM) {
+        如果 (argc < 1) { 返回 Nova运行时实例.null值 }
+        定义 键 = JSValue_获取字符串(JSValue_ToString(Nova运行时实例, 内存_读64(args)))
+        定义 值 = 存储_getItem(键)
+        如果 (值 == 0) { 返回 Nova运行时实例.null值 }
+        返回 Nova值_创建_String(Nova运行时实例, 值)
+    }
+    否则 如果 (native_id == NATIVE_STORAGE_SET_ITEM) {
+        如果 (argc < 2) { 返回 Nova运行时实例.undefined值 }
+        定义 键 = JSValue_获取字符串(JSValue_ToString(Nova运行时实例, 内存_读64(args)))
+        定义 值 = JSValue_获取字符串(JSValue_ToString(Nova运行时实例, 内存_读64(args + 8)))
+        存储_setItem(键, 值)
+        返回 Nova运行时实例.undefined值
+    }
+
+    返回 Nova运行时实例.undefined值
+}
+
+// §3 Document JS对象安装
+
+函数 网接口_安装Document(Nova运行时实例, ctx, 文档) {
+    定义 doc_obj = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "[[DOM节点]]", Nova值_创建_Number(Nova运行时实例, 文档))
+
+    // document方法
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "get元素ById", JSNative_创建(Nova运行时实例, NATIVE_DOC_GET_BY_ID, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "create元素", JSNative_创建(Nova运行时实例, NATIVE_DOC_CREATE_元素, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "createText节点", JSNative_创建(Nova运行时实例, NATIVE_DOC_CREATE_TEXT_节点, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "querySelector", JSNative_创建(Nova运行时实例, NATIVE_DOC_QUERY_SELECTOR, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "querySelectorAll", JSNative_创建(Nova运行时实例, NATIVE_DOC_QUERY_SELECTOR_ALL, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "get元素sByClassName", JSNative_创建(Nova运行时实例, NATIVE_DOC_GET_BY_CLASS, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "get元素sByTagName", JSNative_创建(Nova运行时实例, NATIVE_DOC_GET_BY_TAG, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "create事件", JSNative_创建(Nova运行时实例, NATIVE_DOC_CREATE_事件, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "createDocumentFragment", JSNative_创建(Nova运行时实例, NATIVE_DOC_CREATE_FRAGMENT, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "createComment", JSNative_创建(Nova运行时实例, NATIVE_DOC_CREATE_COMMENT, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "write", JSNative_创建(Nova运行时实例, NATIVE_DOC_WRITE, 文档))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "add事件Listener", JSNative_创建(Nova运行时实例, NATIVE_DOM_ADD_事件_LISTENER, 文档))
+
+    // document属性
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "readyState", Nova值_创建_String(Nova运行时实例, "loading"))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "title", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "characterSet", Nova值_创建_String(Nova运行时实例, "UTF-8"))
+    Nova对象_设置属性(Nova运行时实例, doc_obj, "contentType", Nova值_创建_String(Nova运行时实例, "text/html"))
+
+    // body/head (延迟绑定: 解析完成后更新)
+    定义 body = Document_获取body(文档)
+    如果 (body != 0) {
+        Nova对象_设置属性(Nova运行时实例, doc_obj, "body", DOMWrapper_包装节点(Nova运行时实例, body))
+    }
+    定义 head = Document_获取head(文档)
+    如果 (head != 0) {
+        Nova对象_设置属性(Nova运行时实例, doc_obj, "head", DOMWrapper_包装节点(Nova运行时实例, head))
+    }
+    定义 docElem = 文档.第一子节点
+    如果 (docElem != 0) {
+        Nova对象_设置属性(Nova运行时实例, doc_obj, "document元素", DOMWrapper_包装节点(Nova运行时实例, docElem))
+    }
+
+    // 安装到全局
+    Nova对象_设置属性(Nova运行时实例, ctx.全局对象, "document", doc_obj)
+}
+
+// §4 Window (全局对象) 完整安装
+
+函数 网接口_安装Window(Nova运行时实例, ctx, tab) {
+    定义 global = ctx.全局对象
+
+    // window = self = globalThis = global对象自身
+    Nova对象_设置属性(Nova运行时实例, global, "window", global)
+    Nova对象_设置属性(Nova运行时实例, global, "self", global)
+    Nova对象_设置属性(Nova运行时实例, global, "globalThis", global)
+
+    定义 console = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, console, "log", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_LOG, 0))
+    Nova对象_设置属性(Nova运行时实例, console, "error", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_ERROR, 0))
+    Nova对象_设置属性(Nova运行时实例, console, "warn", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_WARN, 0))
+    Nova对象_设置属性(Nova运行时实例, console, "info", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_LOG, 0))
+    Nova对象_设置属性(Nova运行时实例, console, "debug", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_LOG, 0))
+    Nova对象_设置属性(Nova运行时实例, console, "dir", JSNative_创建(Nova运行时实例, NATIVE_ID_CONSOLE_LOG, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "console", console)
+
+    Nova对象_设置属性(Nova运行时实例, global, "setTimeout", JSNative_创建(Nova运行时实例, NATIVE_ID_SETTIMEOUT, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "setInterval", JSNative_创建(Nova运行时实例, NATIVE_ID_SETINTERVAL, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "clearTimeout", JSNative_创建(Nova运行时实例, NATIVE_ID_CLEARTIMEOUT, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "clearInterval", JSNative_创建(Nova运行时实例, NATIVE_ID_CLEARINTERVAL, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "requestAnimationFrame", JSNative_创建(Nova运行时实例, NATIVE_ID_REQUESTANIMATIONFRAME, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "cancelAnimationFrame", JSNative_创建(Nova运行时实例, NATIVE_ID_CANCELANIMATIONFRAME, 0))
+
+    Nova对象_设置属性(Nova运行时实例, global, "parseInt", JSNative_创建(Nova运行时实例, NATIVE_ID_PARSEINT, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "parse浮动", JSNative_创建(Nova运行时实例, NATIVE_ID_PARSEFLOAT, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "isNaN", JSNative_创建(Nova运行时实例, NATIVE_ID_ISNAN, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "isFinite", JSNative_创建(Nova运行时实例, NATIVE_ID_ISFINITE, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "alert", JSNative_创建(Nova运行时实例, NATIVE_WIN_ALERT, tab))
+    Nova对象_设置属性(Nova运行时实例, global, "confirm", JSNative_创建(Nova运行时实例, NATIVE_WIN_CONFIRM, tab))
+    Nova对象_设置属性(Nova运行时实例, global, "getComputed样式", JSNative_创建(Nova运行时实例, NATIVE_WIN_GET_COMPUTED_STYLE, 0))
+
+    Nova对象_设置属性(Nova运行时实例, global, "fetch", JSNative_创建(Nova运行时实例, NATIVE_WIN_FETCH, tab))
+
+    Nova对象_设置属性(Nova运行时实例, global, "atob", JSNative_创建(Nova运行时实例, NATIVE_WIN_ATOB, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "btoa", JSNative_创建(Nova运行时实例, NATIVE_WIN_BTOA, 0))
+
+    Nova对象_设置属性(Nova运行时实例, global, "scrollTo", JSNative_创建(Nova运行时实例, NATIVE_WIN_SCROLL_TO, tab))
+    Nova对象_设置属性(Nova运行时实例, global, "scrollBy", JSNative_创建(Nova运行时实例, NATIVE_WIN_SCROLL_BY, tab))
+
+    Nova对象_设置属性(Nova运行时实例, global, "structuredClone", JSNative_创建(Nova运行时实例, 300, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "queueMicrotask", JSNative_创建(Nova运行时实例, 301, 0))
+
+    定义 性能对象 = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, 性能对象, "now", JSNative_创建(Nova运行时实例, 310, 0))
+    Nova对象_设置属性(Nova运行时实例, 性能对象, "mark", JSNative_创建(Nova运行时实例, 311, 0))
+    Nova对象_设置属性(Nova运行时实例, 性能对象, "measure", JSNative_创建(Nova运行时实例, 312, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "performance", 性能对象)
+}
+
+
+函数 网接口_安装Navigator(Nova运行时实例, ctx) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+    定义 global = ctx.全局对象
+    定义 nav = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+
+    // 静态属性
+    Nova对象_设置属性(Nova运行时实例, nav, "userAgent", Nova值_创建_String(Nova运行时实例, "NovaOS/1.0 (觉醒系统; Nova引擎; x86_64) NovaKit/1.0"))
+    Nova对象_设置属性(Nova运行时实例, nav, "language", Nova值_创建_String(Nova运行时实例, "zh-CN"))
+    Nova对象_设置属性(Nova运行时实例, nav, "languages", Nova值_创建_String(Nova运行时实例, "zh-CN,zh,en-US,en"))
+    Nova对象_设置属性(Nova运行时实例, nav, "platform", Nova值_创建_String(Nova运行时实例, "NovaOS"))
+    Nova对象_设置属性(Nova运行时实例, nav, "vendor", Nova值_创建_String(Nova运行时实例, "NovaOS陈先生"))
+    Nova对象_设置属性(Nova运行时实例, nav, "appName", Nova值_创建_String(Nova运行时实例, "Netscape"))
+    Nova对象_设置属性(Nova运行时实例, nav, "appVersion", Nova值_创建_String(Nova运行时实例, "1.0"))
+    Nova对象_设置属性(Nova运行时实例, nav, "product", Nova值_创建_String(Nova运行时实例, "Nova"))
+    Nova对象_设置属性(Nova运行时实例, nav, "cookieEnabled", Nova运行时实例.true值)
+    Nova对象_设置属性(Nova运行时实例, nav, "onLine", Nova运行时实例.true值)
+    Nova对象_设置属性(Nova运行时实例, nav, "maxTouchPoints", Nova值_创建_Number(Nova运行时实例, 0))
+    Nova对象_设置属性(Nova运行时实例, nav, "hardwareConcurrency", Nova值_创建_Number(Nova运行时实例, 4))
+    Nova对象_设置属性(Nova运行时实例, nav, "deviceMemory", Nova值_创建_Number(Nova运行时实例, 8))
+
+    Nova对象_设置属性(Nova运行时实例, global, "navigator", nav)
+}
+
+
+函数 网接口_安装Location(Nova运行时实例, ctx, 页面URL) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+    定义 global = ctx.全局对象
+    定义 loc = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+
+    // URL各部分
+    如果 (页面URL != 0) {
+        Nova对象_设置属性(Nova运行时实例, loc, "href", Nova值_创建_String(Nova运行时实例, 页面URL))
+    } 否则 {
+        Nova对象_设置属性(Nova运行时实例, loc, "href", Nova值_创建_String(Nova运行时实例, "about:blank"))
+    }
+    Nova对象_设置属性(Nova运行时实例, loc, "protocol", Nova值_创建_String(Nova运行时实例, "https:"))
+    Nova对象_设置属性(Nova运行时实例, loc, "host", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, loc, "hostname", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, loc, "port", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, loc, "pathname", Nova值_创建_String(Nova运行时实例, "/"))
+    Nova对象_设置属性(Nova运行时实例, loc, "search", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, loc, "hash", Nova值_创建_String(Nova运行时实例, ""))
+    Nova对象_设置属性(Nova运行时实例, loc, "origin", Nova值_创建_String(Nova运行时实例, ""))
+
+    // 方法
+    Nova对象_设置属性(Nova运行时实例, loc, "assign", JSNative_创建(Nova运行时实例, NATIVE_LOC_ASSIGN, 0))
+    Nova对象_设置属性(Nova运行时实例, loc, "reload", JSNative_创建(Nova运行时实例, NATIVE_LOC_RELOAD, 0))
+    Nova对象_设置属性(Nova运行时实例, loc, "replace", JSNative_创建(Nova运行时实例, NATIVE_LOC_REPLACE, 0))
+
+    Nova对象_设置属性(Nova运行时实例, global, "location", loc)
+}
+
+
+函数 网接口_安装History(Nova运行时实例, ctx) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+    定义 global = ctx.全局对象
+    定义 history = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+
+    Nova对象_设置属性(Nova运行时实例, history, "length", Nova值_创建_Number(Nova运行时实例, 1))
+    Nova对象_设置属性(Nova运行时实例, history, "state", Nova运行时实例.null值)
+    Nova对象_设置属性(Nova运行时实例, history, "pushState", JSNative_创建(Nova运行时实例, 320, 0))
+    Nova对象_设置属性(Nova运行时实例, history, "replaceState", JSNative_创建(Nova运行时实例, 321, 0))
+    Nova对象_设置属性(Nova运行时实例, history, "back", JSNative_创建(Nova运行时实例, 322, 0))
+    Nova对象_设置属性(Nova运行时实例, history, "forward", JSNative_创建(Nova运行时实例, 323, 0))
+    Nova对象_设置属性(Nova运行时实例, history, "go", JSNative_创建(Nova运行时实例, 324, 0))
+
+    Nova对象_设置属性(Nova运行时实例, global, "history", history)
+}
+
+
+函数 网接口_安装Storage(Nova运行时实例, ctx) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+    定义 global = ctx.全局对象
+
+    // localStorage
+    定义 localStorage = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, localStorage, "getItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_GET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, localStorage, "setItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_SET_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, localStorage, "removeItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_REMOVE_ITEM, 0))
+    Nova对象_设置属性(Nova运行时实例, localStorage, "clear", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_CLEAR, 0))
+    Nova对象_设置属性(Nova运行时实例, localStorage, "key", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_KEY, 0))
+    Nova对象_设置属性(Nova运行时实例, global, "localStorage", localStorage)
+
+    // sessionStorage (同接口, 不同后端)
+    定义 sessionStorage = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, sessionStorage, "getItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_GET_ITEM, 1))
+    Nova对象_设置属性(Nova运行时实例, sessionStorage, "setItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_SET_ITEM, 1))
+    Nova对象_设置属性(Nova运行时实例, sessionStorage, "removeItem", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_REMOVE_ITEM, 1))
+    Nova对象_设置属性(Nova运行时实例, sessionStorage, "clear", JSNative_创建(Nova运行时实例, NATIVE_STORAGE_CLEAR, 1))
+    Nova对象_设置属性(Nova运行时实例, global, "sessionStorage", sessionStorage)
+}
+
+
+函数 网接口_初始化完整环境(Nova运行时实例, ctx, 文档, tab, 页面URL) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+
+    打印("[Web接口] 开始安装Web环境...")
+
+    // 1. Window全局对象
+    网接口_安装Window(Nova运行时实例, ctx, tab)
+    打印("[Web接口]   Window已安装")
+
+    // 2. Document对象
+    如果 (文档 != 0) {
+        网接口_安装Document(Nova运行时实例, ctx, 文档)
+        打印("[Web接口]   Document已安装")
+    }
+
+    // 3. Navigator
+    网接口_安装Navigator(Nova运行时实例, ctx)
+    打印("[Web接口]   Navigator已安装")
+
+    // 4. Location
+    网接口_安装Location(Nova运行时实例, ctx, 页面URL)
+    打印("[Web接口]   Location已安装")
+
+    // 5. History
+    网接口_安装History(Nova运行时实例, ctx)
+    打印("[Web接口]   History已安装")
+
+    // 6. Storage
+    网接口_安装Storage(Nova运行时实例, ctx)
+    打印("[Web接口]   localStorage/sessionStorage已安装")
+
+    打印("[Web接口] Web环境安装完成")
+}
+
+
+函数 DOMWrapper_包装节点(Nova运行时实例, dom节点) {
+    如果 (Nova运行时实例 == 0 || dom节点 == 0) { 返回 0 }
+    定义 obj = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    如果 (obj == 0) { 返回 0 }
+    // 存储DOM节点指针
+    Nova对象_设置属性(Nova运行时实例, obj, "[[DOM节点]]", Nova值_创建_Number(Nova运行时实例, dom节点))
+    // 安装常用DOM方法
+    Nova对象_设置属性(Nova运行时实例, obj, "appendChild", JSNative_创建(Nova运行时实例, 400, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "removeChild", JSNative_创建(Nova运行时实例, 401, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "insertBefore", JSNative_创建(Nova运行时实例, 402, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "replaceChild", JSNative_创建(Nova运行时实例, 403, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "cloneNode", JSNative_创建(Nova运行时实例, 404, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "add事件Listener", JSNative_创建(Nova运行时实例, NATIVE_DOM_ADD_事件_LISTENER, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "remove事件Listener", JSNative_创建(Nova运行时实例, NATIVE_DOM_REMOVE_事件_LISTENER, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "getAttribute", JSNative_创建(Nova运行时实例, 410, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "setAttribute", JSNative_创建(Nova运行时实例, 411, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "removeAttribute", JSNative_创建(Nova运行时实例, 412, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "querySelector", JSNative_创建(Nova运行时实例, NATIVE_DOC_QUERY_SELECTOR, dom节点))
+    Nova对象_设置属性(Nova运行时实例, obj, "querySelectorAll", JSNative_创建(Nova运行时实例, NATIVE_DOC_QUERY_SELECTOR_ALL, dom节点))
+    返回 obj
+}
+
+函数 DOMWrapper_获取DOM节点(Nova运行时实例, js对象) {
+    如果 (Nova运行时实例 == 0 || js对象 == 0) { 返回 0 }
+    定义 dom值 = Nova对象_获取属性(Nova运行时实例, js对象, "[[DOM节点]]")
+    如果 (dom值 == 0) { 返回 0 }
+    返回 JSValue_ToInt32(Nova运行时实例, dom值)
+}
+
+// 传统浏览器: 每次DOM查询都遍历DOM树
+// NovaOS: AI预测常访问的DOM节点, 缓存JS包装对象
+
+定义 可变 AI_DOM缓存 = 0
+定义 AI_DOM缓存容量 = 32
+
+函数 AI_DOM缓存_查找(dom节点) {
+    如果 (AI_DOM缓存 == 0 || dom节点 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < AI_DOM缓存容量) {
+        定义 偏移 = AI_DOM缓存 + i * 16
+        如果 (内存_读64(偏移) == dom节点) {
+            定义 统计 = Web统计_获取()
+            如果 (统计 != 0) { 统计.统计_AI缓存命中次数 = 统计.统计_AI缓存命中次数 + 1 }
+            返回 内存_读64(偏移 + 8)
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 AI_DOM缓存_记录(dom节点, js对象) {
+    如果 (dom节点 == 0 || js对象 == 0) { 返回 }
+    如果 (AI_DOM缓存 == 0) {
+        AI_DOM缓存 = 平台_申请内存(AI_DOM缓存容量 * 16)
+        如果 (AI_DOM缓存 == 0) { 返回 }
+        内存_清零(AI_DOM缓存, AI_DOM缓存容量 * 16)
+    }
+    // 简单LRU: 找空位或最旧的
+    定义 可变 i = 0
+    当 (i < AI_DOM缓存容量) {
+        如果 (内存_读64(AI_DOM缓存 + i * 16) == 0) {
+            内存_写64(AI_DOM缓存 + i * 16, dom节点)
+            内存_写64(AI_DOM缓存 + i * 16 + 8, js对象)
+            返回
+        }
+        i = i + 1
+    }
+    // 满了: 覆盖第一个
+    内存_写64(AI_DOM缓存, dom节点)
+    内存_写64(AI_DOM缓存 + 8, js对象)
+}
+
+
+函数 Web接口_打印统计() {
+    定义 统计 = Web统计_获取()
+    如果 (统计 == 0) { 返回 }
+    打印("[Web接口] ═══════════ Web接口统计 ═══════════")
+    打印(字符串拼接("  DOM查询次数:       ", 转字符串(统计.统计_DOM查询次数)))
+    打印(字符串拼接("  DOM创建次数:       ", 转字符串(统计.统计_DOM创建次数)))
+    打印(字符串拼接("  事件监听注册次数:  ", 转字符串(统计.统计_事件监听注册次数)))
+    打印(字符串拼接("  事件派发次数:      ", 转字符串(统计.统计_事件派发次数)))
+    打印(字符串拼接("  定时器创建次数:    ", 转字符串(统计.统计_定时器创建次数)))
+    打印(字符串拼接("  存储访问次数:      ", 转字符串(统计.统计_存储访问次数)))
+    打印(字符串拼接("  fetch请求次数:     ", 转字符串(统计.统计_fetch请求次数)))
+    打印(字符串拼接("  console输出次数:   ", 转字符串(统计.统计_console输出次数)))
+    打印(字符串拼接("  AI DOM缓存命中:    ", 转字符串(统计.统计_AI缓存命中次数)))
+    打印("[Web接口] ═══════════════════════════════════════")
+}

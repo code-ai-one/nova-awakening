@@ -1,0 +1,116 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §4 CSS.registerProperty() / @property
+
+// 语法类型
+
+定义 SYNTAX_UNIVERSAL = 0    // "*" (任意值)
+定义 SYNTAX_LENGTH    = 1    // "<length>"
+定义 SYNTAX_COLOR     = 2    // "<color>"
+定义 SYNTAX_NUMBER    = 3    // "<number>"
+定义 SYNTAX_PERCENTAGE = 4   // "<percentage>"
+定义 SYNTAX_URL       = 5    // "<url>"
+定义 SYNTAX_INTEGER   = 6    // "<integer>"
+定义 SYNTAX_ANGLE     = 7    // "<angle>"
+定义 SYNTAX_TIME      = 8    // "<time>"
+定义 SYNTAX_RESOLUTION = 9   // "<resolution>"
+定义 SYNTAX_TRANSFORM_FN = 10 // "<transform-function>"
+定义 SYNTAX_CUSTOM_IDENT = 11 // "<custom-ident>"
+定义 SYNTAX_IMAGE     = 12   // "<image>"
+定义 SYNTAX_LENGTH_PERCENTAGE = 13  // "<length-percentage>"
+
+结构 RegisteredProperty {
+    名称,    // u64 "--my-color"
+    语法,    // u8 SYNTAX_xxx
+    继承,    // 布尔 inherits
+    初始值,    // u64 initial-value 字符串
+    // 用于动画插值
+    可动画,    // 布尔 类型化属性可以插值
+    // 链表
+    下一个,
+}
+
+定义 可变 注册属性头 = 0
+定义 可变 注册属性数 = 0
+
+
+函数 RegisterProperty(名称, 语法字符串, 继承, 初始值) {
+    如果 (名称 == 0) { 返回 }
+    // 验证名称以"--"开头
+    如果 (字节长度(名称) < 3) { 返回 }
+    如果 (字节取(名称, 0) != 0x2D || 字节取(名称, 1) != 0x2D) { 返回 }
+
+    定义 reg = 堆_分配(RegisteredProperty)
+    reg.名称 = 名称; reg.继承 = 继承; reg.初始值 = 初始值
+
+    // 解析语法字符串
+    reg.语法 = RegisterProperty_解析语法(语法字符串)
+    reg.可动画 = (reg.语法 != SYNTAX_UNIVERSAL)
+
+    // 验证初始值符合语法
+    如果 (初始值 != 0 && reg.语法 != SYNTAX_UNIVERSAL) {
+        定义 valid = RegisterProperty_验证值(reg.语法, 初始值)
+        如果 (!valid) { 返回 }    // Type错误
+    }
+
+    // 注册(覆盖已有)
+    定义 可变 existing = 注册属性头
+    当 (existing != 0) {
+        如果 (字符串_相等(existing.名称, 名称)) {
+            // 已注册的不能重复注册(抛InvalidModification错误)
+            返回
+        }
+        existing = existing.下一个
+    }
+    reg.下一个 = 注册属性头; 注册属性头 = reg
+    注册属性数 = 注册属性数 + 1
+}
+
+函数 RegisterProperty_解析语法(语法) {
+    如果 (语法 == 0) { 返回 SYNTAX_UNIVERSAL }
+    如果 (字符串_相等(语法, "*")) { 返回 SYNTAX_UNIVERSAL }
+    如果 (字符串_相等(语法, "<length>")) { 返回 SYNTAX_LENGTH }
+    如果 (字符串_相等(语法, "<color>")) { 返回 SYNTAX_COLOR }
+    如果 (字符串_相等(语法, "<number>")) { 返回 SYNTAX_NUMBER }
+    如果 (字符串_相等(语法, "<percentage>")) { 返回 SYNTAX_PERCENTAGE }
+    如果 (字符串_相等(语法, "<integer>")) { 返回 SYNTAX_INTEGER }
+    如果 (字符串_相等(语法, "<angle>")) { 返回 SYNTAX_ANGLE }
+    如果 (字符串_相等(语法, "<time>")) { 返回 SYNTAX_TIME }
+    如果 (字符串_相等(语法, "<url>")) { 返回 SYNTAX_URL }
+    如果 (字符串_相等(语法, "<image>")) { 返回 SYNTAX_IMAGE }
+    如果 (字符串_相等(语法, "<transform-function>")) { 返回 SYNTAX_TRANSFORM_FN }
+    如果 (字符串_相等(语法, "<custom-ident>")) { 返回 SYNTAX_CUSTOM_IDENT }
+    如果 (字符串_相等(语法, "<length-percentage>")) { 返回 SYNTAX_LENGTH_PERCENTAGE }
+    返回 SYNTAX_UNIVERSAL
+}
+
+函数 RegisterProperty_验证值(语法, 值) {
+    如果 (值 == 0) { 返回 假 }
+    如果 (语法 == SYNTAX_UNIVERSAL) { 返回 真 }
+    如果 (语法 == SYNTAX_COLOR) {
+        // 验证是否为有效颜色: #hex / rgb() / named color
+        返回 真    // 需要CSS颜色解析器
+    }
+    如果 (语法 == SYNTAX_LENGTH) {
+        // 验证: 数字+单位(px/em/rem/vw/vh/...)
+        返回 真
+    }
+    如果 (语法 == SYNTAX_NUMBER || 语法 == SYNTAX_INTEGER) {
+        // 验证: 纯数字
+        返回 真
+    }
+    返回 真
+}
+
+函数 RegisteredProperty_查找(名称) {
+    如果 (名称 == 0) { 返回 0 }
+    定义 可变 reg = 注册属性头
+    当 (reg != 0) {
+        如果 (字符串_相等(reg.名称, 名称)) { 返回 reg }
+        reg = reg.下一个
+    }
+    返回 0
+}

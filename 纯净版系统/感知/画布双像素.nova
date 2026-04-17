@@ -1,0 +1,110 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./变换.nova")
+导入("./内核直连层.nova")
+导入("./样式滤镜.nova")
+
+// §8 像素操作
+
+
+函数 画布2D_写像素(ctx, x, y, r, g, b, a) {
+    如果 (ctx == 0) { 返回 }
+    如果 (x < 0 || x >= ctx.宽 || y < 0 || y >= ctx.高) { 返回 }
+    定义 偏移 = (y * ctx.宽 + x) * 4
+
+    // Alpha合成(Source Over)
+    定义 s = ctx.状态
+    定义 sa = a * s.全局透明度 / 255
+    如果 (sa == 255) {
+        内存_写8(ctx.像素缓冲 + 偏移, r)
+        内存_写8(ctx.像素缓冲 + 偏移 + 1, g)
+        内存_写8(ctx.像素缓冲 + 偏移 + 2, b)
+        内存_写8(ctx.像素缓冲 + 偏移 + 3, 255)
+    } 否则 如果 (sa > 0) {
+        定义 dr = 内存_读8(ctx.像素缓冲 + 偏移)
+        定义 dg = 内存_读8(ctx.像素缓冲 + 偏移 + 1)
+        定义 db = 内存_读8(ctx.像素缓冲 + 偏移 + 2)
+        定义 da = 内存_读8(ctx.像素缓冲 + 偏移 + 3)
+        定义 inv = 255 - sa
+        内存_写8(ctx.像素缓冲 + 偏移, (r * sa + dr * inv) / 255)
+        内存_写8(ctx.像素缓冲 + 偏移 + 1, (g * sa + dg * inv) / 255)
+        内存_写8(ctx.像素缓冲 + 偏移 + 2, (b * sa + db * inv) / 255)
+        内存_写8(ctx.像素缓冲 + 偏移 + 3, sa + da * inv / 255)
+    }
+}
+
+// §9 便捷图形接口
+
+函数 画布2D_fillRect(ctx, x, y, w, h) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    定义 可变 py = y
+    当 (py < y + h) {
+        定义 可变 px = x
+        当 (px < x + w) {
+            定义 tx = (s.a * px + s.c * py) / 1024 + s.e
+            定义 ty = (s.b * px + s.d * py) / 1024 + s.f
+            画布2D_写像素(ctx, tx, ty, s.填充颜色R, s.填充颜色G, s.填充颜色B, s.填充颜色A)
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+函数 画布2D_strokeRect(ctx, x, y, w, h) {
+    画布2D_beginPath(ctx)
+    画布2D_rect(ctx, x, y, w, h)
+    画布2D_stroke(ctx)
+}
+
+函数 画布2D_clearRect(ctx, x, y, w, h) {
+    如果 (ctx == 0) { 返回 }
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.高) {
+        定义 可变 px = x
+        当 (px < x + w && px < ctx.宽) {
+            如果 (px >= 0 && py >= 0) {
+                定义 偏移 = (py * ctx.宽 + px) * 4
+                内存_写32(ctx.像素缓冲 + 偏移, 0)    // 透明黑
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// §10 渐变
+
+结构 画布Gradient {
+    类型,    // u32 0=线性 1=径向
+    x0,    // i32, y0: i32, x1: i32, y1: i32 线性/径向起终点
+    r0,    // u32, r1: u32 径向半径
+    色标,    // [16]u32 RGBA packed
+    色标位置,    // [16]u32 Q10 (0-1024)
+    色标数,
+}
+
+函数 画布2D_createLinearGradient(x0, y0, x1, y1) {
+    定义 g = 堆_分配(画布Gradient)
+    g.类型 = 0
+    g.x0 = x0; g.y0 = y0; g.x1 = x1; g.y1 = y1
+    g.色标数 = 0
+    返回 g
+}
+
+函数 画布2D_createRadialGradient(x0, y0, r0, x1, y1, r1) {
+    定义 g = 堆_分配(画布Gradient)
+    g.类型 = 1
+    g.x0 = x0; g.y0 = y0; g.r0 = r0
+    g.x1 = x1; g.y1 = y1; g.r1 = r1
+    g.色标数 = 0
+    返回 g
+}
+
+函数 画布Gradient_addColorStop(g, 位置, R, G, B, A) {
+    如果 (g == 0 || g.色标数 >= 16) { 返回 }
+    定义 i = g.色标数
+    g.色标[i] = (R << 24) | (G << 16) | (B << 8) | A
+    g.色标位置[i] = 位置
+    g.色标数 = g.色标数 + 1
+}

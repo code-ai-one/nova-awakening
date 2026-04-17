@@ -1,0 +1,240 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+导入("./资源取数.nova")
+导入("./超传头部创.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+
+// §3 Gzip解包 (Nova协议规范 1952)
+// gzip头: ID1(0x1f) ID2(0x8b) CM(8) FLG ... + DEFLATE数据 + CRC32 + ISIZE
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 Gzip_解压(输入, 输入长度) {
+    如果 (输入 == 0 || 输入长度 < 10) { 返回 0 }
+
+    // 验证gzip头
+    如果 (内存_读8(输入) != 0x1F || 内存_读8(输入 + 1) != 0x8B) {
+        返回 0    // 不是gzip
+    }
+    如果 (内存_读8(输入 + 2) != 8) {
+        返回 0    // 不支持的压缩方法(只支持DEFLATE)
+    }
+
+    定义 标志 = 内存_读8(输入 + 3)
+    定义 可变 pos = 10    // 跳过10字节头
+
+    // FEXTRA
+    如果 (标志 & 0x04) {
+        定义 额外长度 = 内存_读8(输入 + pos) | (内存_读8(输入 + pos + 1) << 8)
+        pos = pos + 2 + 额外长度
+    }
+    // FNAME
+    如果 (标志 & 0x08) {
+        当 (pos < 输入长度 && 内存_读8(输入 + pos) != 0) { pos = pos + 1 }
+        pos = pos + 1    // 跳过null terminator
+    }
+    // FCOMMENT
+    如果 (标志 & 0x10) {
+        当 (pos < 输入长度 && 内存_读8(输入 + pos) != 0) { pos = pos + 1 }
+        pos = pos + 1
+    }
+    // FHCRC
+    如果 (标志 & 0x02) { pos = pos + 2 }
+
+    // DEFLATE数据
+    定义 deflate数据 = 输入 + pos
+    定义 deflate长度 = 输入长度 - pos - 8    // 减去尾部CRC32+ISIZE
+
+    定义 inflate = Inflate_创建()
+    Inflate_解压(inflate, deflate数据, deflate长度)
+
+    // 返回解压数据
+    如果 (inflate.输出长度 > 0) {
+        内存_写8(inflate.输出 + inflate.输出长度, 0)
+    }
+    返回 inflate
+}
+
+// §4 Cookie管理 (net::CookieMonster)
+
+结构 Cookie {
+    名,
+    值,
+    域,    // u64 .example.com
+    路径,    // u64 path
+    过期时间,    // u64 0=会话cookie
+    是安全的,    // 布尔 Secure
+    仅HTTP,    // 布尔 HttpOnly
+    同站策略,    // u32 0=None 1=Lax 2=Strict
+}
+
+结构 CookieJar {
+    cookies,    // u64 Cookie*数组
+    数量,
+    容量,
+}
+
+定义 可变 全局CookieJar = 0
+
+函数 CookieJar_初始化() {
+    如果 (全局CookieJar != 0) { 返回 }
+    全局CookieJar = 堆_分配(CookieJar)
+    全局CookieJar.容量 = 256
+    全局CookieJar.cookies = 堆_分配_数组(256 * 64)
+    全局CookieJar.数量 = 0
+}
+
+函数 Cookie_解析SetCookie(头值, 请求域) {
+    // 解析 Set-Cookie: name=value; Path=/; Domain=.example.com; Secure; HttpOnly; SameSite=Lax
+    如果 (全局CookieJar == 0) { CookieJar_初始化() }
+
+    定义 cookie = 堆_分配(Cookie)
+    cookie.域 = 字符串_复制(请求域)
+    cookie.路径 = 字符串_复制("/")
+    cookie.过期时间 = 0
+    cookie.是安全的 = 假
+    cookie.仅HTTP = 假
+    cookie.同站策略 = 1    // Lax默认
+
+    定义 长度 = 字符串_长度(头值)
+    定义 可变 pos = 0
+
+    // 解析 name=value
+    定义 名起 = pos
+    当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3D && 内存_读8(头值 + pos) != 0x3B) {
+        pos = pos + 1
+    }
+    cookie.名 = 字符串_复制_N(头值 + 名起, pos - 名起)
+
+    如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x3D) {
+        pos = pos + 1
+        定义 值起 = pos
+        当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3B) { pos = pos + 1 }
+        cookie.值 = 字符串_复制_N(头值 + 值起, pos - 值起)
+    } 否则 {
+        cookie.值 = 字符串_复制("")
+    }
+
+    // 解析属性
+    当 (pos < 长度) {
+        如果 (内存_读8(头值 + pos) == 0x3B) { pos = pos + 1 }
+        // 跳空白
+        当 (pos < 长度 && 内存_读8(头值 + pos) == 0x20) { pos = pos + 1 }
+
+        定义 属性起 = pos
+        当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3D && 内存_读8(头值 + pos) != 0x3B) {
+            pos = pos + 1
+        }
+        定义 属性名 = 字符串_复制_N(头值 + 属性起, pos - 属性起)
+        定义 可变 属性值 = ""
+
+        如果 (pos < 长度 && 内存_读8(头值 + pos) == 0x3D) {
+            pos = pos + 1
+            定义 值起 = pos
+            当 (pos < 长度 && 内存_读8(头值 + pos) != 0x3B) { pos = pos + 1 }
+            属性值 = 字符串_复制_N(头值 + 值起, pos - 值起)
+        }
+
+        如果 (字符串_相等_不区分大小写(属性名, "Domain")) {
+            cookie.域 = 属性值
+        }
+        否则 如果 (字符串_相等_不区分大小写(属性名, "Path")) {
+            cookie.路径 = 属性值
+        }
+        否则 如果 (字符串_相等_不区分大小写(属性名, "Secure")) {
+            cookie.是安全的 = 真
+        }
+        否则 如果 (字符串_相等_不区分大小写(属性名, "HttpOnly")) {
+            cookie.仅HTTP = 真
+        }
+        否则 如果 (字符串_相等_不区分大小写(属性名, "SameSite")) {
+            如果 (字符串_相等_不区分大小写(属性值, "Strict")) { cookie.同站策略 = 2 }
+            否则 如果 (字符串_相等_不区分大小写(属性值, "None")) { cookie.同站策略 = 0 }
+            否则 { cookie.同站策略 = 1 }
+        }
+    }
+
+    // 存入jar(替换同名cookie)
+    Cookie_存入(cookie)
+}
+
+函数 Cookie_存入(cookie) {
+    定义 jar = 全局CookieJar
+    // 查找同域同名cookie
+    定义 可变 i = 0
+    当 (i < jar.数量) {
+        定义 偏移 = jar.cookies + i * 64
+        定义 已有名 = 内存_读64(偏移)
+        定义 已有域 = 内存_读64(偏移 + 16)
+        如果 (字符串_相等(已有名, cookie.名) && 字符串_相等(已有域, cookie.域)) {
+            // 替换
+            内存_写64(偏移 + 8, cookie.值)
+            返回
+        }
+        i = i + 1
+    }
+    // 新增
+    如果 (jar.数量 >= jar.容量) { 返回 }
+    定义 偏移 = jar.cookies + jar.数量 * 64
+    内存_写64(偏移, cookie.名)
+    内存_写64(偏移 + 8, cookie.值)
+    内存_写64(偏移 + 16, cookie.域)
+    内存_写64(偏移 + 24, cookie.路径)
+    内存_写64(偏移 + 32, cookie.过期时间)
+    内存_写8(偏移 + 40, cookie.是安全的)
+    内存_写8(偏移 + 41, cookie.仅HTTP)
+    内存_写32(偏移 + 44, cookie.同站策略)
+    jar.数量 = jar.数量 + 1
+}
+
+函数 Cookie_获取请求头(域, 路径, 是安全) {
+    // 构建 Cookie: name1=value1; name2=value2
+    如果 (全局CookieJar == 0) { 返回 0 }
+    定义 jar = 全局CookieJar
+    定义 可变 结果 = ""
+    定义 可变 首个 = 真
+
+    定义 可变 i = 0
+    当 (i < jar.数量) {
+        定义 偏移 = jar.cookies + i * 64
+        定义 cookie域 = 内存_读64(偏移 + 16)
+        定义 cookie路径 = 内存_读64(偏移 + 24)
+        定义 cookie安全 = 内存_读8(偏移 + 40)
+
+        // 域匹配
+        如果 (Cookie_域匹配(域, cookie域)) {
+            // 路径匹配
+            如果 (Cookie_路径匹配(路径, cookie路径)) {
+                // 安全检查
+                如果 (!cookie安全 || 是安全) {
+                    如果 (!首个) { 结果 = 字符串_连接(结果, "; ") }
+                    结果 = 字符串_连接(结果, 内存_读64(偏移))
+                    结果 = 字符串_连接(结果, "=")
+                    结果 = 字符串_连接(结果, 内存_读64(偏移 + 8))
+                    首个 = 假
+                }
+            }
+        }
+        i = i + 1
+    }
+    如果 (字符串_长度(结果) == 0) { 返回 0 }
+    返回 结果
+}
+
+定义 可变 AI_解包_热点函数 = []
+
+函数 AI_解包_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_解包_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_解包_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

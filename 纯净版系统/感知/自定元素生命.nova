@@ -1,0 +1,391 @@
+// §4 Custom 元素生命周期
+
+// 元素升级: 将已存在的unknown 元素升级为custom 元素
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./获取注册表.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/字符串替换.nova")
+
+函数 CE_升级元素(元素, def) {
+    如果 (元素 == 0 || def == 0) { 返回 }
+    // 1. 设置状态为precustomized
+    // 元素.ceState = CE_STATE_PRECUSTOMIZED
+
+    // 2. 调用构造器
+    // 注意: 构造器中不能读属性/子元素(它们尚未被处理)
+    // new def.构造器()
+
+    // 3. 处理observedAttributes → 对每个已有属性触发attributeChangedCallback
+    如果 (def.attributeChangedCallback != 0 && def.观察属性数 > 0) {
+        // 遍历元素的属性, 如果在observedAttributes中, 触发回调
+    }
+
+    // 4. 如果已在文档中 → 触发connectedCallback
+    // 如果 (元素在文档中 && def.connectedCallback != 0) {
+    //     def.connectedCallback(元素)
+    // }
+
+    // 5. 设置状态为custom
+    // 元素.ceState = CE_STATE_CUSTOM
+}
+
+函数 CE_升级已有元素(def) {
+    如果 (def == 0) { 返回 }
+    // 遍历文档中所有tagName匹配的元素, 升级它们
+    // querySelectorAll(def.名称).forEach(el => CE_升级元素(el, def))
+}
+
+// custom元素s.upgrade(root)
+函数 CE_upgrade(root) {
+    如果 (root == 0) { 返回 }
+    // 遍历root子树中所有未定义的custom 元素, 尝试升级
+}
+
+// DOM插入时触发
+函数 CE_connected回调(元素) {
+    如果 (元素 == 0) { 返回 }
+    定义 def = CE_查找定义(0)    // 通过元素.tagName查找
+    如果 (def != 0 && def.connectedCallback != 0) {
+        // 入队微任务: def.connectedCallback.call(元素)
+    }
+}
+
+// DOM移除时触发
+函数 CE_disconnected回调(元素) {
+    如果 (元素 == 0) { 返回 }
+    定义 def = CE_查找定义(0)
+    如果 (def != 0 && def.disconnectedCallback != 0) {
+        // 入队微任务: def.disconnectedCallback.call(元素)
+    }
+}
+
+// 属性变化时触发
+函数 CE_attribute变化(元素, 属性名, 旧值, 新值) {
+    如果 (元素 == 0 || 属性名 == 0) { 返回 }
+    定义 def = CE_查找定义(0)
+    如果 (def == 0 || def.attributeChangedCallback == 0) { 返回 }
+    // 检查属性是否在observedAttributes中
+    定义 可变 在列表中 = 假
+    定义 可变 i = 0
+    当 (i < def.观察属性数) {
+        定义 attr = 内存_读64(def.观察属性 + i * 8)
+        如果 (字符串_相等(attr, 属性名)) { 在列表中 = 真; 跳出 }
+        i = i + 1
+    }
+    如果 (在列表中) {
+        // 入队微任务: def.attributeChangedCallback.call(元素, name, oldVal, newVal)
+    }
+}
+
+// 文档转移时触发
+函数 CE_adopted回调(元素, 旧文档, 新文档) {
+    如果 (元素 == 0) { 返回 }
+    定义 def = CE_查找定义(0)
+    如果 (def != 0 && def.adoptedCallback != 0) {
+        // def.adoptedCallback.call(元素, oldDocument, newDocument)
+    }
+}
+
+// §5 Shadow DOM
+
+结构 ShadowRoot {
+    // 基类: DocumentFragment行为
+    宿主,    // u64 host 元素*
+    模式,    // u8 SHADOW_OPEN / SHADOW_CLOSED
+    delegatesFocus,
+    slotAssignment,    // u8 0=named 1=manual
+    // DOM树
+    子节点头,    // u64 节点*
+    子节点尾,
+    子节点数,
+    // 样式表
+    adopted样式Sheets,    // u64 CSS样式Sheet*数组
+    样式表数,
+    // Slot缓存
+    slot列表,    // u64 HTMLSlot元素*数组
+    slot数,
+}
+
+函数 ShadowRoot_创建(宿主, 模式, delegatesFocus) {
+    如果 (宿主 == 0) { 返回 0 }
+    // 检查是否可以attachShadow
+    // 不允许: img, input, textarea, select, ...
+    定义 sr = 堆_分配(ShadowRoot)
+    sr.宿主 = 宿主; sr.模式 = 模式; sr.delegatesFocus = delegatesFocus
+    sr.slotAssignment = 0
+    sr.子节点头 = 0; sr.子节点尾 = 0; sr.子节点数 = 0
+    sr.adopted样式Sheets = 0; sr.样式表数 = 0
+    sr.slot列表 = 0; sr.slot数 = 0
+    返回 sr
+}
+
+// 元素.attachShadow({mode, delegatesFocus, slotAssignment})
+函数 元素_attachShadow(元素, 模式, delegatesFocus) {
+    如果 (元素 == 0) { 返回 0 }
+    // 检查: 已有shadowRoot → 抛出NotSupported错误
+    // 检查: 不允许的元素 → 抛出NotSupported错误
+    定义 sr = ShadowRoot_创建(元素, 模式, delegatesFocus)
+    // 元素.shadowRoot = sr (open模式下可通过JS访问)
+    返回 sr
+}
+
+// shadowRoot.innerHTML = "..."
+函数 ShadowRoot_setInnerHTML(sr, html) {
+    如果 (sr == 0 || html == 0) { 返回 }
+    // 清除现有子节点
+    sr.子节点头 = 0; sr.子节点尾 = 0; sr.子节点数 = 0
+    // 解析HTML并添加为子节点
+    // HTML解析器生成DOM树 → 附加到sr
+}
+
+// shadowRoot.querySelector(selector)
+函数 ShadowRoot_querySelector(sr, selector) {
+    如果 (sr == 0 || selector == 0) { 返回 0 }
+    // 在shadow tree中查询
+    返回 0
+}
+
+// §6 Custom元素定义结构
+
+定义 CE_STATE_UNDEFINED = 0
+定义 CE_STATE_FAILED = 1
+定义 CE_STATE_UNCUSTOMIZED = 2
+定义 CE_STATE_PRECUSTOMIZED = 3
+定义 CE_STATE_CUSTOM = 4
+
+定义 SHADOW_OPEN = 0
+定义 SHADOW_CLOSED = 1
+
+结构 CE定义 {
+    名称,
+    构造器,
+    观察属性,
+    观察属性数,
+    connectedCallback,
+    disconnectedCallback,
+    attributeChangedCallback,
+    adoptedCallback,
+    formAssociatedCallback,
+    extends标签,
+    已升级元素数,
+}
+
+定义 可变 CE注册表 = []
+定义 可变 CE注册表_数量 = 0
+
+函数 CE_注册(名称, 构造器) {
+    如果 (名称 == 0 || 构造器 == 0) { 返回 错误_无效参数 }
+    如果 (!CE_是有效名称(名称)) { 返回 错误_无效参数 }
+    如果 (CE_查找定义_按名称(名称) != 空) { 返回 错误_已存在 }
+    定义 def = CE定义 {}
+    def.名称 = 字符串_复制(名称)
+    def.构造器 = 构造器
+    def.观察属性 = 0
+    def.观察属性数 = 0
+    def.connectedCallback = 0
+    def.disconnectedCallback = 0
+    def.attributeChangedCallback = 0
+    def.adoptedCallback = 0
+    def.formAssociatedCallback = 0
+    def.extends标签 = 0
+    def.已升级元素数 = 0
+    追加(CE注册表, def)
+    CE注册表_数量 = CE注册表_数量 + 1
+    CE_升级已有元素(def)
+    返回 0
+}
+
+函数 CE_查找定义_按名称(名称) {
+    定义 可变 i = 0
+    当 (i < CE注册表_数量) {
+        如果 (字符串_相等(CE注册表[i].名称, 名称)) { 返回 CE注册表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 CE_是有效名称(名称) {
+    如果 (名称 == 0) { 返回 假 }
+    定义 长度 = 字符串_长度(名称)
+    如果 (长度 < 2) { 返回 假 }
+    定义 可变 有横杠 = 假
+    定义 第一个 = 字节取(名称, 0)
+    如果 (第一个 < 97 || 第一个 > 122) { 返回 假 }
+    定义 可变 i = 1
+    当 (i < 长度) {
+        定义 ch = 字节取(名称, i)
+        如果 (ch == 45) { 有横杠 = 真 }
+        i = i + 1
+    }
+    返回 有横杠
+}
+
+函数 CE_设置回调(def, 回调名, 函数) {
+    如果 (def == 0) { 返回 }
+    如果 (字符串_相等(回调名, "connectedCallback")) { def.connectedCallback = 函数 }
+    否则 如果 (字符串_相等(回调名, "disconnectedCallback")) { def.disconnectedCallback = 函数 }
+    否则 如果 (字符串_相等(回调名, "attributeChangedCallback")) { def.attributeChangedCallback = 函数 }
+    否则 如果 (字符串_相等(回调名, "adoptedCallback")) { def.adoptedCallback = 函数 }
+}
+
+函数 CE_设置观察属性(def, 属性列表, 数量) {
+    如果 (def == 0) { 返回 }
+    def.观察属性 = 属性列表
+    def.观察属性数 = 数量
+}
+
+// §7 ShadowRoot操作扩展
+
+函数 ShadowRoot_添加子节点(sr, 节点) {
+    如果 (sr == 0 || 节点 == 0) { 返回 }
+    如果 (sr.子节点尾 != 0) {
+        sr.子节点尾 = 节点
+    } 否则 {
+        sr.子节点头 = 节点
+        sr.子节点尾 = 节点
+    }
+    sr.子节点数 = sr.子节点数 + 1
+}
+
+函数 ShadowRoot_清空子节点(sr) {
+    如果 (sr == 0) { 返回 }
+    sr.子节点头 = 0
+    sr.子节点尾 = 0
+    sr.子节点数 = 0
+}
+
+函数 ShadowRoot_获取模式名(模式) {
+    如果 (模式 == SHADOW_OPEN) { 返回 "open" }
+    返回 "closed"
+}
+
+函数 ShadowRoot_添加样式表(sr, 样式表) {
+    如果 (sr == 0 || 样式表 == 0) { 返回 }
+    sr.样式表数 = sr.样式表数 + 1
+}
+
+函数 ShadowRoot_获取宿主(sr) {
+    如果 (sr == 0) { 返回 0 }
+    返回 sr.宿主
+}
+
+// §8 Slot分发
+
+结构 Slot {
+    名称,
+    分配节点,
+    分配数,
+}
+
+函数 Slot_创建(名称) {
+    定义 slot = Slot {}
+    slot.名称 = 名称
+    slot.分配节点 = []
+    slot.分配数 = 0
+    返回 slot
+}
+
+函数 Slot_分配(slot, 节点) {
+    如果 (slot == 0 || 节点 == 0) { 返回 }
+    追加(slot.分配节点, 节点)
+    slot.分配数 = slot.分配数 + 1
+}
+
+函数 Slot_获取已分配(slot) {
+    如果 (slot == 0) { 返回 [] }
+    返回 slot.分配节点
+}
+
+函数 ShadowRoot_查找Slot(sr, 名称) {
+    如果 (sr == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < sr.slot数) {
+        如果 (字符串_相等(sr.slot列表[i].名称, 名称)) {
+            返回 sr.slot列表[i]
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 ShadowRoot_添加Slot(sr, slot) {
+    如果 (sr == 0 || slot == 0) { 返回 }
+    追加(sr.slot列表, slot)
+    sr.slot数 = sr.slot数 + 1
+}
+
+// §9 模板(Template)
+
+结构 模板内容 {
+    文档片段,
+    已克隆,
+}
+
+函数 Template_获取内容(模板元素) {
+    如果 (模板元素 == 0) { 返回 0 }
+    返回 模板元素
+}
+
+函数 Template_克隆内容(模板元素) {
+    如果 (模板元素 == 0) { 返回 0 }
+    返回 模板元素
+}
+
+// §10 Web组件统计与健康检查
+
+定义 可变 CE_注册总数 = 0
+定义 可变 CE_升级总数 = 0
+定义 可变 CE_回调总数 = 0
+定义 可变 CE_错误总数 = 0
+定义 可变 Shadow_创建总数 = 0
+
+函数 WebComponent_统计() {
+    返回 {
+        注册定义数: CE注册表_数量,
+        注册总数: CE_注册总数,
+        升级总数: CE_升级总数,
+        回调触发: CE_回调总数,
+        错误数: CE_错误总数,
+        ShadowRoot创建: Shadow_创建总数,
+    }
+}
+
+函数 WebComponent_健康检查() {
+    定义 可变 问题 = []
+    如果 (CE_错误总数 > 10) {
+        追加(问题, "自定义元素错误过多: " + 整数转字符串(CE_错误总数))
+    }
+    如果 (CE注册表_数量 > 1000) {
+        追加(问题, "自定义元素定义过多: " + 整数转字符串(CE注册表_数量))
+    }
+    如果 (计数(问题) == 0) { 返回 "Web组件健康" }
+    返回 问题
+}
+
+函数 WebComponent_重置统计() {
+    CE_注册总数 = 0
+    CE_升级总数 = 0
+    CE_回调总数 = 0
+    CE_错误总数 = 0
+    Shadow_创建总数 = 0
+}
+
+函数 CE状态_名称(状态) {
+    如果 (状态 == CE_STATE_UNDEFINED) { 返回 "undefined" }
+    如果 (状态 == CE_STATE_FAILED) { 返回 "failed" }
+    如果 (状态 == CE_STATE_UNCUSTOMIZED) { 返回 "uncustomized" }
+    如果 (状态 == CE_STATE_PRECUSTOMIZED) { 返回 "precustomized" }
+    如果 (状态 == CE_STATE_CUSTOM) { 返回 "custom" }
+    返回 "unknown"
+}
+
+函数 WebComponent_完整统计() {
+    返回 [CE注册表_数量, CE_升级总数, CE_回调总数, CE_错误总数, Shadow_创建总数]
+}
+
+定义 错误_无效参数 = -22
+定义 错误_已存在 = -17

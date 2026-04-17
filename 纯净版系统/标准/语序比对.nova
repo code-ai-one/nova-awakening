@@ -1,0 +1,469 @@
+// §4 Intl.Collator
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/字符串替换.nova")
+
+定义 COLLATION_SENSITIVITY_BASE    = 0    // a = á = A
+定义 COLLATION_SENSITIVITY_ACCENT  = 1    // a = A ≠ á
+定义 COLLATION_SENSITIVITY_CASE    = 2    // a ≠ A = á (不常见)
+定义 COLLATION_SENSITIVITY_VARIANT = 3    // a ≠ A ≠ á
+
+结构 Collator {
+    locale,
+    usage,    // u8 0=sort 1=search
+    sensitivity,    // u8 COLLATION_SENSITIVITY_xxx
+    ignorePunctuation,
+    numeric,    // 布尔 "1" < "2" < "10" (而非 "1" < "10" < "2")
+    caseFirst,    // u8 0=false 1=upper 2=lower
+}
+
+函数 Collator_创建(locale标签, sensitivity) {
+    定义 c = 堆_分配(Collator)
+    c.locale = Locale_解析(locale标签)
+    c.usage = 0; c.sensitivity = sensitivity
+    c.ignorePunctuation = 假; c.numeric = 假; c.caseFirst = 0
+    返回 c
+}
+
+函数 Collator_compare(c, a, b) {
+    如果 (c == 0 || a == 0 || b == 0) { 返回 0 }
+    // 完整UCA(Unicode Collation Algorithm):
+    //   1. 将字符串分解为排序权重(L1=base, L2=accent, L3=case, L4=variant)
+    //   2. 逐级比较
+    // 逐字符比较(L1基本权重, 后续可扩展L2/L3多级比较)
+    定义 lenA = 字节长度(a)
+    定义 lenB = 字节长度(b)
+    定义 minLen = 如果(lenA < lenB, lenA, lenB)
+
+    // 数字排序: "file2" < "file10"
+    如果 (c.numeric) {
+        返回 Collator_数字比较(a, lenA, b, lenB)
+    }
+
+    定义 可变 i = 0
+    当 (i < minLen) {
+        定义 ca = 字节取(a, i)
+        定义 cb = 字节取(b, i)
+        // 根据sensitivity决定是否忽略大小写
+        如果 (c.sensitivity == COLLATION_SENSITIVITY_BASE || c.sensitivity == COLLATION_SENSITIVITY_ACCENT) {
+            // 忽略大小写
+            如果 (ca >= 65 && ca <= 90) { ca = ca + 32 }
+            如果 (cb >= 65 && cb <= 90) { cb = cb + 32 }
+        }
+        如果 (ca != cb) { 返回 如果(ca < cb, -1, 1) }
+        i = i + 1
+    }
+    如果 (lenA == lenB) { 返回 0 }
+    返回 如果(lenA < lenB, -1, 1)
+}
+
+函数 Collator_数字比较(a, lenA, b, lenB) {
+    // 提取字符串中的数字段进行数值比较
+    定义 可变 i = 0; 定义 可变 j = 0
+    当 (i < lenA && j < lenB) {
+        定义 ca = 字节取(a, i); 定义 cb = 字节取(b, j)
+        如果 ((ca >= 48 && ca <= 57) && (cb >= 48 && cb <= 57)) {
+            // 两边都是数字:提取完整数字并比较
+            定义 可变 numA = 0; 定义 可变 numB = 0
+            当 (i < lenA && 字节取(a, i) >= 48 && 字节取(a, i) <= 57) {
+                numA = numA * 10 + 字节取(a, i) - 48; i = i + 1
+            }
+            当 (j < lenB && 字节取(b, j) >= 48 && 字节取(b, j) <= 57) {
+                numB = numB * 10 + 字节取(b, j) - 48; j = j + 1
+            }
+            如果 (numA != numB) { 返回 如果(numA < numB, -1, 1) }
+        } 否则 {
+            如果 (ca != cb) { 返回 如果(ca < cb, -1, 1) }
+            i = i + 1; j = j + 1
+        }
+    }
+    如果 (lenA == lenB) { 返回 0 }
+    返回 如果(lenA < lenB, -1, 1)
+}
+
+// §5 Intl.PluralRules
+
+// 复数类别: zero/one/two/few/many/other
+定义 PLURAL_ZERO   = 0
+定义 PLURAL_ONE    = 1
+定义 PLURAL_TWO    = 2
+定义 PLURAL_FEW    = 3
+定义 PLURAL_MANY   = 4
+定义 PLURAL_OTHER  = 5
+
+结构 PluralRules {
+    locale,
+    类型,    // u8 0=cardinal 1=ordinal
+}
+
+函数 PluralRules_创建(locale标签, 类型) {
+    定义 pr = 堆_分配(PluralRules)
+    pr.locale = Locale_解析(locale标签)
+    pr.类型 = 类型
+    返回 pr
+}
+
+函数 PluralRules_select(pr, n) {
+    如果 (pr == 0) { 返回 PLURAL_OTHER }
+    定义 loc = pr.locale
+    如果 (loc == 0) { 返回 PLURAL_OTHER }
+
+    // 中文/日文/韩文: 没有复数(总是other)
+    如果 (字符串_相等(loc.语言, "zh") || 字符串_相等(loc.语言, "ja") || 字符串_相等(loc.语言, "ko")) {
+        返回 PLURAL_OTHER
+    }
+
+    // 英语cardinal: 1→one, 其他→other
+    如果 (字符串_相等(loc.语言, "en")) {
+        如果 (pr.类型 == 0) {  // cardinal
+            如果 (n == 1) { 返回 PLURAL_ONE }
+            返回 PLURAL_OTHER
+        } 否则 {  // ordinal
+            如果 (n % 10 == 1 && n % 100 != 11) { 返回 PLURAL_ONE }   // 1st, 21st
+            如果 (n % 10 == 2 && n % 100 != 12) { 返回 PLURAL_TWO }   // 2nd, 22nd
+            如果 (n % 10 == 3 && n % 100 != 13) { 返回 PLURAL_FEW }   // 3rd, 23rd
+            返回 PLURAL_OTHER
+        }
+    }
+
+    // 阿拉伯语: 复杂的复数规则
+    如果 (字符串_相等(loc.语言, "ar")) {
+        如果 (n == 0) { 返回 PLURAL_ZERO }
+        如果 (n == 1) { 返回 PLURAL_ONE }
+        如果 (n == 2) { 返回 PLURAL_TWO }
+        如果 (n % 100 >= 3 && n % 100 <= 10) { 返回 PLURAL_FEW }
+        如果 (n % 100 >= 11 && n % 100 <= 99) { 返回 PLURAL_MANY }
+        返回 PLURAL_OTHER
+    }
+
+    // 默认: 1→one, 其他→other
+    如果 (n == 1) { 返回 PLURAL_ONE }
+    返回 PLURAL_OTHER
+}
+
+函数 PluralRules_类别名(类别) {
+    如果 (类别 == PLURAL_ZERO) { 返回 "zero" }
+    如果 (类别 == PLURAL_ONE) { 返回 "one" }
+    如果 (类别 == PLURAL_TWO) { 返回 "two" }
+    如果 (类别 == PLURAL_FEW) { 返回 "few" }
+    如果 (类别 == PLURAL_MANY) { 返回 "many" }
+    返回 "other"
+}
+
+// §6 Intl.NumberFormat
+
+定义 NUMBER_STYLE_DECIMAL = 0
+定义 NUMBER_STYLE_CURRENCY = 1
+定义 NUMBER_STYLE_PERCENT = 2
+定义 NUMBER_STYLE_UNIT = 3
+
+结构 NumberFormat {
+    locale,
+    style,
+    currency,
+    currencyDisplay,
+    minimumIntegerDigits,
+    minimumFractionDigits,
+    maximumFractionDigits,
+    useGrouping,
+    notation,
+}
+
+函数 NumberFormat_创建(locale标签, style) {
+    定义 nf = 堆_分配(NumberFormat)
+    nf.locale = Locale_解析(locale标签)
+    nf.style = style
+    nf.currency = 0
+    nf.currencyDisplay = 0
+    nf.minimumIntegerDigits = 1
+    nf.minimumFractionDigits = 0
+    nf.maximumFractionDigits = 3
+    nf.useGrouping = 真
+    nf.notation = 0
+    返回 nf
+}
+
+函数 NumberFormat_format(nf, 数值) {
+    如果 (nf == 0) { 返回 整数转字符串(数值) }
+    定义 可变 结果 = ""
+    如果 (nf.style == NUMBER_STYLE_PERCENT) {
+        结果 = 整数转字符串(数值 * 100 / 1024) + "%"
+        返回 结果
+    }
+    如果 (nf.style == NUMBER_STYLE_CURRENCY) {
+        定义 符号 = NumberFormat_货币符号(nf.currency)
+        结果 = 符号 + 整数转字符串(数值)
+        返回 结果
+    }
+    结果 = 整数转字符串(数值)
+    如果 (nf.useGrouping && 数值 >= 1000) {
+        结果 = NumberFormat_添加千分位(结果)
+    }
+    返回 结果
+}
+
+函数 NumberFormat_货币符号(货币代码) {
+    如果 (货币代码 == 0) { 返回 "$" }
+    如果 (字符串_相等(货币代码, "USD")) { 返回 "$" }
+    如果 (字符串_相等(货币代码, "EUR")) { 返回 "€" }
+    如果 (字符串_相等(货币代码, "GBP")) { 返回 "£" }
+    如果 (字符串_相等(货币代码, "JPY")) { 返回 "¥" }
+    如果 (字符串_相等(货币代码, "CNY")) { 返回 "¥" }
+    如果 (字符串_相等(货币代码, "KRW")) { 返回 "₩" }
+    返回 货币代码
+}
+
+函数 NumberFormat_添加千分位(s) {
+    如果 (s == 0) { 返回 "0" }
+    定义 长度 = 字符串_长度(s)
+    如果 (长度 <= 3) { 返回 s }
+    定义 可变 结果 = ""
+    定义 可变 i = 0
+    当 (i < 长度) {
+        如果 (i > 0 && (长度 - i) % 3 == 0) { 结果 = 结果 + "," }
+        结果 = 结果 + 字符串_子串(s, i, 1)
+        i = i + 1
+    }
+    返回 结果
+}
+
+// §7 Intl.DateTimeFormat
+
+定义 DATETIME_STYLE_FULL = 0
+定义 DATETIME_STYLE_LONG = 1
+定义 DATETIME_STYLE_MEDIUM = 2
+定义 DATETIME_STYLE_SHORT = 3
+
+结构 DateTimeFormat {
+    locale,
+    dateStyle,
+    timeStyle,
+    timeZone,
+    hour12,
+    weekday,
+    era,
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+}
+
+函数 DateTimeFormat_创建(locale标签) {
+    定义 dtf = 堆_分配(DateTimeFormat)
+    dtf.locale = Locale_解析(locale标签)
+    dtf.dateStyle = DATETIME_STYLE_MEDIUM
+    dtf.timeStyle = DATETIME_STYLE_MEDIUM
+    dtf.timeZone = 0
+    dtf.hour12 = 假
+    dtf.weekday = 0
+    dtf.year = 1
+    dtf.month = 1
+    dtf.day = 1
+    dtf.hour = 1
+    dtf.minute = 1
+    dtf.second = 0
+    返回 dtf
+}
+
+函数 DateTimeFormat_format(dtf, 时间戳) {
+    如果 (dtf == 0) { 返回 整数转字符串(时间戳) }
+    定义 秒 = 时间戳 / 1000
+    定义 分 = 秒 / 60
+    定义 时 = 分 / 60
+    定义 天 = 时 / 24
+    定义 年 = 1970 + 天 / 365
+    定义 月 = (天 % 365) / 30 + 1
+    定义 日 = (天 % 365) % 30 + 1
+    定义 小时 = 时 % 24
+    定义 分钟 = 分 % 60
+    定义 可变 结果 = ""
+    结果 = 结果 + 整数转字符串(年) + "-"
+    如果 (月 < 10) { 结果 = 结果 + "0" }
+    结果 = 结果 + 整数转字符串(月) + "-"
+    如果 (日 < 10) { 结果 = 结果 + "0" }
+    结果 = 结果 + 整数转字符串(日) + " "
+    如果 (小时 < 10) { 结果 = 结果 + "0" }
+    结果 = 结果 + 整数转字符串(小时) + ":"
+    如果 (分钟 < 10) { 结果 = 结果 + "0" }
+    结果 = 结果 + 整数转字符串(分钟)
+    返回 结果
+}
+
+// §8 Locale解析
+
+结构 Locale {
+    语言,
+    脚本,
+    地区,
+    原始标签,
+}
+
+函数 Locale_解析(标签) {
+    如果 (标签 == 0) { 返回 Locale_默认() }
+    定义 loc = 堆_分配(Locale)
+    loc.原始标签 = 标签
+    loc.语言 = ""
+    loc.脚本 = ""
+    loc.地区 = ""
+    定义 长度 = 字符串_长度(标签)
+    定义 可变 位置 = 0
+    定义 可变 段 = 0
+    定义 可变 开始 = 0
+    当 (位置 <= 长度) {
+        如果 (位置 == 长度 || 字节取(标签, 位置) == 45 || 字节取(标签, 位置) == 95) {
+            定义 片段 = 字符串_子串(标签, 开始, 位置 - 开始)
+            如果 (段 == 0) { loc.语言 = 片段 }
+            否则 如果 (段 == 1 && 位置 - 开始 == 4) { loc.脚本 = 片段 }
+            否则 如果 (段 == 1 || 段 == 2) { loc.地区 = 片段 }
+            段 = 段 + 1
+            开始 = 位置 + 1
+        }
+        位置 = 位置 + 1
+    }
+    返回 loc
+}
+
+函数 Locale_默认() {
+    定义 loc = 堆_分配(Locale)
+    loc.语言 = "zh"
+    loc.脚本 = "Hans"
+    loc.地区 = "CN"
+    loc.原始标签 = "zh-Hans-CN"
+    返回 loc
+}
+
+函数 Locale_语言名(语言) {
+    如果 (字符串_相等(语言, "zh")) { 返回 "中文" }
+    如果 (字符串_相等(语言, "en")) { 返回 "English" }
+    如果 (字符串_相等(语言, "ja")) { 返回 "日本語" }
+    如果 (字符串_相等(语言, "ko")) { 返回 "한국어" }
+    如果 (字符串_相等(语言, "fr")) { 返回 "Français" }
+    如果 (字符串_相等(语言, "de")) { 返回 "Deutsch" }
+    如果 (字符串_相等(语言, "es")) { 返回 "Español" }
+    如果 (字符串_相等(语言, "ar")) { 返回 "العربية" }
+    如果 (字符串_相等(语言, "ru")) { 返回 "Русский" }
+    返回 语言
+}
+
+// §9 Intl.ListFormat
+
+定义 LIST_TYPE_CONJUNCTION = 0
+定义 LIST_TYPE_DISJUNCTION = 1
+定义 LIST_TYPE_UNIT = 2
+
+函数 ListFormat_format(locale, 类型, 列表) {
+    如果 (列表 == 0 || 计数(列表) == 0) { 返回 "" }
+    如果 (计数(列表) == 1) { 返回 列表[0] }
+    定义 连接词 = "、"
+    如果 (locale != 0 && 字符串_相等(locale.语言, "en")) {
+        如果 (类型 == LIST_TYPE_CONJUNCTION) { 连接词 = ", " }
+        否则 如果 (类型 == LIST_TYPE_DISJUNCTION) { 连接词 = " or " }
+    } 否则 {
+        如果 (类型 == LIST_TYPE_DISJUNCTION) { 连接词 = "或" }
+    }
+    定义 可变 结果 = 列表[0]
+    定义 可变 i = 1
+    当 (i < 计数(列表) - 1) {
+        结果 = 结果 + 连接词 + 列表[i]
+        i = i + 1
+    }
+    如果 (locale != 0 && 字符串_相等(locale.语言, "en") && 类型 == LIST_TYPE_CONJUNCTION) {
+        结果 = 结果 + ", and " + 列表[计数(列表) - 1]
+    } 否则 {
+        结果 = 结果 + 连接词 + 列表[计数(列表) - 1]
+    }
+    返回 结果
+}
+
+// §10 Intl.RelativeTimeFormat
+
+定义 TIME_UNIT_SECOND = 0
+定义 TIME_UNIT_MINUTE = 1
+定义 TIME_UNIT_HOUR = 2
+定义 TIME_UNIT_DAY = 3
+定义 TIME_UNIT_WEEK = 4
+定义 TIME_UNIT_MONTH = 5
+定义 TIME_UNIT_YEAR = 6
+
+函数 RelativeTimeFormat_format(locale, 值, 单位) {
+    定义 单位名 = RelativeTimeFormat_单位名(locale, 单位)
+    如果 (值 == 0) { 返回 "现在" }
+    如果 (locale != 0 && 字符串_相等(locale.语言, "zh")) {
+        如果 (值 > 0) { 返回 整数转字符串(值) + 单位名 + "后" }
+        返回 整数转字符串(0 - 值) + 单位名 + "前"
+    }
+    如果 (值 > 0) { 返回 "in " + 整数转字符串(值) + " " + 单位名 }
+    返回 整数转字符串(0 - 值) + " " + 单位名 + " ago"
+}
+
+函数 RelativeTimeFormat_单位名(locale, 单位) {
+    如果 (locale != 0 && 字符串_相等(locale.语言, "zh")) {
+        如果 (单位 == TIME_UNIT_SECOND) { 返回 "秒" }
+        如果 (单位 == TIME_UNIT_MINUTE) { 返回 "分钟" }
+        如果 (单位 == TIME_UNIT_HOUR) { 返回 "小时" }
+        如果 (单位 == TIME_UNIT_DAY) { 返回 "天" }
+        如果 (单位 == TIME_UNIT_WEEK) { 返回 "周" }
+        如果 (单位 == TIME_UNIT_MONTH) { 返回 "个月" }
+        如果 (单位 == TIME_UNIT_YEAR) { 返回 "年" }
+    }
+    如果 (单位 == TIME_UNIT_SECOND) { 返回 "second" }
+    如果 (单位 == TIME_UNIT_MINUTE) { 返回 "minute" }
+    如果 (单位 == TIME_UNIT_HOUR) { 返回 "hour" }
+    如果 (单位 == TIME_UNIT_DAY) { 返回 "day" }
+    如果 (单位 == TIME_UNIT_WEEK) { 返回 "week" }
+    如果 (单位 == TIME_UNIT_MONTH) { 返回 "month" }
+    如果 (单位 == TIME_UNIT_YEAR) { 返回 "year" }
+    返回 "unit"
+}
+
+// §11 国际化统计
+
+定义 可变 Intl_比较总数 = 0
+定义 可变 Intl_格式化总数 = 0
+定义 可变 Intl_复数选择总数 = 0
+定义 可变 Intl_Locale解析总数 = 0
+
+函数 Intl_统计() {
+    返回 {
+        比较: Intl_比较总数,
+        格式化: Intl_格式化总数,
+        复数选择: Intl_复数选择总数,
+        Locale解析: Intl_Locale解析总数,
+    }
+}
+
+函数 Intl_健康检查() {
+    返回 "国际化子系统健康"
+}
+
+函数 Intl_重置统计() {
+    Intl_比较总数 = 0
+    Intl_格式化总数 = 0
+    Intl_复数选择总数 = 0
+    Intl_Locale解析总数 = 0
+}
+
+函数 Intl_完整统计() {
+    返回 [Intl_比较总数, Intl_格式化总数, Intl_复数选择总数, Intl_Locale解析总数]
+}
+
+定义 可变 AI_语序比对_热点函数 = []
+
+函数 AI_语序比对_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_语序比对_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_语序比对_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

@@ -1,0 +1,202 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../标准/字串.nova")
+导入("./内核直连层.nova")
+导入("./请求对象.nova")
+导入("../执行/接口绑定.nova")
+导入("./资源加载资源.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./超传头部创.nova")
+导入("../中枢/内存初始化.nova")
+导入("../推理/小整数快速判.nova")
+导入("../标准/加法运算符.nova")
+导入("./项解析.nova")
+导入("../中枢/辅助存根.nova")
+
+// §4 fetch() 实现
+// fetch(url, options) → 承诺<Response>
+
+函数 取数_执行(Nova运行时实例, url, 选项) {
+    // 创建承诺
+    定义 promise = Nova承诺_创建(Nova运行时实例)
+
+    // 创建请求
+    定义 req = 取数Request_创建(url, 选项)
+
+    // 检查AbortSignal
+    如果 (req.信号 != 0) {
+        定义 aborted = Nova对象_获取属性(Nova运行时实例, req.信号, "aborted")
+        如果 (aborted != 0 && JSValue_IsTrue(Nova运行时实例, aborted)) {
+            // 已中止
+            Nova承诺_reject(Nova运行时实例, promise, Nova值_创建_String(Nova运行时实例, "Abort错误: The operation was aborted"))
+            返回 promise
+        }
+    }
+
+    // 创建ResourceLoader并加载
+    定义 方法 = HTTP_GET
+    如果 (字符串_相等(req.方法, "POST")) { 方法 = HTTP_POST }
+    否则 如果 (字符串_相等(req.方法, "PUT")) { 方法 = HTTP_PUT }
+    否则 如果 (字符串_相等(req.方法, "DELETE")) { 方法 = HTTP_DELETE }
+
+    定义 loader = ResourceLoader_创建(req.URL, 资源类型_XHR)
+    loader.请求.方法 = 方法
+
+    // 复制自定义头
+    定义 可变 i = 0
+    当 (i < req.头.数量) {
+        定义 偏移 = req.头.条目 + i * 16
+        HTTP头部_添加(loader.请求.请求头, 内存_读64(偏移), 内存_读64(偏移 + 8))
+        i = i + 1
+    }
+
+    // 请求体
+    如果 (req.体 != 0 && req.体长度 > 0) {
+        loader.请求.请求体 = req.体
+        loader.请求.请求体长度 = req.体长度
+    }
+
+    // 执行完整加载(含chunked/gzip/cookie/重定向)
+    ResourceLoader_完整加载(loader)
+
+    如果 (loader.状态 == 请求状态_完成) {
+        // 创建Response对象
+        定义 response = 取数Response_创建(loader.响应.状态码, loader.接收缓冲, loader.已接收字节, loader.响应.响应头)
+        response.URL = 字符串_复制(req.URL)
+
+        // 包装为JS对象
+        定义 js_resp = 取数_包装Response(Nova运行时实例, response)
+        Nova承诺_resolve(Nova运行时实例, promise, js_resp)
+    } 否则 {
+        // 网络错误
+        Nova承诺_reject(Nova运行时实例, promise, Nova值_创建_String(Nova运行时实例, "Type错误: Failed to fetch"))
+    }
+
+    返回 promise
+}
+
+函数 取数_包装Response(Nova运行时实例, resp) {
+    定义 obj = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+
+    Nova对象_设置属性(Nova运行时实例, obj, "ok", resp.OK ? Nova运行时实例.true值 : Nova运行时实例.false值)
+    Nova对象_设置属性(Nova运行时实例, obj, "status", Nova值_创建_Number(Nova运行时实例, resp.状态码))
+    Nova对象_设置属性(Nova运行时实例, obj, "statusText", Nova值_创建_String(Nova运行时实例, resp.状态文本))
+    Nova对象_设置属性(Nova运行时实例, obj, "redirected", resp.是否重定向 ? Nova运行时实例.true值 : Nova运行时实例.false值)
+    如果 (resp.URL != 0) {
+        Nova对象_设置属性(Nova运行时实例, obj, "url", Nova值_创建_String(Nova运行时实例, resp.URL))
+    }
+
+    // headers
+    定义 headers_obj = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, headers_obj, "get", JSNative_创建(Nova运行时实例, 1000, resp.头))
+    Nova对象_设置属性(Nova运行时实例, headers_obj, "has", JSNative_创建(Nova运行时实例, 1001, resp.头))
+    Nova对象_设置属性(Nova运行时实例, obj, "headers", headers_obj)
+
+    // body方法: text()/json()/blob()/arrayBuffer()
+    Nova对象_设置属性(Nova运行时实例, obj, "text", JSNative_创建(Nova运行时实例, 1010, resp))
+    Nova对象_设置属性(Nova运行时实例, obj, "json", JSNative_创建(Nova运行时实例, 1011, resp))
+    Nova对象_设置属性(Nova运行时实例, obj, "blob", JSNative_创建(Nova运行时实例, 1012, resp))
+    Nova对象_设置属性(Nova运行时实例, obj, "arrayBuffer", JSNative_创建(Nova运行时实例, 1013, resp))
+    Nova对象_设置属性(Nova运行时实例, obj, "clone", JSNative_创建(Nova运行时实例, 1014, resp))
+
+    // bodyUsed
+    Nova对象_设置属性(Nova运行时实例, obj, "bodyUsed", Nova运行时实例.false值)
+
+    返回 obj
+}
+
+// §5 承诺实现
+// (Nova的承诺极其复杂, ~5000行, 这里是最小可用版)
+
+结构 Nova承诺 {
+    状态,    // u32 0=pending 1=fulfilled 2=rejected
+    结果,    // u64 JSValue* 完成值/拒绝原因
+    then回调,    // u64 JSValue* Function数组
+    catch回调,    // u64 JSValue* Function数组
+    回调数量,
+    回调容量,
+}
+
+函数 Nova承诺_创建(Nova运行时实例) {
+    定义 p = NovaGC_新生代分配(Nova运行时实例.heap, 128)
+    内存_写32(p, JS类型_承诺)
+    内存_写32(p + 4, GC_白)
+    内存_写32(p + 8, 0)       // 状态: pending
+    内存_写64(p + 16, 0)      // 结果
+    内存_写64(p + 24, 堆_分配_数组(8 * 8))    // then回调
+    内存_写64(p + 32, 堆_分配_数组(8 * 8))    // catch回调
+    内存_写32(p + 40, 0)      // 回调数量
+    内存_写32(p + 44, 8)      // 回调容量
+    返回 p
+}
+
+函数 Nova承诺_resolve(Nova运行时实例, promise, 值) {
+    如果 (内存_读32(promise + 8) != 0) { 返回 }    // 非pending
+    内存_写32(promise + 8, 1)    // fulfilled
+    内存_写64(promise + 16, 值)
+
+    // 执行then回调(作为微任务)
+    定义 回调数 = 内存_读32(promise + 40)
+    定义 then列表 = 内存_读64(promise + 24)
+    定义 可变 i = 0
+    当 (i < 回调数) {
+        定义 回调 = 内存_读64(then列表 + i * 8)
+        如果 (回调 != 0) {
+            // 排入微任务队列
+            Nova运行时实例_排队微任务(Nova运行时实例, 回调)
+        }
+        i = i + 1
+    }
+}
+
+函数 Nova承诺_reject(Nova运行时实例, promise, 原因) {
+    如果 (内存_读32(promise + 8) != 0) { 返回 }
+    内存_写32(promise + 8, 2)    // rejected
+    内存_写64(promise + 16, 原因)
+
+    定义 回调数 = 内存_读32(promise + 40)
+    定义 catch列表 = 内存_读64(promise + 32)
+    定义 可变 i = 0
+    当 (i < 回调数) {
+        定义 回调 = 内存_读64(catch列表 + i * 8)
+        如果 (回调 != 0) {
+            Nova运行时实例_排队微任务(Nova运行时实例, 回调)
+        }
+        i = i + 1
+    }
+}
+
+函数 Nova承诺_then(Nova运行时实例, promise, on_fulfilled, on_rejected) {
+    // 返回新承诺(链式)
+    定义 新promise = Nova承诺_创建(Nova运行时实例)
+
+    定义 状态 = 内存_读32(promise + 8)
+    如果 (状态 == 1) {
+        // 已完成: 立即执行
+        如果 (on_fulfilled != 0) {
+            Nova运行时实例_排队微任务(Nova运行时实例, on_fulfilled)
+        }
+    } 否则 如果 (状态 == 2) {
+        // 已拒绝
+        如果 (on_rejected != 0) {
+            Nova运行时实例_排队微任务(Nova运行时实例, on_rejected)
+        }
+    } 否则 {
+        // pending: 注册回调
+        定义 回调数 = 内存_读32(promise + 40)
+        定义 容量 = 内存_读32(promise + 44)
+        如果 (回调数 < 容量) {
+            如果 (on_fulfilled != 0) {
+                定义 then列表 = 内存_读64(promise + 24)
+                内存_写64(then列表 + 回调数 * 8, on_fulfilled)
+            }
+            如果 (on_rejected != 0) {
+                定义 catch列表 = 内存_读64(promise + 32)
+                内存_写64(catch列表 + 回调数 * 8, on_rejected)
+            }
+            内存_写32(promise + 40, 回调数 + 1)
+        }
+    }
+
+    返回 新promise
+}

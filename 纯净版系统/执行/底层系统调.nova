@@ -1,0 +1,151 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §2 底层系统调用原语 (内联汇编)
+
+函数 系统调用0(号) {
+    内联汇编("mv a7, a0")    // Nova系统调用号
+    内联汇编("ecall")
+    内联汇编("mv a0, a0")    // 返回值已在a0
+}
+
+函数 系统调用1(号, a1) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("ecall")
+}
+
+函数 系统调用2(号, a1, a2) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("mv a1, a2")
+    内联汇编("ecall")
+}
+
+函数 系统调用3(号, a1, a2, a3) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("mv a1, a2")
+    内联汇编("mv a2, a3")
+    内联汇编("ecall")
+}
+
+函数 系统调用4(号, a1, a2, a3, a4) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("mv a1, a2")
+    内联汇编("mv a2, a3")
+    内联汇编("mv a3, a4")
+    内联汇编("ecall")
+}
+
+函数 系统调用5(号, a1, a2, a3, a4, a5) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("mv a1, a2")
+    内联汇编("mv a2, a3")
+    内联汇编("mv a3, a4")
+    内联汇编("mv a4, a5")
+    内联汇编("ecall")
+}
+
+函数 系统调用6(号, a1, a2, a3, a4, a5, a6) {
+    内联汇编("mv a7, a0")
+    内联汇编("mv a0, a1")
+    内联汇编("mv a1, a2")
+    内联汇编("mv a2, a3")
+    内联汇编("mv a3, a4")
+    内联汇编("mv a4, a5")
+    内联汇编("mv a5, a6")
+    内联汇编("ecall")
+}
+
+// §3 文件I/O封装
+
+函数 系统调用_open(路径, 标志) {
+    返回 系统调用4(SYS_openat, AT_FDCWD, 路径, 标志, 0o644)
+}
+
+函数 系统调用_open_模式(路径, 标志, 模式) {
+    返回 系统调用4(SYS_openat, AT_FDCWD, 路径, 标志, 模式)
+}
+
+函数 系统调用_read(fd, buf, count) {
+    返回 系统调用3(SYS_read, fd, buf, count)
+}
+
+函数 系统调用_write(fd, buf, count) {
+    返回 系统调用3(SYS_write, fd, buf, count)
+}
+
+函数 系统调用_close(fd) {
+    返回 系统调用1(SYS_close, fd)
+}
+
+函数 系统调用_fstat(fd, statbuf) {
+    返回 系统调用2(SYS_fstat, fd, statbuf)
+}
+
+函数 系统调用_lseek(fd, offset, whence) {
+    返回 系统调用3(SYS_lseek, fd, offset, whence)
+}
+
+函数 系统调用_pread(fd, buf, count, offset) {
+    返回 系统调用4(SYS_pread64, fd, buf, count, offset)
+}
+
+函数 系统调用_pwrite(fd, buf, count, offset) {
+    返回 系统调用4(SYS_pwrite64, fd, buf, count, offset)
+}
+
+函数 系统调用_writev(fd, iov, iovcnt) {
+    返回 系统调用3(SYS_writev, fd, iov, iovcnt)
+}
+
+函数 系统调用_readv(fd, iov, iovcnt) {
+    返回 系统调用3(SYS_readv, fd, iov, iovcnt)
+}
+
+函数 系统调用_dup(fd) {
+    返回 系统调用1(SYS_dup, fd)
+}
+
+函数 系统调用_dup3(oldfd, newfd, flags) {
+    返回 系统调用3(SYS_dup3, oldfd, newfd, flags)
+}
+
+函数 系统调用_pipe2(fds, flags) {
+    返回 系统调用2(SYS_pipe2, fds, flags)
+}
+
+函数 系统调用_fcntl(fd, cmd, arg) {
+    返回 系统调用3(SYS_fcntl, fd, cmd, arg)
+}
+
+函数 系统调用_Nova设备控制(fd, request, arg) {
+    返回 系统调用3(SYS_Nova设备控制, fd, request, arg)
+}
+
+函数 系统调用_fsync(fd) {
+    返回 系统调用1(SYS_fsync, fd)
+}
+
+函数 系统调用_ftruncate(fd, length) {
+    返回 系统调用2(SYS_ftruncate, fd, length)
+}
+
+函数 系统调用_unlink(路径) {
+    返回 系统调用3(SYS_unlinkat, AT_FDCWD, 路径, 0)
+}
+
+函数 系统调用_mkdir(路径, 模式) {
+    返回 系统调用3(SYS_mkdirat, AT_FDCWD, 路径, 模式)
+}
+
+函数 系统调用_access(路径, 模式) {
+    返回 系统调用3(SYS_faccessat, AT_FDCWD, 路径, 模式)
+}
+
+函数 系统调用_getcwd(buf, size) {
+    返回 系统调用2(SYS_getcwd, buf, size)
+}

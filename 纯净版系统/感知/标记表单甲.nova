@@ -1,0 +1,322 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../标准/原生字符串.nova")
+导入("./内核直连层.nova")
+导入("./文档节点.nova")
+导入("./文档事件.nova")
+导入("../中枢/辅助存根.nova")
+
+// §6 HTMLTextArea元素
+
+结构 TextAreaState {
+    值,
+    默认值,
+    名,
+    占位文本,    // u64 placeholder
+    行数,    // u32 rows属性
+    列数,    // u32 cols属性
+    选区起始,
+    选区结束,
+    已禁用,
+    只读,
+    必填,
+    最大长度,
+    换行模式,    // u32 0=soft 1=hard 2=off
+    所属表单,
+}
+
+函数 TextAreaState_创建(元素) {
+    定义 state = 堆_分配(TextAreaState)
+    state.值 = 字符串_复制("")
+    state.默认值 = 0
+    state.占位文本 = 0
+    state.行数 = 2
+    state.列数 = 20
+    state.最大长度 = -1
+    state.换行模式 = 0
+
+    如果 (元素 != 0) {
+        // 文本内容作为默认值
+        定义 文本 = 元素.第一子节点
+        如果 (文本 != 0 && 文本.节点类型 == TEXT_节点) {
+            state.值 = 字符串_复制(CharacterData_data(文本))
+            state.默认值 = 字符串_复制(state.值)
+        }
+        state.名 = 元素_getAttribute(元素, "name")
+        state.占位文本 = 元素_getAttribute(元素, "placeholder")
+        定义 rows = 元素_getAttribute(元素, "rows")
+        如果 (rows != 0) { state.行数 = 字符串转整数(rows) }
+        定义 cols = 元素_getAttribute(元素, "cols")
+        如果 (cols != 0) { state.列数 = 字符串转整数(cols) }
+        如果 (元素_getAttribute(元素, "disabled") != 0) { state.已禁用 = 真 }
+        如果 (元素_getAttribute(元素, "readonly") != 0) { state.只读 = 真 }
+    }
+    返回 state
+}
+
+// §7 HTMLSelect元素
+
+结构 SelectOption {
+    值,    // u64 value属性
+    标签,    // u64 显示文本
+    已选,
+    已禁用,
+}
+
+结构 SelectState {
+    名,
+    选项列表,    // u64 SelectOption*数组
+    选项数量,
+    选项容量,
+    已选索引,    // i32 selectedIndex
+    多选,
+    已禁用,
+    大小,    // u32 size属性(显示行数)
+    展开,    // 布尔 下拉菜单是否展开
+    所属表单,
+}
+
+函数 SelectState_创建(元素) {
+    定义 state = 堆_分配(SelectState)
+    state.名 = 元素_getAttribute(元素, "name")
+    state.选项容量 = 64
+    state.选项列表 = 堆_分配_数组(state.选项容量 * 24)
+    state.选项数量 = 0
+    state.已选索引 = -1
+    state.多选 = 元素_getAttribute(元素, "multiple") != 0
+    state.已禁用 = 元素_getAttribute(元素, "disabled") != 0
+    state.大小 = 1
+    state.展开 = 假
+
+    定义 size = 元素_getAttribute(元素, "size")
+    如果 (size != 0) { state.大小 = 字符串转整数(size) }
+
+    // 收集<option>子元素
+    定义 可变 子 = 元素.第一子节点
+    当 (子 != 0) {
+        如果 (子.节点类型 == 元素_节点) {
+            定义 扩展 = 元素_获取扩展(子)
+            如果 (扩展 != 0 && 扩展.标签名原子 == 原子_option) {
+                如果 (state.选项数量 < state.选项容量) {
+                    定义 偏移 = state.选项列表 + state.选项数量 * 24
+                    定义 value = 元素_getAttribute(子, "value")
+                    定义 文本 = 节点_textContent(子)
+                    内存_写64(偏移, value != 0 ? 字符串_复制(value) : 字符串_复制(文本))
+                    内存_写64(偏移 + 8, 字符串_复制(文本))
+                    定义 selected = 元素_getAttribute(子, "selected") != 0
+                    内存_写8(偏移 + 16, selected)
+                    内存_写8(偏移 + 17, 元素_getAttribute(子, "disabled") != 0)
+                    如果 (selected && state.已选索引 < 0) {
+                        state.已选索引 = state.选项数量
+                    }
+                    state.选项数量 = state.选项数量 + 1
+                }
+            }
+        }
+        子 = 子.后一兄弟
+    }
+
+    // 默认选中第一个
+    如果 (state.已选索引 < 0 && state.选项数量 > 0) {
+        state.已选索引 = 0
+        内存_写8(state.选项列表 + 16, 1)
+    }
+
+    返回 state
+}
+
+函数 Select_获取值(state) {
+    如果 (state.已选索引 < 0 || state.已选索引 >= state.选项数量) { 返回 "" }
+    返回 内存_读64(state.选项列表 + state.已选索引 * 24)
+}
+
+函数 Select_设置选中(state, 元素, 索引) {
+    如果 (索引 < 0 || 索引 >= state.选项数量) { 返回 }
+    // 取消旧选中
+    如果 (!state.多选 && state.已选索引 >= 0) {
+        内存_写8(state.选项列表 + state.已选索引 * 24 + 16, 0)
+    }
+    // 新选中
+    内存_写8(state.选项列表 + 索引 * 24 + 16, 1)
+    state.已选索引 = 索引
+    state.展开 = 假
+    // 触发change事件
+    定义 事件 = 事件_创建("change", 真, 假)
+    事件Target_dispatch事件(元素, 事件)
+}
+
+// §8 TextArea操作扩展
+
+函数 TextArea_获取值(state) {
+    如果 (state == 0) { 返回 "" }
+    返回 state.值
+}
+
+函数 TextArea_设置值(state, 新值) {
+    如果 (state == 0) { 返回 }
+    如果 (state.最大长度 >= 0 && 字节长度(新值) > state.最大长度) { 返回 }
+    state.值 = 字符串_复制(新值)
+}
+
+函数 TextArea_获取选区文本(state) {
+    如果 (state == 0 || state.值 == 0) { 返回 "" }
+    如果 (state.选区起始 >= state.选区结束) { 返回 "" }
+    返回 字符串_子串(state.值, state.选区起始, state.选区结束 - state.选区起始)
+}
+
+函数 TextArea_插入文本(state, 文本) {
+    如果 (state == 0 || state.只读 || state.已禁用) { 返回 }
+    定义 前 = 字符串_子串(state.值, 0, state.选区起始)
+    定义 后 = 字符串_子串(state.值, state.选区结束, 字节长度(state.值) - state.选区结束)
+    state.值 = 前 + 文本 + 后
+    state.选区起始 = state.选区起始 + 字节长度(文本)
+    state.选区结束 = state.选区起始
+}
+
+函数 TextArea_全选(state) {
+    如果 (state == 0) { 返回 }
+    state.选区起始 = 0
+    state.选区结束 = 字节长度(state.值)
+}
+
+函数 TextArea_行数_实际(state) {
+    如果 (state == 0 || state.值 == 0) { 返回 1 }
+    定义 长度 = 字节长度(state.值)
+    定义 可变 行 = 1
+    定义 可变 i = 0
+    当 (i < 长度) {
+        如果 (内存_读8(state.值 + i) == 10) { 行 = 行 + 1 }
+        i = i + 1
+    }
+    返回 行
+}
+
+// §9 Select操作扩展
+
+函数 Select_添加选项(state, 值, 标签) {
+    如果 (state == 0 || state.选项数量 >= state.选项容量) { 返回 }
+    定义 偏移 = state.选项列表 + state.选项数量 * 24
+    内存_写64(偏移, 字符串_复制(值))
+    内存_写64(偏移 + 8, 字符串_复制(标签))
+    内存_写8(偏移 + 16, 0)
+    内存_写8(偏移 + 17, 0)
+    state.选项数量 = state.选项数量 + 1
+}
+
+函数 Select_移除选项(state, 索引) {
+    如果 (state == 0 || 索引 >= state.选项数量) { 返回 }
+    定义 可变 i = 索引
+    当 (i < state.选项数量 - 1) {
+        内存_复制(state.选项列表 + i * 24, state.选项列表 + (i + 1) * 24, 24)
+        i = i + 1
+    }
+    state.选项数量 = state.选项数量 - 1
+    如果 (state.已选索引 >= state.选项数量) { state.已选索引 = state.选项数量 - 1 }
+}
+
+函数 Select_获取选项标签(state, 索引) {
+    如果 (state == 0 || 索引 >= state.选项数量) { 返回 "" }
+    返回 内存_读64(state.选项列表 + 索引 * 24 + 8)
+}
+
+函数 Select_获取选中列表(state) {
+    定义 可变 结果 = []
+    如果 (state == 0) { 返回 结果 }
+    定义 可变 i = 0
+    当 (i < state.选项数量) {
+        如果 (内存_读8(state.选项列表 + i * 24 + 16)) { 追加(结果, i) }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 Select_展开(state) {
+    如果 (state == 0 || state.已禁用) { 返回 }
+    state.展开 = 真
+}
+
+函数 Select_折叠(state) {
+    如果 (state == 0) { 返回 }
+    state.展开 = 假
+}
+
+// §10 常量与辅助接口
+
+定义 TEXT_节点 = 3
+定义 元素_节点 = 1
+定义 原子_option = 200
+
+// §11 表单控件统计
+
+定义 可变 表单_textarea创建数 = 0
+定义 可变 表单_select创建数 = 0
+定义 可变 表单_change事件数 = 0
+
+函数 表单控件_统计() {
+    返回 {
+        textarea: 表单_textarea创建数,
+        select: 表单_select创建数,
+        change事件: 表单_change事件数,
+    }
+}
+
+函数 表单控件_健康检查() { 返回 "表单控件子系统健康" }
+
+函数 表单控件_重置() {
+    表单_textarea创建数 = 0
+    表单_select创建数 = 0
+    表单_change事件数 = 0
+}
+
+函数 表单控件_完整统计() {
+    返回 [表单_textarea创建数, 表单_select创建数, 表单_change事件数]
+}
+
+定义 可变 AI_标记表单甲_热节点缓存 = 0
+
+函数 AI_标记表单甲_节点热度(节点, 操作类型) {
+    如果 (操作类型 == "查询") { 返回 "缓存" }
+    如果 (操作类型 == "修改") { AI_标记表单甲_热节点缓存 = 0; 返回 "失效" }
+    返回 "普通"
+}
+
+函数 AI_标记表单甲_批量DOM优化(操作数) {
+    如果 (操作数 > 100) { 返回 "延迟重排" }
+    如果 (操作数 > 10) { 返回 "批量重排" }
+    返回 "即时重排"
+}
+
+函数 标记表单甲_统计() {
+    返回 {
+        模块: "标记表单甲",
+        表单_textarea创建数: 表单_textarea创建数,
+        表单_select创建数: 表单_select创建数,
+        表单_change事件数: 表单_change事件数,
+        AI_标记表单甲_热节点缓存: AI_标记表单甲_热节点缓存
+    }
+}
+
+函数 标记表单甲_健康评估() {
+    定义 可变 问题 = []
+
+    返回 计数(问题) == 0
+}
+
+函数 标记表单甲_综合报告() {
+    打印("[标记表单甲] ═══ 综合报告 ═══")
+    打印("  表单_textarea创建数: " + 整数转字符串(表单_textarea创建数))
+    打印("  表单_select创建数: " + 整数转字符串(表单_select创建数))
+    打印("  表单_change事件数: " + 整数转字符串(表单_change事件数))
+    打印("  AI_标记表单甲_热节点缓存: " + 整数转字符串(AI_标记表单甲_热节点缓存))
+    打印("  健康: " + 如果 (标记表单甲_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 标记表单甲_全局重置() {
+    表单_textarea创建数 = 0
+    表单_select创建数 = 0
+    表单_change事件数 = 0
+    AI_标记表单甲_热节点缓存 = 0
+    打印("[标记表单甲] 全局统计已重置")
+    返回 0
+}

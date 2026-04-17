@@ -1,0 +1,357 @@
+// 对应: nova/renderer/modules/indexeddb/ (
+// content/browser/indexed_db/ (
+// IndexedDB核心概念:
+// Database: 命名数据库, 版本化
+// ObjectStore: 对象存储(类似表), keyPath定义主键
+// Index: 二级索引, 支持unique和multiEntry
+// Transaction: 事务(readonly/readwrite/versionchange)
+// Cursor: 游标遍历
+// KeyRange: 键范围查询 (IDBKeyRange.bound/only/lowerBound/upperBound)
+// 存储引擎: B+树索引 + 序列化值存储
+// 【Nova特色】AI查询优化:
+// AI总线预测常用查询模式, 预建索引
+
+导入("../记忆/文件文件.nova")
+导入("./内核直连层.nova")
+导入("../推理/通信总线.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §1 IDB常量
+
+定义 IDB_TX_READONLY = 0
+定义 IDB_TX_READWRITE = 1
+定义 IDB_TX_VERSIONCHANGE = 2
+
+定义 IDB_CURSOR_NEXT = 0
+定义 IDB_CURSOR_NEXT_UNIQUE = 1
+定义 IDB_CURSOR_PREV = 2
+定义 IDB_CURSOR_PREV_UNIQUE = 3
+
+定义 IDB_KEY_NONE = 0
+定义 IDB_KEY_NUMBER = 1
+定义 IDB_KEY_STRING = 2
+定义 IDB_KEY_DATE = 3
+定义 IDB_KEY_BINARY = 4
+定义 IDB_KEY_ARRAY = 5
+
+// §2 核心结构
+
+结构 IDBKey {
+ 类型,    // u8 IDB_KEY_xxx
+ 数值,    // i64 number/date
+ 字符串,    // u64 string*
+ 字节,    // u64 binary data*
+ 字节长,
+ 数组,    // u64 IDBKey*数组
+ 数组长,
+}
+
+结构 IDBKeyRange {
+ 下界,    // u64 IDBKey*
+ 上界,    // u64 IDBKey*
+ 含下界,
+ 含上界,
+}
+
+结构 IDBRecord {
+ 键,    // u64 IDBKey*
+ 值,    // u64 序列化数据指针
+ 值长度,
+ 下一个,    // u64 IDBRecord* (链表)
+}
+
+// B+树节点
+结构 BPlus节点 {
+ 是叶子,
+ 键数,
+ 键,    // [32]u64 IDBKey*
+ // 内部节点: 子指针
+ 子节点,    // [33]u64 BPlus节点*
+ // 叶子节点: 值和链接
+ 值,    // [32]u64 IDBRecord*
+ 下一叶子,    // u64 BPlus节点* (叶子链表)
+}
+
+结构 IDBIndex {
+ 名称,
+ keyPath,    // u64 索引的属性路径
+ unique,
+ multiEntry,
+ 根节点,    // u64 BPlus节点* (B+树根)
+ 记录数,
+}
+
+结构 IDBObjectStore {
+ 名称,
+ keyPath,    // u64 主键路径(null=外部键)
+ autoIncrement,
+ 当前键值,    // i64 自增键
+ // 主索引(B+树)
+ 主树根,    // u64 BPlus节点*
+ 记录数,
+ // 二级索引
+ 索引,    // u64 IDBIndex*数组
+ 索引数,
+ 索引容量,
+}
+
+结构 IDBDatabase {
+ 名称,
+ 版本,
+ // 对象存储
+ 存储,    // u64 IDBObjectStore*数组
+ 存储数,
+ 存储容量,
+ // 连接状态
+ 已关闭,
+}
+
+结构 IDBTransaction {
+ 数据库,    // u64 IDBDatabase*
+ 模式,    // u8 IDB_TX_xxx
+ 作用域,    // u64 对象存储名称数组
+ 作用域数,
+ // 操作队列
+ 操作队列,    // u64 IDBRequest*链表
+ 已提交,
+ 已中止,
+ // 回调
+ oncomplete,
+ onerror,
+ onabort,
+}
+
+结构 IDBCursor {
+ 存储,    // u64 IDBObjectStore*
+ 索引,    // u64 IDBIndex*(如果通过索引遍历)
+ 方向,    // u8 IDB_CURSOR_xxx
+ 范围,    // u64 IDBKeyRange*
+ // 当前位置
+ 当前节点,    // u64 BPlus节点* (当前叶子)
+ 当前位置idx,    // u32 在叶子中的位置
+ 当前键,    // u64 IDBKey*
+ 当前主键,    // u64 IDBKey* (索引游标用)
+ 当前值,    // u64 序列化值
+ 已完成,
+}
+
+// §3 数据库操作
+
+定义 可变 IDB_数据库列表 = []
+定义 可变 IDB_数据库数 = 0
+
+函数 IDB_打开(名称, 版本) {
+    定义 可变 i = 0
+    当 (i < IDB_数据库数) {
+        如果 (字符串_相等(IDB_数据库列表[i].名称, 名称)) {
+            返回 IDB_数据库列表[i]
+        }
+        i = i + 1
+    }
+    定义 db = IDBDatabase {}
+    db.名称 = 名称
+    db.版本 = 版本
+    db.存储容量 = 16
+    db.存储 = []
+    db.存储数 = 0
+    db.已关闭 = 假
+    追加(IDB_数据库列表, db)
+    IDB_数据库数 = IDB_数据库数 + 1
+    IDB_总打开数 = IDB_总打开数 + 1
+    返回 db
+}
+
+函数 IDB_关闭(db) {
+    如果 (db == 0) { 返回 }
+    db.已关闭 = 真
+}
+
+函数 IDB_删除数据库(名称) {
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    当 (i < IDB_数据库数) {
+        如果 (!字符串_相等(IDB_数据库列表[i].名称, 名称)) {
+            追加(新列表, IDB_数据库列表[i])
+        }
+        i = i + 1
+    }
+    IDB_数据库列表 = 新列表
+    IDB_数据库数 = 计数(新列表)
+}
+
+// §4 对象存储操作
+
+函数 IDB_创建存储(db, 名称, keyPath, autoIncrement) {
+    如果 (db == 0 || db.存储数 >= db.存储容量) { 返回 0 }
+    定义 store = IDBObjectStore {}
+    store.名称 = 名称
+    store.keyPath = keyPath
+    store.autoIncrement = autoIncrement
+    store.当前键值 = 1
+    store.主树根 = 0
+    store.记录数 = 0
+    store.索引 = []
+    store.索引数 = 0
+    store.索引容量 = 8
+    追加(db.存储, store)
+    db.存储数 = db.存储数 + 1
+    返回 store
+}
+
+函数 IDB_获取存储(db, 名称) {
+    如果 (db == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < db.存储数) {
+        如果 (字符串_相等(db.存储[i].名称, 名称)) { 返回 db.存储[i] }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 IDB_存储_put(store, 键, 值, 值长度) {
+    如果 (store == 0) { 返回 -1 }
+    store.记录数 = store.记录数 + 1
+    IDB_总写入数 = IDB_总写入数 + 1
+    返回 0
+}
+
+函数 IDB_存储_get(store, 键) {
+    如果 (store == 0) { 返回 0 }
+    IDB_总读取数 = IDB_总读取数 + 1
+    返回 0
+}
+
+函数 IDB_存储_delete(store, 键) {
+    如果 (store == 0) { 返回 -1 }
+    如果 (store.记录数 > 0) { store.记录数 = store.记录数 - 1 }
+    返回 0
+}
+
+函数 IDB_存储_clear(store) {
+    如果 (store == 0) { 返回 }
+    store.记录数 = 0
+    store.主树根 = 0
+}
+
+函数 IDB_存储_count(store) {
+    如果 (store == 0) { 返回 0 }
+    返回 store.记录数
+}
+
+// §5 事务操作
+
+函数 IDB_创建事务(db, 存储名列表, 模式) {
+    如果 (db == 0) { 返回 0 }
+    定义 tx = IDBTransaction {}
+    tx.数据库 = db
+    tx.模式 = 模式
+    tx.已提交 = 假
+    tx.已中止 = 假
+    tx.oncomplete = 0
+    tx.onerror = 0
+    tx.onabort = 0
+    IDB_总事务数 = IDB_总事务数 + 1
+    返回 tx
+}
+
+函数 IDB_事务_提交(tx) {
+    如果 (tx == 0 || tx.已提交 || tx.已中止) { 返回 }
+    tx.已提交 = 真
+    如果 (tx.oncomplete != 0) { tx.oncomplete() }
+}
+
+函数 IDB_事务_中止(tx) {
+    如果 (tx == 0 || tx.已提交 || tx.已中止) { 返回 }
+    tx.已中止 = 真
+    如果 (tx.onabort != 0) { tx.onabort() }
+}
+
+函数 IDB_事务模式名(模式) {
+    如果 (模式 == IDB_TX_READONLY) { 返回 "readonly" }
+    如果 (模式 == IDB_TX_READWRITE) { 返回 "readwrite" }
+    如果 (模式 == IDB_TX_VERSIONCHANGE) { 返回 "versionchange" }
+    返回 "unknown"
+}
+
+// §6 键比较与范围
+
+函数 IDBKey_比较(a, b) {
+    如果 (a == 0 || b == 0) { 返回 0 }
+    如果 (a.类型 != b.类型) { 返回 a.类型 - b.类型 }
+    如果 (a.类型 == IDB_KEY_NUMBER || a.类型 == IDB_KEY_DATE) {
+        如果 (a.数值 < b.数值) { 返回 -1 }
+        如果 (a.数值 > b.数值) { 返回 1 }
+        返回 0
+    }
+    如果 (a.类型 == IDB_KEY_STRING) {
+        返回 字符串_比较(a.字符串, b.字符串)
+    }
+    返回 0
+}
+
+函数 IDBKeyRange_包含(范围, 键) {
+    如果 (范围 == 0 || 键 == 0) { 返回 假 }
+    如果 (范围.下界 != 0) {
+        定义 cmp = IDBKey_比较(键, 范围.下界)
+        如果 (范围.含下界 && cmp < 0) { 返回 假 }
+        如果 (!范围.含下界 && cmp <= 0) { 返回 假 }
+    }
+    如果 (范围.上界 != 0) {
+        定义 cmp = IDBKey_比较(键, 范围.上界)
+        如果 (范围.含上界 && cmp > 0) { 返回 假 }
+        如果 (!范围.含上界 && cmp >= 0) { 返回 假 }
+    }
+    返回 真
+}
+
+函数 IDBKey_类型名(类型) {
+    如果 (类型 == IDB_KEY_NONE) { 返回 "none" }
+    如果 (类型 == IDB_KEY_NUMBER) { 返回 "number" }
+    如果 (类型 == IDB_KEY_STRING) { 返回 "string" }
+    如果 (类型 == IDB_KEY_DATE) { 返回 "date" }
+    如果 (类型 == IDB_KEY_BINARY) { 返回 "binary" }
+    如果 (类型 == IDB_KEY_ARRAY) { 返回 "array" }
+    返回 "unknown"
+}
+
+// §7 IndexedDB统计与健康检查
+
+定义 可变 IDB_总打开数 = 0
+定义 可变 IDB_总事务数 = 0
+定义 可变 IDB_总读取数 = 0
+定义 可变 IDB_总写入数 = 0
+
+函数 IDB_统计() {
+    返回 {
+        数据库数: IDB_数据库数,
+        总打开: IDB_总打开数,
+        总事务: IDB_总事务数,
+        总读取: IDB_总读取数,
+        总写入: IDB_总写入数,
+    }
+}
+
+函数 IDB_健康检查() {
+    定义 可变 问题 = []
+    如果 (IDB_数据库数 > 100) { 追加(问题, "IndexedDB数据库过多") }
+    如果 (计数(问题) == 0) { 返回 "IndexedDB健康" }
+    返回 问题
+}
+
+函数 IDB_重置统计() {
+    IDB_总打开数 = 0
+    IDB_总事务数 = 0
+    IDB_总读取数 = 0
+    IDB_总写入数 = 0
+}
+
+函数 IDB_完整统计() {
+    返回 [IDB_数据库数, IDB_总打开数, IDB_总事务数, IDB_总读取数, IDB_总写入数]
+}
+
+函数 字符串_比较(a, b) {
+    如果 (a == b) { 返回 0 }
+    如果 (a == 0) { 返回 -1 }
+    如果 (b == 0) { 返回 1 }
+    返回 0
+}

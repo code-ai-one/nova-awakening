@@ -1,0 +1,146 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./索引客户端引.nova")
+导入("./感知戊甲.nova")
+导入("../中枢/辅助存根.nova")
+
+// §5 Index操作
+
+函数 IDB_createIndex(store, 名称, keyPath, unique, multiEntry) {
+    如果 (store == 0 || store.索引数 >= store.索引容量) { 返回 0 }
+    定义 idx = 堆_分配(IDBIndex)
+    idx.名称 = 字符串_复制(名称)
+    idx.keyPath = 字符串_复制(keyPath)
+    idx.unique = unique; idx.multiEntry = multiEntry
+    idx.根节点 = BPlus_创建叶子()
+    idx.记录数 = 0
+    内存_写64(store.索引 + store.索引数 * 8, idx)
+    store.索引数 = store.索引数 + 1
+    返回 idx
+}
+
+// §6 IDBKeyRange
+
+函数 IDBKeyRange_only(键) {
+    定义 r = 堆_分配(IDBKeyRange)
+    r.下界 = 键; r.上界 = 键; r.含下界 = 真; r.含上界 = 真
+    返回 r
+}
+
+函数 IDBKeyRange_bound(下, 上, 含下, 含上) {
+    定义 r = 堆_分配(IDBKeyRange)
+    r.下界 = 下; r.上界 = 上; r.含下界 = 含下; r.含上界 = 含上
+    返回 r
+}
+
+函数 IDBKeyRange_lowerBound(下, 开放) {
+    定义 r = 堆_分配(IDBKeyRange)
+    r.下界 = 下; r.上界 = 0; r.含下界 = !开放; r.含上界 = 真
+    返回 r
+}
+
+函数 IDBKeyRange_upperBound(上, 开放) {
+    定义 r = 堆_分配(IDBKeyRange)
+    r.下界 = 0; r.上界 = 上; r.含下界 = 真; r.含上界 = !开放
+    返回 r
+}
+
+函数 IDBKeyRange_包含(范围, 键) {
+    如果 (范围 == 0 || 键 == 0) { 返回 真 }
+    如果 (范围.下界 != 0) {
+        定义 cmp = IDBKey_比较(键, 范围.下界)
+        如果 (范围.含下界 && cmp < 0) { 返回 假 }
+        如果 (!范围.含下界 && cmp <= 0) { 返回 假 }
+    }
+    如果 (范围.上界 != 0) {
+        定义 cmp = IDBKey_比较(键, 范围.上界)
+        如果 (范围.含上界 && cmp > 0) { 返回 假 }
+        如果 (!范围.含上界 && cmp >= 0) { 返回 假 }
+    }
+    返回 真
+}
+
+// §7 Cursor遍历
+
+函数 IDB_openCursor(store, 范围, 方向) {
+    如果 (store == 0 || store.主树根 == 0) { 返回 0 }
+    定义 cursor = 堆_分配(IDBCursor)
+    cursor.存储 = store; cursor.索引 = 0
+    cursor.方向 = 方向; cursor.范围 = 范围
+    cursor.已完成 = 假
+
+    // 找到第一个叶子
+    定义 可变 节点 = store.主树根
+    当 (节点 != 0 && !节点.是叶子) {
+        节点 = 节点.子节点[0]
+    }
+    cursor.当前节点 = 节点; cursor.当前位置idx = 0
+
+    // 如果有范围下界, 前进到下界
+    如果 (范围 != 0 && 范围.下界 != 0 && 方向 <= IDB_CURSOR_NEXT_UNIQUE) {
+        IDB_cursor_前进到(cursor, 范围.下界)
+    }
+
+    // 设置当前值
+    IDB_cursor_更新当前(cursor)
+    返回 cursor
+}
+
+函数 IDB_cursor_continue(cursor) {
+    如果 (cursor == 0 || cursor.已完成) { 返回 }
+    定义 节点 = cursor.当前节点
+    如果 (节点 == 0) { cursor.已完成 = 真; 返回 }
+
+    如果 (cursor.方向 == IDB_CURSOR_NEXT || cursor.方向 == IDB_CURSOR_NEXT_UNIQUE) {
+        cursor.当前位置idx = cursor.当前位置idx + 1
+        如果 (cursor.当前位置idx >= 节点.键数) {
+            // 下一个叶子
+            cursor.当前节点 = 节点.下一叶子
+            cursor.当前位置idx = 0
+            如果 (cursor.当前节点 == 0) { cursor.已完成 = 真; 返回 }
+        }
+    } 否则 {
+        // PREV方向
+        如果 (cursor.当前位置idx == 0) {
+            // 反向遍历: 查找前一个叶子节点
+            定义 prev = BTree_前一叶子(cursor.树, cursor.当前节点)
+            如果 (prev == 0) { cursor.已完成 = 真; 返回 }
+            cursor.当前节点 = prev
+            cursor.当前位置idx = prev.键数 - 1
+        }
+        cursor.当前位置idx = cursor.当前位置idx - 1
+    }
+
+    IDB_cursor_更新当前(cursor)
+
+    // 检查范围
+    如果 (cursor.范围 != 0 && cursor.当前键 != 0) {
+        如果 (!IDBKeyRange_包含(cursor.范围, cursor.当前键)) {
+            cursor.已完成 = 真
+        }
+    }
+}
+
+函数 IDB_cursor_更新当前(cursor) {
+    如果 (cursor == 0 || cursor.当前节点 == 0) { 返回 }
+    定义 节点 = cursor.当前节点
+    如果 (cursor.当前位置idx < 节点.键数) {
+        cursor.当前键 = 节点.键[cursor.当前位置idx]
+        cursor.当前值 = 节点.值[cursor.当前位置idx]
+    }
+}
+
+函数 IDB_cursor_前进到(cursor, 目标键) {
+    // 在叶子链中前进到>=目标键的位置
+    当 (cursor.当前节点 != 0 && !cursor.已完成) {
+        定义 节点 = cursor.当前节点
+        当 (cursor.当前位置idx < 节点.键数) {
+            定义 cmp = IDBKey_比较(节点.键[cursor.当前位置idx], 目标键)
+            如果 (cmp >= 0) { 返回 }
+            cursor.当前位置idx = cursor.当前位置idx + 1
+        }
+        cursor.当前节点 = 节点.下一叶子
+        cursor.当前位置idx = 0
+        如果 (cursor.当前节点 == 0) { cursor.已完成 = 真 }
+    }
+}

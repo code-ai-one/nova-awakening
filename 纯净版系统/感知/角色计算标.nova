@@ -1,0 +1,120 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./原子驻留.nova")
+导入("./超传头部创.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("./文档节点.nova")
+
+// §5 角色计算 — HTML标签 → ARIA角色的默认映射
+
+函数 AX_计算角色(dom节点) {
+    如果 (dom节点 == 0) { 返回 AX_ROLE_GENERIC }
+
+    // 文本节点
+    如果 (dom节点.节点类型 == 3) { 返回 AX_ROLE_STATIC_TEXT }
+
+    如果 (dom节点.节点类型 != 1) { 返回 AX_ROLE_UNKNOWN }    // 非元素
+
+    // 检查显式ARIA role
+    定义 显式role = 元素_getAttribute(dom节点, "role")
+    如果 (显式role != 0 && 字符串_长度(显式role) > 0) {
+        返回 AX_ARIA字符串到角色(显式role)
+    }
+
+    // HTML标签默认角色映射
+    定义 扩展 = 元素_获取扩展(dom节点)
+    如果 (扩展 == 0) { 返回 AX_ROLE_GENERIC }
+    定义 标签 = 扩展.标签名
+
+    如果 (字符串_相等_不区分大小写(标签, "a")) {
+        如果 (元素_getAttribute(dom节点, "href") != 0) { 返回 AX_ROLE_LINK }
+        返回 AX_ROLE_GENERIC
+    }
+    如果 (字符串_相等_不区分大小写(标签, "article")) { 返回 AX_ROLE_ARTICLE }
+    如果 (字符串_相等_不区分大小写(标签, "aside")) { 返回 AX_ROLE_COMPLEMENTARY }
+    如果 (字符串_相等_不区分大小写(标签, "button")) { 返回 AX_ROLE_BUTTON }
+    如果 (字符串_相等_不区分大小写(标签, "dialog")) { 返回 AX_ROLE_DIALOG }
+    如果 (字符串_相等_不区分大小写(标签, "footer")) { 返回 AX_ROLE_CONTENTINFO }
+    如果 (字符串_相等_不区分大小写(标签, "form")) { 返回 AX_ROLE_FORM }
+    如果 (字符串_相等_不区分大小写(标签, "header")) { 返回 AX_ROLE_BANNER }
+    如果 (字符串_相等_不区分大小写(标签, "hr")) { 返回 AX_ROLE_SEPARATOR }
+    如果 (字符串_相等_不区分大小写(标签, "img")) { 返回 AX_ROLE_IMAGE }
+    如果 (字符串_相等_不区分大小写(标签, "main")) { 返回 AX_ROLE_MAIN }
+    如果 (字符串_相等_不区分大小写(标签, "meter")) { 返回 AX_ROLE_METER }
+    如果 (字符串_相等_不区分大小写(标签, "nav")) { 返回 AX_ROLE_NAVIGATION }
+    如果 (字符串_相等_不区分大小写(标签, "ol")) { 返回 AX_ROLE_LIST }
+    如果 (字符串_相等_不区分大小写(标签, "ul")) { 返回 AX_ROLE_LIST }
+    如果 (字符串_相等_不区分大小写(标签, "li")) { 返回 AX_ROLE_LISTITEM }
+    如果 (字符串_相等_不区分大小写(标签, "option")) { 返回 AX_ROLE_OPTION }
+    如果 (字符串_相等_不区分大小写(标签, "output")) { 返回 AX_ROLE_STATUS }
+    如果 (字符串_相等_不区分大小写(标签, "p")) { 返回 AX_ROLE_PARAGRAPH }
+    如果 (字符串_相等_不区分大小写(标签, "progress")) { 返回 AX_ROLE_PROGRESSBAR }
+    如果 (字符串_相等_不区分大小写(标签, "section")) { 返回 AX_ROLE_REGION }
+    如果 (字符串_相等_不区分大小写(标签, "select")) { 返回 AX_ROLE_COMBOBOX }
+    如果 (字符串_相等_不区分大小写(标签, "table")) { 返回 AX_ROLE_TABLE }
+    如果 (字符串_相等_不区分大小写(标签, "tr")) { 返回 AX_ROLE_ROW }
+    如果 (字符串_相等_不区分大小写(标签, "td")) { 返回 AX_ROLE_CELL }
+    如果 (字符串_相等_不区分大小写(标签, "th")) { 返回 AX_ROLE_CELL }
+    如果 (字符串_相等_不区分大小写(标签, "textarea")) { 返回 AX_ROLE_TEXTBOX }
+    如果 (字符串_相等_不区分大小写(标签, "h1") || 字符串_相等_不区分大小写(标签, "h2") || 字符串_相等_不区分大小写(标签, "h3") || 字符串_相等_不区分大小写(标签, "h4") || 字符串_相等_不区分大小写(标签, "h5") || 字符串_相等_不区分大小写(标签, "h6")) {
+        返回 AX_ROLE_HEADING
+    }
+
+    // <input type="...">
+    如果 (字符串_相等_不区分大小写(标签, "input")) {
+        定义 类型 = 元素_getAttribute(dom节点, "type")
+        如果 (类型 == 0 || 字符串_相等(类型, "text") || 字符串_相等(类型, "email") || 字符串_相等(类型, "tel") || 字符串_相等(类型, "url") || 字符串_相等(类型, "search") || 字符串_相等(类型, "password")) {
+            返回 AX_ROLE_TEXTBOX
+        }
+        如果 (字符串_相等(类型, "button") || 字符串_相等(类型, "submit") || 字符串_相等(类型, "reset") || 字符串_相等(类型, "image")) {
+            返回 AX_ROLE_BUTTON
+        }
+        如果 (字符串_相等(类型, "checkbox")) { 返回 AX_ROLE_CHECKBOX }
+        如果 (字符串_相等(类型, "radio")) { 返回 AX_ROLE_RADIO }
+        如果 (字符串_相等(类型, "range")) { 返回 AX_ROLE_SLIDER }
+        如果 (字符串_相等(类型, "number")) { 返回 AX_ROLE_SPINBUTTON }
+        返回 AX_ROLE_TEXTBOX
+    }
+
+    返回 AX_ROLE_GENERIC
+}
+
+函数 AX_ARIA字符串到角色(str) {
+    如果 (字符串_相等(str, "alert")) { 返回 AX_ROLE_ALERT }
+    如果 (字符串_相等(str, "button")) { 返回 AX_ROLE_BUTTON }
+    如果 (字符串_相等(str, "checkbox")) { 返回 AX_ROLE_CHECKBOX }
+    如果 (字符串_相等(str, "combobox")) { 返回 AX_ROLE_COMBOBOX }
+    如果 (字符串_相等(str, "dialog")) { 返回 AX_ROLE_DIALOG }
+    如果 (字符串_相等(str, "grid")) { 返回 AX_ROLE_GRID }
+    如果 (字符串_相等(str, "heading")) { 返回 AX_ROLE_HEADING }
+    如果 (字符串_相等(str, "img")) { 返回 AX_ROLE_IMAGE }
+    如果 (字符串_相等(str, "link")) { 返回 AX_ROLE_LINK }
+    如果 (字符串_相等(str, "list")) { 返回 AX_ROLE_LIST }
+    如果 (字符串_相等(str, "listitem")) { 返回 AX_ROLE_LISTITEM }
+    如果 (字符串_相等(str, "menu")) { 返回 AX_ROLE_MENU }
+    如果 (字符串_相等(str, "menubar")) { 返回 AX_ROLE_MENUBAR }
+    如果 (字符串_相等(str, "menuitem")) { 返回 AX_ROLE_MENUITEM }
+    如果 (字符串_相等(str, "navigation")) { 返回 AX_ROLE_NAVIGATION }
+    如果 (字符串_相等(str, "none")) { 返回 AX_ROLE_NONE }
+    如果 (字符串_相等(str, "presentation")) { 返回 AX_ROLE_PRESENTATION }
+    如果 (字符串_相等(str, "progressbar")) { 返回 AX_ROLE_PROGRESSBAR }
+    如果 (字符串_相等(str, "radio")) { 返回 AX_ROLE_RADIO }
+    如果 (字符串_相等(str, "radiogroup")) { 返回 AX_ROLE_RADIOGROUP }
+    如果 (字符串_相等(str, "region")) { 返回 AX_ROLE_REGION }
+    如果 (字符串_相等(str, "search")) { 返回 AX_ROLE_SEARCH }
+    如果 (字符串_相等(str, "searchbox")) { 返回 AX_ROLE_SEARCHBOX }
+    如果 (字符串_相等(str, "slider")) { 返回 AX_ROLE_SLIDER }
+    如果 (字符串_相等(str, "switch")) { 返回 AX_ROLE_SWITCH }
+    如果 (字符串_相等(str, "tab")) { 返回 AX_ROLE_TAB }
+    如果 (字符串_相等(str, "table")) { 返回 AX_ROLE_TABLE }
+    如果 (字符串_相等(str, "tablist")) { 返回 AX_ROLE_TABLIST }
+    如果 (字符串_相等(str, "tabpanel")) { 返回 AX_ROLE_TABPANEL }
+    如果 (字符串_相等(str, "textbox")) { 返回 AX_ROLE_TEXTBOX }
+    如果 (字符串_相等(str, "toolbar")) { 返回 AX_ROLE_TOOLBAR }
+    如果 (字符串_相等(str, "tooltip")) { 返回 AX_ROLE_TOOLTIP }
+    如果 (字符串_相等(str, "tree")) { 返回 AX_ROLE_TREE }
+    如果 (字符串_相等(str, "treeitem")) { 返回 AX_ROLE_TREEITEM }
+    如果 (字符串_相等(str, "treegrid")) { 返回 AX_ROLE_TREEGRID }
+    返回 AX_ROLE_GENERIC
+}

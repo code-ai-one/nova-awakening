@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+导入("./全连接层.nova")
+导入("./分组查询.nova")
+导入("./位置编码.nova")
+导入("./缩点积注意.nova")
+导入("../中枢/网络激活层前.nova")
+导入("../中枢/最大池一维.nova")
+
+// §5 Nova注意力架构编码器块
+// Nova注意力架构块级 = LayerNorm → MultiHeadNova注意力 → 残差
+//                  → LayerNorm → FFN → 残差
+
+结构 Nova注意力架构块级 {
+    注意力,    // u64 MultiHeadNova注意力*
+    前馈网络,    // u64 Nova多层感知器* (2层: d→4d→d)
+    层归一化1,    // u64 LayerNorm*
+    层归一化2,    // u64 LayerNorm*
+    模型维度,
+}
+
+函数 Nova注意力架构块级_创建(模型维度, 头数) {
+    定义 block = 堆_分配(Nova注意力架构块级)
+    block.模型维度 = 模型维度
+    block.注意力 = MultiHeadNova注意力_创建(模型维度, 头数)
+    block.层归一化1 = LayerNorm_创建(模型维度)
+    block.层归一化2 = LayerNorm_创建(模型维度)
+
+    // FFN: d_model → 4*d_model → d_model (GELU激活)
+    定义 ffn = Nova多层感知器_创建(3)
+    Nova多层感知器_添加层(ffn, 模型维度, 模型维度 * 4, 激活类型_GELU)
+    Nova多层感知器_添加层(ffn, 模型维度 * 4, 模型维度, 激活类型_无)
+    block.前馈网络 = ffn
+
+    返回 block
+}
+
+函数 Nova注意力架构块级_前向(block, 输入, 掩码) {
+    // 1. 自注意力 + 残差 + LayerNorm (Pre-Norm)
+    定义 归一化1 = LayerNorm_前向(block.层归一化1, 输入)
+    定义 注意力输出 = MultiHeadNova注意力_前向(block.注意力, 归一化1, 归一化1, 归一化1, 掩码)
+    定义 残差1 = Tensor_加(输入, 注意力输出)
+    Tensor_释放(归一化1)
+    Tensor_释放(注意力输出)
+
+    // 2. FFN + 残差 + LayerNorm
+    定义 归一化2 = LayerNorm_前向(block.层归一化2, 残差1)
+    定义 ffn输出 = Nova多层感知器_前向(block.前馈网络, 归一化2)
+    定义 残差2 = Tensor_加(残差1, ffn输出)
+    Tensor_释放(归一化2)
+    Tensor_释放(ffn输出)
+    Tensor_释放(残差1)
+
+    返回 残差2
+}
+
+函数 Nova注意力架构块级_销毁(block) {
+    如果 (block == 0) { 返回 }
+    如果 (block.注意力 != 0) { MultiHeadNova注意力_销毁(block.注意力) }
+    如果 (block.前馈网络 != 0) { Nova多层感知器_销毁(block.前馈网络) }
+    如果 (block.层归一化1 != 0) { LayerNorm_销毁(block.层归一化1) }
+    如果 (block.层归一化2 != 0) { LayerNorm_销毁(block.层归一化2) }
+    堆_释放(block)
+}
+
+// §6 完整Nova注意力架构编码器 — 多层堆叠
+
+结构 Nova注意力架构Encoder {
+    块列表,    // u64 Nova注意力架构块级* 数组
+    块数量,
+    位置编码,    // u64 Tensor* 位置编码矩阵
+    模型维度,
+    最大序列长,
+}
+
+函数 Nova注意力架构Encoder_创建(模型维度, 头数, 层数, 最大序列长) {
+    定义 enc = 堆_分配(Nova注意力架构Encoder)
+    enc.模型维度 = 模型维度
+    enc.块数量 = 层数
+    enc.最大序列长 = 最大序列长
+    enc.块列表 = 堆_分配_数组(层数 * 8)
+    enc.位置编码 = 位置编码_生成(最大序列长, 模型维度)
+
+    定义 可变 i = 0
+    当 (i < 层数) {
+        定义 block = Nova注意力架构块级_创建(模型维度, 头数)
+        内存_写64(enc.块列表 + i * 8, block)
+        i = i + 1
+    }
+    返回 enc
+}
+
+函数 Nova注意力架构Encoder_前向(enc, 输入嵌入, 掩码) {
+    // 1. 加位置编码
+    定义 seq_len = 输入嵌入.行数
+    定义 PE切片 = Tensor_切片行(enc.位置编码, 0, seq_len)
+    定义 可变 当前 = Tensor_加(输入嵌入, PE切片)
+    Tensor_释放(PE切片)
+
+    // 2. 通过每个Nova注意力架构块
+    定义 可变 i = 0
+    当 (i < enc.块数量) {
+        定义 block = 内存_读64(enc.块列表 + i * 8)
+        定义 输出 = Nova注意力架构块级_前向(block, 当前, 掩码)
+        Tensor_释放(当前)
+        当前 = 输出
+        i = i + 1
+    }
+
+    返回 当前
+}
+
+函数 Nova注意力架构_销毁(enc) {
+    如果 (enc == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < enc.块数量) {
+        Nova注意力架构块级_销毁(内存_读64(enc.块列表 + i * 8))
+        i = i + 1
+    }
+    如果 (enc.位置编码 != 0) { Tensor_释放(enc.位置编码) }
+    如果 (enc.块列表 != 0) { 堆_释放(enc.块列表) }
+    堆_释放(enc)
+}
+
+结构 GQA注意力架构Encoder {
+    GQA堆栈,
+    模型维度,
+    Q头数,
+    KV头数,
+    层数,
+    中间维度,
+}
+
+函数 GQA注意力架构Encoder_创建(模型维度, Q头数, KV头数, 层数, 分页分配器) {
+    定义 enc = 堆_分配(GQA注意力架构Encoder)
+    enc.模型维度 = 模型维度
+    enc.Q头数 = Q头数
+    enc.KV头数 = KV头数
+    enc.层数 = 层数
+    enc.中间维度 = 模型维度 * 4
+    enc.GQA堆栈 = GQA_Transformer堆栈_创建(模型维度, enc.中间维度, Q头数, KV头数, 层数, 分页分配器)
+    返回 enc
+}
+
+函数 GQA注意力架构Encoder_增量前向(enc, 输入嵌入, 位置) {
+    如果 (enc == 0 || 输入嵌入 == 0) { 返回 空 }
+    返回 GQA_Transformer堆栈_增量前向(enc.GQA堆栈, 输入嵌入, 位置)
+}
+
+函数 GQA注意力架构Encoder_重置缓存(enc) {
+    如果 (enc == 0) { 返回 }
+    GQA_Transformer堆栈_重置缓存(enc.GQA堆栈)
+}
+
+函数 GQA注意力架构Encoder_销毁(enc) {
+    如果 (enc == 0) { 返回 }
+    GQA_Transformer堆栈_销毁(enc.GQA堆栈)
+    堆_释放(enc)
+}
+
+// 行切片: 提取前n行
+函数 Tensor_切片行(A, 起始行, 行数) {
+    定义 B = Tensor_创建(行数, A.列数)
+    定义 可变 i = 0
+    当 (i < 行数) {
+        定义 可变 j = 0
+        当 (j < A.列数) {
+            Tensor_写(B, i, j, Tensor_读(A, 起始行 + i, j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 B
+}

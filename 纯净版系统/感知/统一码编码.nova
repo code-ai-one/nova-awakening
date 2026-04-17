@@ -1,0 +1,108 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+
+// 对应: nova/renderer/modules/encoding/ (
+// nova/renderer/platform/wtf/text/ (
+// TextEncoder:
+// new TextEncoder() — 总是UTF-8
+// encoder.encode(string) → Uint8数组
+// encoder.encodeInto(string, uint8数组) → {read, written}
+// TextDecoder:
+// new TextDecoder(encoding, {fatal, ignoreBOM})
+// decoder.decode(bufferSource, {stream}) → string
+// 支持编码: utf-8/utf-16le/utf-16be/gbk/gb18030/big5/
+// euc-jp/iso-2022-jp/shift_jis/euc-kr/iso-8859-1...
+// Base64:
+// btoa(string) → Base64字符串
+// atob(base64) → 原始字符串
+// URL编码:
+// encodeURI(string) / decodeURI(string)
+// encodeURIComponent(string) / decodeURIComponent(string)
+
+// §1 UTF-8编解码
+
+// UTF-8编码: Unicode码点 → UTF-8字节序列
+// U+0000..U+007F: 0xxxxxxx (1字节)
+// U+0080..U+07FF: 110xxxxx 10xxxxxx (2字节)
+// U+0800..U+FFFF: 1110xxxx 10xxxxxx 10xxxxxx (3字节)
+// U+10000..U+10FFFF: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (4字节)
+
+函数 UTF8_编码码点(cp, buf, pos) {
+ 如果 (buf == 0) { 返回 0 }
+ 如果 (cp < 0x80) {
+ 字节写(buf, pos, cp)
+ 返回 1
+ } 否则 如果 (cp < 0x800) {
+ 字节写(buf, pos, 0xC0 | (cp >> 6))
+ 字节写(buf, pos + 1, 0x80 | (cp & 0x3F))
+ 返回 2
+ } 否则 如果 (cp < 0x10000) {
+ 字节写(buf, pos, 0xE0 | (cp >> 12))
+ 字节写(buf, pos + 1, 0x80 | ((cp >> 6) & 0x3F))
+ 字节写(buf, pos + 2, 0x80 | (cp & 0x3F))
+ 返回 3
+ } 否则 如果 (cp < 0x110000) {
+ 字节写(buf, pos, 0xF0 | (cp >> 18))
+ 字节写(buf, pos + 1, 0x80 | ((cp >> 12) & 0x3F))
+ 字节写(buf, pos + 2, 0x80 | ((cp >> 6) & 0x3F))
+ 字节写(buf, pos + 3, 0x80 | (cp & 0x3F))
+ 返回 4
+ }
+ // 无效码点 → 替换字符 U+FFFD
+ 字节写(buf, pos, 0xEF); 字节写(buf, pos + 1, 0xBF); 字节写(buf, pos + 2, 0xBD)
+ 返回 3
+}
+
+// UTF-8解码: 读取一个码点, 返回码点值和消耗字节数
+函数 UTF8_解码码点(buf, pos, len) {
+ 如果 (buf == 0 || pos >= len) { 返回 0 }
+ 定义 b0 = 字节取(buf, pos)
+
+ 如果 (b0 < 0x80) {
+ // 1字节: ASCII
+ 返回 b0 // 消耗1字节
+ }
+
+ 如果 ((b0 & 0xE0) == 0xC0 && pos + 1 < len) {
+ // 2字节
+ 定义 b1 = 字节取(buf, pos + 1)
+ 如果 ((b1 & 0xC0) != 0x80) { 返回 0xFFFD }
+ 定义 cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+ 如果 (cp < 0x80) { 返回 0xFFFD } // 过长编码
+ 返回 cp
+ }
+
+ 如果 ((b0 & 0xF0) == 0xE0 && pos + 2 < len) {
+ // 3字节
+ 定义 b1 = 字节取(buf, pos + 1)
+ 定义 b2 = 字节取(buf, pos + 2)
+ 如果 ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) { 返回 0xFFFD }
+ 定义 cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+ 如果 (cp < 0x800) { 返回 0xFFFD }
+ 如果 (cp >= 0xD800 && cp <= 0xDFFF) { 返回 0xFFFD } // 代理对
+ 返回 cp
+ }
+
+ 如果 ((b0 & 0xF8) == 0xF0 && pos + 3 < len) {
+ // 4字节
+ 定义 b1 = 字节取(buf, pos + 1)
+ 定义 b2 = 字节取(buf, pos + 2)
+ 定义 b3 = 字节取(buf, pos + 3)
+ 如果 ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) { 返回 0xFFFD }
+ 定义 cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+ 如果 (cp < 0x10000 || cp > 0x10FFFF) { 返回 0xFFFD }
+ 返回 cp
+ }
+
+ 返回 0xFFFD // 无效序列
+}
+
+// 获取UTF-8字符的字节长度
+函数 UTF8_字节长度(b0) {
+ 如果 (b0 < 0x80) { 返回 1 }
+ 如果 ((b0 & 0xE0) == 0xC0) { 返回 2 }
+ 如果 ((b0 & 0xF0) == 0xE0) { 返回 3 }
+ 如果 ((b0 & 0xF8) == 0xF0) { 返回 4 }
+ 返回 1 // 无效字节作为1字节处理
+}

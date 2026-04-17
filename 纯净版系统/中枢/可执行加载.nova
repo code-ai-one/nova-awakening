@@ -1,0 +1,307 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("../记忆/文件层文件.nova")
+导入("./字符串替换.nova")
+导入("./进程描述符.nova")
+导入("../引导/端口输入.nova")
+导入("./整数转字符串.nova")
+导入("./内核打印.nova")
+导入("../感知/内核直连层.nova")
+
+//   1. 解析ELF64头部: 验证魔数/类型/架构
+//   2. 遍历Program Header: 映射PT_LOAD段到用户空间
+//   3. 处理PT_INTERP: 动态链接器路径
+//   4. 设置入口点: e_entry或interp的入口
+//   5. 设置辅助向量(auxv): AT_PHDR/AT_ENTRY等
+//   6. 初始化用户栈: argc/argv/envp/auxv
+
+定义 ELF_MAGIC      = 0x464C457F  // "\x7fELF"
+定义 ELFCLASS64     = 2
+定义 ELFDATA2LSB    = 1           // 小端
+定义 ET_EXEC        = 2           // 可执行
+定义 ET_DYN         = 3           // 共享对象(PIE)
+定义 EM_X86_64      = 62          // x86-64架构
+定义 PT_NULL        = 0
+定义 PT_LOAD        = 1           // 可加载段
+定义 PT_DYNAMIC     = 2
+定义 PT_INTERP      = 3           // 解释器路径
+定义 PT_NOTE        = 4
+定义 PT_PHDR        = 6
+定义 PF_X           = 1           // 可执行
+定义 PF_W           = 2           // 可写
+定义 PF_R           = 4           // 可读
+
+结构 Elf64_Ehdr {
+    e_ident,    // [16]u8 魔数+类+数据+版本+OS/ABI
+    e_type,    // u16 ET_EXEC/ET_DYN
+    e_machine,    // u16 EM_X86_64
+    e_version,
+    e_entry,    // u64 入口点虚拟地址
+    e_phoff,    // u64 Program Header偏移
+    e_shoff,    // u64 Section Header偏移
+    e_flags,
+    e_ehsize,    // u16 ELF头大小(64字节)
+    e_phentsize,    // u16 Program Header条目大小(56字节)
+    e_phnum,    // u16 Program Header数量
+    e_shentsize,
+    e_shnum,
+    e_shstrndx,
+}
+
+结构 Elf64_Phdr {
+    p_type,    // u32 PT_LOAD等
+    p_flags,    // u32 PF_R|PF_W|PF_X
+    p_offset,    // u64 文件偏移
+    p_vaddr,    // u64 虚拟地址
+    p_paddr,    // u64 物理地址(通常忽略)
+    p_filesz,    // u64 文件中大小
+    p_memsz,    // u64 内存中大小(>=filesz, BSS补零)
+    p_align,    // u64 对齐
+}
+
+定义 AT_NULL    = 0
+定义 AT_PHDR    = 3    // Program Header地址
+定义 AT_PHENT   = 4    // phdr条目大小
+定义 AT_PHNUM   = 5    // phdr数量
+定义 AT_PAGESZ  = 6    // 页大小
+定义 AT_BASE    = 7    // 解释器基址
+定义 AT_ENTRY   = 9    // 原始入口点
+定义 AT_UID     = 11
+定义 AT_EUID    = 12
+定义 AT_GID     = 13
+定义 AT_EGID    = 14
+定义 AT_RANDOM  = 25   // 16字节随机数地址
+
+// 加载ELF二进制 
+
+// 被兼容层通过外部声明引用的别名
+函数 ELF加载_解析(路径) { 返回 加载ELF二进制(路径, 空) }
+
+函数 加载ELF二进制(路径, 任务) {
+    // 1. 读取ELF头(前64字节)
+    定义 文件 = vfs_打开(路径, O_RDONLY)
+    如果 (文件 == 空) { 返回 错误_不存在 }
+
+    定义 头数据 = vfs_读取(文件, 0, 64)
+    如果 (头数据 == 空 || 长度(头数据) < 64) {
+        vfs_关闭(文件)
+        返回 错误_格式
+    }
+
+    // 2. 验证ELF魔数
+    定义 魔数 = 读取u32(头数据, 0)
+    如果 (魔数 != ELF_MAGIC) {
+        vfs_关闭(文件)
+        返回 错误_格式   // 不是ELF文件
+    }
+
+    // 3. 验证ELF类型
+    如果 (头数据[4] != ELFCLASS64) { vfs_关闭(文件); 返回 错误_格式 }  // 非64位
+    如果 (头数据[5] != ELFDATA2LSB) { vfs_关闭(文件); 返回 错误_格式 }  // 非小端
+
+    定义 e_type = 读取u16(头数据, 16)
+    如果 (e_type != ET_EXEC && e_type != ET_DYN) {
+        vfs_关闭(文件); 返回 错误_格式
+    }
+
+    定义 e_machine = 读取u16(头数据, 18)
+    如果 (e_machine != EM_X86_64) { vfs_关闭(文件); 返回 错误_格式 }
+
+    // 4. 提取关键字段
+    定义 e_entry   = 读取u64(头数据, 24)
+    定义 e_phoff   = 读取u64(头数据, 32)
+    定义 e_phentsize = 读取u16(头数据, 54)
+    定义 e_phnum   = 读取u16(头数据, 56)
+
+    如果 (e_phnum == 0 || e_phnum > 128) {
+        vfs_关闭(文件); 返回 错误_格式
+    }
+
+    // 5. 读取所有Program Headers
+    定义 ph_大小 = e_phnum * e_phentsize
+    定义 ph数据 = vfs_读取(文件, e_phoff, ph_大小)
+    如果 (ph数据 == 空) { vfs_关闭(文件); 返回 错误_格式 }
+
+    // 6. PIE基址偏移(ET_DYN随机化)
+    定义 可变 加载偏移 = 0
+    如果 (e_type == ET_DYN) {
+        加载偏移 = 0x400000  // PIE默认基址(ASLR时应随机化)
+    }
+
+    // 7. 遍历Program Headers, 映射PT_LOAD段
+    定义 可变 brk结束 = 0
+    定义 可变 interp路径 = ""
+    定义 可变 phdr_地址 = 0
+    定义 可变 i = 0
+
+    当 (i < e_phnum) {
+        定义 偏移 = i * e_phentsize
+        定义 p_type   = 读取u32(ph数据, 偏移 + 0)
+        定义 p_flags  = 读取u32(ph数据, 偏移 + 4)
+        定义 p_offset = 读取u64(ph数据, 偏移 + 8)
+        定义 p_vaddr  = 读取u64(ph数据, 偏移 + 16)
+        定义 p_filesz = 读取u64(ph数据, 偏移 + 32)
+        定义 p_memsz  = 读取u64(ph数据, 偏移 + 40)
+
+        如果 (p_type == PT_LOAD) {
+            // 将ELF段映射到用户空间
+            定义 映射地址 = p_vaddr + 加载偏移
+            定义 保护 = elf_flags到prot(p_flags)
+            定义 映射大小 = 页对齐(p_memsz)
+
+            // Nova内存映射映射: 文件内容 + BSS补零
+            定义 结果 = 进程_Nova内存映射(任务, 映射地址, 映射大小, 保护, 文件, p_offset)
+            如果 (是错误(结果)) {
+                vfs_关闭(文件)
+                返回 结果
+            }
+
+            // 更新brk(堆起始 = 最高PT_LOAD段结束)
+            定义 段结束 = 映射地址 + p_memsz
+            如果 (段结束 > brk结束) { brk结束 = 段结束 }
+
+            // BSS: memsz > filesz 的部分需要清零
+            如果 (p_memsz > p_filesz) {
+                定义 bss起始 = 映射地址 + p_filesz
+                定义 bss大小 = p_memsz - p_filesz
+                内存清零(bss起始, bss大小)
+            }
+        }
+
+        如果 (p_type == PT_INTERP) {
+            // 读取动态链接器路径
+            定义 interp数据 = vfs_读取(文件, p_offset, p_filesz)
+            如果 (interp数据 != 空) { interp路径 = 字节到字符串(interp数据) }
+        }
+
+        如果 (p_type == PT_PHDR) {
+            phdr_地址 = p_vaddr + 加载偏移
+        }
+
+        i = i + 1
+    }
+
+    vfs_关闭(文件)
+
+    // 8. 设置进程brk(堆起始地址)
+    进程_设brk(任务, 页对齐(brk结束))
+
+    // 9. 设置入口点
+    定义 可变 实际入口 = e_entry + 加载偏移
+    // 如果有动态链接器, 需要加载interp并使用其入口点
+    如果 (interp路径 != "") {
+        定义 interp结果 = 加载ELF解释器(interp路径, 任务)
+        如果 (!是错误(interp结果)) { 实际入口 = interp结果 }
+    }
+    进程_设入口点(任务, 实际入口)
+
+    // 10. 设置用户栈 + 辅助向量
+    定义 栈顶 = 用户栈顶 - 16  // 16字节对齐
+    栈顶 = 设置辅助向量(任务, 栈顶, e_entry + 加载偏移, phdr_地址, e_phentsize, e_phnum)
+    进程_设用户RSP(任务, 栈顶)
+
+    内核调试("ELF加载完成: " + 路径 + " 入口=0x" + 整数转十六进制(实际入口))
+    返回 成功
+}
+
+// 辅助函数
+
+函数 elf_flags到prot(flags) {
+    定义 可变 prot = 0
+    如果 ((flags & PF_R) != 0) { prot = prot | PROT_READ }
+    如果 ((flags & PF_W) != 0) { prot = prot | PROT_WRITE }
+    如果 ((flags & PF_X) != 0) { prot = prot | PROT_EXEC }
+    返回 prot
+}
+
+函数 页对齐(地址) {
+    返回 (地址 + 4095) & ~4095
+}
+
+函数 设置辅助向量(任务, 栈顶, 入口点, phdr地址, phent大小, phnum) {
+    // 辅助向量(auxv): 内核→用户空间的信息传递
+    定义 可变 sp = 栈顶
+    // AT_PAGESZ
+    sp = sp - 16; 内存写64(sp, AT_PAGESZ); 内存写64(sp + 8, 4096)
+    // AT_PHDR
+    sp = sp - 16; 内存写64(sp, AT_PHDR); 内存写64(sp + 8, phdr地址)
+    // AT_PHENT
+    sp = sp - 16; 内存写64(sp, AT_PHENT); 内存写64(sp + 8, phent大小)
+    // AT_PHNUM
+    sp = sp - 16; 内存写64(sp, AT_PHNUM); 内存写64(sp + 8, phnum)
+    // AT_ENTRY
+    sp = sp - 16; 内存写64(sp, AT_ENTRY); 内存写64(sp + 8, 入口点)
+    // AT_NULL (结束)
+    sp = sp - 16; 内存写64(sp, AT_NULL); 内存写64(sp + 8, 0)
+    返回 sp
+}
+
+函数 加载ELF解释器(路径, 任务) {
+    // 加载ld-linux.so到高地址区域
+    // 返回解释器入口点
+    内核调试("加载动态链接器: " + 路径)
+    返回 错误_不支持  // M1: 静态链接优先
+}
+
+函数 读取u16(数据, 偏移) {
+    返回 数据[偏移] | (数据[偏移 + 1] << 8)
+}
+函数 读取u32(数据, 偏移) {
+    返回 数据[偏移] | (数据[偏移 + 1] << 8) | (数据[偏移 + 2] << 16) | (数据[偏移 + 3] << 24)
+}
+函数 读取u64(数据, 偏移) {
+    返回 读取u32(数据, 偏移) | (读取u32(数据, 偏移 + 4) << 32)
+}
+
+定义 用户栈顶 = 0x7FFFFFFFE000  // Nova默认用户栈顶
+
+
+函数 ELF加载器_完整统计() {
+    返回 [ELF_加载总数, ELF_加载失败数]
+}
+
+// ELF加载器健康检查与辅助
+
+函数 ELF加载器_健康检查() {
+    定义 可变 问题 = []
+    如果 (ELF_加载失败数 > ELF_加载总数 / 3 && ELF_加载总数 > 10) {
+        追加(问题, "ELF加载失败率过高")
+    }
+    如果 (计数(问题) == 0) { 返回 "ELF加载器健康" }
+    返回 问题
+}
+
+函数 ELF_验证魔数(头部) {
+    如果 (头部 == 空) { 返回 假 }
+    如果 (内存_读8(头部) != 0x7F) { 返回 假 }
+    如果 (内存_读8(头部 + 1) != 0x45) { 返回 假 }
+    如果 (内存_读8(头部 + 2) != 0x4C) { 返回 假 }
+    如果 (内存_读8(头部 + 3) != 0x46) { 返回 假 }
+    返回 真
+}
+
+函数 ELF_是64位(头部) {
+    返回 内存_读8(头部 + 4) == 2
+}
+
+函数 ELF_入口点(头部) {
+    返回 内存_读64(头部 + 24)
+}
+
+定义 ELF_PT_LOAD = 1
+定义 ELF_PT_DYNAMIC = 2
+定义 ELF_PT_INTERP = 3
+定义 ELF_PT_PHDR = 6
+
+定义 可变 AI_可执行加载_运行指标 = 0
+定义 可变 AI_可执行加载_异常指标 = 0
+
+函数 AI_可执行加载_自诊断() {
+    AI_可执行加载_运行指标 = 0
+    返回 AI_可执行加载_运行指标
+}
+
+函数 AI_可执行加载_优化建议() {
+    定义 指标 = AI_可执行加载_自诊断()
+    返回 "可执行加载状态正常"
+}

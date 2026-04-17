@@ -1,0 +1,449 @@
+// §5 播放控制接口
+
+// media.play() → 承诺<void>
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("./播放循环.nova")
+导入("./解码器.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./解析序列.nova")
+
+
+函数 媒体元素_play(me) {
+    如果 (me == 0) { 返回 }
+    如果 (me.networkState == NETWORK_EMPTY) {
+        媒体元素_加载资源(me)
+    }
+    如果 (me.ended && me.readyState >= HAVE_CURRENT_DATA) {
+        me.currentTime = 0
+        me.ended = 假
+    }
+    me.paused = 假
+    me.autoplaying = 假
+    媒体元素_触发事件(me, "play")
+    如果 (me.readyState < HAVE_FUTURE_DATA) {
+        媒体元素_触发事件(me, "waiting")
+    } 否则 {
+        媒体元素_触发事件(me, "playing")
+        媒体元素_开始播放循环(me)
+    }
+}
+
+// media.pause()
+函数 媒体元素_pause(me) {
+    如果 (me == 0 || me.paused) { 返回 }
+    me.paused = 真
+    媒体元素_触发事件(me, "pause")
+    // 停止解码和渲染循环
+}
+
+// media.load() — 重新加载
+函数 媒体元素_load(me) {
+    如果 (me == 0) { 返回 }
+    媒体元素_停止播放(me)
+    me.networkState = NETWORK_EMPTY
+    me.readyState = HAVE_NOTHING
+    me.currentTime = 0; me.duration = -1
+    me.error = 0; me.paused = 真; me.ended = 假
+    媒体元素_加载资源(me)
+}
+
+// media.currentTime = t (seek)
+函数 媒体元素_seek(me, 目标时间) {
+    如果 (me == 0 || me.readyState == HAVE_NOTHING) { 返回 }
+    定义 目标 = 目标时间
+    如果 (目标 < 0) { 目标 = 0 }
+    如果 (me.duration > 0 && 目标 > me.duration) { 目标 = me.duration }
+    me.seeking = 真
+    媒体元素_触发事件(me, "seeking")
+    me.currentTime = 目标
+    // 刷新解码器缓冲
+    如果 (me.demuxer != 0) { Demuxer_seek(me.demuxer, 目标) }
+    如果 (me.audioDecoder != 0) { 音频Decoder_刷新(me.audioDecoder) }
+    如果 (me.videoDecoder != 0) { 视频Decoder_刷新(me.videoDecoder) }
+    me.seeking = 假
+    媒体元素_触发事件(me, "seeked")
+    如果 (me.readyState >= HAVE_CURRENT_DATA) {
+        媒体元素_触发事件(me, "timeupdate")
+    }
+}
+
+// 音量控制
+函数 媒体元素_setVolume(me, volume) {
+    如果 (me == 0) { 返回 }
+    定义 v = volume
+    如果 (v < 0) { v = 0 }
+    如果 (v > 1024) { v = 1024 }
+    如果 (me.volume != v) {
+        me.volume = v
+        媒体元素_触发事件(me, "volumechange")
+    }
+}
+
+函数 媒体元素_setMuted(me, muted) {
+    如果 (me == 0) { 返回 }
+    如果 (me.muted != muted) {
+        me.muted = muted
+        媒体元素_触发事件(me, "volumechange")
+    }
+}
+
+函数 媒体元素_setPlaybackRate(me, rate) {
+    如果 (me == 0) { 返回 }
+    如果 (rate < 256) { rate = 256 }     // 最小0.25x
+    如果 (rate > 16384) { rate = 16384 } // 最大16x
+    如果 (me.playbackRate != rate) {
+        me.playbackRate = rate
+        媒体元素_触发事件(me, "ratechange")
+    }
+}
+
+// §6 资源加载
+
+函数 媒体元素_加载资源(me) {
+    如果 (me == 0 || me.src == 0) {
+        me.networkState = NETWORK_NO_SOURCE
+        返回
+    }
+    me.networkState = NETWORK_LOADING
+    me.currentSrc = me.src
+
+    // 创建解复用器
+    me.demuxer = Demuxer_创建(me.currentSrc)
+    如果 (me.demuxer == 0) {
+        me.error = MEDIA_ERR_SRC_NOT_SUPPORTED
+        媒体元素_触发事件(me, "error")
+        返回
+    }
+
+    // 探测容器格式
+    定义 格式 = Demuxer_探测格式(me.demuxer)
+    如果 (格式 == 0) {
+        me.error = MEDIA_ERR_SRC_NOT_SUPPORTED
+        媒体元素_触发事件(me, "error")
+        返回
+    }
+
+    // 解析轨道信息
+    Demuxer_解析轨道(me.demuxer, me)
+
+    // 创建解码器
+    如果 (me.音频轨道数 > 0) {
+        me.audioDecoder = 音频Decoder_创建(me.音频轨道[0].编解码器)
+        me.audio渲染er = 音频渲染er_创建(me.音频轨道[0].采样率, me.音频轨道[0].声道数)
+    }
+    如果 (me.视频轨道数 > 0) {
+        me.videoDecoder = 视频Decoder_创建(me.视频轨道[0].编解码器)
+        me.video渲染er = 视频渲染er_创建(me.视频轨道[0].宽度, me.视频轨道[0].高度)
+        me.videoWidth = me.视频轨道[0].宽度
+        me.videoHeight = me.视频轨道[0].高度
+    }
+
+    // 就绪状态转换
+    me.readyState = HAVE_METADATA
+    媒体元素_触发事件(me, "loadedmetadata")
+    me.readyState = HAVE_CURRENT_DATA
+    媒体元素_触发事件(me, "loadeddata")
+    me.networkState = NETWORK_IDLE
+    媒体元素_触发事件(me, "canplay")
+}
+
+// §7 媒体状态常量
+
+定义 NETWORK_EMPTY = 0
+定义 NETWORK_IDLE = 1
+定义 NETWORK_LOADING = 2
+定义 NETWORK_NO_SOURCE = 3
+
+定义 HAVE_NOTHING = 0
+定义 HAVE_METADATA = 1
+定义 HAVE_CURRENT_DATA = 2
+定义 HAVE_FUTURE_DATA = 3
+定义 HAVE_ENOUGH_DATA = 4
+
+定义 MEDIA_ERR_ABORTED = 1
+定义 MEDIA_ERR_NETWORK = 2
+定义 MEDIA_ERR_DECODE = 3
+定义 MEDIA_ERR_SRC_NOT_SUPPORTED = 4
+
+函数 媒体_网络状态名(状态) {
+    如果 (状态 == NETWORK_EMPTY) { 返回 "EMPTY" }
+    如果 (状态 == NETWORK_IDLE) { 返回 "IDLE" }
+    如果 (状态 == NETWORK_LOADING) { 返回 "LOADING" }
+    如果 (状态 == NETWORK_NO_SOURCE) { 返回 "NO_SOURCE" }
+    返回 "UNKNOWN"
+}
+
+函数 媒体_就绪状态名(状态) {
+    如果 (状态 == HAVE_NOTHING) { 返回 "NOTHING" }
+    如果 (状态 == HAVE_METADATA) { 返回 "METADATA" }
+    如果 (状态 == HAVE_CURRENT_DATA) { 返回 "CURRENT_DATA" }
+    如果 (状态 == HAVE_FUTURE_DATA) { 返回 "FUTURE_DATA" }
+    如果 (状态 == HAVE_ENOUGH_DATA) { 返回 "ENOUGH_DATA" }
+    返回 "UNKNOWN"
+}
+
+函数 媒体_错误名(错误码) {
+    如果 (错误码 == 0) { 返回 "无错误" }
+    如果 (错误码 == MEDIA_ERR_ABORTED) { 返回 "ABORTED" }
+    如果 (错误码 == MEDIA_ERR_NETWORK) { 返回 "NETWORK" }
+    如果 (错误码 == MEDIA_ERR_DECODE) { 返回 "DECODE" }
+    如果 (错误码 == MEDIA_ERR_SRC_NOT_SUPPORTED) { 返回 "SRC_NOT_SUPPORTED" }
+    返回 "UNKNOWN"
+}
+
+// §8 媒体元素结构
+
+结构 媒体元素 {
+    src,
+    currentSrc,
+    networkState,
+    readyState,
+    error,
+    paused,
+    ended,
+    seeking,
+    autoplaying,
+    currentTime,
+    duration,
+    volume,
+    muted,
+    playbackRate,
+    defaultPlaybackRate,
+    videoWidth,
+    videoHeight,
+    loop,
+    autoplay,
+    controls,
+    crossOrigin,
+    preload,
+    demuxer,
+    audioDecoder,
+    videoDecoder,
+    audio渲染er,
+    video渲染er,
+    音频轨道,
+    音频轨道数,
+    视频轨道,
+    视频轨道数,
+    缓冲范围,
+    事件处理器,
+}
+
+函数 媒体元素_创建() {
+    定义 me = 媒体元素 {}
+    me.src = 0
+    me.currentSrc = 0
+    me.networkState = NETWORK_EMPTY
+    me.readyState = HAVE_NOTHING
+    me.error = 0
+    me.paused = 真
+    me.ended = 假
+    me.seeking = 假
+    me.autoplaying = 假
+    me.currentTime = 0
+    me.duration = -1
+    me.volume = 1024
+    me.muted = 假
+    me.playbackRate = 1024
+    me.defaultPlaybackRate = 1024
+    me.videoWidth = 0
+    me.videoHeight = 0
+    me.loop = 假
+    me.autoplay = 假
+    me.controls = 假
+    me.crossOrigin = 0
+    me.preload = 0
+    me.demuxer = 0
+    me.audioDecoder = 0
+    me.videoDecoder = 0
+    me.audio渲染er = 0
+    me.video渲染er = 0
+    me.音频轨道 = []
+    me.音频轨道数 = 0
+    me.视频轨道 = []
+    me.视频轨道数 = 0
+    me.缓冲范围 = []
+    me.事件处理器 = []
+    返回 me
+}
+
+// §9 播放循环
+
+定义 可变 播放_活跃元素数 = 0
+定义 可变 播放_总帧数 = 0
+定义 可变 播放_丢帧数 = 0
+
+函数 媒体元素_开始播放循环(me) {
+    如果 (me == 0 || me.paused) { 返回 }
+    播放_活跃元素数 = 播放_活跃元素数 + 1
+}
+
+函数 媒体元素_停止播放(me) {
+    如果 (me == 0) { 返回 }
+    me.paused = 真
+    如果 (播放_活跃元素数 > 0) { 播放_活跃元素数 = 播放_活跃元素数 - 1 }
+}
+
+函数 媒体元素_播放帧(me, 帧时间us) {
+    如果 (me == 0 || me.paused) { 返回 }
+    定义 增量 = 帧时间us * me.playbackRate / 1024 / 1000
+    me.currentTime = me.currentTime + 增量
+    播放_总帧数 = 播放_总帧数 + 1
+    如果 (me.duration > 0 && me.currentTime >= me.duration) {
+        如果 (me.loop) {
+            me.currentTime = 0
+            媒体元素_触发事件(me, "seeked")
+        } 否则 {
+            me.currentTime = me.duration
+            me.ended = 真
+            me.paused = 真
+            媒体元素_触发事件(me, "ended")
+        }
+    }
+    媒体元素_触发事件(me, "timeupdate")
+}
+
+// §10 事件系统
+
+函数 媒体元素_触发事件(me, 事件名) {
+    如果 (me == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < 计数(me.事件处理器)) {
+        如果 (me.事件处理器[i].名称 == 事件名) {
+            me.事件处理器[i].处理函数(me, 事件名)
+        }
+        i = i + 1
+    }
+}
+
+函数 媒体元素_注册事件(me, 事件名, 处理函数) {
+    如果 (me == 0) { 返回 }
+    追加(me.事件处理器, { 名称: 事件名, 处理函数: 处理函数 })
+}
+
+函数 媒体元素_移除事件(me, 事件名) {
+    如果 (me == 0) { 返回 }
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    当 (i < 计数(me.事件处理器)) {
+        如果 (me.事件处理器[i].名称 != 事件名) {
+            追加(新列表, me.事件处理器[i])
+        }
+        i = i + 1
+    }
+    me.事件处理器 = 新列表
+}
+
+// §11 缓冲范围
+
+函数 媒体元素_缓冲长度(me) {
+    如果 (me == 0) { 返回 0 }
+    返回 计数(me.缓冲范围)
+}
+
+函数 媒体元素_缓冲起始(me, 索引) {
+    如果 (me == 0 || 索引 >= 计数(me.缓冲范围)) { 返回 0 }
+    返回 me.缓冲范围[索引].起始
+}
+
+函数 媒体元素_缓冲结束(me, 索引) {
+    如果 (me == 0 || 索引 >= 计数(me.缓冲范围)) { 返回 0 }
+    返回 me.缓冲范围[索引].结束
+}
+
+函数 媒体元素_添加缓冲范围(me, 起始, 结束) {
+    如果 (me == 0) { 返回 }
+    追加(me.缓冲范围, { 起始: 起始, 结束: 结束 })
+}
+
+函数 媒体元素_总缓冲时长(me) {
+    如果 (me == 0) { 返回 0 }
+    定义 可变 总 = 0
+    定义 可变 i = 0
+    当 (i < 计数(me.缓冲范围)) {
+        总 = 总 + me.缓冲范围[i].结束 - me.缓冲范围[i].起始
+        i = i + 1
+    }
+    返回 总
+}
+
+// §12 媒体统计与健康检查
+
+定义 可变 媒体_创建总数 = 0
+定义 可变 媒体_销毁总数 = 0
+定义 可变 媒体_错误总数 = 0
+
+函数 媒体_统计() {
+    返回 {
+        活跃播放: 播放_活跃元素数,
+        总帧数: 播放_总帧数,
+        丢帧数: 播放_丢帧数,
+        创建: 媒体_创建总数,
+        销毁: 媒体_销毁总数,
+        错误: 媒体_错误总数,
+    }
+}
+
+函数 媒体_健康检查() {
+    定义 可变 问题 = []
+    如果 (播放_丢帧数 > 播放_总帧数 / 10 && 播放_总帧数 > 100) {
+        追加(问题, "媒体丢帧率过高: " + 整数转字符串(播放_丢帧数 * 100 / 播放_总帧数) + "%")
+    }
+    如果 (媒体_错误总数 > 10) {
+        追加(问题, "媒体错误过多: " + 整数转字符串(媒体_错误总数))
+    }
+    如果 (计数(问题) == 0) { 返回 "媒体子系统健康" }
+    返回 问题
+}
+
+函数 媒体_重置统计() {
+    播放_活跃元素数 = 0
+    播放_总帧数 = 0
+    播放_丢帧数 = 0
+    媒体_创建总数 = 0
+    媒体_销毁总数 = 0
+    媒体_错误总数 = 0
+}
+
+函数 媒体_完整统计() {
+    返回 [播放_活跃元素数, 播放_总帧数, 播放_丢帧数, 媒体_创建总数, 媒体_错误总数]
+}
+
+函数 媒体元素_诊断(me) {
+    如果 (me == 0) { 返回 "元素为空" }
+    返回 {
+        源: me.currentSrc,
+        网络状态: 媒体_网络状态名(me.networkState),
+        就绪状态: 媒体_就绪状态名(me.readyState),
+        暂停: me.paused,
+        结束: me.ended,
+        当前时间: me.currentTime,
+        时长: me.duration,
+        音量: me.volume,
+        播放速率: me.playbackRate,
+        视频宽: me.videoWidth,
+        视频高: me.videoHeight,
+        缓冲段数: 计数(me.缓冲范围),
+        错误: 媒体_错误名(me.error),
+    }
+}
+
+定义 可变 AI_播放控制接_带宽估计 = 0
+定义 可变 AI_播放控制接_丢包窗口 = []
+
+函数 AI_播放控制接_带宽预测(发送字节, 耗时毫秒) {
+    如果 (耗时毫秒 == 0) { 返回 AI_播放控制接_带宽估计 }
+    定义 当前 = 发送字节 * 1000 / 耗时毫秒
+    AI_播放控制接_带宽估计 = AI_播放控制接_带宽估计 * 700 / 1000 + 当前 * 300 / 1000
+    返回 AI_播放控制接_带宽估计
+}
+
+函数 AI_播放控制接_拥塞建议(丢包率) {
+    追加(AI_播放控制接_丢包窗口, 丢包率)
+    如果 (计数(AI_播放控制接_丢包窗口) > 10) { 列表_移除(AI_播放控制接_丢包窗口, 0) }
+    如果 (丢包率 > 50) { 返回 "减半窗口" }
+    如果 (丢包率 < 5) { 返回 "增大窗口" }
+    返回 "保持"
+}

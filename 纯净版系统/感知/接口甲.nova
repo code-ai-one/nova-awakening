@@ -1,0 +1,135 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./运行域.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+
+// §5 Reporting 接口
+
+定义 REPORT_DEPRECATION   = 0
+定义 REPORT_INTERVENTION  = 1
+定义 REPORT_CSP_VIOLATION = 2
+定义 REPORT_CRASH         = 3
+定义 REPORT_PERMISSION    = 4
+
+结构 Report {
+    类型,    // u8 REPORT_xxx
+    url,    // u64 产生报告的文档URL
+    body,    // u64 报告体(序列)
+    时间戳,
+    下一个,
+}
+
+结构 ReportingObserver {
+    回调,    // u64 Nova函数*
+    类型过滤,    // u32 REPORT_xxx位掩码(0=全部)
+    buffered,
+    // 缓冲
+    队列头,
+    队列大小,
+}
+
+定义 可变 报告观察者列表 = 0
+定义 可变 报告观察者数 = 0
+定义 可变 报告缓冲头 = 0
+定义 可变 报告缓冲数 = 0
+
+函数 ReportingObserver_创建(回调, 类型过滤, buffered) {
+    定义 ro = 堆_分配(ReportingObserver)
+    ro.回调 = 回调; ro.类型过滤 = 类型过滤; ro.buffered = buffered
+    ro.队列头 = 0; ro.队列大小 = 0
+    返回 ro
+}
+
+函数 ReportingObserver_observe(ro) {
+    如果 (ro == 0) { 返回 }
+    // 添加到全局观察者列表
+    // 如果buffered=true, 推送已有的缓冲报告
+}
+
+函数 ReportingObserver_disconnect(ro) {
+    如果 (ro == 0) { 返回 }
+    // 从全局列表移除
+}
+
+函数 ReportingObserver_takeRecords(ro) {
+    如果 (ro == 0) { 返回 0 }
+    定义 头 = ro.队列头
+    ro.队列头 = 0; ro.队列大小 = 0
+    返回 头
+}
+
+// 生成报告(内部调用)
+函数 错误Reporting_记录(error) {
+    如果 (error == 0) { 返回 }
+    // 创建Report并推送到所有观察者
+}
+
+函数 Reporting_弃用警告(特性名, message) {
+    定义 report = 堆_分配(Report)
+    report.类型 = REPORT_DEPRECATION
+    report.body = message; report.时间戳 = 平台_获取高精度时间()
+    report.下一个 = 报告缓冲头; 报告缓冲头 = report
+    报告缓冲数 = 报告缓冲数 + 1
+    // Console警告
+    Console_记录(1, message, 0, 0)    // CONSOLE_WARN
+}
+
+函数 Reporting_干预(特性名, message) {
+    定义 report = 堆_分配(Report)
+    report.类型 = REPORT_INTERVENTION
+    report.body = message; report.时间戳 = 平台_获取高精度时间()
+    report.下一个 = 报告缓冲头; 报告缓冲头 = report
+    报告缓冲数 = 报告缓冲数 + 1
+}
+
+// Report-To HTTP头: 自动发送到服务器
+函数 Reporting_发送到端点(enNova直接偏好优化int_url) {
+    如果 (enNova直接偏好优化int_url == 0 || 报告缓冲头 == 0) { 返回 }
+    // 将缓冲的报告序列化为序列
+    // 通过fetch POST到enNova直接偏好优化int_url
+    // 使用Beacon 接口(navigator.sendBeacon)保证送达
+}
+
+// §6 错误聚合与统计
+
+结构 错误Aggregation {
+    // 按错误签名聚合
+    签名,    // u64 message+filename+lineno的哈希
+    消息,
+    文件,
+    行号,
+    计数,
+    首次时间,
+    最后时间,
+    下一个,
+}
+
+定义 可变 错误聚合头 = 0
+定义 可变 错误聚合数 = 0
+
+函数 错误Aggregation_记录(message, filename, lineno) {
+    如果 (message == 0) { 返回 }
+    // 计算签名
+    定义 签名 = 哈希(message) ^ (lineno * 31)
+
+    // 查找已有聚合
+    定义 可变 agg = 错误聚合头
+    当 (agg != 0) {
+        如果 (agg.签名 == 签名 && 字符串_相等(agg.消息, message)) {
+            agg.计数 = agg.计数 + 1
+            agg.最后时间 = 平台_获取高精度时间()
+            返回
+        }
+        agg = agg.下一个
+    }
+
+    // 新增聚合
+    定义 新agg = 堆_分配(错误Aggregation)
+    新agg.签名 = 签名; 新agg.消息 = message; 新agg.文件 = filename
+    新agg.行号 = lineno; 新agg.计数 = 1
+    新agg.首次时间 = 平台_获取高精度时间()
+    新agg.最后时间 = 新agg.首次时间
+    新agg.下一个 = 错误聚合头; 错误聚合头 = 新agg
+    错误聚合数 = 错误聚合数 + 1
+}

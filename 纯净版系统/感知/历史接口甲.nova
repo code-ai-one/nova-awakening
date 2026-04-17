@@ -1,0 +1,164 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/控制台输出.nova")
+导入("../推理/小整数快速判.nova")
+导入("./内核直连层.nova")
+
+// §6 历史 接口 + Location 接口
+
+结构 历史Entry {
+    url,
+    状态,    // u64 JS对象(序列化)
+    标题,
+}
+
+结构 历史 {
+    条目,    // [128]历史Entry
+    数量,
+    当前索引,
+}
+
+函数 历史_pushState(history, 状态, 标题, url) {
+    如果 (history == 0 || history.数量 >= 128) { 返回 }
+    // 清除当前位置之后的前进历史
+    history.数量 = history.当前索引 + 1
+    history.条目[history.数量].url = url
+    history.条目[history.数量].状态 = 状态
+    history.条目[history.数量].标题 = 标题
+    history.当前索引 = history.数量
+    history.数量 = history.数量 + 1
+    // 不触发导航, 只更新URL栏
+}
+
+函数 历史_replaceState(history, 状态, 标题, url) {
+    如果 (history == 0) { 返回 }
+    history.条目[history.当前索引].url = url
+    history.条目[history.当前索引].状态 = 状态
+    history.条目[history.当前索引].标题 = 标题
+}
+
+函数 历史_back(history) {
+    如果 (history == 0 || history.当前索引 == 0) { 返回 }
+    history.当前索引 = history.当前索引 - 1
+    // 触发popstate事件
+}
+
+函数 历史_forward(history) {
+    如果 (history == 0 || history.当前索引 >= history.数量 - 1) { 返回 }
+    history.当前索引 = history.当前索引 + 1
+    // 触发popstate事件
+}
+
+// §7 IntersectionObserver — 可见性观察(性能关键接口)
+
+结构 IntersectionObserver {
+    回调,    // u64 JS回调
+    根元素,    // u64 根(0=viewport)
+    根边距,    // [4]i32 top/right/bottom/left
+    阈值,    // [8]u32 Q10 (0-1024)
+    阈值数,
+    观察列表,    // [64]u64 元素* 数组
+    观察数,
+}
+
+函数 IntersectionObserver_创建(回调, options) {
+    定义 obs = 堆_分配(IntersectionObserver)
+    obs.回调 = 回调
+    obs.根元素 = 0
+    obs.阈值数 = 1
+    obs.阈值[0] = 0    // 默认阈值0(任何可见即触发)
+    obs.观察数 = 0
+    返回 obs
+}
+
+函数 IntersectionObserver_observe(obs, 元素) {
+    如果 (obs == 0 || obs.观察数 >= 64) { 返回 }
+    obs.观察列表[obs.观察数] = 元素
+    obs.观察数 = obs.观察数 + 1
+}
+
+函数 IntersectionObserver_unobserve(obs, 元素) {
+    如果 (obs == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < obs.观察数) {
+        如果 (obs.观察列表[i] == 元素) {
+            obs.观察数 = obs.观察数 - 1
+            obs.观察列表[i] = obs.观察列表[obs.观察数]
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// 辅助函数声明
+函数 选项_读字符串(obj, key) {
+    如果 (obj == 0 || key == 0) { 返回 0 }
+    定义 val = Nova对象_获取属性(0, obj, key)
+    如果 (val == Nova_未定义 || val == 0) { 返回 0 }
+    返回 JSValue_获取字符串(val)
+}
+函数 选项_读对象(obj, key) {
+    如果 (obj == 0 || key == 0) { 返回 0 }
+    定义 val = Nova对象_获取属性(0, obj, key)
+    如果 (val == Nova_未定义 || !JSValue_IsObject(0, val)) { 返回 0 }
+    返回 val
+}
+函数 选项_读布尔(obj, key) {
+    如果 (obj == 0) { 返回 假 }
+    定义 val = Nova对象_获取属性(0, obj, key)
+    如果 (val == Nova_真) { 返回 真 }
+    如果 (val == Nova_假) { 返回 假 }
+    // truthy: 非0非null非undefined
+    返回 val != 0 && val != Nova_未定义 && val != Nova_空值
+}
+函数 字符串_相等_忽略大小写(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 len_a = 字节长度(a)
+    定义 len_b = 字节长度(b)
+    如果 (len_a != len_b) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < len_a) {
+        定义 ca = 内存_读8(a + i)
+        定义 cb = 内存_读8(b + i)
+        // 大写转小写
+        如果 (ca >= 0x41 && ca <= 0x5A) { ca = ca + 0x20 }
+        如果 (cb >= 0x41 && cb <= 0x5A) { cb = cb + 0x20 }
+        如果 (ca != cb) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+函数 Nova_创建承诺(Nova运行时实例) {
+    定义 p = 堆_分配(Nova承诺)
+    p.状态 = 0; p.值 = Nova_未定义
+    p.then回调数 = 0; p.then回调 = 0
+    p.catch回调数 = 0; p.catch回调 = 0
+    返回 Nova值_创建_Object(Nova运行时实例, p)
+}
+函数 Nova_调用函数(Nova运行时实例, func, arg1, arg2) { Nova调用(func, arg1, arg2, 2) }
+函数 Nova_调用函数_带参(Nova运行时实例, func, arg) { Nova调用(func, arg, 0, 1) }
+函数 序列_解析(数据, 长度) {
+    // 委托给Nova的序列解析器
+    如果 (数据 == 0 || 长度 == 0) { 返回 Nova_未定义 }
+    如果 (长度 > 16777216) { 返回 Nova_未定义 }
+    定义 str = 堆_分配(长度 + 1)
+    内存_复制(str, 数据, 长度)
+    内存_写8(str + 长度, 0)
+    定义 result = 序列Parser_解析(str, 长度)
+    堆_释放(str)
+    返回 result
+}
+函数 字符串_从内存(ptr, len) { 返回 ptr }
+函数 取数_序列化请求(req) {
+    // 将取数 Request对象序列化为HTTP请求字节流
+    如果 (req == 0) { 返回 0 }
+    定义 buf = 堆_分配(4096)
+    定义 len = HTTP_序列化请求(req, buf, 4096)
+    定义 result = 堆_分配(16)
+    内存_写64(result, buf)
+    内存_写64(result + 8, len)
+    返回 result
+}
+函数 取数_注册回调(req, promise, Nova运行时实例) { req.回调promise = promise; req.回调Nova运行时实例 = Nova运行时实例 }

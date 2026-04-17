@@ -1,0 +1,36 @@
+函数 matvec(M, cols, v) {
+    定义 rows = 计数(M) / cols
+    定义 可变 r = []
+    定义 可变 i = 0
+    当 (i < rows) {
+        定义 可变 s = 0.0
+        定义 可变 j = 0
+        当 (j < cols) {
+            s = s + M[i * cols + j] * v[j]
+            j = j + 1
+        }
+        追加(r, s)
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 主程序() {
+    定义 N = 4
+    定义 可变 M = []
+    定义 可变 v = []
+    定义 可变 i = 0
+    当 (i < N * N) { 追加(M, 0.5) i = i + 1 }
+    i = 0
+    当 (i < N) { 追加(v, 1.0) i = i + 1 }
+    // r[0] = 2.0 per iter, 3 iter → 6.0 bits = 4618441417868443648
+    定义 可变 checksum = 0.0
+    定义 可变 iter = 0
+    当 (iter < 3) {
+        定义 r = matvec(M, N, v)
+        checksum = checksum + r[0]
+        iter = iter + 1
+    }
+    打印(字符串拼接("checksum bits=", 转字符串(checksum)))
+    返回 0
+}

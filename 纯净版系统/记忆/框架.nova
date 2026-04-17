@@ -1,0 +1,227 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("./超级块.nova")
+导入("./文件节点创.nova")
+导入("./记忆丙.nova")
+导入("./目录项添加.nova")
+导入("./路径缓初始.nova")
+导入("./文件节点缓.nova")
+导入("./文件系统类.nova")
+导入("../中枢/硬链接.nova")
+
+//   1. sysfs是kobject层级在用户空间的映射 — /sys目录
+//   2. 每个kobject对应sysfs中一个目录
+//   3. 每个sysfs_attribute对应目录中一个文件(show/store回调)
+//   4. 用户通过cat/echo读写sysfs文件 → 调用内核show/store
+//   5. 顶级目录: /sys/devices, /sys/bus, /sys/class, /sys/block, /sys/kernel
+
+定义 SYSFS_MAGIC = 0x62656572
+
+定义 可变 sysfs_sb = 空
+定义 可变 sysfs_根Nova路径项 = 空
+定义 可变 sysfs_根kobject = 空
+
+定义 可变 sysfs_devices_kobj = 空
+定义 可变 sysfs_bus_kobj = 空
+定义 可变 sysfs_class_kobj = 空
+定义 可变 sysfs_block_kobj = 空
+定义 可变 sysfs_kernel_kobj = 空
+定义 可变 sysfs_module_kobj = 空
+定义 可变 sysfs_firmware_kobj = 空
+
+// 初始化和挂载
+
+函数 sysfs_初始化() {
+    注册文件系统_完整("sysfs", sysfs_挂载, 0, 空)
+
+    // 创建根kobject
+    sysfs_根kobject = kobject_创建("", 空)
+
+    // 创建顶级目录
+    sysfs_devices_kobj = kobject_创建_并注册("devices", sysfs_根kobject, 空)
+    sysfs_bus_kobj = kobject_创建_并注册("bus", sysfs_根kobject, 空)
+    sysfs_class_kobj = kobject_创建_并注册("class", sysfs_根kobject, 空)
+    sysfs_block_kobj = kobject_创建_并注册("block", sysfs_根kobject, 空)
+    sysfs_kernel_kobj = kobject_创建_并注册("kernel", sysfs_根kobject, 空)
+    sysfs_module_kobj = kobject_创建_并注册("module", sysfs_根kobject, 空)
+    sysfs_firmware_kobj = kobject_创建_并注册("firmware", sysfs_根kobject, 空)
+
+    内核信息("sysfs: 初始化完成 (/sys/devices,bus,class,block,kernel,module,firmware)")
+}
+
+函数 sysfs_挂载(fs类型, 标志, 设备名, 选项) {
+    sysfs_sb = 超级块_创建(SYSFS_MAGIC, 4096, 0, "sysfs")
+
+    // 创建根Nova路径项
+    定义 根Nova文件节点 = Nova文件节点_创建(类型_目录, 0o555)
+    sysfs_根Nova路径项 = 目录项_创建("/", 根Nova文件节点, 空)
+    超级块_设置根(sysfs_sb, sysfs_根Nova路径项)
+
+    // 为每个顶级kobject创建目录Nova路径项
+    sysfs_同步kobject目录(sysfs_根kobject, sysfs_根Nova路径项)
+
+    返回 sysfs_sb
+}
+
+// sysfs目录操作 (kobject ↔ Nova路径项映射)
+
+函数 sysfs_创建kobject目录(kobj) {
+    如果 (kobj == 空 || sysfs_根Nova路径项 == 空) { 返回 空 }
+
+    // 查找父Nova路径项
+    定义 可变 父Nova路径项 = sysfs_根Nova路径项
+    如果 (kobj.父 != 空 && kobj.父.sysfs目录 != 空) {
+        父Nova路径项 = kobj.父.sysfs目录
+    }
+
+    // 创建目录Nova路径项
+    定义 Nova文件节点 = Nova文件节点_创建(类型_目录, 0o555)
+    定义 Nova路径项 = 目录项_创建(kobj.名称, Nova文件节点, 父Nova路径项)
+    目录项_添加子(父Nova路径项, Nova路径项)
+
+    返回 Nova路径项
+}
+
+函数 sysfs_移除kobject目录(kobj) {
+    如果 (kobj == 空 || kobj.sysfs目录 == 空) { 返回 }
+    定义 Nova路径项 = kobj.sysfs目录
+    定义 父 = 目录项_父(Nova路径项)
+    如果 (父 != 空) {
+        目录项_移除子(父, Nova路径项)
+    }
+    kobj.sysfs目录 = 空
+}
+
+函数 sysfs_同步kobject目录(kobj, 父Nova路径项) {
+    如果 (kobj == 空) { 返回 }
+    定义 子列表 = kobj.子列表
+    定义 可变 i = 0
+    当 (i < 计数(子列表)) {
+        定义 子kobj = 子列表[i]
+        定义 Nova文件节点 = Nova文件节点_创建(类型_目录, 0o555)
+        定义 Nova路径项 = 目录项_创建(子kobj.名称, Nova文件节点, 父Nova路径项)
+        目录项_添加子(父Nova路径项, Nova路径项)
+        子kobj.sysfs目录 = Nova路径项
+        // 递归同步子目录
+        sysfs_同步kobject目录(子kobj, Nova路径项)
+        i = i + 1
+    }
+}
+
+// sysfs属性文件 
+// 每个属性 = 一个虚拟文件, 读时调show(), 写时调store()
+
+函数 sysfs_创建属性文件(kobj, 属性) {
+    如果 (kobj == 空 || kobj.sysfs目录 == 空 || 属性 == 空) { 返回 错误_无效参数 }
+
+    定义 Nova文件节点 = Nova文件节点_创建(类型_普通文件, 属性.模式)
+    // 设置文件操作为sysfs属性读写
+    Nova文件节点_设置file_ops(Nova文件节点, sysfs_属性_file_ops(kobj, 属性))
+    Nova文件节点_设私有(Nova文件节点, [kobj, 属性])
+
+    定义 Nova路径项 = 目录项_创建(属性.名称, Nova文件节点, kobj.sysfs目录)
+    目录项_添加子(kobj.sysfs目录, Nova路径项)
+    返回 成功
+}
+
+函数 sysfs_移除属性文件(kobj, 属性名) {
+    如果 (kobj == 空 || kobj.sysfs目录 == 空) { 返回 }
+    定义 子 = 目录项_查找子(kobj.sysfs目录, 属性名)
+    如果 (子 != 空) {
+        目录项_移除子(kobj.sysfs目录, 子)
+    }
+}
+
+// sysfs属性文件操作 (show/store回调桥接)
+// cat /sys/xxx → sysfs_attr_show → attr.show(kobj, attr, buf)
+// echo xxx > /sys/xxx → sysfs_attr_store → attr.store(kobj, attr, buf, len)
+
+函数 sysfs_属性_file_ops(kobj, 属性) {
+    返回 {
+        读: sysfs_属性_读,
+        写: sysfs_属性_写
+    }
+}
+
+函数 sysfs_属性_读(文件, 缓冲, 大小, 位置) {
+    定义 私有 = Nova文件节点_获取私有(文件_Nova文件节点(文件))
+    如果 (私有 == 空) { 返回 0 }
+    定义 kobj = 私有[0]
+    定义 属性 = 私有[1]
+
+    如果 (属性.show == 空) { 返回 错误_权限 }
+
+    // 调用show回调生成内容
+    定义 内容 = 属性.show(kobj, 属性, 缓冲)
+    如果 (内容 == 空) { 返回 0 }
+    返回 内容
+}
+
+函数 sysfs_属性_写(文件, 缓冲, 大小, 位置) {
+    定义 私有 = Nova文件节点_获取私有(文件_Nova文件节点(文件))
+    如果 (私有 == 空) { 返回 0 }
+    定义 kobj = 私有[0]
+    定义 属性 = 私有[1]
+
+    如果 (属性.store == 空) { 返回 错误_权限 }
+
+    返回 属性.store(kobj, 属性, 缓冲, 大小)
+}
+
+// 便捷接口: 创建sysfs组/二进制属性
+
+函数 sysfs_创建属性组(kobj, 属性列表) {
+    定义 可变 i = 0
+    当 (i < 计数(属性列表)) {
+        sysfs_创建属性文件(kobj, 属性列表[i])
+        i = i + 1
+    }
+    返回 成功
+}
+
+函数 sysfs_创建链接(kobj, 目标kobj, 名称) {
+    如果 (kobj == 空 || kobj.sysfs目录 == 空) { 返回 错误_无效参数 }
+    定义 目标路径 = kobject_路径(目标kobj)
+    定义 Nova文件节点 = Nova文件节点_创建(类型_符号链接, 0o777)
+    Nova文件节点_设置链接目标(Nova文件节点, 目标路径)
+    定义 Nova路径项 = 目录项_创建(名称, Nova文件节点, kobj.sysfs目录)
+    目录项_添加子(kobj.sysfs目录, Nova路径项)
+    返回 成功
+}
+
+// 获取全局kobject (供驱动/总线/类注册使用)
+
+函数 sysfs_devices_root()  { 返回 sysfs_devices_kobj }
+函数 sysfs_bus_root()      { 返回 sysfs_bus_kobj }
+函数 sysfs_class_root()    { 返回 sysfs_class_kobj }
+函数 sysfs_block_root()    { 返回 sysfs_block_kobj }
+函数 sysfs_kernel_root()   { 返回 sysfs_kernel_kobj }
+函数 sysfs_module_root()   { 返回 sysfs_module_kobj }
+
+// 完整统计
+
+函数 sysfs_完整统计() {
+    返回 [sysfs_已初始化]
+}
+
+定义 可变 AI_框架_热文件表 = []
+
+函数 AI_框架_访问模式(路径) {
+    定义 可变 i = 0
+    当 (i < 计数(AI_框架_热文件表)) {
+        如果 (AI_框架_热文件表[i].路径 == 路径) {
+            AI_框架_热文件表[i].频率 = AI_框架_热文件表[i].频率 + 1
+            返回 AI_框架_热文件表[i].频率
+        }
+        i = i + 1
+    }
+    如果 (计数(AI_框架_热文件表) < 128) {
+        追加(AI_框架_热文件表, { 路径: 路径, 频率: 1 })
+    }
+    返回 1
+}
+
+函数 AI_框架_预读建议(文件大小, 已读偏移) {
+    如果 (已读偏移 > 文件大小 * 80 / 100) { 返回 0 }
+    返回 32768
+}

@@ -1,0 +1,146 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("./底层系统调.nova")
+
+// §11 控制台输出
+
+函数 平台_控制台输出(str, len) {
+    如果 (str == 0) { 返回 }
+    如果 (len == 0) { len = 字节长度(str) }
+    系统调用_write(1, str, len)   // stdout = fd 1
+}
+
+函数 平台_控制台错误(str, len) {
+    如果 (str == 0) { 返回 }
+    如果 (len == 0) { len = 字节长度(str) }
+    系统调用_write(2, str, len)   // stderr = fd 2
+}
+
+函数 内核信息(msg) {
+    如果 (msg == 0) { 返回 }
+    平台_控制台错误(msg, 字节长度(msg))
+    平台_控制台错误("\n", 1)
+}
+
+// §12 内存操作辅助
+
+函数 内存_置零(dst, len) {
+    // 8字节对齐快速清零
+    定义 可变 i = 0
+    定义 align_end = len & (~7)
+    当 (i < align_end) {
+        内存_写64(dst + i, 0)
+        i = i + 8
+    }
+    当 (i < len) {
+        内存_写8(dst + i, 0)
+        i = i + 1
+    }
+}
+
+函数 内存_复制(dst, src, len) {
+    如果 (dst == 0 || src == 0 || len <= 0) { 返回 }
+    // 8字节对齐快速复制
+    定义 可变 i = 0
+    定义 align_end = len & (~7)
+    当 (i < align_end) {
+        内存_写64(dst + i, 内存_读64(src + i))
+        i = i + 8
+    }
+    当 (i < len) {
+        内存_写8(dst + i, 内存_读8(src + i))
+        i = i + 1
+    }
+}
+
+函数 内存_比较(a, b, len) {
+    定义 可变 i = 0
+    当 (i < len) {
+        定义 da = 内存_读8(a + i)
+        定义 db = 内存_读8(b + i)
+        如果 (da != db) { 返回 da - db }
+        i = i + 1
+    }
+    返回 0
+}
+
+// §13 字符串辅助
+
+函数 字节长度(str) {
+    如果 (str == 0) { 返回 0 }
+    定义 可变 len = 0
+    当 (内存_读8(str + len) != 0) { len = len + 1 }
+    返回 len
+}
+
+函数 字节取(str, idx) {
+    返回 内存_读8(str + idx)
+}
+
+函数 字符串_相等(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 la = 字节长度(a)
+    定义 lb = 字节长度(b)
+    如果 (la != lb) { 返回 假 }
+    返回 内存_比较(a, b, la) == 0
+}
+
+函数 字符串_子串(str, start, end) {
+    如果 (str == 0 || start >= end) { 返回 0 }
+    定义 len = end - start
+    定义 buf = 堆_分配(len + 1)
+    内存_复制(buf, str + start, len)
+    内存_写8(buf + len, 0)
+    返回 buf
+}
+
+函数 字符串_拼接(a, b) {
+    定义 la = 字节长度(a)
+    定义 lb = 字节长度(b)
+    定义 buf = 堆_分配(la + lb + 1)
+    内存_复制(buf, a, la)
+    内存_复制(buf + la, b, lb)
+    内存_写8(buf + la + lb, 0)
+    返回 buf
+}
+
+函数 字符串_哈希(str) {
+    如果 (str == 0) { 返回 0 }
+    // FNV-1a hash
+    定义 可变 hash = 0x811c9dc5
+    定义 可变 i = 0
+    当 (内存_读8(str + i) != 0) {
+        hash = hash ^ 内存_读8(str + i)
+        hash = hash * 0x01000193
+        i = i + 1
+    }
+    返回 hash & 0x7FFFFFFF
+}
+
+函数 字符串_开头是(str, prefix) {
+    如果 (str == 0 || prefix == 0) { 返回 假 }
+    定义 plen = 字节长度(prefix)
+    定义 slen = 字节长度(str)
+    如果 (plen > slen) { 返回 假 }
+    返回 内存_比较(str, prefix, plen) == 0
+}
+
+函数 字符串_相等_忽略大小写(a, b) {
+    如果 (a == b) { 返回 真 }
+    如果 (a == 0 || b == 0) { 返回 假 }
+    定义 la = 字节长度(a)
+    定义 lb = 字节长度(b)
+    如果 (la != lb) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < la) {
+        定义 可变 ca = 内存_读8(a + i)
+        定义 可变 cb = 内存_读8(b + i)
+        如果 (ca >= 0x41 && ca <= 0x5A) { ca = ca + 32 }
+        如果 (cb >= 0x41 && cb <= 0x5A) { cb = cb + 32 }
+        如果 (ca != cb) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}

@@ -1,0 +1,253 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("./框架.nova")
+导入("../中枢/链表后继.nova")
+导入("../中枢/内核打印.nova")
+
+//   1. kobject是Linux设备模型的基石 — 每个设备/驱动/总线都内嵌kobject
+//   2. 引用计数(kref): kobject_get/kobject_put管理生命周期
+//   3. 树形层级: parent/children形成/sys下的目录树
+//   4. ktype: 定义该kobject类型的属性和释放函数
+//   5. kset: 同类kobject的集合(如所有块设备)
+//   6. u事件: kobject状态变化时向用户空间发送事件
+
+结构 kobject {
+    名称,
+    父,    // u64 parent kobject
+    子列表,    // [] children
+    引用计数,    // u32 kref
+    ktype,    // u64 kobj_type指针
+    kset,    // u64 所属kset
+    sysfs目录,    // u64 sysfs中对应的目录Nova路径项
+    状态,    // u32 初始化/已注册/u事件已发送
+}
+
+定义 KOBJ_未初始化 = 0
+定义 KOBJ_已初始化 = 1
+定义 KOBJ_已注册   = 2
+
+结构 kobj_type {
+    释放,    // u64 release函数(引用计数归零时调用)
+    属性列表,    // [] default_attrs: 默认sysfs属性
+    sysfs_ops,    // u64 show/store回调
+}
+
+结构 kset {
+    kobj,    // u64 内嵌的kobject(kset本身也是kobject)
+    成员列表,    // [] 所有成员kobject
+    u事件_ops,    // u64 过滤/命名/环境变量回调
+}
+
+结构 sysfs_属性 {
+    名称,
+    模式,    // u32 0444(只读)/0644(读写)
+    show,    // u64 读取回调: fn(kobj, attr, buf) → len
+    store,    // u64 写入回调: fn(kobj, attr, buf, len) → len
+}
+
+定义 KOBJ_ADD    = 0
+定义 KOBJ_REMOVE = 1
+定义 KOBJ_CHANGE = 2
+定义 KOBJ_MOVE   = 3
+定义 KOBJ_ONLINE = 4
+定义 KOBJ_OFFLINE = 5
+
+定义 可变 kobject_总数 = 0
+
+// kobject 接口 
+
+函数 kobject_创建(名称, 父) {
+    定义 kobj = kobject {}
+    kobj.名称 = 名称
+    kobj.父 = 父
+    kobj.子列表 = []
+    kobj.引用计数 = 1
+    kobj.ktype = 空
+    kobj.kset = 空
+    kobj.sysfs目录 = 空
+    kobj.状态 = KOBJ_已初始化
+    kobject_总数 = kobject_总数 + 1
+    返回 kobj
+}
+
+函数 kobject_创建_并注册(名称, 父, ktype) {
+    定义 kobj = kobject_创建(名称, 父)
+    kobj.ktype = ktype
+    kobject_注册(kobj)
+    返回 kobj
+}
+
+函数 kobject_注册(kobj) {
+    如果 (kobj == 空) { 返回 错误_无效参数 }
+    如果 (kobj.状态 < KOBJ_已初始化) { 返回 错误_无效参数 }
+
+    // 加入父的子列表
+    如果 (kobj.父 != 空) {
+        追加(kobj.父.子列表, kobj)
+    }
+
+    // 加入kset
+    如果 (kobj.kset != 空) {
+        追加(kobj.kset.成员列表, kobj)
+    }
+
+    // 在sysfs中创建目录
+    kobj.sysfs目录 = sysfs_创建kobject目录(kobj)
+
+    // 创建默认属性文件
+    如果 (kobj.ktype != 空 && kobj.ktype.属性列表 != 空) {
+        定义 可变 i = 0
+        当 (i < 计数(kobj.ktype.属性列表)) {
+            sysfs_创建属性文件(kobj, kobj.ktype.属性列表[i])
+            i = i + 1
+        }
+    }
+
+    kobj.状态 = KOBJ_已注册
+
+    // 发送ADD u事件
+    kobject_u事件(kobj, KOBJ_ADD)
+
+    返回 成功
+}
+
+函数 kobject_注销(kobj) {
+    如果 (kobj == 空) { 返回 }
+
+    // 发送REMOVE u事件
+    kobject_u事件(kobj, KOBJ_REMOVE)
+
+    // 从sysfs移除
+    如果 (kobj.sysfs目录 != 空) {
+        sysfs_移除kobject目录(kobj)
+    }
+
+    // 从父的子列表移除
+    如果 (kobj.父 != 空) {
+        定义 可变 i = 0
+        当 (i < 计数(kobj.父.子列表)) {
+            如果 (kobj.父.子列表[i] == kobj) {
+                链表_删除(kobj.父.子列表, i)
+                中断
+            }
+            i = i + 1
+        }
+    }
+
+    // 从kset移除
+    如果 (kobj.kset != 空) {
+        定义 可变 i = 0
+        当 (i < 计数(kobj.kset.成员列表)) {
+            如果 (kobj.kset.成员列表[i] == kobj) {
+                链表_删除(kobj.kset.成员列表, i)
+                中断
+            }
+            i = i + 1
+        }
+    }
+
+    kobj.状态 = KOBJ_未初始化
+}
+
+// 引用计数 
+
+函数 kobject_get(kobj) {
+    如果 (kobj != 空) { kobj.引用计数 = kobj.引用计数 + 1 }
+    返回 kobj
+}
+
+函数 kobject_put(kobj) {
+    如果 (kobj == 空) { 返回 }
+    kobj.引用计数 = kobj.引用计数 - 1
+    如果 (kobj.引用计数 <= 0) {
+        // 调用ktype的释放函数
+        如果 (kobj.ktype != 空 && kobj.ktype.释放 != 空) {
+            kobj.ktype.释放(kobj)
+        }
+        kobject_总数 = kobject_总数 - 1
+    }
+}
+
+// u事件: 向用户空间通知设备事件
+
+函数 kobject_u事件(kobj, 动作) {
+    如果 (kobj == 空) { 返回 错误_无效参数 }
+    定义 动作名 = u事件_动作名(动作)
+    定义 路径 = kobject_路径(kobj)
+
+    // 构造u事件环境变量
+    // ACTION=add DEVPATH=/sys/devices/... SUBSYSTEM=block
+    // 通过netlink发送给udevd(M1阶段: 仅记录日志)
+    内核调试("u事件: " + 动作名 + " " + 路径)
+
+    返回 成功
+}
+
+函数 u事件_动作名(动作) {
+    如果 (动作 == KOBJ_ADD) { 返回 "add" }
+    如果 (动作 == KOBJ_REMOVE) { 返回 "remove" }
+    如果 (动作 == KOBJ_CHANGE) { 返回 "change" }
+    如果 (动作 == KOBJ_MOVE) { 返回 "move" }
+    如果 (动作 == KOBJ_ONLINE) { 返回 "online" }
+    如果 (动作 == KOBJ_OFFLINE) { 返回 "offline" }
+    返回 "unknown"
+}
+
+// kset 接口
+
+函数 kset_创建(名称, 父) {
+    定义 ks = kset {}
+    ks.kobj = kobject_创建(名称, 父)
+    ks.成员列表 = []
+    ks.u事件_ops = 空
+    返回 ks
+}
+
+函数 kset_注册(ks) {
+    返回 kobject_注册(ks.kobj)
+}
+
+// 路径和访问器
+
+函数 kobject_路径(kobj) {
+    如果 (kobj == 空) { 返回 "" }
+    定义 可变 路径 = kobj.名称
+    定义 可变 当前 = kobj.父
+    当 (当前 != 空) {
+        路径 = 当前.名称 + "/" + 路径
+        当前 = 当前.父
+    }
+    返回 "/sys/" + 路径
+}
+
+函数 kobject_名称(kobj)   { 返回 kobj.名称 }
+函数 kobject_父(kobj)     { 返回 kobj.父 }
+函数 kobject_子列表(kobj) { 返回 kobj.子列表 }
+函数 kobject_添加子(父, 子) { 追加(父.子列表, 子) }
+
+
+函数 kobject_完整统计() {
+    返回 [kobject_总数]
+}
+
+定义 可变 AI_记忆丙_热文件表 = []
+
+函数 AI_记忆丙_访问模式(路径) {
+    定义 可变 i = 0
+    当 (i < 计数(AI_记忆丙_热文件表)) {
+        如果 (AI_记忆丙_热文件表[i].路径 == 路径) {
+            AI_记忆丙_热文件表[i].频率 = AI_记忆丙_热文件表[i].频率 + 1
+            返回 AI_记忆丙_热文件表[i].频率
+        }
+        i = i + 1
+    }
+    如果 (计数(AI_记忆丙_热文件表) < 128) {
+        追加(AI_记忆丙_热文件表, { 路径: 路径, 频率: 1 })
+    }
+    返回 1
+}
+
+函数 AI_记忆丙_预读建议(文件大小, 已读偏移) {
+    如果 (已读偏移 > 文件大小 * 80 / 100) { 返回 0 }
+    返回 32768
+}

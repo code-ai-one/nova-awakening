@@ -1,0 +1,179 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// 对应: nova/renderer/modules/service_worker/ (
+// content/browser/service_worker/ (
+//  (~5000行)
+// Service 工线生命周期:
+// 注册 → 安装(install) → 等待(waiting) → 激活(activate) → 运行
+// 更新: 新版本install → 旧版本仍在运行 → skipWaiting或页面关闭 → 激活
+// 核心接口:
+// navigator.service工线.register(url, {scope})
+// self.add事件Listener('install', ...)
+// self.add事件Listener('activate', ...)
+// self.add事件Listener('fetch', ...) — 网络拦截
+// self.add事件Listener('push', ...) — 推送通知
+// self.add事件Listener('sync', ...) — 后台同步
+// self.add事件Listener('message', ...) — 通信
+// 缓存 接口:
+// caches.open(name) → 缓存
+// cache.put(request, response)
+// cache.match(request) → Response
+// cache.delete(request)
+// cache.addAll(urls)
+// 策略模式:
+// 缓存 First / Network First / Stale While Revalidate /
+// 缓存 Only / Network Only
+// 【Nova特色】AI缓存策略:
+// AI总线根据用户行为预测下一访问资源, 主动预缓存
+
+// §1 常量
+
+// SW状态
+定义 SW_STATE_PARSED = 0
+定义 SW_STATE_INSTALLING = 1
+定义 SW_STATE_INSTALLED = 2 // = waiting
+定义 SW_STATE_ACTIVATING = 3
+定义 SW_STATE_ACTIVATED = 4
+定义 SW_STATE_REDUNDANT = 5
+
+// 注册状态
+定义 REG_STATE_INSTALLING = 0
+定义 REG_STATE_WAITING = 1
+定义 REG_STATE_ACTIVE = 2
+
+// 缓存匹配选项
+定义 CACHE_MATCH_IGNORE_SEARCH = 1
+定义 CACHE_MATCH_IGNORE_METHOD = 2
+定义 CACHE_MATCH_IGNORE_VARY = 4
+
+// 取数事件响应方式
+定义 FETCH_PASSTHROUGH = 0 // 不拦截, 走网络
+定义 FETCH_RESPOND_WITH = 1 // 用respondWith()的Response
+定义 FETCH_CACHE_FIRST = 2
+定义 FETCH_NETWORK_FIRST = 3
+定义 FETCH_STALE_REVALIDATE = 4
+
+// §2 核心结构
+
+结构 Service工线 {
+ 脚本URL,    // u64 SW脚本URL
+ 作用域,    // u64 scope URL
+ 状态,    // u8 SW_STATE_xxx
+ ID,    // u32 唯一注册ID
+ // 脚本内容
+ 脚本,    // u64 编译后的字节码
+ 脚本长度,
+ // 事件监听器
+ install处理器,    // u64 Nova函数*
+ activate处理器,
+ fetch处理器,
+ push处理器,
+ sync处理器,
+ message处理器,
+ // 客户端列表
+ 客户端,    // u64 Client*数组
+ 客户端数,
+ // 版本
+ 版本哈希,    // u64 脚本内容的哈希
+ // skipWaiting
+ 跳过等待,
+}
+
+结构 Service工线Registration {
+ ID,
+ 作用域,
+ // 三个可能的SW
+ installing,    // u64 Service工线* (正在安装)
+ waiting,    // u64 Service工线* (已安装, 等待激活)
+ active,    // u64 Service工线* (已激活)
+ // 更新状态
+ 更新中,
+ 最后更新检查,    // u64 时间戳
+}
+
+结构 Service工线Container {
+ // navigator.service工线
+ 注册表,    // u64 Service工线Registration*数组
+ 注册数,
+ 注册容量,
+ // 当前控制器
+ controller,    // u64 Service工线*
+ // ready 承诺
+ ready,
+}
+
+函数 服务工作线_状态名称(状态) {
+    如果 (状态 == SW_STATE_PARSED) { 返回 "parsed" }
+    如果 (状态 == SW_STATE_INSTALLING) { 返回 "installing" }
+    如果 (状态 == SW_STATE_INSTALLED) { 返回 "installed" }
+    如果 (状态 == SW_STATE_ACTIVATING) { 返回 "activating" }
+    如果 (状态 == SW_STATE_ACTIVATED) { 返回 "activated" }
+    如果 (状态 == SW_STATE_REDUNDANT) { 返回 "redundant" }
+    返回 "unknown"
+}
+
+函数 服务工作线_容器摘要(容器) {
+    定义 摘要 = {
+        注册数: 0,
+        installing数: 0,
+        waiting数: 0,
+        active数: 0,
+        controller状态: "none",
+        ready: 假
+    }
+    如果 (容器 == 0) { 返回 摘要 }
+
+    摘要.注册数 = 容器.注册数
+    摘要.ready = 容器.ready
+    如果 (容器.controller != 0) {
+        摘要.controller状态 = 服务工作线_状态名称(容器.controller.状态)
+    }
+
+    定义 可变 i = 0
+    当 (i < 容器.注册数) {
+        定义 reg = 内存_读64(容器.注册表 + i * 8)
+        如果 (reg != 0) {
+            如果 (reg.installing != 0) { 摘要.installing数 = 摘要.installing数 + 1 }
+            如果 (reg.waiting != 0) { 摘要.waiting数 = 摘要.waiting数 + 1 }
+            如果 (reg.active != 0) { 摘要.active数 = 摘要.active数 + 1 }
+        }
+        i = i + 1
+    }
+    返回 摘要
+}
+
+函数 服务工作线_容器健康评估(容器) {
+    如果 (容器 == 0) { 返回 真 }
+    如果 (容器.controller != 0 && !容器.ready) { 返回 假 }
+    如果 (容器.注册数 > 容器.注册容量) { 返回 假 }
+    返回 真
+}
+
+函数 服务工作线_统计() {
+    返回 {
+        模块: "服务工作线",
+        状态映射: [
+            服务工作线_状态名称(SW_STATE_PARSED),
+            服务工作线_状态名称(SW_STATE_INSTALLING),
+            服务工作线_状态名称(SW_STATE_INSTALLED),
+            服务工作线_状态名称(SW_STATE_ACTIVATED)
+        ]
+    }
+}
+
+函数 服务工作线_健康评估() {
+    定义 可变 问题 = []
+
+    返回 计数(问题) == 0
+}
+
+函数 服务工作线_综合报告() {
+    打印("[服务工作线] ═══ 综合报告 ═══")
+    打印("  健康: " + 如果 (服务工作线_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 服务工作线_全局重置() {
+    打印("[服务工作线] 全局统计已重置")
+    返回 0
+}

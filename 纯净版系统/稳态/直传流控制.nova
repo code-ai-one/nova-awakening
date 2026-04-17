@@ -1,0 +1,194 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("./软件混音器.nova")
+导入("../中枢/字符串替换.nova")
+导入("./接收初始化.nova")
+导入("../引导/端口输入.nova")
+导入("./快存驱动辅.nova")
+导入("./中断处理.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §10 直传流控制
+
+// BDL条目(Buffer Descriptor List Entry) — 16字节
+// 每个条目描述一段直传缓冲区
+
+结构 BDL条目 {
+    地址低,
+    地址高,
+    长度,
+    IOC,    // u32 bit0=Interrupt On Completion
+}
+
+定义 可变 声驱_当前流索引 = 0
+定义 可变 声驱_BDL缓冲列表 = []   // 每个流一个BDL 直传地址
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 声驱_编码流格式(采样率, 位深, 声道数) {
+    // 声驱流格式寄存器编码 
+    // bits[15:14] = 采样率基频 (0=48kHz, 1=44.1kHz)
+    // bits[13:11] = 采样率乘数 (0=×1, 1=×2, 2=×3, 3=×4)
+    // bits[10:8]  = 采样率除数 (0=÷1, 1=÷2, 2=÷3, ...)
+    // bits[7:4]   = 位深 (0=8bit, 1=16bit, 2=20bit, 3=24bit, 4=32bit)
+    // bits[3:0]   = 声道数-1
+    定义 可变 fmt = 0
+
+    // 采样率
+    如果 (采样率 == 48000) { fmt = 0 }
+    否则 如果 (采样率 == 96000) { fmt = (1 << 11) }       // 48k × 2
+    否则 如果 (采样率 == 192000) { fmt = (3 << 11) }      // 48k × 4
+    否则 如果 (采样率 == 44100) { fmt = (1 << 14) }       // 44.1k基频
+    否则 如果 (采样率 == 88200) { fmt = (1 << 14) | (1 << 11) }
+    否则 如果 (采样率 == 16000) { fmt = (2 << 8) }        // 48k ÷ 3
+    否则 如果 (采样率 == 8000) { fmt = (5 << 8) }         // 48k ÷ 6
+    否则 { fmt = 0 }  // 默认48kHz
+
+    // 位深
+    如果 (位深 == 16) { fmt = fmt | (1 << 4) }
+    否则 如果 (位深 == 20) { fmt = fmt | (2 << 4) }
+    否则 如果 (位深 == 24) { fmt = fmt | (3 << 4) }
+    否则 如果 (位深 == 32) { fmt = fmt | (4 << 4) }
+    否则 { fmt = fmt | (1 << 4) }  // 默认16bit
+
+    // 声道数
+    fmt = fmt | ((声道数 - 1) & 0xF)
+    返回 fmt
+}
+
+函数 声驱_启动流(流) {
+    // 需要找到对应的声驱控制器和流描述符
+    如果 (计数(声卡列表) == 0) { 返回 }
+    定义 card = 声卡列表[0]
+    定义 base = card.MMIO基址
+    如果 (base == 0) { 返回 }
+
+    // 选择流索引: 输出流从输入流数量之后开始
+    定义 gcap = 声驱_读16(base, 声驱_GCAP)
+    定义 输入流数 = (gcap >> 8) & 0xF
+    定义 流索引 = 输入流数   // 第一个输出流
+    如果 (流.方向 == SND_PCM_STREAM_CAPTURE) {
+        流索引 = 0           // 第一个输入流
+    }
+    定义 sd_base = base + 0x80 + 流索引 * 0x20
+
+    // 1. 先停止流(确保干净状态)
+    定义 ctl = 声驱_读8(base, sd_base - base + 声驱_SD_CTL)
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL, ctl & ~0x01)  // 清Run位
+    // 等待流停止
+    定义 可变 等待停 = 0
+    当 (等待停 < 100) {
+        如果 ((声驱_读8(base, sd_base - base + 声驱_SD_CTL) & 0x01) == 0) { 跳出 }
+        延迟_us(10)
+        等待停 = 等待停 + 1
+    }
+
+    // 2. 复位流
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL, 0x01)  // SRST
+    延迟_us(100)
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL, 0x00)  // 清SRST
+    延迟_us(100)
+
+    // 3. 设置BDL(Buffer Descriptor List)
+    定义 bdl_addr = 直传_分配(4096)  // 分配BDL空间(最多256条目)
+    内存填零(bdl_addr, 4096)
+    追加(声驱_BDL缓冲列表, bdl_addr)
+
+    // 将直传缓冲区分成周期大小的BDL条目
+    定义 周期字节 = 流.周期帧数 * 流.帧大小
+    定义 周期数 = 流.缓冲帧数 / 流.周期帧数
+    定义 可变 bi = 0
+    当 (bi < 周期数 && bi < 256) {
+        定义 entry = bdl_addr + bi * 16
+        定义 buf_offset = bi * 周期字节
+        内存写32(entry, (流.缓冲区 + buf_offset) & 0xFFFFFFFF)
+        内存写32(entry + 4, ((流.缓冲区 + buf_offset) >> 32) & 0xFFFFFFFF)
+        内存写32(entry + 8, 周期字节)
+        内存写32(entry + 12, 1)  // IOC=1, 每个周期产生中断
+        bi = bi + 1
+    }
+
+    // 4. 写BDL地址到流描述符
+    声驱_写32(base, sd_base - base + 声驱_SD_BDLPL, bdl_addr & 0xFFFFFFFF)
+    声驱_写32(base, sd_base - base + 声驱_SD_BDLPU, (bdl_addr >> 32) & 0xFFFFFFFF)
+
+    // 5. 设置CBL(Cyclic Buffer Length) — 整个缓冲区字节数
+    定义 总字节 = 流.缓冲帧数 * 流.帧大小
+    声驱_写32(base, sd_base - base + 声驱_SD_CBL, 总字节)
+
+    // 6. 设置LVI(Last Valid Index) — BDL最后一个有效条目索引
+    声驱_写16(base, sd_base - base + 声驱_SD_LVI, 周期数 - 1)
+
+    // 7. 设置流格式
+    定义 位深 = 16
+    如果 (流.格式 == SND_PCM_FORMAT_S24_LE || 流.格式 == SND_PCM_FORMAT_S32_LE) { 位深 = 32 }
+    如果 (流.格式 == SND_PCM_FORMAT_S24_3LE) { 位深 = 24 }
+    定义 fmt = 声驱_编码流格式(流.采样率, 位深, 流.声道数)
+    声驱_写16(base, sd_base - base + 声驱_SD_FORMAT, fmt)
+
+    // 8. 设置流ID到codec(通过CORB命令)
+    // 流ID = 流索引 + 1 (非零)
+    定义 stream_id = 流索引 + 1
+    // 通知codec使用此流ID(SET_STREAM verb)
+    如果 (计数(card.PCM列表) > 0) {
+        // 找到输出音频 Widget节点, 设置流ID和频道
+        // verb = SET_STREAM_FORMAT | (stream_id << 4) | channel
+        声驱_发送命令(card, 0, 2, 声驱_VERB_SET_STREAM | (stream_id << 4))
+        声驱_发送命令(card, 0, 2, 声驱_VERB_SET_FORMAT | fmt)
+    }
+
+    // 9. 启动流: CTL = Run(bit0) + IRQ(bit1) + 流ID(bits[23:20])
+    定义 new_ctl = 0x02 | 0x04 | (stream_id << 20)  // Run + IOCE + FEIE + StreamID
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL + 2, (stream_id << 4) & 0xFF)
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL, 0x02 | 0x01)  // IOCE + RUN
+
+    声驱_当前流索引 = 流索引
+    内核信息("声驱: 启动流 索引=" + 整数转字符串(流索引) +
+             " 方向=" + (如果 (流.方向 == 0) { "播放" } 否则 { "录音" }) +
+             " 格式=" + 整数转十六进制(fmt) +
+             " 缓冲=" + 整数转字符串(总字节) + "字节" +
+             " 周期=" + 整数转字符串(周期数))
+}
+
+函数 声驱_停止流(流) {
+    如果 (计数(声卡列表) == 0) { 返回 }
+    定义 card = 声卡列表[0]
+    定义 base = card.MMIO基址
+    如果 (base == 0) { 返回 }
+
+    定义 gcap = 声驱_读16(base, 声驱_GCAP)
+    定义 输入流数 = (gcap >> 8) & 0xF
+    定义 流索引 = 输入流数
+    如果 (流.方向 == SND_PCM_STREAM_CAPTURE) { 流索引 = 0 }
+    定义 sd_base = base + 0x80 + 流索引 * 0x20
+
+    // 清Run位停止直传
+    定义 ctl = 声驱_读8(base, sd_base - base + 声驱_SD_CTL)
+    声驱_写8(base, sd_base - base + 声驱_SD_CTL, ctl & ~0x03)  // 清Run+IOCE
+
+    // 等待流停止
+    定义 可变 等待 = 0
+    当 (等待 < 300) {
+        如果 ((声驱_读8(base, sd_base - base + 声驱_SD_CTL) & 0x01) == 0) { 跳出 }
+        延迟_us(10)
+        等待 = 等待 + 1
+    }
+
+    内核信息("声驱: 停止流 索引=" + 整数转字符串(流索引))
+}
+
+函数 声驱_读8(base, offset) { 返回 内存读8(base + offset) }
+
+定义 可变 AI_直传流控制_调用数 = 0
+定义 可变 AI_直传流控制_异常数 = 0
+
+函数 AI_直传流控制_监控() {
+    AI_直传流控制_调用数 = AI_直传流控制_调用数 + 1
+    返回 AI_直传流控制_异常数 == 0
+}
+
+函数 AI_直传流控制_健康检查() {
+    如果 (AI_直传流控制_调用数 > 0 && AI_直传流控制_异常数 * 100 / AI_直传流控制_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

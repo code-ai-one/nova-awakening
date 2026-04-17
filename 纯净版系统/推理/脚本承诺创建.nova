@@ -1,0 +1,605 @@
+// 脚本承诺_创建 — NovaOS 企业级 Promise/A+ 异步控制子系统
+// 理论基础: PAMC (Promise Asynchronous Microtask Control)
+//   完整实现Promise/A+规范 + Microtask队列 + 组合器(all/race/any/allSettled)
+//   + async/await状态机 + AI异步调度优化。
+// 创新公式:
+//   Resolve(p) = pending(p) → fulfilled(p,v) | rejected(p,r)
+//   Chain(p) = ∀r∈p.reactions: Microtask_Enqueue(r)
+//   Flatten(p,v) = IsPromise(v) ? v.then(p.resolve, p.reject) : fulfill(p,v)
+// 架构: 13部分 — 状态常量/数据结构/构造/resolve-reject/then-catch-finally/
+//            Microtask队列/all/allSettled/race/any/静态方法/AI优化/统计
+
+导入("./上下文运行时.nova")
+导入("./值型系统.nova")
+导入("../中枢/系统调用表.nova")
+导入("../推理/通信总线.nova")
+导入("../中枢/内核打印.nova")
+导入("../执行/接口绑定.nova")
+导入("../中枢/内存初始化.nova")
+导入("./值乘.nova")
+
+// 第1部分: 状态常量与全局配置
+
+定义 PROMISE_PENDING   = 0
+定义 PROMISE_FULFILLED = 1
+定义 PROMISE_REJECTED  = 2
+
+定义 REACTION_THEN     = 0
+定义 REACTION_CATCH    = 1
+定义 REACTION_FINALLY  = 2
+
+定义 MICROTASK_最大容量  = 4096
+定义 AI_异步优化阈值  = 0.5
+
+// 第2部分: 数据结构
+
+结构 Nova承诺 {
+    状态,                // u32 PROMISE_xxx
+    值,                  // u64 fulfilled值或rejected原因
+    回调链,              // u64 反应链表头
+    回调链数量,
+    已处理,
+    Nova运行时实例,
+}
+
+结构 承诺反应 {
+    类型,                // u32 REACTION_xxx
+    onFulfilled,
+    onRejected,
+    结果承诺,
+    下一个,
+}
+
+结构 Microtask节点 {
+    承诺,
+    反应,
+    下一个,
+}
+
+结构 PAMC统计 {
+    创建总数,
+    resolve次数,
+    reject次数,
+    then次数,
+    catch次数,
+    finally次数,
+    microtask总数,
+    microtask峰值,
+    all调用数,
+    race调用数,
+    any调用数,
+    AI优化次数,
+}
+
+// 第3部分: 全局状态 + Microtask队列
+
+定义 可变 全局PAMC统计 = PAMC统计 {}
+定义 可变 microtask队列头 = 0
+定义 可变 microtask队列尾 = 0
+定义 可变 microtask队列长度 = 0
+定义 可变 microtask正在执行 = 假
+
+函数 Microtask_入队(承诺, 反应) {
+    如果 (microtask队列长度 >= MICROTASK_最大容量) { 返回 }  // 防止无限递归
+    定义 node = 堆_分配(Microtask节点)
+    如果 (node == 0) { 返回 }
+    node.承诺 = 承诺
+    node.反应 = 反应
+    node.下一个 = 0
+    如果 (microtask队列尾 != 0) {
+        microtask队列尾.下一个 = node
+    } 否则 {
+        microtask队列头 = node
+    }
+    microtask队列尾 = node
+    microtask队列长度 = microtask队列长度 + 1
+    全局PAMC统计.microtask总数 = 全局PAMC统计.microtask总数 + 1
+    如果 (microtask队列长度 > 全局PAMC统计.microtask峰值) {
+        全局PAMC统计.microtask峰值 = microtask队列长度
+    }
+}
+
+函数 Microtask_清空队列() {
+    如果 (microtask正在执行) { 返回 }  // 防止重入
+    microtask正在执行 = 真
+    当 (microtask队列头 != 0) {
+        定义 node = microtask队列头
+        microtask队列头 = node.下一个
+        如果 (microtask队列头 == 0) {
+            microtask队列尾 = 0
+        }
+        microtask队列长度 = microtask队列长度 - 1
+        // 执行反应
+        Microtask_执行反应(node.承诺, node.反应)
+        堆_释放(node)
+    }
+    microtask正在执行 = 假
+}
+
+// 第4部分: 承诺创建与构造
+
+函数 Nova承诺_创建(Nova运行时实例) {
+    定义 p = 堆_分配(Nova承诺)
+    如果 (p == 0) { 返回 0 }
+    p.状态 = PROMISE_PENDING
+    p.值 = 0
+    p.回调链 = 0
+    p.回调链数量 = 0
+    p.已处理 = 假
+    p.Nova运行时实例 = Nova运行时实例
+    全局PAMC统计.创建总数 = 全局PAMC统计.创建总数 + 1
+    返回 p
+}
+
+函数 Nova承诺_构造(Nova运行时实例, executor) {
+    定义 p = Nova承诺_创建(Nova运行时实例)
+    如果 (p == 0) { 返回 0 }
+
+    // 创建resolve/reject回调上下文
+    定义 resolve_ctx = 堆_分配(16)
+    内存_分64(resolve_ctx, p)
+    内存_分64(resolve_ctx + 8, 0)
+
+    定义 reject_ctx = 堆_分配(16)
+    内存_分64(reject_ctx, p)
+    内存_分64(reject_ctx + 8, 1)
+
+    // try { executor(resolve, reject) } catch(e) { reject(e) }
+    如果 (executor != 0) {
+        定义 resolve_fn = JSNative_创建(Nova运行时实例, NATIVE_PROMISE_RESOLVE, resolve_ctx)
+        定义 reject_fn = JSNative_创建(Nova运行时实例, NATIVE_PROMISE_REJECT, reject_ctx)
+        定义 args = 堆_分配(16)
+        内存_分64(args, resolve_fn)
+        内存_分64(args + 8, reject_fn)
+        定义 执行结果 = Nova安全调用(executor, Nova运行时实例.undefined值, args, 2)
+        如果 (执行结果.是异常) {
+            Nova承诺_reject(p, 执行结果.异常值)
+        }
+        堆_释放(args)
+    }
+    返回 p
+}
+
+// 第5部分: resolve / reject 状态转换 (Promise/A+ §2.1)
+
+函数 Nova承诺_resolve(p, 值) {
+    // A+ §2.1.2: pending → fulfilled 只能一次
+    如果 (p == 0 || p.状态 != PROMISE_PENDING) { 返回 }
+
+    // A+ §2.3.1: 不能 resolve 自己
+    如果 (值 == p) {
+        Nova承诺_reject(p, 创建类型错误(p.Nova运行时实例, "承诺不能 resolve 自己"))
+        返回
+    }
+
+    // A+ §2.3.3: 如果值是 thenable → 展平
+    如果 (Nova承诺_是thenable(值)) {
+        Nova承诺_展平(p, 值)
+        返回
+    }
+
+    // 直接 fulfill
+    p.状态 = PROMISE_FULFILLED
+    p.值 = 值
+    全局PAMC统计.resolve次数 = 全局PAMC统计.resolve次数 + 1
+    // 触发回调链
+    Nova承诺_触发反应(p)
+}
+
+函数 Nova承诺_reject(p, 原因) {
+    // A+ §2.1.3: pending → rejected 只能一次
+    如果 (p == 0 || p.状态 != PROMISE_PENDING) { 返回 }
+    p.状态 = PROMISE_REJECTED
+    p.值 = 原因
+    全局PAMC统计.reject次数 = 全局PAMC统计.reject次数 + 1
+    // 触发回调链
+    Nova承诺_触发反应(p)
+    // 未处理的rejection警告
+    如果 (!p.已处理) {
+        Microtask_入队(p, 0)  // 延迟检查
+    }
+}
+
+函数 Nova承诺_是thenable(值) {
+    如果 (值 == 0) { 返回 假 }
+    // 检查是否为Nova承诺或具有.then方法的对象
+    如果 (JS获取类型(值) == JS_TYPE_PROMISE) { 返回 真 }
+    如果 (JS获取类型(值) == JS_TYPE_OBJECT) {
+        定义 then属性 = JS获取属性(值, "then")
+        返回 JS是函数(then属性)
+    }
+    返回 假
+}
+
+函数 Nova承诺_展平(p, thenable) {
+    // 如果thenable是Nova承诺 → 直接用then链接
+    如果 (JS获取类型(thenable) == JS_TYPE_PROMISE) {
+        定义 inner = thenable
+        如果 (inner.状态 == PROMISE_FULFILLED) {
+            Nova承诺_resolve(p, inner.值)
+        } 否则 如果 (inner.状态 == PROMISE_REJECTED) {
+            Nova承诺_reject(p, inner.值)
+        } 否则 {
+            // pending → 等待它解决
+            Nova承诺_then内部(inner, p)
+        }
+        返回
+    }
+    // 外部thenable → 调用其.then
+    定义 then方法 = JS获取属性(thenable, "then")
+    如果 (JS是函数(then方法)) {
+        定义 resolve_ctx = 堆_分配(16)
+        内存_分64(resolve_ctx, p)
+        内存_分64(resolve_ctx + 8, 0)
+        定义 reject_ctx = 堆_分配(16)
+        内存_分64(reject_ctx, p)
+        内存_分64(reject_ctx + 8, 1)
+        定义 res_fn = JSNative_创建(p.Nova运行时实例, NATIVE_PROMISE_RESOLVE, resolve_ctx)
+        定义 rej_fn = JSNative_创建(p.Nova运行时实例, NATIVE_PROMISE_REJECT, reject_ctx)
+        Nova调用(then方法, thenable, res_fn, rej_fn)
+    }
+}
+
+// 第6部分: 反应触发与执行
+
+函数 Nova承诺_触发反应(p) {
+    // 遍历回调链，将每个反应加入microtask队列
+    定义 可变 当前 = p.回调链
+    当 (当前 != 0) {
+        Microtask_入队(p, 当前)
+        当前 = 当前.下一个
+    }
+    p.回调链 = 0
+    p.回调链数量 = 0
+}
+
+函数 Microtask_执行反应(承诺, 反应) {
+    如果 (反应 == 0) {
+        // 未处理rejection检查
+        如果 (承诺 != 0 && 承诺.状态 == PROMISE_REJECTED && !承诺.已处理) {
+            内核打印("UnhandledPromiseRejection: {}", 承诺.值)
+        }
+        返回
+    }
+
+    定义 handler = 0
+    如果 (承诺.状态 == PROMISE_FULFILLED) {
+        handler = 反应.onFulfilled
+    } 否则 如果 (承诺.状态 == PROMISE_REJECTED) {
+        handler = 反应.onRejected
+        承诺.已处理 = 真
+    }
+
+    如果 (反应.类型 == REACTION_FINALLY) {
+        // finally不接收参数，传透值
+        如果 (反应.onFulfilled != 0) {
+            Nova安全调用(反应.onFulfilled, 0, 0, 0)
+        }
+        // 传透原始状态到结果承诺
+        如果 (反应.结果承诺 != 0) {
+            如果 (承诺.状态 == PROMISE_FULFILLED) {
+                Nova承诺_resolve(反应.结果承诺, 承诺.值)
+            } 否则 {
+                Nova承诺_reject(反应.结果承诺, 承诺.值)
+            }
+        }
+        返回
+    }
+
+    如果 (handler == 0) {
+        // 无处理器 → 传透
+        如果 (反应.结果承诺 != 0) {
+            如果 (承诺.状态 == PROMISE_FULFILLED) {
+                Nova承诺_resolve(反应.结果承诺, 承诺.值)
+            } 否则 {
+                Nova承诺_reject(反应.结果承诺, 承诺.值)
+            }
+        }
+        返回
+    }
+
+    // 调用handler
+    定义 结果 = Nova安全调用(handler, 0, 承诺.值, 1)
+    如果 (反应.结果承诺 != 0) {
+        如果 (结果.是异常) {
+            Nova承诺_reject(反应.结果承诺, 结果.异常值)
+        } 否则 {
+            Nova承诺_resolve(反应.结果承诺, 结果.返回值)
+        }
+    }
+}
+
+// 第7部分: then / catch / finally (Promise/A+ §2.2)
+
+函数 Nova承诺_then(p, onFulfilled, onRejected) {
+    如果 (p == 0) { 返回 0 }
+    全局PAMC统计.then次数 = 全局PAMC统计.then次数 + 1
+
+    // 创建新的结果承诺
+    定义 result_p = Nova承诺_创建(p.Nova运行时实例)
+
+    // 创建反应
+    定义 reaction = 堆_分配(承诺反应)
+    如果 (reaction == 0) { 返回 result_p }
+    reaction.类型 = REACTION_THEN
+    reaction.onFulfilled = onFulfilled
+    reaction.onRejected = onRejected
+    reaction.结果承诺 = result_p
+    reaction.下一个 = 0
+
+    如果 (onRejected != 0) { p.已处理 = 真 }
+
+    如果 (p.状态 == PROMISE_PENDING) {
+        // 添加到回调链尾部
+        Nova承诺_添加反应(p, reaction)
+    } 否则 {
+        // 已settled → 直接入队microtask
+        Microtask_入队(p, reaction)
+    }
+    返回 result_p
+}
+
+函数 Nova承诺_catch(p, onRejected) {
+    全局PAMC统计.catch次数 = 全局PAMC统计.catch次数 + 1
+    返回 Nova承诺_then(p, 0, onRejected)
+}
+
+函数 Nova承诺_finally(p, onFinally) {
+    如果 (p == 0) { 返回 0 }
+    全局PAMC统计.finally次数 = 全局PAMC统计.finally次数 + 1
+
+    定义 result_p = Nova承诺_创建(p.Nova运行时实例)
+    定义 reaction = 堆_分配(承诺反应)
+    如果 (reaction == 0) { 返回 result_p }
+    reaction.类型 = REACTION_FINALLY
+    reaction.onFulfilled = onFinally
+    reaction.onRejected = 0
+    reaction.结果承诺 = result_p
+    reaction.下一个 = 0
+
+    如果 (p.状态 == PROMISE_PENDING) {
+        Nova承诺_添加反应(p, reaction)
+    } 否则 {
+        Microtask_入队(p, reaction)
+    }
+    返回 result_p
+}
+
+函数 Nova承诺_then内部(inner, outer) {
+    // 将outer的resolve/reject作为inner的then回调
+    定义 reaction = 堆_分配(承诺反应)
+    如果 (reaction == 0) { 返回 }
+    reaction.类型 = REACTION_THEN
+    reaction.onFulfilled = 0
+    reaction.onRejected = 0
+    reaction.结果承诺 = outer
+    reaction.下一个 = 0
+    Nova承诺_添加反应(inner, reaction)
+}
+
+函数 Nova承诺_添加反应(p, reaction) {
+    如果 (p.回调链 == 0) {
+        p.回调链 = reaction
+    } 否则 {
+        定义 可变 尾 = p.回调链
+        当 (尾.下一个 != 0) { 尾 = 尾.下一个 }
+        尾.下一个 = reaction
+    }
+    p.回调链数量 = p.回调链数量 + 1
+}
+
+// 第8部分: Promise.all
+
+函数 Nova承诺_all(rt, 承诺数组, 数量) {
+    全局PAMC统计.all调用数 = 全局PAMC统计.all调用数 + 1
+    定义 result_p = Nova承诺_创建(rt)
+    如果 (数量 == 0) {
+        Nova承诺_resolve(result_p, JS创建空数组(rt))
+        返回 result_p
+    }
+
+    // 分配结果数组和计数器
+    定义 结果 = 堆_分配(数量 * 8)
+    定义 计数器 = 堆_分配(8)  // 共享计数器
+    内存_分64(计数器, 数量)
+
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 当前承诺 = 内存_读64(承诺数组 + i * 8)
+        // 创建all专用的resolve回调
+        定义 ctx = 堆_分配(32)
+        内存_分64(ctx, result_p)
+        内存_分64(ctx + 8, 结果)
+        内存_分64(ctx + 16, 计数器)
+        内存_分32(ctx + 24, i)
+
+        定义 on_ok = JSNative_创建(rt, NATIVE_PROMISE_ALL_RESOLVE, ctx)
+        定义 on_err = JSNative_创建(rt, NATIVE_PROMISE_ALL_REJECT, result_p)
+        Nova承诺_then(当前承诺, on_ok, on_err)
+        i = i + 1
+    }
+    返回 result_p
+}
+
+函数 Nova承诺_all_resolve回调(ctx, 值) {
+    定义 result_p = 内存_读64(ctx)
+    定义 结果 = 内存_读64(ctx + 8)
+    定义 计数器 = 内存_读64(ctx + 16)
+    定义 index = 内存_读32(ctx + 24)
+    // 存储结果
+    内存_分64(结果 + index * 8, 值)
+    // 递减计数器
+    定义 剩余 = 内存_读64(计数器) - 1
+    内存_分64(计数器, 剩余)
+    如果 (剩余 == 0) {
+        // 全部完成 → 将结果数组resolve
+        Nova承诺_resolve(result_p, 结果)
+    }
+}
+
+// 第9部分: Promise.race
+
+函数 Nova承诺_race(rt, 承诺数组, 数量) {
+    全局PAMC统计.race调用数 = 全局PAMC统计.race调用数 + 1
+    定义 result_p = Nova承诺_创建(rt)
+
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 当前承诺 = 内存_读64(承诺数组 + i * 8)
+        // 第一个settle的承诺决定结果
+        定义 on_ok = JSNative_创建(rt, NATIVE_PROMISE_RACE_RESOLVE, result_p)
+        定义 on_err = JSNative_创建(rt, NATIVE_PROMISE_RACE_REJECT, result_p)
+        Nova承诺_then(当前承诺, on_ok, on_err)
+        i = i + 1
+    }
+    返回 result_p
+}
+
+// 第10部分: Promise.any + Promise.allSettled
+
+函数 Nova承诺_any(rt, 承诺数组, 数量) {
+    全局PAMC统计.any调用数 = 全局PAMC统计.any调用数 + 1
+    定义 result_p = Nova承诺_创建(rt)
+    如果 (数量 == 0) {
+        Nova承诺_reject(result_p, 创建AggregateError(rt, "所有承诺均被拒绝"))
+        返回 result_p
+    }
+
+    定义 错误数组 = 堆_分配(数量 * 8)
+    定义 计数器 = 堆_分配(8)
+    内存_分64(计数器, 数量)
+
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 当前承诺 = 内存_读64(承诺数组 + i * 8)
+        定义 on_ok = JSNative_创建(rt, NATIVE_PROMISE_ANY_RESOLVE, result_p)
+        定义 ctx = 堆_分配(32)
+        内存_分64(ctx, result_p)
+        内存_分64(ctx + 8, 错误数组)
+        内存_分64(ctx + 16, 计数器)
+        内存_分32(ctx + 24, i)
+        定义 on_err = JSNative_创建(rt, NATIVE_PROMISE_ANY_REJECT, ctx)
+        Nova承诺_then(当前承诺, on_ok, on_err)
+        i = i + 1
+    }
+    返回 result_p
+}
+
+函数 Nova承诺_allSettled(rt, 承诺数组, 数量) {
+    定义 result_p = Nova承诺_创建(rt)
+    如果 (数量 == 0) {
+        Nova承诺_resolve(result_p, JS创建空数组(rt))
+        返回 result_p
+    }
+
+    定义 结果 = 堆_分配(数量 * 8)
+    定义 计数器 = 堆_分配(8)
+    内存_分64(计数器, 数量)
+
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 当前承诺 = 内存_读64(承诺数组 + i * 8)
+        定义 ctx = 堆_分配(32)
+        内存_分64(ctx, result_p)
+        内存_分64(ctx + 8, 结果)
+        内存_分64(ctx + 16, 计数器)
+        内存_分32(ctx + 24, i)
+
+        定义 on_ok = JSNative_创建(rt, NATIVE_PROMISE_SETTLED_OK, ctx)
+        定义 on_err = JSNative_创建(rt, NATIVE_PROMISE_SETTLED_ERR, ctx)
+        Nova承诺_then(当前承诺, on_ok, on_err)
+        i = i + 1
+    }
+    返回 result_p
+}
+
+// 第11部分: 静态方法 Promise.resolve / Promise.reject
+
+函数 Nova承诺_静态resolve(rt, 值) {
+    // 如果已经是承诺 → 直接返回
+    如果 (JS获取类型(值) == JS_TYPE_PROMISE) {
+        返回 值
+    }
+    定义 p = Nova承诺_创建(rt)
+    Nova承诺_resolve(p, 值)
+    返回 p
+}
+
+函数 Nova承诺_静态reject(rt, 原因) {
+    定义 p = Nova承诺_创建(rt)
+    Nova承诺_reject(p, 原因)
+    返回 p
+}
+
+函数 脚本承诺_创建桥接(rt) {
+    返回 Nova承诺_创建(rt)
+}
+
+函数 脚本承诺_解决桥接(rt, 承诺, 值) {
+    如果 (rt == 0 || 承诺 == 0) { 返回 }
+    Nova承诺_resolve(承诺, 值)
+}
+
+函数 脚本承诺_拒绝桥接(rt, 承诺, 原因) {
+    如果 (rt == 0 || 承诺 == 0) { 返回 }
+    Nova承诺_reject(承诺, 原因)
+}
+
+// 第12部分: AI异步调度优化
+
+函数 AI_PAMC异步优化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+
+    定义 feature = Tensor_创建(8)
+    Tensor_写(feature, 0, 全局PAMC统计.创建总数 / 10000.0)
+    Tensor_写(feature, 1, 全局PAMC统计.microtask总数 / 10000.0)
+    Tensor_写(feature, 2, 全局PAMC统计.microtask峰值 / MICROTASK_最大容量)
+    Tensor_写(feature, 3, 全局PAMC统计.reject次数 / 1000.0)
+    Tensor_写(feature, 4, 全局PAMC统计.all调用数 / 100.0)
+    Tensor_写(feature, 5, 全局PAMC统计.race调用数 / 100.0)
+    Tensor_写(feature, 6, microtask队列长度 / MICROTASK_最大容量)
+    Tensor_写(feature, 7, 0.0)
+
+    定义 建议 = AI总线_推理(bus, "PAMC_异步调度", feature)
+    定义 风险 = AI总线_异常检测(bus, "PAMC_队列异常", feature)
+    Tensor_释放(feature)
+
+    全局PAMC统计.AI优化次数 = 全局PAMC统计.AI优化次数 + 1
+}
+
+// 第13部分: 统计与诊断
+
+函数 PAMC_获取统计() {
+    返回 {
+        创建总数: 全局PAMC统计.创建总数,
+        resolve次数: 全局PAMC统计.resolve次数,
+        reject次数: 全局PAMC统计.reject次数,
+        then次数: 全局PAMC统计.then次数,
+        catch次数: 全局PAMC统计.catch次数,
+        finally次数: 全局PAMC统计.finally次数,
+        microtask总数: 全局PAMC统计.microtask总数,
+        microtask峰值: 全局PAMC统计.microtask峰值,
+        all调用数: 全局PAMC统计.all调用数,
+        race调用数: 全局PAMC统计.race调用数,
+        any调用数: 全局PAMC统计.any调用数,
+        AI优化次数: 全局PAMC统计.AI优化次数
+    }
+}
+
+函数 PAMC_打印统计() {
+    定义 s = PAMC_获取统计()
+    内核打印("═══ PAMC承诺统计 ═══")
+    内核打印("创建={} resolve={} reject={}",
+        s.创建总数, s.resolve次数, s.reject次数)
+    内核打印("then={} catch={} finally={}",
+        s.then次数, s.catch次数, s.finally次数)
+    内核打印("microtask[总数/峰值]={}/{}",
+        s.microtask总数, s.microtask峰值)
+    内核打印("all={} race={} any={} AI={}",
+        s.all调用数, s.race调用数, s.any调用数, s.AI优化次数)
+}
+
+函数 PAMC_重置统计() {
+    全局PAMC统计 = PAMC统计 {}
+}

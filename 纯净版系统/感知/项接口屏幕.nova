@@ -1,0 +1,106 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/内存初始化.nova")
+导入("./权限接口权限.nova")
+导入("./文档节点.nova")
+
+// §6 Screen Orientation 接口 — 屏幕方向
+// screen.orientation.type / angle / lock() / unlock()
+
+定义 ORIENT_PORTRAIT_PRIMARY    = 0
+定义 ORIENT_PORTRAIT_SECONDARY  = 1    // 倒置
+定义 ORIENT_LANDSCAPE_PRIMARY   = 2
+定义 ORIENT_LANDSCAPE_SECONDARY = 3
+
+结构 ScreenOrientation {
+    类型,    // u32 ORIENT_xxx
+    角度,    // u32 0/90/180/270
+    已锁定,
+    onchange,
+}
+
+定义 可变 全局屏幕方向 = 0
+
+函数 ScreenOrientation_获取() {
+    如果 (全局屏幕方向 == 0) {
+        全局屏幕方向 = 堆_分配(ScreenOrientation)
+        全局屏幕方向.类型 = ORIENT_PORTRAIT_PRIMARY
+        全局屏幕方向.角度 = 0
+        全局屏幕方向.已锁定 = 假
+    }
+    返回 全局屏幕方向
+}
+
+函数 ScreenOrientation_lock(方向字符串) {
+    // "portrait" / "landscape" / "portrait-primary" / ...
+    // 需要全屏模式
+    定义 fs = Fullscreen_获取状态()
+    如果 (fs.状态 != FS_STATE_FULLSCREEN) { 返回 假 }
+
+    定义 ori = ScreenOrientation_获取()
+    ori.已锁定 = 真
+    // 通知平台锁定方向
+    返回 真
+}
+
+函数 ScreenOrientation_unlock() {
+    定义 ori = ScreenOrientation_获取()
+    ori.已锁定 = 假
+}
+
+// §7 Vibration 接口 — 设备振动
+// navigator.vibrate(200)
+// navigator.vibrate([200, 100, 200])  — 振动-暂停-振动
+
+函数 Navigator_vibrate(模式, 模式长度) {
+    如果 (模式 == 0 || 模式长度 == 0) {
+        // 取消振动
+        平台_取消振动()
+        返回 真
+    }
+
+    // 验证: 需要用户手势
+    // 模式: [振动ms, 暂停ms, 振动ms, ...]
+    定义 可变 i = 0
+    当 (i < 模式长度) {
+        定义 时间 = 内存_读32(模式 + i * 4)
+        如果 (i % 2 == 0) {
+            平台_振动(时间)
+        } 否则 {
+            平台_等待(时间)
+        }
+        i = i + 1
+    }
+    返回 真
+}
+
+// §8 Battery Status 接口 — 电池状态
+// navigator.getBattery() → 承诺<BatteryManager>
+
+结构 BatteryManager {
+    充电中,    // 布尔 charging
+    电量,    // u32 ×100 (0-10000 → 0-100%)
+    充电时间,    // i32 秒 (-1=无穷)
+    放电时间,    // i32 秒 (-1=无穷)
+    onchargingchange,
+    onlevelchange,
+    onchargingtimechange,
+    ondischargingtimechange,
+}
+
+定义 可变 全局电池 = 0
+
+函数 BatteryManager_获取() {
+    如果 (全局电池 == 0) {
+        全局电池 = 堆_分配(BatteryManager)
+        全局电池.充电中 = 真
+        全局电池.电量 = 10000    // 100%
+        全局电池.充电时间 = 0
+        全局电池.放电时间 = -1
+    }
+    返回 全局电池
+}
+
+函数 Navigator_getBattery(Nova运行时实例) {
+    返回 BatteryManager_获取()
+}

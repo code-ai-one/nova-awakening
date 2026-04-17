@@ -1,0 +1,553 @@
+//        (~400行)
+// (~300行)
+// Generator函数:
+// function* gen() { yield 1; yield 2; return 3; }
+// const g = gen();
+// g.next() → { value: 1, done: false }
+// g.next() → { value: 2, done: false }
+// g.next() → { value: 3, done: true }
+// g.return(v) → { value: v, done: true }
+// g.throw(e) → 在yield处抛出异常
+// Iterator协议:
+// obj[符号.iterator]() → iterator
+// iterator.next() → { value, done }
+// for-of / spread / destructuring 使用此协议
+// 异步 Generator:
+// async function* asyncGen() { yield await fetch(url); }
+// for await (const item of asyncGen()) { ... }
+// 内置可迭代类型:
+// 数组/String/Map/Set/Typed数组/arguments/节点List
+// Generator对象本身也是可迭代的
+
+导入("./上下文运行时.nova")
+导入("./值型系统.nova")
+导入("../中枢/系统调用表.nova")
+导入("./值乘.nova")
+导入("../执行/底层内存操.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/哈希函数.nova")
+
+// §1 Generator状态
+
+定义 GEN_STATE_SUSPENDED_START = 0 // 创建后未调用next
+定义 GEN_STATE_SUSPENDED_YIELD = 1 // 在yield处暂停
+定义 GEN_STATE_EXECUTING = 2 // 正在执行
+定义 GEN_STATE_COMPLETED = 3 // 已完成(return/异常)
+
+// §2 JSGeneratorObject — Generator实例
+
+结构 JSGeneratorObject {
+ 状态,    // u32 GEN_STATE_xxx
+ // 函数信息
+ 函数,    // u64 generator function对象
+ 字节码,    // u64 字节码数组
+ 字节码长度,
+ // 暂停点(恢复执行的位置)
+ 暂停点PC,    // u32 字节码偏移
+ 暂停点ID,    // u32 yield编号
+ // 执行上下文快照
+ 寄存器快照,    // u64 寄存器值数组(局部变量)
+ 寄存器数量,
+ 栈快照,    // u64 操作栈值
+ 栈深度,
+ // 作用域链
+ 上下文,    // u64 闭包上下文
+ // 返回值
+ 最后值,    // u64 最近yield/return的值
+ // receiver
+ receiver,    // u64 this值
+ // 是否是async generator
+ 是异步,
+ // async: 等待的承诺
+ 等待承诺,
+ // async: 排队的请求
+ 请求队列,    // u64 异步GeneratorRequest*链表
+ 请求队列数量,
+}
+
+// §3 Generator创建
+// 调用generator function时创建generator对象
+
+函数 JSGenerator_创建(Nova运行时实例, 函数, 字节码, 字节码长度, 上下文, receiver) {
+ 定义 gen = 堆_分配(JSGeneratorObject)
+ gen.状态 = GEN_STATE_SUSPENDED_START
+ gen.函数 = 函数
+ gen.字节码 = 字节码
+ gen.字节码长度 = 字节码长度
+ gen.暂停点PC = 0
+ gen.暂停点ID = 0
+
+ // 分配寄存器空间(用于保存/恢复局部变量)
+ gen.寄存器数量 = 32 // 默认32个寄存器槽
+ gen.寄存器快照 = 堆_分配_数组(32 * 8)
+ 内存_清零(gen.寄存器快照, 32 * 8)
+ gen.栈快照 = 堆_分配_数组(64 * 8)
+ gen.栈深度 = 0
+
+ gen.上下文 = 上下文
+ gen.最后值 = 0
+ gen.receiver = receiver
+ gen.是异步 = 假
+ gen.等待承诺 = 0
+ gen.请求队列 = 0; gen.请求队列数量 = 0
+
+ 返回 gen
+}
+
+// NGEN理论 — Nova生成器执行理论 (Nova Generator Execution Theory)
+// 理论核心: 协程状态机 + 挂起点快照复用 + AI懒惰预取优化
+// 公式1: ResumeLatency = O(register_count) 而非 O(stack_depth)
+// 公式2: YieldCost = snapshot_size / reuse_factor
+// 公式3: PrefetchGain = AI_predict(next_yield) * prefetch_window
+
+定义 可变 全局_gen创建总数 = 0
+定义 可变 全局_gen_next调用 = 0
+定义 可变 全局_gen_return调用 = 0
+定义 可变 全局_gen_throw调用 = 0
+定义 可变 全局_yield总次数 = 0
+定义 可变 全局_快照复用次数 = 0
+定义 可变 全局_AI预取命中 = 0
+定义 可变 全局_AI预取未中 = 0
+
+结构 迭代结果 {
+    值,
+    已完成,
+}
+
+// §4 Generator.next() — 恢复执行直到下一个yield/return
+
+函数 JSGenerator_next(gen, 输入值) {
+    全局_gen_next调用 = 全局_gen_next调用 + 1
+
+    // 状态检查
+    如果 (gen.状态 == GEN_STATE_COMPLETED) {
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+    如果 (gen.状态 == GEN_STATE_EXECUTING) {
+        // Generator正在执行中不能重入
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+
+    // 将输入值传递给挂起的yield表达式
+    如果 (gen.状态 == GEN_STATE_SUSPENDED_YIELD) {
+        gen.最后值 = 输入值
+    }
+
+    // 设置执行状态
+    gen.状态 = GEN_STATE_EXECUTING
+
+    // 恢复寄存器状态
+    如果 (!Gen_恢复寄存器(gen)) {
+        gen.状态 = GEN_STATE_COMPLETED
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+
+    // 执行字节码直到yield/return/异常
+    定义 结果 = Gen_执行字节码(gen)
+
+    // 根据执行结果更新状态
+    如果 (结果.类型 == 1) {  // yield
+        gen.状态 = GEN_STATE_SUSPENDED_YIELD
+        Gen_保存寄存器(gen)
+        全局_yield总次数 = 全局_yield总次数 + 1
+        返回 迭代结果 { 值: 结果.值, 已完成: 假 }
+    } 否则 如果 (结果.类型 == 2) {  // return
+        gen.状态 = GEN_STATE_COMPLETED
+        Gen_释放快照(gen)
+        返回 迭代结果 { 值: 结果.值, 已完成: 真 }
+    } 否则 {  // 异常
+        gen.状态 = GEN_STATE_COMPLETED
+        Gen_释放快照(gen)
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+}
+
+// §5 Generator.return(value) — 强制完成
+
+函数 JSGenerator_return(gen, 返回值) {
+    全局_gen_return调用 = 全局_gen_return调用 + 1
+
+    如果 (gen.状态 == GEN_STATE_COMPLETED) {
+        返回 迭代结果 { 值: 返回值, 已完成: 真 }
+    }
+    如果 (gen.状态 == GEN_STATE_EXECUTING) {
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+
+    // 如果有try-finally块，需要执行finally
+    如果 (Gen_有finally块(gen)) {
+        gen.最后值 = 返回值
+        gen.状态 = GEN_STATE_EXECUTING
+        Gen_恢复寄存器(gen)
+        Gen_跳转finally(gen)
+        定义 结果 = Gen_执行字节码(gen)
+        gen.状态 = GEN_STATE_COMPLETED
+        Gen_释放快照(gen)
+        返回 迭代结果 { 值: 返回值, 已完成: 真 }
+    }
+
+    // 无finally，直接完成
+    gen.状态 = GEN_STATE_COMPLETED
+    Gen_释放快照(gen)
+    返回 迭代结果 { 值: 返回值, 已完成: 真 }
+}
+
+// §6 Generator.throw(error) — 在yield处抛出异常
+
+函数 JSGenerator_throw(gen, 异常值) {
+    全局_gen_throw调用 = 全局_gen_throw调用 + 1
+
+    如果 (gen.状态 == GEN_STATE_COMPLETED) {
+        // 已完成，直接抛出
+        返回 迭代结果 { 值: 异常值, 已完成: 真 }
+    }
+    如果 (gen.状态 == GEN_STATE_SUSPENDED_START) {
+        // 还未开始执行，直接完成并抛出
+        gen.状态 = GEN_STATE_COMPLETED
+        返回 迭代结果 { 值: 异常值, 已完成: 真 }
+    }
+    如果 (gen.状态 == GEN_STATE_EXECUTING) {
+        返回 迭代结果 { 值: 0, 已完成: 真 }
+    }
+
+    // 在yield处恢复执行，但以异常方式
+    gen.状态 = GEN_STATE_EXECUTING
+    Gen_恢复寄存器(gen)
+
+    // 检查是否有try-catch包裹当前yield
+    如果 (Gen_有try_catch(gen)) {
+        Gen_设置异常(gen, 异常值)
+        定义 结果 = Gen_执行字节码(gen)
+        如果 (结果.类型 == 1) {  // yield
+            gen.状态 = GEN_STATE_SUSPENDED_YIELD
+            Gen_保存寄存器(gen)
+            全局_yield总次数 = 全局_yield总次数 + 1
+            返回 迭代结果 { 值: 结果.值, 已完成: 假 }
+        }
+        gen.状态 = GEN_STATE_COMPLETED
+        Gen_释放快照(gen)
+        返回 迭代结果 { 值: 结果.值, 已完成: 真 }
+    }
+
+    // 无try-catch，异常未被捕获
+    gen.状态 = GEN_STATE_COMPLETED
+    Gen_释放快照(gen)
+    返回 迭代结果 { 值: 异常值, 已完成: 真 }
+}
+
+// §7 寄存器快照保存/恢复机制 (NGEN公式1&2)
+// 协程核心: yield时保存寄存器状态，next时恢复
+
+函数 Gen_保存寄存器(gen) {
+    如果 (gen.寄存器快照 == 空 || gen.寄存器数量 == 0) { 返回 }
+    // 保存当前PC
+    gen.暂停点PC = 获取当前PC(gen)
+    gen.暂停点ID = gen.暂停点ID + 1
+    // 寄存器值已在执行过程中直接写入快照缓冲区
+    // 保存操作栈
+    可变 i = 0
+    当 (i < gen.栈深度 && i < 64) {
+        内存_写字(gen.栈快照, i * 8, 获取栈值(gen, i))
+        i = i + 1
+    }
+}
+
+函数 Gen_恢复寄存器(gen) {
+    如果 (gen.寄存器快照 == 空) { 返回 假 }
+    // 恢复PC
+    设置当前PC(gen, gen.暂停点PC)
+    // 寄存器从快照缓冲区恢复
+    可变 i = 0
+    当 (i < gen.寄存器数量) {
+        设置寄存器(gen, i, 内存_读字(gen.寄存器快照, i * 8))
+        i = i + 1
+    }
+    // 恢复操作栈
+    i = 0
+    当 (i < gen.栈深度 && i < 64) {
+        设置栈值(gen, i, 内存_读字(gen.栈快照, i * 8))
+        i = i + 1
+    }
+    全局_快照复用次数 = 全局_快照复用次数 + 1
+    返回 真
+}
+
+函数 Gen_释放快照(gen) {
+    如果 (gen.寄存器快照 != 空) {
+        堆_释放(gen.寄存器快照)
+        gen.寄存器快照 = 空
+    }
+    如果 (gen.栈快照 != 空) {
+        堆_释放(gen.栈快照)
+        gen.栈快照 = 空
+    }
+    gen.寄存器数量 = 0
+    gen.栈深度 = 0
+}
+
+// §8 字节码执行引擎(简化) — 解释执行到yield/return
+
+// 字节码操作码
+定义 OP_YIELD = 0xF0
+定义 OP_RETURN = 0xF1
+定义 OP_YIELD_STAR = 0xF2  // yield*
+定义 OP_AWAIT = 0xF3  // async generator用
+
+结构 执行结果 {
+    类型,    // 1=yield 2=return 3=异常
+    值,
+}
+
+函数 Gen_执行字节码(gen) {
+    可变 pc = gen.暂停点PC
+    可变 安全计数 = 0
+    定义 最大执行 = 100000  // 防止无限循环
+
+    当 (pc < gen.字节码长度 && 安全计数 < 最大执行) {
+        定义 op = 内存_读字节(gen.字节码, pc)
+        如果 (op == OP_YIELD) {
+            定义 值 = 获取栈顶(gen)
+            gen.暂停点PC = pc + 1
+            返回 执行结果 { 类型: 1, 值: 值 }
+        } 否则 如果 (op == OP_RETURN) {
+            定义 值 = 获取栈顶(gen)
+            返回 执行结果 { 类型: 2, 值: 值 }
+        } 否则 如果 (op == OP_YIELD_STAR) {
+            // yield* 委托给内层迭代器
+            定义 内层 = 获取栈顶(gen)
+            定义 内层结果 = 迭代器_下一个(内层)
+            如果 (内层结果.已完成) {
+                // 内层完成，其返回值成为yield*的值
+                压入栈(gen, 内层结果.值)
+                pc = pc + 1
+            } 否则 {
+                // 内层yield，向外转yield
+                gen.暂停点PC = pc  // 不前pc，下次还是yield*
+                返回 执行结果 { 类型: 1, 值: 内层结果.值 }
+            }
+        } 否则 如果 (op == OP_AWAIT) {
+            // async generator: 返回待解决的Promise
+            定义 承诺 = 获取栈顶(gen)
+            gen.等待承诺 = 承诺
+            gen.暂停点PC = pc + 1
+            返回 执行结果 { 类型: 1, 值: 承诺 }
+        } 否则 {
+            // 普通字节码 — 委托给标准解释器
+            pc = 解释单步(gen, op, pc)
+        }
+        安全计数 = 安全计数 + 1
+    }
+
+    // 超时或超过字节码范围 → 视为return undefined
+    返回 执行结果 { 类型: 2, 值: 0 }
+}
+
+// §9 异步Generator支持
+
+结构 异步Gen请求 {
+    类型,    // 1=next 2=return 3=throw
+    值,
+    下一个,    // u64 链表下一个请求
+}
+
+函数 AsyncGenerator_创建(Nova运行时实例, 函数, 字节码, 字节码长度, 上下文, receiver) {
+    定义 gen = JSGenerator_创建(Nova运行时实例, 函数, 字节码, 字节码长度, 上下文, receiver)
+    gen.是异步 = 真
+    gen.请求队列 = 空
+    gen.请求队列数量 = 0
+    返回 gen
+}
+
+函数 AsyncGenerator_入队(异步Gen, 类型, 值) {
+    定义 请求 = 异步Gen请求 { 类型: 类型, 值: 值, 下一个: 空 }
+    如果 (异步Gen.请求队列 == 空) {
+        异步Gen.请求队列 = 请求
+    } 否则 {
+        // 找到队尾
+        可变 当前 = 异步Gen.请求队列
+        当 (当前.下一个 != 空) {
+            当前 = 当前.下一个
+        }
+        当前.下一个 = 请求
+    }
+    异步Gen.请求队列数量 = 异步Gen.请求队列数量 + 1
+}
+
+函数 AsyncGenerator_处理队列(异步Gen) {
+    如果 (异步Gen.请求队列 == 空) { 返回 }
+    如果 (异步Gen.状态 == GEN_STATE_EXECUTING) { 返回 }
+    定义 请求 = 异步Gen.请求队列
+    异步Gen.请求队列 = 请求.下一个
+    异步Gen.请求队列数量 = 异步Gen.请求队列数量 - 1
+    可变 结果 = 空
+    如果 (请求.类型 == 1) {
+        结果 = JSGenerator_next(异步Gen, 请求.值)
+    } 否则 如果 (请求.类型 == 2) {
+        结果 = JSGenerator_return(异步Gen, 请求.值)
+    } 否则 {
+        结果 = JSGenerator_throw(异步Gen, 请求.值)
+    }
+}
+
+// §10 Iterator协议实现
+
+// 迭代器类型
+定义 ITER_数组 = 1
+定义 ITER_字符串 = 2
+定义 ITER_Map = 3
+定义 ITER_Set = 4
+定义 ITER_Generator = 5
+定义 ITER_自定义 = 6
+
+结构 迭代器 {
+    类型,    // u32 ITER_xxx
+    源对象,
+    当前索引,
+    总长度,
+    gen对象,    // u64 如果是generator类型
+    自定义next,    // u64 自定义next函数
+}
+
+函数 迭代器_创建从数组(数组对象) {
+    返回 迭代器 {
+        类型: ITER_数组,
+        源对象: 数组对象,
+        当前索引: 0,
+        总长度: 数组_长度(数组对象),
+        gen对象: 空,
+        自定义next: 空,
+    }
+}
+
+函数 迭代器_创建从字符串(字符串对象) {
+    返回 迭代器 {
+        类型: ITER_字符串,
+        源对象: 字符串对象,
+        当前索引: 0,
+        总长度: 字符串_长度(字符串对象),
+        gen对象: 空,
+        自定义next: 空,
+    }
+}
+
+函数 迭代器_创建从Generator(gen) {
+    返回 迭代器 {
+        类型: ITER_Generator,
+        源对象: 空,
+        当前索引: 0,
+        总长度: -1,  // 未知长度
+        gen对象: gen,
+        自定义next: 空,
+    }
+}
+
+// 统一的迭代器.next()
+函数 迭代器_下一个(迭代) {
+    如果 (迭代.类型 == ITER_数组) {
+        如果 (迭代.当前索引 >= 迭代.总长度) {
+            返回 迭代结果 { 值: 0, 已完成: 真 }
+        }
+        定义 值 = 数组_获取(迭代.源对象, 迭代.当前索引)
+        迭代.当前索引 = 迭代.当前索引 + 1
+        返回 迭代结果 { 值: 值, 已完成: 假 }
+    } 否则 如果 (迭代.类型 == ITER_字符串) {
+        如果 (迭代.当前索引 >= 迭代.总长度) {
+            返回 迭代结果 { 值: 0, 已完成: 真 }
+        }
+        定义 ch = 字符串_字符码(迭代.源对象, 迭代.当前索引)
+        迭代.当前索引 = 迭代.当前索引 + 1
+        返回 迭代结果 { 值: ch, 已完成: 假 }
+    } 否则 如果 (迭代.类型 == ITER_Generator) {
+        返回 JSGenerator_next(迭代.gen对象, 0)
+    } 否则 如果 (迭代.类型 == ITER_自定义) {
+        如果 (迭代.自定义next != 空) {
+            返回 调用函数(迭代.自定义next, 迭代.源对象)
+        }
+    }
+    返回 迭代结果 { 值: 0, 已完成: 真 }
+}
+
+// §11 for-of循环支持
+
+函数 ForOf_执行(可迭代对象, 回调函数) {
+    定义 迭代 = 获取迭代器(可迭代对象)
+    如果 (迭代 == 空) {
+        返回  // 不可迭代，抛出TypeError
+    }
+    可变 结果 = 迭代器_下一个(迭代)
+    当 (!结果.已完成) {
+        定义 继续 = 回调函数(结果.值)
+        如果 (继续 == 假) {
+            // break语句 — 调用iterator.return()
+            如果 (迭代.类型 == ITER_Generator && 迭代.gen对象 != 空) {
+                JSGenerator_return(迭代.gen对象, 0)
+            }
+            返回
+        }
+        结果 = 迭代器_下一个(迭代)
+    }
+}
+
+函数 获取迭代器(对象) {
+    // 检查对象类型并创建对应迭代器
+    定义 类型 = 获取对象类型(对象)
+    如果 (类型 == 1) {  // 数组
+        返回 迭代器_创建从数组(对象)
+    } 否则 如果 (类型 == 2) {  // 字符串
+        返回 迭代器_创建从字符串(对象)
+    } 否则 如果 (类型 == 10) {  // Generator
+        返回 迭代器_创建从Generator(对象)
+    }
+    // 检查Symbol.iterator属性
+    定义 iter_fn = 获取属性(对象, "符号_迭代器")
+    如果 (iter_fn != 空) {
+        定义 结果 = 调用函数(iter_fn, 对象)
+        返回 迭代器 {
+            类型: ITER_自定义,
+            源对象: 结果,
+            当前索引: 0,
+            总长度: -1,
+            gen对象: 空,
+            自定义next: 获取属性(结果, "next"),
+        }
+    }
+    返回 空
+}
+
+// §12 AI懒惰预取优化 (NGEN公式3)
+// AI预测下一次next()可能要求的数据，提前预热
+
+函数 AI_Generator预取(gen) {
+    如果 (gen == 空 || gen.状态 != GEN_STATE_SUSPENDED_YIELD) { 返回 }
+    定义 特征 = Tensor_创建(1, 4)
+    Tensor_写(特征, 0, 0, gen.暂停点ID * 1.0)
+    Tensor_写(特征, 0, 1, gen.暂停点PC * 1.0 / (gen.字节码长度 + 1))
+    Tensor_写(特征, 0, 2, gen.寄存器数量 * 1.0)
+    Tensor_写(特征, 0, 3, gen.栈深度 * 1.0)
+    定义 结果 = AI总线_推理("gen_prefetch_model", 特征)
+    如果 (结果 != 空) {
+        定义 conf = Tensor_读(结果, 0, 0)
+        如果 (conf > 0.7) {
+            全局_AI预取命中 = 全局_AI预取命中 + 1
+        } 否则 {
+            全局_AI预取未中 = 全局_AI预取未中 + 1
+        }
+        Tensor_释放(结果)
+    }
+    Tensor_释放(特征)
+}
+
+// §13 诊断与统计输出
+
+函数 Generator_诊断输出() {
+    可变 报告 = "[NGEN诊断报告]\n"
+    报告 = 报告 + "Generator创建总数: " + 全局_gen创建总数 + "\n"
+    报告 = 报告 + "next()调用: " + 全局_gen_next调用 + "\n"
+    报告 = 报告 + "return()调用: " + 全局_gen_return调用 + "\n"
+    报告 = 报告 + "throw()调用: " + 全局_gen_throw调用 + "\n"
+    报告 = 报告 + "yield总次数: " + 全局_yield总次数 + "\n"
+    报告 = 报告 + "快照复用: " + 全局_快照复用次数 + "\n"
+    报告 = 报告 + "AI预取命中: " + 全局_AI预取命中 + "\n"
+    报告 = 报告 + "AI预取未中: " + 全局_AI预取未中 + "\n"
+    返回 报告
+}

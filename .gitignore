@@ -1,0 +1,34 @@
+# 编译产物
+*.o
+*.out
+*.bin
+*.elf
+*.so
+*.dylib
+
+# Nova缓存
+.nova_cache/
+__pycache__/
+*.pyc
+
+# 构建目录
+分离链式自举/阶段1_自举启动/_stage1_build/
+分离链式自举/阶段1_自举启动/阶段1_编译器
+分离链式自举/阶段1_自举启动/固定点_编译器
+分离链式自举/阶段1_自举启动/固定点_编译器.map
+分离链式自举/阶段1_自举启动/阶段1_编译器.map
+
+# Rust构建产物
+分离链式自举/种子/rust生成器/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时文件
+.*_nova_files_tmp.txt
+.*_nova_dir_tmp.txt
+_manifest.txt.bak*

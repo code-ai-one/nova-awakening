@@ -1,0 +1,210 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §2 ResizeObserver
+
+结构 ResizeObserverEntry {
+    target,    // u64 元素*
+    // content rect
+    contentRect_x,
+    contentRect_y,
+    contentRect_w,
+    contentRect_h,
+    // border box size
+    borderBoxSize_inlineSize,
+    borderBoxSize_blockSize,
+    // content box size
+    contentBoxSize_inlineSize,
+    contentBoxSize_blockSize,
+    // device pixel content box
+    devicePixelContentBox_inlineSize,
+    devicePixelContentBox_blockSize,
+}
+
+结构 ResizeObserverTarget {
+    元素,    // u64 元素*
+    上次宽,
+    上次高,
+    盒模型,    // u8 0=content-box 1=border-box 2=device-pixel-content-box
+}
+
+结构 ResizeObserver {
+    回调,    // u64 Nova函数*
+    目标,    // [64]ResizeObserverTarget
+    目标数,
+}
+
+函数 ResizeObserver_创建(回调) {
+    定义 ro = 堆_分配(ResizeObserver)
+    ro.回调 = 回调; ro.目标数 = 0
+    返回 ro
+}
+
+函数 ResizeObserver_observe(ro, 元素, 盒模型) {
+    如果 (ro == 0 || 元素 == 0 || ro.目标数 >= 64) { 返回 }
+    // 检查重复
+    定义 可变 i = 0
+    当 (i < ro.目标数) {
+        如果 (ro.目标[i].元素 == 元素) { 返回 }
+        i = i + 1
+    }
+    ro.目标[ro.目标数].元素 = 元素
+    ro.目标[ro.目标数].上次宽 = -1; ro.目标[ro.目标数].上次高 = -1
+    ro.目标[ro.目标数].盒模型 = 盒模型
+    ro.目标数 = ro.目标数 + 1
+}
+
+函数 ResizeObserver_unobserve(ro, 元素) {
+    如果 (ro == 0 || 元素 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < ro.目标数) {
+        如果 (ro.目标[i].元素 == 元素) {
+            ro.目标[i] = ro.目标[ro.目标数 - 1]
+            ro.目标数 = ro.目标数 - 1
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 ResizeObserver_disconnect(ro) {
+    如果 (ro == 0) { 返回 }
+    ro.目标数 = 0
+}
+
+// 布局后检查尺寸变化
+函数 ResizeObserver_检查(ro) {
+    如果 (ro == 0 || ro.目标数 == 0) { 返回 }
+    定义 可变 有变化 = 假
+    定义 可变 i = 0
+    当 (i < ro.目标数) {
+        定义 el = ro.目标[i].元素
+        如果 (el == 0) { i = i + 1; 继续 }
+        // 获取元素当前尺寸(从layout结果)
+        定义 当前宽 = 0    // 元素.offsetWidth
+        定义 当前高 = 0    // 元素.offsetHeight
+        如果 (当前宽 != ro.目标[i].上次宽 || 当前高 != ro.目标[i].上次高) {
+            有变化 = 真
+            ro.目标[i].上次宽 = 当前宽; ro.目标[i].上次高 = 当前高
+        }
+        i = i + 1
+    }
+    如果 (有变化 && ro.回调 != 0) {
+        // 调用回调(entries, observer)
+    }
+}
+
+// §3 MutationObserver
+
+// 配置
+定义 MUT_CHILD_LIST      = 1
+定义 MUT_ATTRIBUTES      = 2
+定义 MUT_CHARACTER_DATA  = 4
+定义 MUT_SUBTREE         = 8
+定义 MUT_ATTRIBUTE_OLD_VALUE = 16
+定义 MUT_CHARACTER_DATA_OLD_VALUE = 32
+
+结构 MutationRecord {
+    类型,    // u64 "childList"/"attributes"/"characterData"
+    target,    // u64 节点*
+    // childList
+    added节点s,    // u64 节点List*
+    removed节点s,    // u64 节点List*
+    previousSibling,    // u64 节点*
+    nextSibling,    // u64 节点*
+    // attributes
+    attributeName,
+    attributeNamespace,
+    oldValue,
+    下一个,    // u64 MutationRecord*
+}
+
+结构 MutationObserverRegistration {
+    目标,    // u64 节点*
+    选项,    // u32 MUT_xxx位掩码
+    属性过滤,    // u64 仅观察的属性名数组
+    属性过滤数,
+}
+
+结构 MutationObserver {
+    回调,    // u64 Nova函数*
+    // 注册列表
+    注册,    // [32]MutationObserverRegistration
+    注册数,
+    // 待通知队列
+    队列头,    // u64 MutationRecord*
+    队列尾,
+    队列大小,
+}
+
+函数 MutationObserver_创建(回调) {
+    定义 mo = 堆_分配(MutationObserver)
+    mo.回调 = 回调; mo.注册数 = 0
+    mo.队列头 = 0; mo.队列尾 = 0; mo.队列大小 = 0
+    返回 mo
+}
+
+函数 MutationObserver_observe(mo, target, 选项) {
+    如果 (mo == 0 || target == 0 || mo.注册数 >= 32) { 返回 }
+    // 检查已有注册
+    定义 可变 i = 0
+    当 (i < mo.注册数) {
+        如果 (mo.注册[i].目标 == target) {
+            mo.注册[i].选项 = 选项
+            返回
+        }
+        i = i + 1
+    }
+    mo.注册[mo.注册数].目标 = target
+    mo.注册[mo.注册数].选项 = 选项
+    mo.注册[mo.注册数].属性过滤 = 0; mo.注册[mo.注册数].属性过滤数 = 0
+    mo.注册数 = mo.注册数 + 1
+}
+
+函数 MutationObserver_disconnect(mo) {
+    如果 (mo == 0) { 返回 }
+    mo.注册数 = 0; mo.队列头 = 0; mo.队列尾 = 0; mo.队列大小 = 0
+}
+
+函数 MutationObserver_takeRecords(mo) {
+    如果 (mo == 0) { 返回 0 }
+    定义 头 = mo.队列头
+    mo.队列头 = 0; mo.队列尾 = 0; mo.队列大小 = 0
+    返回 头
+}
+
+// DOM操作时调用: 通知所有相关的MutationObserver
+函数 MutationObserver_通知childList(target, added, removed, prev, next) {
+    // 遍历所有MO, 检查是否观察了target(包括subtree祖先)
+    定义 可变 i = 0
+    当 (i < 全局_MO列表_数量) {
+        定义 mo = 内存_读64(全局_MO列表 + i * 8)
+        如果 (mo != 0 && MO_观察了目标(mo, target, MUT_CHILDLIST)) {
+            定义 record = 堆_分配(MutationRecord)
+            record.类型 = "childList"
+            record.目标 = target
+            record.添加节点 = added
+            record.删除节点 = removed
+            record.前兄弟 = prev
+            record.后兄弟 = next
+            MO_入队记录(mo, record)
+        }
+        i = i + 1
+    }
+}
+
+函数 MutationObserver_通知attribute(target, 属性名, 旧值) {
+    定义 可变 i = 0
+    当 (i < 全局_MO列表_数量) {
+        定义 mo = 内存_读64(全局_MO列表 + i * 8)
+        如果 (mo != 0 && MO_观察了目标(mo, target, MUT_ATTRIBUTES)) {
+            定义 record = 堆_分配(MutationRecord)
+            record.类型 = "attributes"
+            record.目标 = target
+            record.属性名 = 属性名
+            如果 (mo.记录旧值) { record.旧值 = 旧值 }
+            MO_入队记录(mo, record)
+        }
+        i = i + 1
+    }
+}

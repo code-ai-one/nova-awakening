@@ -1,0 +1,247 @@
+导入("../核心/FFI桥接.nova")
+导入("../核心/设备管理.nova")
+导入("../../../标准库/基础.nova")
+
+// Nova · GPU · AMD MIOpen 完整接入
+// AMD深度学习加速库 — 等价于NVIDIA cuDNN
+// 卷积/池化/归一化/激活/RNN/Softmax/Dropout
+// 真实调用MIOpen.dll / libMIOpen.so (ROCm)
+
+// MIOpen 数据类型
+定义 MIOpen_单精度   = 0
+定义 MIOpen_半精度    = 1
+定义 MIOpen_整8    = 3
+定义 MIOpen_BF16精度 = 5
+
+// 卷积模式
+定义 MIOpen_卷积     = 0
+定义 MIOpen_交叉相关 = 1
+定义 MIOpen_转置       = 2
+定义 MIOpen_分组            = 3
+定义 MIOpen_深度卷积        = 4
+
+// 池化模式
+定义 MIOpen_池化_最大 = 0
+定义 MIOpen_池化_平均 = 1
+定义 MIOpen_池化_平均含边界 = 2
+
+// 激活模式
+定义 MIOpen_激活_ReLU    = 1
+定义 MIOpen_激活_Sigmoid = 2
+定义 MIOpen_激活_Tanh    = 3
+定义 MIOpen_激活_ELU     = 4
+定义 MIOpen_激活_泄漏ReLU = 5
+
+// 归一化模式
+定义 MIOpen_批归一_逐激活 = 0
+定义 MIOpen_批归一_空间        = 1
+
+// MIOpen库缓存
+定义 可变 _MIOpen库 = 0
+定义 可变 _MIOpen句柄 = 0
+
+函数 MIOpen_加载() {
+    如果 (_MIOpen库 != 0) { 返回 _MIOpen库 }
+    _MIOpen库 = GPU_加载ROCm候选([
+        "MIOpen.dll",
+        "libMIOpen.so"
+    ])
+    返回 _MIOpen库
+}
+
+函数 MIOpen_初始化() {
+    如果 (_MIOpen句柄 != 0) { 返回 _MIOpen句柄 }
+    定义 lib = MIOpen_加载()
+    如果 (lib == 0) { 返回 0 }
+    _MIOpen句柄 = 外部调用(lib,  "miopenCreate", 0, 0, 0, 0, 0)
+    返回 _MIOpen句柄
+}
+
+// 张量描述符
+函数 MIOpen_创建张量描述(N, C, H, W, 数据类型) {
+    定义 lib = MIOpen_加载()
+    定义 desc = 外部调用(lib,  "miopenCreateTensorDescriptor", 0, 0, 0, 0, 0)
+    外部调用6(lib,  "miopenSet4dTensorDescriptor",  desc,  数据类型,  N,  C,  H,  W, 0)
+    返回 desc
+}
+
+// 卷积
+函数 MIOpen_创建卷积描述(pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, 模式) {
+    定义 lib = MIOpen_加载()
+    定义 desc = 外部调用(lib,  "miopenCreateConvolutionDescriptor", 0, 0, 0, 0, 0)
+    外部调用N(lib, "miopenInitConvolutionDescriptor",
+        [desc, 模式, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w])
+    返回 desc
+}
+
+函数 MIOpen_卷积前向(输入desc, 输入, 滤波desc, 滤波, 卷积desc, 输出desc, 输出) {
+    定义 handle = MIOpen_初始化()
+    如果 (handle == 0) { 返回 假 }
+    定义 lib = MIOpen_加载()
+    // 搜索最优算法
+    定义 算法 = 外部调用N(lib, "miopenFindConvolutionForwardAlgorithm",
+        [handle, 输入desc, 输入, 滤波desc, 滤波, 卷积desc, 输出desc, 输出, 1, 0, 0, 假])
+    // 执行卷积
+    返回 外部调用N(lib, "miopenConvolutionForward",
+        [handle, 1.0, 输入desc, 输入, 滤波desc, 滤波, 卷积desc, 算法, 0.0, 输出desc, 输出,]) == 0
+}
+
+函数 MIOpen_卷积反向数据(滤波desc, 滤波, 梯度输出desc, 梯度输出, 卷积desc, 梯度输入desc, 梯度输入) {
+    定义 handle = MIOpen_初始化()
+    定义 lib = MIOpen_加载()
+    返回 外部调用N(lib, "miopenConvolutionBackwardData",
+        [handle, 1.0, 梯度输出desc, 梯度输出, 滤波desc, 滤波, 卷积desc,.0, 梯度输入desc, 梯度输入,]) == 0
+}
+
+函数 MIOpen_卷积反向权重(输入desc, 输入, 梯度输出desc, 梯度输出, 卷积desc, 梯度滤波desc, 梯度滤波) {
+    定义 handle = MIOpen_初始化()
+    定义 lib = MIOpen_加载()
+    返回 外部调用N(lib, "miopenConvolutionBackwardWeights",
+        [handle, 1.0, 梯度输出desc, 梯度输出, 输入desc, 输入, 卷积desc,.0, 梯度滤波desc, 梯度滤波,]) == 0
+}
+
+// 池化
+函数 MIOpen_创建池化描述(模式, 窗口H, 窗口W, pad_h, pad_w, stride_h, stride_w) {
+    定义 lib = MIOpen_加载()
+    定义 desc = 外部调用(lib,  "miopenCreatePoolingDescriptor", 0, 0, 0, 0, 0)
+    外部调用N(lib, "miopenSet2dPoolingDescriptor",
+        [desc, 模式, 窗口H, 窗口W, pad_h, pad_w, stride_h, stride_w])
+    返回 desc
+}
+
+函数 MIOpen_池化前向(池化desc, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenPoolingForward",
+        [handle, 池化desc, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出, 假,]) == 0
+}
+
+// 激活
+函数 MIOpen_创建激活描述(模式, alpha) {
+    定义 lib = MIOpen_加载()
+    定义 desc = 外部调用(lib,  "miopenCreateActivationDescriptor", 0, 0, 0, 0, 0)
+    外部调用4(lib, "miopenSetActivationDescriptor", desc, 模式, alpha, 0.0, 0.0)
+    返回 desc
+}
+
+函数 MIOpen_激活前向(激活desc, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenActivationForward",
+        [handle, 激活desc, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出]) == 0
+}
+
+// 批归一化
+函数 MIOpen_批归一化前向_训练(模式, 输入desc, 输入, 输出desc, 输出, BN_scale_bias_desc, scale, bias, 动量, 均值, 方差, epsilon) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenBatchNormalizationForwardTraining",
+        [handle, 模式, 1.0, 0.0, 输入desc, 输入, 输出desc, 输出, BN_scale_bias_desc, scale, bias, 动量, 均值, 方差, epsilon,]) == 0
+}
+
+函数 MIOpen_批归一化前向_推理(模式, 输入desc, 输入, 输出desc, 输出, BN_desc, scale, bias, 均值, 方差, epsilon) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenBatchNormalizationForwardInference",
+        [handle, 模式, 1.0, 0.0, 输入desc, 输入, 输出desc, 输出, BN_desc, scale, bias, 均值, 方差, epsilon]) == 0
+}
+
+// Softmax
+函数 MIOpen_Softmax前向(输入desc, 输入, 输出desc, 输出) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenSoftmaxForward_V2",
+        [handle, 1.0, 输入desc, 输入, 0.0, 输出desc, 输出, 0, 1]) == 0
+}
+
+// 清理
+函数 MIOpen_清理() {
+    如果 (_MIOpen句柄 != 0) {
+        外部调用(MIOpen_加载(),  "miopenDestroy",  _MIOpen句柄, 0, 0, 0, 0)
+        _MIOpen句柄 = 0
+    }
+}
+
+// RNN
+
+函数 MIOpen_RNN描述(隐藏大小, 层数, 模式) {
+    // 模式: 0=ReLU, 1=Tanh, 2=LSTM, 3=GRU
+    定义 lib = MIOpen_加载()
+    定义 desc = 外部调用(lib,  "miopenCreateRNNDescriptor", 0, 0, 0, 0, 0)
+    外部调用N(lib, "miopenSetRNNDescriptor_V2",
+        [desc, 隐藏大小, 层数, 0, 模式,])
+    返回 desc
+}
+
+函数 MIOpen_RNN前向(rnnDesc, 序列长度, 输入desc, 输入, 隐藏desc, 隐藏, 输出desc, 输出, 权重desc, 权重) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenRNNForward",
+        [handle, rnnDesc, 序列长度, 输入desc, 输入, 隐藏desc, 隐藏, 0, 输出desc, 输出, 权重desc, 权重, 0, 0]) == 0
+}
+
+// Dropout
+
+函数 MIOpen_Dropout描述(丢弃率, 种子) {
+    定义 lib = MIOpen_加载()
+    定义 handle = MIOpen_初始化()
+    定义 desc = 外部调用(lib,  "miopenCreateDropoutDescriptor", 0, 0, 0, 0, 0)
+    // 获取状态大小
+    定义 状态大小 = 外部调用(lib,  "miopenDropoutGetStatesSize",  handle, 0, 0, 0, 0)
+    外部调用N(lib, "miopenSetDropoutDescriptor",
+        [desc, handle, 丢弃率, 0, 状态大小, 种子])
+    返回 desc
+}
+
+函数 MIOpen_Dropout前向(dropoutDesc, 输入desc, 输入, 输出desc, 输出) {
+    定义 handle = MIOpen_初始化()
+    返回 外部调用N(MIOpen_加载(), "miopenDropoutForward",
+        [handle, dropoutDesc, 0, 输入desc, 输入, 输出desc, 输出,]) == 0
+}
+
+// 性能调优
+
+定义 可变 _MIOpen_调优缓存_键 = []
+定义 可变 _MIOpen_调优缓存_算法 = []
+
+函数 MIOpen_缓存算法(卷积键, 最佳算法) {
+    追加(_MIOpen_调优缓存_键, 卷积键)
+    追加(_MIOpen_调优缓存_算法, 最佳算法)
+}
+
+函数 MIOpen_查缓存(卷积键) {
+    定义 可变 i = 0
+    当 (i < 计数(_MIOpen_调优缓存_键)) {
+        如果 (_MIOpen_调优缓存_键[i] == 卷积键) { 返回 _MIOpen_调优缓存_算法[i] }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 MIOpen_卷积键(输入N, 输入C, 输入H, 输入W, 滤波K, 滤波R, _滤波S) {
+    返回 输入N * 10000000 + 输入C * 100000 + 输入H * 1000 + 输入W * 100 + 滤波K * 10 + 滤波R
+}
+
+// 工作空间管理
+
+定义 可变 _MIOpen_工作空间 = 0
+定义 可变 _MIOpen_工作空间大小 = 0
+
+函数 MIOpen_分配工作空间(大小) {
+    如果 (大小 > _MIOpen_工作空间大小) {
+        如果 (_MIOpen_工作空间 != 0) {
+            外部调用(MIOpen_加载(),  "hipFree",  _MIOpen_工作空间, 0, 0, 0, 0)
+        }
+        _MIOpen_工作空间 = 外部调用(MIOpen_加载(),  "hipMalloc",  大小, 0, 0, 0, 0)
+        _MIOpen_工作空间大小 = 大小
+    }
+    返回 _MIOpen_工作空间
+}
+
+函数 MIOpen_释放工作空间() {
+    如果 (_MIOpen_工作空间 != 0) {
+        外部调用(MIOpen_加载(),  "hipFree",  _MIOpen_工作空间, 0, 0, 0, 0)
+        _MIOpen_工作空间 = 0
+        _MIOpen_工作空间大小 = 0
+    }
+}
+
+定义 可变 _MIOpen_调用数 = 0
+定义 可变 _MIOpen_失败数 = 0
+
+函数 MIOpen_记录调用() { _MIOpen_调用数 = _MIOpen_调用数 + 1 }
+函数 MIOpen_记录失败() { _MIOpen_失败数 = _MIOpen_失败数 + 1 }

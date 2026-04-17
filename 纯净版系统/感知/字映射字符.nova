@@ -1,0 +1,210 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+
+// §3 cmap: 字符→字形映射
+
+函数 字体_字符到字形(font, codepoint) {
+    如果 (font == 0 || font.cmap偏移 == 0) { 返回 0 }
+    定义 数据 = font.数据
+    定义 cmap = font.cmap偏移
+
+    // 查找合适的子表(优先BMP: platform=3, encoding=1, format 4)
+    定义 子表数 = 字体_读u16(数据, cmap + 2)
+    定义 可变 best偏移 = 0
+    定义 可变 i = 0
+    当 (i < 子表数) {
+        定义 rec偏移 = cmap + 4 + i * 8
+        定义 platformID = 字体_读u16(数据, rec偏移)
+        定义 encodingID = 字体_读u16(数据, rec偏移 + 2)
+        定义 子表offset = 字体_读u32(数据, rec偏移 + 4)
+        如果 (platformID == 3 && encodingID == 1) {
+            best偏移 = cmap + 子表offset; 跳出
+        }
+        如果 (platformID == 0) {
+            best偏移 = cmap + 子表offset
+        }
+        i = i + 1
+    }
+    如果 (best偏移 == 0) { 返回 0 }
+
+    定义 format = 字体_读u16(数据, best偏移)
+    如果 (format == 4) {
+        返回 字体_cmap_format4(数据, best偏移, codepoint)
+    } 否则 如果 (format == 12) {
+        返回 字体_cmap_format12(数据, best偏移, codepoint)
+    }
+    返回 0
+}
+
+函数 字体_cmap_format4(数据, 偏移, cp) {
+    // Format 4: BMP段映射
+    定义 segCount = 字体_读u16(数据, 偏移 + 6) / 2
+    定义 endCodes = 偏移 + 14
+    定义 startCodes = endCodes + segCount * 2 + 2
+    定义 idDelta = startCodes + segCount * 2
+    定义 idRangeOffset = idDelta + segCount * 2
+
+    定义 可变 lo = 0; 定义 可变 hi = segCount - 1
+    当 (lo <= hi) {
+        定义 mid = (lo + hi) / 2
+        定义 endCode = 字体_读u16(数据, endCodes + mid * 2)
+        定义 startCode = 字体_读u16(数据, startCodes + mid * 2)
+        如果 (cp > endCode) { lo = mid + 1 }
+        否则 如果 (cp < startCode) { hi = mid - 1 }
+        否则 {
+            // 找到段
+            定义 delta = 字体_读i16(数据, idDelta + mid * 2)
+            定义 rangeOff = 字体_读u16(数据, idRangeOffset + mid * 2)
+            如果 (rangeOff == 0) {
+                返回 (cp + delta) & 0xFFFF
+            } 否则 {
+                定义 glyphAddr = idRangeOffset + mid * 2 + rangeOff + (cp - startCode) * 2
+                定义 glyph = 字体_读u16(数据, glyphAddr)
+                如果 (glyph != 0) { 返回 (glyph + delta) & 0xFFFF }
+                返回 0
+            }
+        }
+    }
+    返回 0
+}
+
+函数 字体_cmap_format12(数据, 偏移, cp) {
+    // Format 12: 全Unicode段映射
+    定义 nGroups = 字体_读u32(数据, 偏移 + 12)
+    定义 可变 lo = 0; 定义 可变 hi = nGroups - 1
+    当 (lo <= hi) {
+        定义 mid = (lo + hi) / 2
+        定义 rec = 偏移 + 16 + mid * 12
+        定义 startChar = 字体_读u32(数据, rec)
+        定义 endChar = 字体_读u32(数据, rec + 4)
+        定义 startGlyph = 字体_读u32(数据, rec + 8)
+        如果 (cp > endChar) { lo = mid + 1 }
+        否则 如果 (cp < startChar) { hi = mid - 1 }
+        否则 { 返回 startGlyph + (cp - startChar) }
+    }
+    返回 0
+}
+
+// §4 字形轮廓读取
+
+函数 字体_获取字形偏移(font, glyphID) {
+    如果 (font == 0 || font.loca偏移 == 0) { 返回 0 }
+    如果 (font.loca格式 == 0) {
+        // short format: offset/2
+        返回 字体_读u16(font.数据, font.loca偏移 + glyphID * 2) * 2
+    } 否则 {
+        // long format
+        返回 字体_读u32(font.数据, font.loca偏移 + glyphID * 4)
+    }
+}
+
+函数 字体_获取字形轮廓(font, glyphID) {
+    如果 (font == 0 || font.glyf偏移 == 0) { 返回 0 }
+    定义 offset = 字体_获取字形偏移(font, glyphID)
+    定义 addr = font.glyf偏移 + offset
+    定义 数据 = font.数据
+
+    定义 outline = 堆_分配(GlyphOutline)
+    定义 轮廓数 = 字体_读i16(数据, addr)
+    outline.xMin = 字体_读i16(数据, addr + 2)
+    outline.yMin = 字体_读i16(数据, addr + 4)
+    outline.xMax = 字体_读i16(数据, addr + 6)
+    outline.yMax = 字体_读i16(数据, addr + 8)
+
+    如果 (轮廓数 < 0) {
+        // 复合字形
+        outline.是复合 = 真; outline.轮廓数 = 0; outline.点数 = 0
+        返回 outline
+    }
+
+    outline.是复合 = 假; outline.轮廓数 = 轮廓数
+    // 读取轮廓结束索引(endPtsOfContours)
+    定义 可变 hdr_off = addr + 10
+    定义 可变 最后点idx = 0
+    定义 可变 c = 0
+    当 (c < 轮廓数) {
+        定义 endPt = 字体_读u16(数据, hdr_off + c * 2)
+        如果 (endPt > 最后点idx) { 最后点idx = endPt }
+        c = c + 1
+    }
+    outline.点数 = 最后点idx + 1
+    // 跳过instructionLength和指令
+    定义 instr_off = hdr_off + 轮廓数 * 2
+    定义 instr_len = 字体_读u16(数据, instr_off)
+    // flags从 instr_off + 2 + instr_len 开始
+    // 每个点1字节flag: bit0=在曲线上, bit1=x短, bit2=y短...
+    返回 outline
+}
+
+// §5 GlyphOutline结构与辅助
+
+结构 GlyphOutline {
+    轮廓数,
+    点数,
+    xMin,
+    yMin,
+    xMax,
+    yMax,
+    是复合,
+}
+
+函数 字体_读u16(数据, 偏移) {
+    返回 (内存_读8(数据 + 偏移) << 8) | 内存_读8(数据 + 偏移 + 1)
+}
+
+函数 字体_读i16(数据, 偏移) {
+    定义 值 = 字体_读u16(数据, 偏移)
+    如果 (值 >= 32768) { 返回 值 - 65536 }
+    返回 值
+}
+
+函数 字体_读u32(数据, 偏移) {
+    返回 (内存_读8(数据 + 偏移) << 24) | (内存_读8(数据 + 偏移 + 1) << 16) |
+           (内存_读8(数据 + 偏移 + 2) << 8) | 内存_读8(数据 + 偏移 + 3)
+}
+
+函数 字形_宽度(outline) {
+    如果 (outline == 0) { 返回 0 }
+    返回 outline.xMax - outline.xMin
+}
+
+函数 字形_高度(outline) {
+    如果 (outline == 0) { 返回 0 }
+    返回 outline.yMax - outline.yMin
+}
+
+// §6 字体统计
+
+定义 可变 cmap_查找总数 = 0
+定义 可变 cmap_命中总数 = 0
+定义 可变 字形_加载总数 = 0
+
+函数 字体映射_统计() {
+    返回 {
+        查找: cmap_查找总数,
+        命中: cmap_命中总数,
+        字形加载: 字形_加载总数,
+    }
+}
+
+函数 字体映射_健康检查() { 返回 "字体映射健康" }
+
+函数 字体映射_完整统计() {
+    返回 [cmap_查找总数, cmap_命中总数, 字形_加载总数]
+}
+
+定义 可变 AI_字映射字符_调用数 = 0
+定义 可变 AI_字映射字符_异常数 = 0
+
+函数 AI_字映射字符_监控() {
+    AI_字映射字符_调用数 = AI_字映射字符_调用数 + 1
+    返回 AI_字映射字符_异常数 == 0
+}
+
+函数 AI_字映射字符_健康检查() {
+    如果 (AI_字映射字符_调用数 > 0 && AI_字映射字符_异常数 * 100 / AI_字映射字符_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

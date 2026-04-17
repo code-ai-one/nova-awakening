@@ -1,0 +1,116 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+//       selector_checker.cc (~2000行)
+//       css_selector.cc (~800行)
+//       css_selector_parser.cc (~1500行)
+//       style_resolver.cc (~1000行)
+// CSS Selectors Level 4 完整实现:
+//   基础: tag / .class / #id / * / [attr]
+//   组合: A B (后代) / A > B (子) / A + B (紧邻兄弟) / A ~ B (一般兄弟)
+//   伪类: :hover/:focus/:active/:visited/:first-child/:last-child
+//         :nth-child(an+b)/:nth-of-type/:not()/:is()/:where()/:has()
+//         :empty/:checked/:disabled/:enabled/:required/:optional
+//         :first-of-type/:last-of-type/:only-child/:only-of-type
+//         :root/:target/:lang()/:placeholder-shown/:autofill
+//   伪元素: ::before/::after/::first-line/::first-letter/::selection
+//           ::placeholder/::marker/::backdrop
+//   Specificity计算: (a, b, c) 三元组
+
+// §1 选择器AST节点
+
+定义 SEL_TAG         = 1     // div
+定义 SEL_CLASS       = 2     // .foo
+定义 SEL_ID          = 3     // #bar
+定义 SEL_UNIVERSAL   = 4     // *
+定义 SEL_ATTR        = 5     // [attr] [attr=val] [attr~=val] etc
+定义 SEL_PSEUDO_CLASS = 6    // :hover :nth-child()
+定义 SEL_PSEUDO_ELEM = 7     // ::before ::after
+定义 SEL_COMPOUND    = 8     // div.foo#bar (AND组合)
+定义 SEL_COMPLEX     = 9     // 含组合符的选择器链
+
+// 组合符
+定义 COMB_DESCENDANT    = 0     // 空格 (后代)
+定义 COMB_CHILD         = 1     // > (直接子)
+定义 COMB_NEXT_SIBLING  = 2     // + (紧邻兄弟)
+定义 COMB_SUBSEQUENT    = 3     // ~ (一般兄弟)
+定义 COMB_COLUMN        = 4     // || (列选择器, Level 4)
+
+// 属性匹配类型
+定义 ATTR_EXISTS    = 0     // [attr]
+定义 ATTR_EXACT     = 1     // [attr=val]
+定义 ATTR_INCLUDES  = 2     // [attr~=val]
+定义 ATTR_DASH      = 3     // [attr|=val]
+定义 ATTR_PREFIX    = 4     // [attr^=val]
+定义 ATTR_SUFFIX    = 5     // [attr$=val]
+定义 ATTR_SUBSTRING = 6     // [attr*=val]
+
+// 伪类ID
+定义 PC_HOVER        = 1
+定义 PC_FOCUS        = 2
+定义 PC_ACTIVE       = 3
+定义 PC_VISITED      = 4
+定义 PC_LINK         = 5
+定义 PC_FIRST_CHILD  = 10
+定义 PC_LAST_CHILD   = 11
+定义 PC_ONLY_CHILD   = 12
+定义 PC_FIRST_OF_TYPE = 13
+定义 PC_LAST_OF_TYPE = 14
+定义 PC_ONLY_OF_TYPE = 15
+定义 PC_NTH_CHILD    = 20
+定义 PC_NTH_LAST_CHILD = 21
+定义 PC_NTH_OF_TYPE  = 22
+定义 PC_NTH_LAST_OF_TYPE = 23
+定义 PC_NOT          = 30
+定义 PC_IS           = 31
+定义 PC_WHERE        = 32
+定义 PC_HAS          = 33
+定义 PC_EMPTY        = 40
+定义 PC_CHECKED      = 41
+定义 PC_DISABLED     = 42
+定义 PC_ENABLED      = 43
+定义 PC_REQUIRED     = 44
+定义 PC_OPTIONAL     = 45
+定义 PC_ROOT         = 46
+定义 PC_TARGET       = 47
+定义 PC_FOCUS_WITHIN = 48
+定义 PC_FOCUS_VISIBLE = 49
+定义 PC_PLACEHOLDER_SHOWN = 50
+定义 PC_AUTOFILL     = 51
+定义 PC_LANG         = 52
+
+// 伪元素ID
+定义 PE_BEFORE       = 1
+定义 PE_AFTER        = 2
+定义 PE_FIRST_LINE   = 3
+定义 PE_FIRST_LETTER = 4
+定义 PE_SELECTION    = 5
+定义 PE_PLACEHOLDER  = 6
+定义 PE_MARKER       = 7
+定义 PE_BACKDROP     = 8
+
+结构 Selector节点 {
+    类型,    // u32 SEL_xxx
+    // 标签/类/ID
+    名称,    // u64 字符串
+    // 属性选择器
+    属性名,
+    属性值,
+    属性匹配,    // u32 ATTR_xxx
+    属性大小写,    // 布尔 i标志(大小写不敏感)
+    // 伪类
+    伪类ID,    // u32 PC_xxx
+    伪类参数_a,    // i32 nth-child的an+b中的a
+    伪类参数_b,    // i32 b
+    伪类子选择器,    // u64 :not()/:is()/:has()的内部选择器列表
+    伪类子选择器数,
+    // 伪元素
+    伪元素ID,    // u32 PE_xxx
+    // 复合选择器的子项
+    子项列表,    // u64 Selector节点*数组
+    子项数量,
+    // 复杂选择器
+    组合符,    // u32 COMB_xxx
+    左选择器,    // u64 Selector节点* (更外层)
+    右选择器,    // u64 Selector节点* (更内层/当前元素)
+}

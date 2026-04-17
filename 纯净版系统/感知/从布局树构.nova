@@ -1,0 +1,114 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./创建销毁.nova")
+导入("./创建初始化.nova")
+
+// §3 从布局树构建绘制层树
+// (对应 绘制LayerCompositor)
+
+函数 绘制Layer_从布局树构建(根布局对象) {
+ 定义 根层 = 绘制Layer_创建(根布局对象)
+ 绘制Layer_构建递归(根层, 根布局对象)
+ 绘制Layer_更新z序(根层)
+ 返回 根层
+}
+
+函数 绘制Layer_构建递归(当前层, 布局对象) {
+ 定义 可变 子lo = 布局对象.第一子
+ 当 (子lo != 0) {
+ 如果 (绘制Layer_需要自己的层(子lo)) {
+ // 创建新层
+ 定义 新层 = 绘制Layer_创建(子lo)
+ 绘制Layer_添加子层(当前层, 新层)
+ 绘制Layer_构建递归(新层, 子lo)
+ } 否则 {
+ // 共享父层
+ 绘制Layer_构建递归(当前层, 子lo)
+ }
+ 子lo = 子lo.后兄
+ }
+}
+
+函数 绘制Layer_需要自己的层(lo) {
+ // 绘制Layer creation conditions
+ 定义 s = lo.样式
+ 如果 (s == 0) { 返回 0 }
+ 如果 (s.position != Position_static) { 返回 1 }
+ 如果 (s.opacity < 100) { 返回 1 }
+ 如果 (s.transform != 0) { 返回 1 }
+ 如果 (s.overflow_x != Overflow_visible || s.overflow_y != Overflow_visible) { 返回 1 }
+ 如果 (!s.z_index_auto) { 返回 1 }
+ 如果 (s.display == Display_flex || s.display == Display_grid) { 返回 1 }
+ 返回 0
+}
+
+// §4 显示列表 (DisplayItem / cc::DisplayItemList)
+// 绘制指令的记录——不直接渲染,而是记录成列表,之后批量执行
+
+定义 显示项_背景 = 1 // DrawRect (background-color)
+定义 显示项_边框 = 2 // DrawBorder
+定义 显示项_文本 = 3 // DrawText
+定义 显示项_图片 = 4 // Draw图像
+定义 显示项_圆角裁剪 = 5 // ClipRoundedRect (border-radius)
+定义 显示项_裁剪 = 6 // Clip
+定义 显示项_还原裁剪 = 7 // EndClip
+定义 显示项_透明度开始 = 8 // SaveLayerAlpha
+定义 显示项_透明度结束 = 9 // Restore
+定义 显示项_变换开始 = 10 // Save + Transform
+定义 显示项_变换结束 = 11 // Restore
+定义 显示项_阴影 = 12 // DrawShadow
+定义 显示项_轮廓 = 13 // DrawOutline
+定义 显示项_滚动条 = 14 // DrawScrollbar
+
+结构 显示项 {
+ 类型,
+ // 矩形区域
+ x,
+ y,
+ w,
+ h,
+ // 颜色
+ 颜色,    // u32 RGBA
+ // 边框
+ 边框宽,
+ 边框颜色,
+ // 文本
+ 文本指针,
+ 文本长度,
+ 字号,
+ 字重,
+ 字体,
+ // 图片
+ 图片URL,
+ // 圆角
+ 圆角半径,
+ // 透明度
+ 透明度,    // i32 0-100 (×100 = 0-10000)
+}
+
+// §5 绘制操作: 遍历布局树生成显示列表
+// (对应 块级绘制er / Inline绘制er / Text绘制er 等)
+// CSS绘制顺序 (CSS2 Appendix E):
+// 1. 背景和边框(当前元素)
+// 2. 负z-index子层
+// 3. 块级子元素(非定位/浮动)
+// 4. 浮动子元素
+// 5. 内联内容(文本)
+// 6. 正z-index子层
+
+函数 绘制Layer_绘制(层, 显示列表, 偏移x, 偏移y) {
+ 如果 (层 == 0) { 返回 }
+ 定义 lo = 层.布局对象
+ 如果 (lo == 0) { 返回 }
+ 定义 s = lo.样式
+ 如果 (s == 0) { 返回 }
+
+ // 检查visibility
+ 如果 (s.visibility == Visibility_hidden) { 返回 }
+
+ // 计算绘制位置
+ 定义 绘制x = lo.绝对x + 偏移x - 层.滚动偏移x
+ 定义 绘制y = lo.绝对y + 偏移y - 层.滚动偏移y
+ 定义 绘制w = 布局Object_边框盒宽(lo)
+ 定义 绘制h = 布局Object_边框盒高(lo)
+}

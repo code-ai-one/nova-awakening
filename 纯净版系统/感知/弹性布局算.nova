@@ -1,0 +1,122 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./创建销毁.nova")
+导入("./绝对位置计.nova")
+导入("./核心布局算.nova")
+
+// §4 弹性box布局算法
+// (对应 布局弹性ibleBox::布局块级)
+
+函数 布局弹性_布局(lo) {
+ 定义 s = lo.样式
+ 如果 (s == 0) { 返回 }
+
+ // 确定主轴方向
+ 定义 是行 = (s.flex_direction == 弹性Dir_row || s.flex_direction == 弹性Dir_row_reverse)
+ 定义 可用主轴 = lo.内容宽
+ 如果 (!是行) { 可用主轴 = lo.内容高 }
+
+ // 收集flex项目
+ 定义 可变 项目数 = 0
+ 定义 可变 总主轴尺寸 = 0
+ 定义 可变 子 = lo.第一子
+ 当 (子 != 0) {
+ 如果 (子.样式 != 0 && 子.样式.display != Display_none) {
+ // 先布局子元素(确定其固有尺寸)
+ 布局Object_布局(子)
+ 如果 (是行) {
+ 总主轴尺寸 = 总主轴尺寸 + 布局Object_外边距盒宽(子)
+ } 否则 {
+ 总主轴尺寸 = 总主轴尺寸 + 布局Object_外边距盒高(子)
+ }
+ 项目数 = 项目数 + 1
+ }
+ 子 = 子.后兄
+ }
+
+ // 计算间距(justify-content)
+ 定义 可变 剩余空间 = 可用主轴 - 总主轴尺寸
+ 如果 (剩余空间 < 0) { 剩余空间 = 0 }
+
+ 定义 可变 起始偏移 = 0
+ 定义 可变 项目间距 = 0
+ 如果 (项目数 > 0) {
+ 如果 (s.justify_content == JC_center) {
+ 起始偏移 = 剩余空间 / 2
+ }
+ 否则 如果 (s.justify_content == JC_flex_end) {
+ 起始偏移 = 剩余空间
+ }
+ 否则 如果 (s.justify_content == JC_space_between && 项目数 > 1) {
+ 项目间距 = 剩余空间 / (项目数 - 1)
+ }
+ 否则 如果 (s.justify_content == JC_space_around && 项目数 > 0) {
+ 项目间距 = 剩余空间 / 项目数
+ 起始偏移 = 项目间距 / 2
+ }
+ 否则 如果 (s.justify_content == JC_space_evenly && 项目数 > 0) {
+ 项目间距 = 剩余空间 / (项目数 + 1)
+ 起始偏移 = 项目间距
+ }
+ }
+
+ // gap
+ 如果 (s.gap > 0 && 项目数 > 1) {
+ 项目间距 = s.gap
+ }
+
+ // 放置flex项目
+ 定义 可变 主轴位置 = 起始偏移 + s.padding_left.值 + s.border_left_width
+ 定义 可变 最大交叉 = 0
+ 子 = lo.第一子
+ 当 (子 != 0) {
+ 如果 (子.样式 == 0 || 子.样式.display == Display_none) {
+ 子 = 子.后兄
+ 继续
+ }
+
+ 定义 子样式 = 子.样式
+ 如果 (是行) {
+ 子.x = 主轴位置 + 子样式.margin_left.值
+
+ // 交叉轴对齐 (align-items)
+ 定义 子高 = 布局Object_边框盒高(子)
+ 如果 (s.align_items == JC_center) {
+ 子.y = s.padding_top.值 + s.border_top_width + (lo.内容高 - 子高) / 2
+ }
+ 否则 如果 (s.align_items == JC_flex_end) {
+ 子.y = lo.内容高 - 子高 - s.padding_bottom.值 - s.border_bottom_width
+ }
+ 否则 {
+ // flex-start / stretch
+ 子.y = s.padding_top.值 + s.border_top_width + 子样式.margin_top.值
+ 如果 (s.align_items == JC_stretch && 子样式.height.是auto) {
+ 子.内容高 = lo.内容高 - s.padding_top.值 - s.padding_bottom.值 - s.border_top_width - s.border_bottom_width - 子样式.margin_top.值 - 子样式.margin_bottom.值
+ }
+ }
+
+ 主轴位置 = 主轴位置 + 布局Object_外边距盒宽(子) + 项目间距
+ 如果 (子高 > 最大交叉) { 最大交叉 = 子高 }
+ } 否则 {
+ // column方向
+ 子.y = 主轴位置 + 子样式.margin_top.值
+ 子.x = s.padding_left.值 + s.border_left_width + 子样式.margin_left.值
+ 主轴位置 = 主轴位置 + 布局Object_外边距盒高(子) + 项目间距
+ 定义 子宽 = 布局Object_边框盒宽(子)
+ 如果 (子宽 > 最大交叉) { 最大交叉 = 子宽 }
+ }
+
+ 子 = 子.后兄
+ }
+
+ // auto尺寸
+ 如果 (s.height.是auto) {
+ 如果 (是行) {
+ lo.内容高 = 最大交叉 + s.padding_top.值 + s.padding_bottom.值 + s.border_top_width + s.border_bottom_width
+ } 否则 {
+ lo.内容高 = 主轴位置 + s.padding_top.值 + s.padding_bottom.值
+ }
+ }
+
+ 布局Object_计算绝对位置(lo)
+}

@@ -1,0 +1,147 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/高级中控设置.nova")
+导入("./原生系统图处.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §5 引擎复位与使能
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NV_引擎复位() {
+    定义 mmio = NV状态.mmio
+    // 保存当前使能状态
+    定义 原使能 = MMIO读32(mmio + NV_PMC_ENABLE)
+    // 禁用所有引擎
+    MMIO写32(mmio + NV_PMC_ENABLE, 0)
+    // 等待图处稳定(100us)
+    NV_等待us(100)
+    // 恢复使能
+    MMIO写32(mmio + NV_PMC_ENABLE, 原使能)
+    NV_等待us(100)
+    内核信息("NV驱动: 引擎复位完成")
+}
+
+函数 NV_引擎使能() {
+    定义 mmio = NV状态.mmio
+    定义 使能位 = PMC_ENABLE_PFIFO | PMC_ENABLE_PGRAPH |
+                   PMC_ENABLE_PCOPY0 | PMC_ENABLE_PCOPY1 |
+                   PMC_ENABLE_PDISPLAY | PMC_ENABLE_PWR
+    MMIO写32(mmio + NV_PMC_ENABLE, 使能位)
+    NV_等待us(10)
+
+    // 验证引擎已启动
+    定义 实际 = MMIO读32(mmio + NV_PMC_ENABLE)
+    如果 ((实际 & 使能位) != 使能位) {
+        内核警告("NV驱动: 部分引擎未能启动 期望=0x" + 整数转十六进制(使能位) +
+                 " 实际=0x" + 整数转十六进制(实际))
+    }
+}
+
+函数 NV_PTIMER_初始化() {
+    // 图处内部定时器: 纳秒精度
+    定义 mmio = NV状态.mmio
+    定义 时间 = MMIO读32(mmio + NV_PTIMER_TIME_0)
+    内核信息("NV驱动: 图处定时器 = " + 整数转字符串(时间) + "ns")
+}
+
+// §6 图处拓扑探测(GPC/TPC/SM)
+
+函数 NV_探测拓扑() {
+    定义 mmio = NV状态.mmio
+
+    如果 (NV状态.架构代 >= NV_ARCH_FERMI) {
+        // Fermi+: 通过PGRAPH寄存器读取拓扑
+        NV状态.GPC数 = MMIO读32(mmio + NV_PGRAPH_GPC_NUM) & 0xFF
+        定义 tpc_per_gpc = MMIO读32(mmio + NV_PGRAPH_TPC_PER_GPC) & 0xFF
+        NV状态.TPC数 = NV状态.GPC数 * tpc_per_gpc
+
+        // SM数 = TPC数 × SM_per_TPC
+        // Volta+: 每TPC 2个SM; 其他: 每TPC 1个SM
+        如果 (NV状态.架构代 >= NV_ARCH_VOLTA) {
+            NV状态.SM数 = NV状态.TPC数 * 2
+        } 否则 {
+            NV状态.SM数 = NV状态.TPC数
+        }
+
+        // 如果从寄存器读到了0, 使用型号数据库的值
+        如果 (NV状态.GPC数 == 0) { NV状态.GPC数 = NV状态.SM数 / 8 }
+        如果 (NV状态.GPC数 == 0) { NV状态.GPC数 = 1 }
+
+        NV状态.最大线程_每SM = 2048
+        如果 (NV状态.架构代 < NV_ARCH_VOLTA) { NV状态.最大线程_每SM = 1024 }
+    } 否则 {
+        // Tesla: 简化
+        NV状态.GPC数 = 1
+        NV状态.SM数 = 8  // 默认
+        NV状态.最大线程_每SM = 512
+    }
+
+    内核信息("NV驱动: 拓扑 GPC=" + 整数转字符串(NV状态.GPC数) +
+             " TPC=" + 整数转字符串(NV状态.TPC数) +
+             " SM=" + 整数转字符串(NV状态.SM数) +
+             " 最大线程/SM=" + 整数转字符串(NV状态.最大线程_每SM))
+}
+
+// §7 PFIFO — 命令通道管理(图处命令提交核心)
+
+结构 NV通道 {
+    ID,
+    实例块地址,    // u64 图处实例内存中的通道描述符
+    推送缓冲地址,    // u64 CPU写命令的直传缓冲
+    推送缓冲图处,    // u64 图处看到的地址
+    推送缓冲大小,
+    写偏移,    // u32 当前写位置
+    引擎,    // u32 0=GR, 1=CE, 2=COMPUTE
+    活跃,
+}
+
+函数 NV_PFIFO_初始化() {
+    定义 mmio = NV状态.mmio
+    NV状态.通道列表 = []
+    NV状态.通道数 = 0
+
+    // 清除FIFO中断
+    MMIO写32(mmio + NV_PFIFO_INTR_0, 0xFFFFFFFF)
+    // 使能FIFO中断
+    MMIO写32(mmio + NV_PFIFO_INTR_EN_0, 0xFFFFFFFF)
+
+    // 创建默认通道: 图形 + 计算 + 复制
+    NV_创建通道(0)   // 图形
+    NV_创建通道(2)   // 计算
+
+    内核信息("NV驱动: PFIFO初始化 通道=" + 整数转字符串(NV状态.通道数))
+}
+
+函数 NV_创建通道(引擎) {
+    定义 通道 = NV通道 {}
+    通道.ID = NV状态.通道数
+    通道.引擎 = 引擎
+    通道.推送缓冲大小 = 131072  // 128KB推送缓冲
+
+    // 分配推送缓冲(直传可访问)
+    通道.推送缓冲地址 = 图处内存_分配(通道.推送缓冲大小, GTT, 用途_命令缓冲)
+    如果 (通道.推送缓冲地址 == 空) { 返回 空 }
+    通道.推送缓冲图处 = 通道.推送缓冲地址.图处地址
+
+    // 在图处实例内存中写入通道描述符(Kepler+格式)
+    定义 实例偏移 = NV_PRAMIN_BASE + 通道.ID * NV_PFIFO_CHAN_SIZE
+    通道.实例块地址 = 实例偏移
+    定义 mmio = NV状态.mmio
+    // 通道描述符: [推送缓冲地址低, 推送缓冲地址高, 引擎绑定, 控制]
+    MMIO写32(mmio + 实例偏移 + 0, 通道.推送缓冲图处 & 0xFFFFFFFF)
+    MMIO写32(mmio + 实例偏移 + 4, (通道.推送缓冲图处 >> 32) & 0xFF)
+    MMIO写32(mmio + 实例偏移 + 8, 引擎)
+    MMIO写32(mmio + 实例偏移 + 12, 1)  // 使能
+
+    通道.写偏移 = 0
+    通道.活跃 = 真
+    追加(NV状态.通道列表, 通道)
+    NV状态.通道数 = NV状态.通道数 + 1
+
+    定义 可变 引擎名 = "GR"
+    如果 (引擎 == 1) { 引擎名 = "CE" }
+    如果 (引擎 == 2) { 引擎名 = "COMPUTE" }
+    内核信息("NV驱动: 通道" + 整数转字符串(通道.ID) + " " + 引擎名 + " 创建")
+    返回 通道
+}

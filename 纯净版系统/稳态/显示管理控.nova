@@ -1,0 +1,482 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/整数转字符串.nova")
+
+// §5 DRM Nova设备控制处理
+
+函数 DRM_Nova设备控制(fd, cmd, 参数) {
+    ioctl_总调用数 = ioctl_总调用数 + 1
+    DRM_Nova设备_确保默认设备()
+    定义 dev_idx = 0    // 当前实现: 使用第一个DRM设备
+    如果 (计数(DRM设备列表) == 0) {
+        ioctl_失败数 = ioctl_失败数 + 1
+        ioctl_最后命令 = cmd
+        ioctl_最后结果 = 错误_设备
+        返回 错误_设备
+    }
+    定义 dev = DRM设备列表[dev_idx]
+    定义 可变 结果 = 错误_ENOSYS
+
+    如果 (cmd == DRM_Nova设备控制_VERSION) {
+        结果 = DRM_Nova设备控制_version(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_GET_CAP) {
+        结果 = DRM_Nova设备控制_get_cap(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_GETRESOURCES) {
+        结果 = DRM_Nova设备控制_getresources(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_GETCONNECTOR) {
+        结果 = DRM_Nova设备控制_getconnector(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_CREATE_DUMB) {
+        结果 = DRM_Nova设备控制_create_dumb(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_MAP_DUMB) {
+        结果 = DRM_Nova设备控制_map_dumb(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_ADDFB || cmd == DRM_Nova设备控制_MODE_ADDFB2) {
+        结果 = DRM_Nova设备控制_addfb(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_SETCRTC) {
+        结果 = DRM_Nova设备控制_setcrtc(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_PAGE_FLIP) {
+        结果 = DRM_Nova设备控制_pageflip(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_RMFB) {
+        结果 = DRM_Nova设备控制_rmfb(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_DESTROY_DUMB) {
+        结果 = DRM_Nova设备控制_destroy_dumb(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_MODE_ATOMIC) {
+        结果 = DRM_Nova设备控制_atomic(dev, 参数)
+    }
+    否则如果 (cmd == DRM_Nova设备控制_PRIME_HANDLE_TO_FD) {
+        结果 = DRM_Nova设备控制_prime_handle_to_fd(dev, 参数)
+    }
+
+    ioctl_最后命令 = cmd
+    ioctl_最后结果 = 结果
+    如果 (结果 >= 0) {
+        ioctl_成功数 = ioctl_成功数 + 1
+    } 否则 {
+        ioctl_失败数 = ioctl_失败数 + 1
+    }
+    返回 结果
+}
+
+函数 DRM_Nova设备控制_version(dev, 参数) {
+    // 返回DRM驱动版本信息
+    内存写32(参数, 1)       // major
+    内存写32(参数 + 4, 0)   // minor
+    内存写32(参数 + 8, 0)   // patchlevel
+    返回 0
+}
+
+函数 DRM_Nova设备控制_get_cap(dev, 参数) {
+    定义 cap = 内存读64(参数)
+    定义 可变 值 = 0
+    如果 (cap == DRM_CAP_DUMB_BUFFER) { 值 = 1 }
+    如果 (cap == DRM_CAP_PRIME) { 值 = 3 }   // 导入+导出
+    如果 (cap == DRM_CAP_ATOMIC) { 值 = 1 }
+    如果 (cap == DRM_CAP_TIMESTAMP_MONOTONIC) { 值 = 1 }
+    内存写64(参数 + 8, 值)
+    返回 0
+}
+
+函数 DRM_Nova设备控制_getresources(dev, 参数) {
+    // 返回CRTC/连接器/编码器的ID列表
+    内存写32(参数 + 0, 计数(dev.帧缓冲列表))
+    内存写32(参数 + 4, 计数(dev.CRTC列表))
+    内存写32(参数 + 8, 计数(dev.连接器列表))
+    内存写32(参数 + 12, 计数(dev.编码器列表))
+    返回 0
+}
+
+函数 DRM_Nova设备控制_getconnector(dev, 参数) {
+    如果 (计数(dev.连接器列表) == 0) { 返回 错误_设备 }
+    定义 conn = dev.连接器列表[0]
+    内存写32(参数 + 0, conn.ID)
+    内存写32(参数 + 4, conn.类型)
+    内存写32(参数 + 8, conn.状态)
+    内存写32(参数 + 12, 计数(conn.模式列表))
+    内存写32(参数 + 16, conn.编码器ID)
+    返回 0
+}
+
+函数 DRM_Nova设备控制_create_dumb(dev, 参数) {
+    定义 宽 = 内存读32(参数 + 0)
+    定义 高 = 内存读32(参数 + 4)
+    定义 bpp = 内存读32(参数 + 8)
+    定义 跨距 = (宽 * bpp / 8 + 63) & ~63   // 64字节对齐
+    定义 大小 = 跨距 * 高
+
+    定义 gem = GEM对象 {}
+    gem.句柄 = DRM_分配ID(dev)
+    gem.大小 = 大小
+    gem.物理地址 = 直传_分配(大小)
+    如果 (gem.物理地址 == 0) { 返回 错误_设备 }
+    gem.引用计数 = 1
+    内存填零(gem.物理地址, 大小)
+    追加(dev.GEM对象列表, gem)
+    ioctl_dumb创建数 = ioctl_dumb创建数 + 1
+
+    内存写32(参数 + 12, gem.句柄)    // handle
+    内存写32(参数 + 16, 跨距)        // pitch
+    内存写64(参数 + 20, 大小)        // size
+    返回 0
+}
+
+函数 DRM_Nova设备控制_map_dumb(dev, 参数) {
+    定义 handle = 内存读32(参数)
+    定义 gem = DRM_查找GEM(dev, handle)
+    如果 (gem == 空) { 返回 错误_无效参数 }
+    // 返回Nova内存映射偏移(用户态通过Nova内存映射 /dev/dri/card0使用此偏移)
+    内存写64(参数 + 8, gem.物理地址)
+    返回 0
+}
+
+函数 DRM_Nova设备控制_addfb(dev, 参数) {
+    定义 fb = DRM帧缓冲 {}
+    fb.ID = DRM_分配ID(dev)
+    fb.宽 = 内存读32(参数 + 0)
+    fb.高 = 内存读32(参数 + 4)
+    fb.跨距 = 内存读32(参数 + 8)
+    fb.像素格式 = DRM_FORMAT_XRGB8888
+    fb.GEM句柄 = 内存读32(参数 + 16)
+    追加(dev.帧缓冲列表, fb)
+    内存写32(参数 + 20, fb.ID)
+    返回 0
+}
+
+函数 DRM_Nova设备控制_setcrtc(dev, 参数) {
+    如果 (计数(dev.CRTC列表) == 0) { 返回 错误_设备 }
+    定义 crtc = dev.CRTC列表[0]
+    crtc.当前FB = 内存读32(参数 + 4)
+    crtc.已启用 = 真
+    // 实际需要: 配置PLL/时钟/显示管线
+    内核信息("DRM: 设置CRTC fb=" + 整数转字符串(crtc.当前FB))
+    返回 0
+}
+
+函数 DRM_Nova设备控制_pageflip(dev, 参数) {
+    如果 (计数(dev.CRTC列表) == 0) { 返回 错误_设备 }
+    定义 crtc = dev.CRTC列表[0]
+    定义 fb_id = 内存读32(参数 + 4)
+    crtc.当前FB = fb_id
+    ioctl_翻转总数 = ioctl_翻转总数 + 1
+    返回 0
+}
+
+// §6 GEM查找与辅助
+
+函数 DRM_查找GEM(dev, handle) {
+    如果 (dev == 0) { 返回 空 }
+    定义 可变 i = 0
+    当 (i < 计数(dev.GEM对象列表)) {
+        如果 (dev.GEM对象列表[i].句柄 == handle) { 返回 dev.GEM对象列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 DRM_分配ID(dev) {
+    如果 (dev == 0) { 返回 0 }
+    dev.下一个对象ID = dev.下一个对象ID + 1
+    返回 dev.下一个对象ID - 1
+}
+
+函数 直传_分配(大小) {
+    返回 堆_分配(大小)
+}
+
+函数 内存填零(地址, 大小) {
+    定义 可变 i = 0
+    当 (i < 大小) {
+        内存_写8(地址 + i, 0)
+        i = i + 1
+    }
+}
+
+// §7 DRM ioctl常量
+
+定义 DRM_Nova设备控制_VERSION = 0x00
+定义 DRM_Nova设备控制_GET_CAP = 0x0C
+定义 DRM_Nova设备控制_MODE_GETRESOURCES = 0xA0
+定义 DRM_Nova设备控制_MODE_GETCONNECTOR = 0xA7
+定义 DRM_Nova设备控制_MODE_CREATE_DUMB = 0xB2
+定义 DRM_Nova设备控制_MODE_MAP_DUMB = 0xB3
+定义 DRM_Nova设备控制_MODE_ADDFB = 0xAE
+定义 DRM_Nova设备控制_MODE_ADDFB2 = 0xB8
+定义 DRM_Nova设备控制_MODE_SETCRTC = 0xA2
+定义 DRM_Nova设备控制_MODE_PAGE_FLIP = 0xB0
+定义 DRM_Nova设备控制_MODE_RMFB = 0xAF
+定义 DRM_Nova设备控制_MODE_DESTROY_DUMB = 0xB4
+定义 DRM_Nova设备控制_MODE_ATOMIC = 0xBC
+定义 DRM_Nova设备控制_PRIME_HANDLE_TO_FD = 0x2D
+
+定义 DRM_CAP_DUMB_BUFFER = 0x01
+定义 DRM_CAP_PRIME = 0x05
+定义 DRM_CAP_ATOMIC = 0x10
+定义 DRM_CAP_TIMESTAMP_MONOTONIC = 0x06
+定义 DRM_FORMAT_XRGB8888 = 0x34325258
+
+定义 错误_设备 = -19
+定义 错误_ENOSYS = -38
+定义 错误_无效参数 = -22
+
+// §8 扩展ioctl: RMFB / DESTROY_DUMB / ATOMIC
+
+函数 DRM_Nova设备控制_rmfb(dev, 参数) {
+    如果 (dev == 0) { 返回 错误_设备 }
+    定义 fb_id = 内存读32(参数)
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    定义 可变 已移除 = 假
+    当 (i < 计数(dev.帧缓冲列表)) {
+        如果 (dev.帧缓冲列表[i].ID != fb_id) {
+            追加(新列表, dev.帧缓冲列表[i])
+        } 否则 {
+            已移除 = 真
+        }
+        i = i + 1
+    }
+    dev.帧缓冲列表 = 新列表
+    如果 (!已移除) { 返回 错误_无效参数 }
+    返回 0
+}
+
+函数 DRM_Nova设备控制_destroy_dumb(dev, 参数) {
+    如果 (dev == 0) { 返回 错误_设备 }
+    定义 handle = 内存读32(参数)
+    定义 可变 新列表 = []
+    定义 可变 i = 0
+    定义 可变 已移除 = 假
+    当 (i < 计数(dev.GEM对象列表)) {
+        如果 (dev.GEM对象列表[i].句柄 != handle) {
+            追加(新列表, dev.GEM对象列表[i])
+        } 否则 {
+            已移除 = 真
+        }
+        i = i + 1
+    }
+    dev.GEM对象列表 = 新列表
+    如果 (!已移除) { 返回 错误_无效参数 }
+    返回 0
+}
+
+函数 DRM_Nova设备控制_atomic(dev, 参数) {
+    如果 (dev == 0) { 返回 错误_设备 }
+    ioctl_原子提交数 = ioctl_原子提交数 + 1
+    返回 0
+}
+
+函数 DRM_Nova设备控制_prime_handle_to_fd(dev, 参数) {
+    如果 (dev == 0) { 返回 错误_设备 }
+    定义 handle = 内存读32(参数)
+    定义 gem = DRM_查找GEM(dev, handle)
+    如果 (gem == 空) { 返回 错误_无效参数 }
+    如果 (gem.导出FD == 0) {
+        gem.导出FD = 4096 + DRM_分配ID(dev)
+    }
+    内存写32(参数 + 8, gem.导出FD)
+    返回 0
+}
+
+// §9 DRM设备列表与结构
+
+定义 可变 DRM设备列表 = []
+
+函数 DRM_Nova设备_确保默认设备() {
+    如果 (计数(DRM设备列表) > 0) { 返回 DRM设备列表[0] }
+
+    定义 dev = {}
+    dev.名称 = "card0"
+    dev.驱动名 = "nova-drm"
+    dev.CRTC列表 = []
+    dev.连接器列表 = []
+    dev.编码器列表 = []
+    dev.帧缓冲列表 = []
+    dev.GEM对象列表 = []
+    dev.下一个对象ID = 4
+
+    定义 crtc = {}
+    crtc.ID = 1
+    crtc.当前FB = 0
+    crtc.已启用 = 假
+    追加(dev.CRTC列表, crtc)
+
+    定义 encoder = {}
+    encoder.ID = 2
+    encoder.类型 = 1
+    encoder.CRTC_ID = crtc.ID
+    encoder.可用CRTC位图 = 1
+    追加(dev.编码器列表, encoder)
+
+    定义 mode = {}
+    mode.名称 = "1024x768"
+    mode.水平显示 = 1024
+    mode.垂直显示 = 768
+    mode.刷新率 = 60
+
+    定义 conn = {}
+    conn.ID = 3
+    conn.类型 = 15
+    conn.状态 = 1
+    conn.编码器ID = encoder.ID
+    conn.模式列表 = [mode]
+    追加(dev.连接器列表, conn)
+
+    追加(DRM设备列表, dev)
+    返回 dev
+}
+
+结构 DRM帧缓冲 {
+    ID,
+    宽,
+    高,
+    跨距,
+    像素格式,
+    GEM句柄,
+}
+
+结构 GEM对象 {
+    句柄,
+    大小,
+    物理地址,
+    引用计数,
+}
+
+函数 内存读32(地址) { 返回 内存_读32(地址) }
+函数 内存写32(地址, 值) { 内存_写32(地址, 值) }
+函数 内存读64(地址) { 返回 内存_读64(地址) }
+函数 内存写64(地址, 值) { 内存_写64(地址, 值) }
+
+// §10 ioctl统计与健康检查
+
+定义 可变 ioctl_总调用数 = 0
+定义 可变 ioctl_成功数 = 0
+定义 可变 ioctl_失败数 = 0
+定义 可变 ioctl_翻转总数 = 0
+定义 可变 ioctl_原子提交数 = 0
+定义 可变 ioctl_dumb创建数 = 0
+定义 可变 ioctl_最后命令 = 0
+定义 可变 ioctl_最后结果 = 0
+
+函数 ioctl_统计() {
+    返回 {
+        总调用: ioctl_总调用数,
+        成功: ioctl_成功数,
+        失败: ioctl_失败数,
+        翻转: ioctl_翻转总数,
+        原子提交: ioctl_原子提交数,
+        dumb创建: ioctl_dumb创建数,
+    }
+}
+
+函数 ioctl_健康检查() {
+    定义 可变 问题 = []
+    如果 (计数(DRM设备列表) == 0) { 追加(问题, "无DRM设备") }
+    如果 (ioctl_失败数 > ioctl_总调用数 / 3 && ioctl_总调用数 > 100) {
+        追加(问题, "DRM ioctl失败率过高")
+    }
+    如果 (计数(问题) == 0) { 返回 "DRM ioctl健康" }
+    返回 问题
+}
+
+函数 ioctl_重置统计() {
+    ioctl_总调用数 = 0
+    ioctl_成功数 = 0
+    ioctl_失败数 = 0
+    ioctl_翻转总数 = 0
+    ioctl_原子提交数 = 0
+    ioctl_dumb创建数 = 0
+}
+
+函数 ioctl_完整统计() {
+    返回 [ioctl_总调用数, ioctl_成功数, ioctl_失败数, ioctl_翻转总数, ioctl_原子提交数]
+}
+
+函数 ioctl_命令名(cmd) {
+    如果 (cmd == DRM_Nova设备控制_VERSION) { 返回 "VERSION" }
+    如果 (cmd == DRM_Nova设备控制_GET_CAP) { 返回 "GET_CAP" }
+    如果 (cmd == DRM_Nova设备控制_MODE_GETRESOURCES) { 返回 "GETRESOURCES" }
+    如果 (cmd == DRM_Nova设备控制_MODE_GETCONNECTOR) { 返回 "GETCONNECTOR" }
+    如果 (cmd == DRM_Nova设备控制_MODE_CREATE_DUMB) { 返回 "CREATE_DUMB" }
+    如果 (cmd == DRM_Nova设备控制_MODE_MAP_DUMB) { 返回 "MAP_DUMB" }
+    如果 (cmd == DRM_Nova设备控制_MODE_ADDFB) { 返回 "ADDFB" }
+    如果 (cmd == DRM_Nova设备控制_MODE_ADDFB2) { 返回 "ADDFB2" }
+    如果 (cmd == DRM_Nova设备控制_MODE_SETCRTC) { 返回 "SETCRTC" }
+    如果 (cmd == DRM_Nova设备控制_MODE_PAGE_FLIP) { 返回 "PAGE_FLIP" }
+    如果 (cmd == DRM_Nova设备控制_MODE_RMFB) { 返回 "RMFB" }
+    如果 (cmd == DRM_Nova设备控制_MODE_DESTROY_DUMB) { 返回 "DESTROY_DUMB" }
+    如果 (cmd == DRM_Nova设备控制_MODE_ATOMIC) { 返回 "ATOMIC" }
+    如果 (cmd == DRM_Nova设备控制_PRIME_HANDLE_TO_FD) { 返回 "PRIME_HANDLE_TO_FD" }
+    返回 "UNKNOWN(0x" + 整数转十六进制(cmd) + ")"
+}
+
+定义 可变 AI_显示管理控_运行指标 = 0
+定义 可变 AI_显示管理控_异常指标 = 0
+
+函数 AI_显示管理控_自诊断() {
+    AI_显示管理控_运行指标 = ioctl_翻转总数
+    返回 AI_显示管理控_运行指标
+}
+
+函数 AI_显示管理控_优化建议() {
+    定义 指标 = AI_显示管理控_自诊断()
+    如果 (AI_显示管理控_运行指标 > 10000) { 返回 "显示管理控负载较高" }
+    返回 "显示管理控状态正常"
+}
+
+函数 显示管理控_统计() {
+    返回 {
+        ioctl总调用数: ioctl_总调用数,
+        ioctl成功数: ioctl_成功数,
+        ioctl失败数: ioctl_失败数,
+        ioctl翻转总数: ioctl_翻转总数,
+        ioctl原子提交数: ioctl_原子提交数,
+        ioctl_dumb创建数: ioctl_dumb创建数,
+        DRM设备数: 计数(DRM设备列表),
+        最后命令: ioctl_命令名(ioctl_最后命令),
+        最后结果: ioctl_最后结果
+    }
+}
+
+函数 显示管理控_健康评估() {
+    定义 可变 问题 = []
+    如果 (计数(DRM设备列表) == 0) { 追加(问题, "DRM设备列表为空") }
+    如果 (ioctl_失败数 > ioctl_总调用数 / 3 && ioctl_总调用数 > 50) { 追加(问题, "ioctl_失败数过高") }
+    返回 计数(问题) == 0
+}
+
+函数 显示管理控_综合报告() {
+    打印("[显示管理控] ═══ 综合报告 ═══")
+    打印("  DRM设备数: " + 整数转字符串(计数(DRM设备列表)))
+    打印("  ioctl_总调用数: " + 整数转字符串(ioctl_总调用数))
+    打印("  ioctl_成功数: " + 整数转字符串(ioctl_成功数))
+    打印("  ioctl_失败数: " + 整数转字符串(ioctl_失败数))
+    打印("  ioctl_翻转总数: " + 整数转字符串(ioctl_翻转总数))
+    打印("  ioctl_原子提交数: " + 整数转字符串(ioctl_原子提交数))
+    打印("  ioctl_dumb创建数: " + 整数转字符串(ioctl_dumb创建数))
+    打印("  最后命令: " + ioctl_命令名(ioctl_最后命令))
+    打印("  最后结果: " + 整数转字符串(ioctl_最后结果))
+    打印("  健康: " + 如果 (显示管理控_健康评估()) { "正常" } 否则 { "异常" })
+}
+
+函数 显示管理控_全局重置() {
+    ioctl_总调用数 = 0
+    ioctl_成功数 = 0
+    ioctl_失败数 = 0
+    ioctl_翻转总数 = 0
+    ioctl_原子提交数 = 0
+    ioctl_dumb创建数 = 0
+    ioctl_最后命令 = 0
+    ioctl_最后结果 = 0
+    打印("[显示管理控] 统计已重置")
+    返回 0
+}

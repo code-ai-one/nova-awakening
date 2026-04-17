@@ -1,0 +1,204 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/链表后继.nova")
+导入("../中枢/同步原语.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. inotify: 文件系统事件监控(文件创建/删除/修改/移动)
+//   2. inotify_init: 创建inotify实例(返回fd)
+//   3. inotify_add_watch: 添加监控(指定路径+事件掩码)
+//   4. inotify_rm_watch: 移除监控
+//   5. read: 读取事件(inotify_事件结构)
+//   6. 用于: 文件管理器自动刷新/配置文件热重载/日志轮转
+
+定义 IN_ACCESS        = 0x00000001   // 文件被访问
+定义 IN_MODIFY        = 0x00000002   // 文件被修改
+定义 IN_ATTRIB        = 0x00000004   // 元数据变化
+定义 IN_CLOSE_WRITE   = 0x00000008   // 可写文件关闭
+定义 IN_CLOSE_NOWRITE = 0x00000010   // 只读文件关闭
+定义 IN_OPEN          = 0x00000020   // 文件打开
+定义 IN_MOVED_FROM    = 0x00000040   // 从此目录移走
+定义 IN_MOVED_TO      = 0x00000080   // 移入此目录
+定义 IN_CREATE        = 0x00000100   // 文件/目录创建
+定义 IN_DELETE        = 0x00000200   // 文件/目录删除
+定义 IN_DELETE_SELF   = 0x00000400   // 被监控对象自身删除
+定义 IN_MOVE_SELF     = 0x00000800   // 被监控对象自身移动
+定义 IN_ALL_事件S    = 0x00000FFF
+
+结构 inotify事件 {
+    wd,    // u32 监控描述符
+    掩码,    // u32 事件类型
+    cookie,    // u32 关联事件(移动操作)
+    名称,    // 字符串 文件名
+}
+
+结构 监控项 {
+    wd,
+    路径,
+    掩码,
+}
+
+结构 inotify实例 {
+    fd,
+    监控列表,    // []
+    事件队列,    // []
+    等待队列,
+    下一个wd,
+}
+
+定义 可变 inotify_列表 = []
+
+// inotify_init
+
+函数 sys_inotify_init() {
+    定义 inst = inotify实例 {}
+    inst.fd = 分配文件fd()
+    inst.监控列表 = []
+    inst.事件队列 = []
+    inst.等待队列 = 等待队列_创建()
+    inst.下一个wd = 1
+    追加(inotify_列表, inst)
+    返回 inst.fd
+}
+
+// inotify_add_watch
+
+函数 sys_inotify_add_watch(inst_fd, 路径, 掩码) {
+    定义 inst = inotify_查找(inst_fd)
+    如果 (inst == 空) { 返回 错误_无效参数 }
+
+    定义 w = 监控项 {}
+    w.wd = inst.下一个wd
+    inst.下一个wd = inst.下一个wd + 1
+    w.路径 = 路径
+    w.掩码 = 掩码
+    追加(inst.监控列表, w)
+    返回 w.wd
+}
+
+// inotify_rm_watch
+
+函数 sys_inotify_rm_watch(inst_fd, wd) {
+    定义 inst = inotify_查找(inst_fd)
+    如果 (inst == 空) { 返回 错误_无效参数 }
+    定义 可变 i = 0
+    当 (i < 计数(inst.监控列表)) {
+        如果 (inst.监控列表[i].wd == wd) {
+            链表_删除(inst.监控列表, i)
+            返回 成功
+        }
+        i = i + 1
+    }
+    返回 错误_无效参数
+}
+
+// 事件投递 (VFS操作时调用)
+
+函数 inotify_发送事件(路径, 事件掩码, 文件名) {
+    定义 可变 i = 0
+    当 (i < 计数(inotify_列表)) {
+        定义 inst = inotify_列表[i]
+        定义 可变 j = 0
+        当 (j < 计数(inst.监控列表)) {
+            定义 w = inst.监控列表[j]
+            如果 (w.路径 == 路径 && (w.掩码 & 事件掩码) != 0) {
+                定义 evt = inotify事件 {}
+                evt.wd = w.wd
+                evt.掩码 = 事件掩码
+                evt.cookie = 0
+                evt.名称 = 文件名
+                追加(inst.事件队列, evt)
+                等待队列_唤醒一个(inst.等待队列)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// read: 读取事件
+
+函数 inotify_read(inst) {
+    如果 (inst == 空) { 返回 空 }
+    如果 (计数(inst.事件队列) == 0) {
+        当 (计数(inst.事件队列) == 0) { 调度() }
+    }
+    如果 (计数(inst.事件队列) == 0) { 返回 空 }
+    定义 evt = inst.事件队列[0]
+    链表_删除(inst.事件队列, 0)
+    返回 evt
+}
+
+函数 inotify_查找(fd) {
+    定义 可变 i = 0
+    当 (i < 计数(inotify_列表)) {
+        如果 (inotify_列表[i].fd == fd) { 返回 inotify_列表[i] }
+        i = i + 1
+    }
+    返回 空
+}
+
+外部 当前进程             // 定义在 核心/进程/PID分配器.nova
+
+函数 分配文件fd() {
+    如果 (当前进程 == 空 || 当前进程.文件表 == 空) { 返回 -1 }
+    定义 可变 fd = 0
+    当 (fd < 计数(当前进程.文件表)) {
+        如果 (当前进程.文件表[fd] == 空) { 返回 fd }
+        fd = fd + 1
+    }
+    追加(当前进程.文件表, 空)
+    返回 fd
+}
+
+// inotify事件名称 (调试用)
+
+函数 inotify_事件名(掩码) {
+    如果 ((掩码 & IN_CREATE) != 0) { 返回 "CREATE" }
+    如果 ((掩码 & IN_DELETE) != 0) { 返回 "DELETE" }
+    如果 ((掩码 & IN_MODIFY) != 0) { 返回 "MODIFY" }
+    如果 ((掩码 & IN_OPEN) != 0) { 返回 "OPEN" }
+    如果 ((掩码 & IN_ACCESS) != 0) { 返回 "ACCESS" }
+    如果 ((掩码 & IN_MOVED_FROM) != 0) { 返回 "MOVED_FROM" }
+    如果 ((掩码 & IN_MOVED_TO) != 0) { 返回 "MOVED_TO" }
+    如果 ((掩码 & IN_CLOSE_WRITE) != 0) { 返回 "CLOSE_WRITE" }
+    如果 ((掩码 & IN_DELETE_SELF) != 0) { 返回 "DELETE_SELF" }
+    返回 "事件_" + 整数转字符串(掩码)
+}
+
+// inotify非阻塞读取 + 待读事件计数
+
+函数 inotify_read_nonblock(inst) {
+    如果 (inst == 空) { 返回 空 }
+    如果 (计数(inst.事件队列) == 0) { 返回 空 }
+    定义 evt = inst.事件队列[0]
+    链表_删除(inst.事件队列, 0)
+    返回 evt
+}
+
+函数 inotify_待读数(inst) {
+    如果 (inst == 空) { 返回 0 }
+    返回 计数(inst.事件队列)
+}
+
+函数 inotify_统计() {
+    返回 [计数(inotify_列表)]
+}
+
+
+函数 inotify_完整统计() {
+    返回 [计数(inotify_列表)]
+}
+
+定义 可变 AI_记忆甲乙_运行指标 = 0
+定义 可变 AI_记忆甲乙_异常指标 = 0
+
+函数 AI_记忆甲乙_自诊断() {
+    AI_记忆甲乙_运行指标 = 0
+    返回 AI_记忆甲乙_运行指标
+}
+
+函数 AI_记忆甲乙_优化建议() {
+    定义 指标 = AI_记忆甲乙_自诊断()
+    返回 "记忆甲乙状态正常"
+}

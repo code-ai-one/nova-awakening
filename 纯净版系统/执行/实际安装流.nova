@@ -1,0 +1,113 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./扫描磁盘.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../外联/分配地址客.nova")
+导入("./辅助界面绘.nova")
+
+// §5 实际安装流程
+
+函数 执行安装() {
+    安装.当前步骤 = 步骤_安装
+    安装.安装进度 = 0
+
+    // 1. 格式化分区 (0-10%)
+    更新进度(5, "创建分区表...")
+    如果 (安装.分区方案 == 0) {
+        自动分区(安装.目标磁盘)
+    }
+    更新进度(10, "格式化EFI分区(FAT32)...")
+    格式化_FAT32(安装.EFI分区)
+    格式化_ext4(安装.根分区)
+    格式化_swap(安装.交换分区)
+
+    // 2. 挂载+复制 (10-40%)
+    更新进度(15, "挂载目标分区...")
+    挂载("/mnt", 安装.根分区)
+    创建目录("/mnt/boot/efi")
+    挂载("/mnt/boot/efi", 安装.EFI分区)
+
+    更新进度(20, "复制系统文件...")
+    复制_系统文件("/cdrom/nova", "/mnt")
+
+    // 3. 安装内核 (40-55%)
+    更新进度(40, "安装NovaOS内核...")
+    复制_内核("/cdrom/nova/boot/nova-kernel", "/mnt/boot/nova-kernel")
+    复制_initramfs("/cdrom/nova/boot/initramfs.cpio", "/mnt/boot/initramfs.cpio")
+
+    // 4. 引导加载器 (55-65%)
+    更新进度(55, "安装Nova门控循环B引导加载器...")
+    安装_Nova门控循环B("/mnt", 安装.目标磁盘)
+    生成_Nova门控循环B配置("/mnt/boot/Nova门控循环b/Nova门控循环b.cfg")
+
+    // 5. AI子系统 (65-80%)
+    更新进度(65, "初始化AI子系统...")
+    创建目录("/mnt/var/nova")
+    创建目录("/mnt/var/nova/模型")
+    创建目录("/mnt/var/nova/记忆")
+    创建目录("/mnt/var/nova/检查点")
+
+    更新进度(70, "配置AI运行模式...")
+    写文件("/mnt/etc/nova/ai.conf", 生成AI配置())
+
+    如果 (安装.AI模式 == 0 || 安装.AI模式 == 2) {
+        更新进度(75, "下载AI基础权重(TNF-256维)...")
+        // 从云端下载基础TNF权重(约50MB)
+        下载文件("https://nova-ai.dev/models/tnf-base-256d.bin",
+                 "/mnt/var/nova/模型/tnf-base.bin")
+    }
+
+    // 6. 系统配置 (80-95%)
+    更新进度(85, "配置网络和驱动...")
+    生成_fstab("/mnt/etc/fstab")
+    配置_网络("/mnt/etc/nova/network.conf")
+    配置_驱动("/mnt/etc/nova/drivers.conf")
+
+    更新进度(90, "创建用户账户...")
+    创建_用户(安装.用户名, 安装.密码哈希)
+    设置_主机名(安装.主机名)
+
+    更新进度(95, "生成个性化桌面...")
+    智能_生成初始桌面(安装.用户名)
+
+    // 7. 完成
+    更新进度(100, "安装完成!")
+    卸载_全部()
+    安装.当前步骤 = 步骤_完成
+}
+
+// §6 Nova门控循环B配置生成
+
+函数 生成_Nova门控循环B配置(路径) {
+    定义 内容 = "# NovaOS Nova门控循环B配置\n"
+    内容 = 内容 + "set timeout=3\n"
+    内容 = 内容 + "set default=0\n\n"
+    内容 = 内容 + "menuentry 'NovaOS' {\n"
+    内容 = 内容 + "    set root=(hd0,2)\n"
+    内容 = 内容 + "    multiboot2 /boot/nova-kernel\n"
+    内容 = 内容 + "    module2 /boot/initramfs.cpio\n"
+    内容 = 内容 + "    boot\n"
+    内容 = 内容 + "}\n\n"
+    内容 = 内容 + "menuentry 'NovaOS (恢复模式)' {\n"
+    内容 = 内容 + "    set root=(hd0,2)\n"
+    内容 = 内容 + "    multiboot2 /boot/nova-kernel recovery\n"
+    内容 = 内容 + "    boot\n"
+    内容 = 内容 + "}\n"
+    写文件(路径, 内容)
+}
+
+函数 生成AI配置() {
+    定义 可变 内容 = "# NovaOS AI配置\n"
+    内容 = 内容 + "ai_mode=" + 整数转字符串(安装.AI模式) + "\n"
+    内容 = 内容 + "# 0=云端优先 1=本地优先 2=智能混合\n\n"
+    如果 (字符串长度(安装.智能_接口密钥) > 0) {
+        内容 = 内容 + "api_key=" + 安装.智能_接口密钥 + "\n"
+    }
+    内容 = 内容 + "local_model=/var/nova/模型/tnf-base.bin\n"
+    内容 = 内容 + "memory_path=/var/nova/记忆/\n"
+    内容 = 内容 + "checkpoint_path=/var/nova/检查点/\n"
+    内容 = 内容 + "auto_learn=true\n"
+    内容 = 内容 + "cloud_fallback=true\n"
+    返回 内容
+}

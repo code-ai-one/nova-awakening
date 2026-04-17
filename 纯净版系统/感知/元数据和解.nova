@@ -1,0 +1,135 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./文档事件.nova")
+导入("./媒体播控.nova")
+导入("../中枢/创建甲.nova")
+
+// §5 元数据和解码
+
+函数 媒体元素_元数据就绪(me, 时长, 宽, 高) {
+    如果 (me == 0) { 返回 }
+    me.duration = 时长
+    me.videoWidth = 宽; me.videoHeight = 高
+    me.readyState = HAVE_METADATA
+    me.networkState = NETWORK_IDLE
+
+    媒体元素_触发事件(me, "loadedmetadata")
+    媒体元素_触发事件(me, "durationchange")
+
+    如果 (宽 > 0 && 高 > 0) {
+        媒体元素_触发事件(me, "resize")
+    }
+
+    // 继续加载
+    me.readyState = HAVE_CURRENT_DATA
+    媒体元素_触发事件(me, "loadeddata")
+
+    me.readyState = HAVE_FUTURE_DATA
+    媒体元素_触发事件(me, "canplay")
+
+    me.readyState = HAVE_ENOUGH_DATA
+    媒体元素_触发事件(me, "canplaythrough")
+
+    // autoplay
+    如果 (me.autoplay && me.paused) {
+        HTML媒体元素_play(me)
+    }
+}
+
+// §6 play() / pause()
+
+函数 HTML媒体元素_play(me) {
+    如果 (me == 0) { 返回 }
+
+    如果 (me.readyState == HAVE_NOTHING) {
+        HTML媒体元素_load(me)
+    }
+
+    如果 (me.ended && me.duration > 0) {
+        me.currentTime = 0
+        me.ended = 假
+    }
+
+    定义 之前暂停 = me.paused
+    me.paused = 假
+    me.播放起始时间 = 平台_获取高精度时间()
+
+    如果 (之前暂停) {
+        媒体元素_触发事件(me, "play")
+        如果 (me.readyState < HAVE_FUTURE_DATA) {
+            媒体元素_触发事件(me, "waiting")
+        } 否则 {
+            媒体元素_触发事件(me, "playing")
+        }
+    }
+
+    // 记录played区间
+    TimeRanges_添加(me.played, me.currentTime, me.currentTime)
+
+    // 启动timeupdate定时器(每250ms)
+    媒体元素_启动timeupdate(me)
+
+    // 返回承诺
+}
+
+函数 HTML媒体元素_pause(me) {
+    如果 (me == 0) { 返回 }
+
+    如果 (me.networkState == NETWORK_EMPTY) {
+        HTML媒体元素_load(me)
+    }
+
+    如果 (!me.paused) {
+        me.paused = 真
+        // 更新played区间
+        如果 (me.played != 0 && me.played.数量 > 0) {
+            定义 最后 = me.played.数量 - 1
+            内存_写64(me.played.区间 + 最后 * 16 + 8, me.currentTime)
+        }
+        媒体元素_触发事件(me, "timeupdate")
+        媒体元素_触发事件(me, "pause")
+    }
+}
+
+// §7 seek — currentTime设置
+
+函数 HTML媒体元素_setCurrentTime(me, 时间) {
+    如果 (me == 0) { 返回 }
+    如果 (me.readyState == HAVE_NOTHING) { 返回 }
+
+    // 范围检查
+    定义 可变 目标 = 时间
+    如果 (目标 < 0) { 目标 = 0 }
+    如果 (me.duration > 0 && 目标 > me.duration) { 目标 = me.duration }
+
+    me.seeking = 真
+    媒体元素_触发事件(me, "seeking")
+
+    me.currentTime = 目标
+
+    // 通知解码器seek
+    如果 (me.解码器 != 0) {
+        // 解码器_seek(me.解码器, 目标)
+    }
+
+    me.seeking = 假
+    媒体元素_触发事件(me, "seeked")
+    媒体元素_触发事件(me, "timeupdate")
+
+    如果 (目标 >= me.duration && me.duration > 0) {
+        媒体元素_播放结束(me)
+    }
+}
+
+函数 媒体元素_播放结束(me) {
+    如果 (me == 0) { 返回 }
+    me.ended = 真
+    me.paused = 真
+    媒体元素_触发事件(me, "ended")
+
+    如果 (me.loop) {
+        me.currentTime = 0
+        me.ended = 假
+        HTML媒体元素_play(me)
+    }
+}

@@ -1,0 +1,290 @@
+// 神经网络核心算子数值正确性验证 (整数定点实现, 避免浮点舍入)
+// 覆盖: conv2d / softmax-argmax / layernorm-整数近似 / attention-QKV
+
+// ═══ 矩阵工具 ═══
+函数 mat_new(行, 列, 初值) {
+    定义 可变 d = []
+    定义 可变 i = 0
+    当 (i < 行 * 列) { 追加(d, 初值) i = i + 1 }
+    返回 [行, 列, d]
+}
+函数 mat_get(m, r, c) { 返回 m[2][r * m[1] + c] }
+函数 mat_set(m, r, c, v) { m[2][r * m[1] + c] = v }
+
+定义 可变 fail_count = 0
+定义 可变 pass_count = 0
+
+函数 check(name, got, want) {
+    如果 (got == want) {
+        pass_count = pass_count + 1
+    } 否则 {
+        fail_count = fail_count + 1
+        打印(字符串拼接(字符串拼接(字符串拼接(字符串拼接("✗ ", name), " got="), 转字符串(got)), 字符串拼接(" want=", 转字符串(want))))
+    }
+}
+
+// ═══════════════════════════════════════════════
+// 算子1: conv2d (2D卷积, stride=1, padding=0)
+// 输入: input(H×W), kernel(kH×kW) → output((H-kH+1)×(W-kW+1))
+// ═══════════════════════════════════════════════
+函数 conv2d(inp, ker) {
+    定义 H = inp[0]
+    定义 W = inp[1]
+    定义 kH = ker[0]
+    定义 kW = ker[1]
+    定义 oH = H - kH + 1
+    定义 oW = W - kW + 1
+    定义 out = mat_new(oH, oW, 0)
+    定义 可变 i = 0
+    当 (i < oH) {
+        定义 可变 j = 0
+        当 (j < oW) {
+            定义 可变 acc = 0
+            定义 可变 ki = 0
+            当 (ki < kH) {
+                定义 可变 kj = 0
+                当 (kj < kW) {
+                    acc = acc + mat_get(inp, i + ki, j + kj) * mat_get(ker, ki, kj)
+                    kj = kj + 1
+                }
+                ki = ki + 1
+            }
+            mat_set(out, i, j, acc)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 out
+}
+
+函数 test_conv2d() {
+    // 4×4 input, 3×3 identity kernel (中心=1其他=0) → 2×2 output
+    // input:
+    //   1  2  3  4
+    //   5  6  7  8
+    //   9 10 11 12
+    //  13 14 15 16
+    // identity kernel 位置(1,1)=1, 其他=0
+    // output[0][0] = input[1][1] = 6
+    // output[0][1] = input[1][2] = 7
+    // output[1][0] = input[2][1] = 10
+    // output[1][1] = input[2][2] = 11
+    定义 inp = mat_new(4, 4, 0)
+    定义 可变 v = 1
+    定义 可变 i = 0
+    当 (i < 4) {
+        定义 可变 j = 0
+        当 (j < 4) {
+            mat_set(inp, i, j, v)
+            v = v + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    定义 ker = mat_new(3, 3, 0)
+    mat_set(ker, 1, 1, 1)  // 单位核只传中心
+    定义 out = conv2d(inp, ker)
+    check("conv2d-identity shape H", out[0], 2)
+    check("conv2d-identity shape W", out[1], 2)
+    check("conv2d-identity[0][0]", mat_get(out, 0, 0), 6)
+    check("conv2d-identity[0][1]", mat_get(out, 0, 1), 7)
+    check("conv2d-identity[1][0]", mat_get(out, 1, 0), 10)
+    check("conv2d-identity[1][1]", mat_get(out, 1, 1), 11)
+
+    // 3×3 input, 2×2 sum kernel (全1) → 2×2 output
+    // input:
+    //   1 2 3
+    //   4 5 6
+    //   7 8 9
+    // out[0][0] = 1+2+4+5 = 12
+    // out[0][1] = 2+3+5+6 = 16
+    // out[1][0] = 4+5+7+8 = 24
+    // out[1][1] = 5+6+8+9 = 28
+    定义 inp2 = mat_new(3, 3, 0)
+    定义 可变 v2 = 1
+    定义 可变 i2 = 0
+    当 (i2 < 3) {
+        定义 可变 j2 = 0
+        当 (j2 < 3) {
+            mat_set(inp2, i2, j2, v2)
+            v2 = v2 + 1
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+    定义 ker2 = mat_new(2, 2, 1)  // 全1 sum核
+    定义 out2 = conv2d(inp2, ker2)
+    check("conv2d-sum[0][0]", mat_get(out2, 0, 0), 12)
+    check("conv2d-sum[0][1]", mat_get(out2, 0, 1), 16)
+    check("conv2d-sum[1][0]", mat_get(out2, 1, 0), 24)
+    check("conv2d-sum[1][1]", mat_get(out2, 1, 1), 28)
+}
+
+// ═══════════════════════════════════════════════
+// 算子2: argmax + softmax变体 (整数softmax = argmax位置)
+// 真softmax需浮点, 用argmax等价验证max-pick行为
+// ═══════════════════════════════════════════════
+函数 argmax(logits) {
+    定义 n = 计数(logits)
+    如果 (n == 0) { 返回 0 - 1 }
+    定义 可变 best_i = 0
+    定义 可变 best_v = logits[0]
+    定义 可变 i = 1
+    当 (i < n) {
+        如果 (logits[i] > best_v) {
+            best_v = logits[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    返回 best_i
+}
+
+函数 test_argmax() {
+    check("argmax[3,1,4,1,5,9,2]", argmax([3, 1, 4, 1, 5, 9, 2]), 5)
+    check("argmax[-5,-1,-3]", argmax([0-5, 0-1, 0-3]), 1)
+    check("argmax[10]", argmax([10]), 0)
+    check("argmax[0,0,1,0]", argmax([0, 0, 1, 0]), 2)
+}
+
+// ═══════════════════════════════════════════════
+// 算子3: layernorm 核心统计 (均值 / 方差, 整数定点)
+// μ = sum/N, σ² = sum((x-μ)²)/N
+// ═══════════════════════════════════════════════
+函数 mean_int(xs) {
+    定义 n = 计数(xs)
+    如果 (n == 0) { 返回 0 }
+    定义 可变 s = 0
+    定义 可变 i = 0
+    当 (i < n) { s = s + xs[i] i = i + 1 }
+    返回 s / n
+}
+
+函数 variance_int(xs) {
+    定义 n = 计数(xs)
+    如果 (n == 0) { 返回 0 }
+    定义 μ = mean_int(xs)
+    定义 可变 s = 0
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 d = xs[i] - μ
+        s = s + d * d
+        i = i + 1
+    }
+    返回 s / n
+}
+
+函数 test_layernorm_stats() {
+    // [1,2,3,4,5] → mean=3, variance=((4+1+0+1+4))/5=2
+    check("mean[1..5]", mean_int([1, 2, 3, 4, 5]), 3)
+    check("var[1..5]", variance_int([1, 2, 3, 4, 5]), 2)
+    // [10,10,10,10] → mean=10, variance=0
+    check("mean[10x4]", mean_int([10, 10, 10, 10]), 10)
+    check("var[10x4]", variance_int([10, 10, 10, 10]), 0)
+    // [0,0,0,100] → mean=25, variance=(625+625+625+5625)/4=1875
+    check("mean[0,0,0,100]", mean_int([0, 0, 0, 100]), 25)
+    check("var[0,0,0,100]", variance_int([0, 0, 0, 100]), 1875)
+}
+
+// ═══════════════════════════════════════════════
+// 算子4: attention 核心步骤 (Q @ K^T, scaled dot-product前半)
+// 简化: 不带scale和softmax, 验证矩阵乘+转置的组合正确性
+// ═══════════════════════════════════════════════
+函数 matmul(a, b) {
+    定义 m = a[0]
+    定义 k = a[1]
+    定义 n = b[1]
+    定义 r = mat_new(m, n, 0)
+    定义 可变 i = 0
+    当 (i < m) {
+        定义 可变 j = 0
+        当 (j < n) {
+            定义 可变 s = 0
+            定义 可变 t = 0
+            当 (t < k) { s = s + mat_get(a, i, t) * mat_get(b, t, j) t = t + 1 }
+            mat_set(r, i, j, s)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 transpose(m) {
+    定义 r = mat_new(m[1], m[0], 0)
+    定义 可变 i = 0
+    当 (i < m[0]) {
+        定义 可变 j = 0
+        当 (j < m[1]) { mat_set(r, j, i, mat_get(m, i, j)) j = j + 1 }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 test_attention_qkt() {
+    // Q (2, 3) = [[1,2,3],[4,5,6]]
+    // K (2, 3) = [[7,8,9],[10,11,12]]  (same shape as Q)
+    // K^T (3, 2) = [[7,10],[8,11],[9,12]]
+    // scores = Q @ K^T (2, 2) = [[50, 68], [122, 167]]
+    //   [0][0] = 1*7+2*8+3*9 = 7+16+27 = 50
+    //   [0][1] = 1*10+2*11+3*12 = 10+22+36 = 68
+    //   [1][0] = 4*7+5*8+6*9 = 28+40+54 = 122
+    //   [1][1] = 4*10+5*11+6*12 = 40+55+72 = 167
+    定义 Q = mat_new(2, 3, 0)
+    mat_set(Q, 0, 0, 1) mat_set(Q, 0, 1, 2) mat_set(Q, 0, 2, 3)
+    mat_set(Q, 1, 0, 4) mat_set(Q, 1, 1, 5) mat_set(Q, 1, 2, 6)
+    定义 K = mat_new(2, 3, 0)
+    mat_set(K, 0, 0, 7) mat_set(K, 0, 1, 8) mat_set(K, 0, 2, 9)
+    mat_set(K, 1, 0, 10) mat_set(K, 1, 1, 11) mat_set(K, 1, 2, 12)
+    定义 Kt = transpose(K)
+    定义 scores = matmul(Q, Kt)
+    check("attention scores shape H", scores[0], 2)
+    check("attention scores shape W", scores[1], 2)
+    check("attention[0][0]=50", mat_get(scores, 0, 0), 50)
+    check("attention[0][1]=68", mat_get(scores, 0, 1), 68)
+    check("attention[1][0]=122", mat_get(scores, 1, 0), 122)
+    check("attention[1][1]=167", mat_get(scores, 1, 1), 167)
+
+    // argmax(scores[0]) — 从row[0]取最大idx
+    定义 row0 = [mat_get(scores, 0, 0), mat_get(scores, 0, 1)]
+    check("attention row0 argmax", argmax(row0), 1)
+}
+
+// ═══════════════════════════════════════════════
+// 算子5: cross_entropy 辅助 (负对数likelihood正确类别)
+// 用整数近似: CE = -log(softmax(x)[target]) ≈ -(x[target] - max(x))
+// ═══════════════════════════════════════════════
+函数 max_int(xs) {
+    定义 n = 计数(xs)
+    如果 (n == 0) { 返回 0 }
+    定义 可变 best = xs[0]
+    定义 可变 i = 1
+    当 (i < n) { 如果 (xs[i] > best) { best = xs[i] } i = i + 1 }
+    返回 best
+}
+
+函数 ce_approx(logits, target) {
+    返回 max_int(logits) - logits[target]
+}
+
+函数 test_cross_entropy_approx() {
+    // logits=[1,2,3,10], target=3 → 10-10=0 (完美预测)
+    check("CE perfect pred", ce_approx([1, 2, 3, 10], 3), 0)
+    // logits=[1,2,3,10], target=0 → 10-1=9 (严重错误)
+    check("CE bad pred", ce_approx([1, 2, 3, 10], 0), 9)
+    // logits=[5,5,5,5], target=2 → 5-5=0 (平局, 任意目标均0)
+    check("CE tie", ce_approx([5, 5, 5, 5], 2), 0)
+}
+
+函数 主程序() {
+    打印("═══ NN核心算子数值正确性验证 ═══")
+    test_conv2d()
+    test_argmax()
+    test_layernorm_stats()
+    test_attention_qkt()
+    test_cross_entropy_approx()
+    打印(字符串拼接(字符串拼接("通过: ", 转字符串(pass_count)), 字符串拼接("/", 转字符串(pass_count + fail_count))))
+    打印(字符串拼接("失败: ", 转字符串(fail_count)))
+    如果 (fail_count > 0) { 返回 1 }
+    返回 0
+}

@@ -1,0 +1,133 @@
+导入("../中枢/内核打印.nova")
+导入("../引导/端口输入.nova")
+导入("../中枢/整数转字符串.nova")
+// §6 基址重定位
+
+函数 PE_重定位(模块) {
+    定义 差值 = 模块.基地址 - 模块.首选基址
+    如果 (差值 == 0) { 返回 }
+
+    // 找到.reloc节的数据目录
+    // 数据目录在Optional Header中, BASERELOC是第6个(索引5)
+    // 当前实现: 遍历节找.reloc
+    定义 可变 i = 0
+    当 (i < 计数(模块.节列表)) {
+        如果 (模块.节列表[i].名称 == ".reloc") {
+            定义 reloc_addr = 模块.基地址 + 模块.节列表[i].虚拟地址
+            定义 reloc_size = 模块.节列表[i].虚拟大小
+            PE_应用重定位(模块, reloc_addr, reloc_size, 差值)
+            模块.已重定位 = 真
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 PE_应用重定位(模块, reloc_addr, reloc_size, 差值) {
+    定义 可变 偏移 = 0
+    当 (偏移 < reloc_size) {
+        定义 块_rva = 内存读32(reloc_addr + 偏移)
+        定义 块_大小 = 内存读32(reloc_addr + 偏移 + 4)
+        如果 (块_大小 == 0) { 跳出 }
+
+        定义 条目数 = (块_大小 - 8) / 2
+        定义 可变 j = 0
+        当 (j < 条目数) {
+            定义 entry = 内存读16(reloc_addr + 偏移 + 8 + j * 2)
+            定义 类型 = (entry >> 12) & 0xF
+            定义 offset = entry & 0xFFF
+            定义 修补地址 = 模块.基地址 + 块_rva + offset
+
+            如果 (类型 == IMAGE_REL_BASED_DIR64) {
+                定义 原值 = 内存读64(修补地址)
+                内存写64(修补地址, 原值 + 差值)
+            } 否则 如果 (类型 == IMAGE_REL_BASED_HIGHLOW) {
+                定义 原值 = 内存读32(修补地址)
+                内存写32(修补地址, 原值 + 差值)
+            }
+            // IMAGE_REL_BASED_ABSOLUTE = 跳过(填充用)
+            j = j + 1
+        }
+        偏移 = 偏移 + 块_大小
+    }
+}
+
+// §7 导入表处理 — 绑定Win32 接口
+
+函数 PE_处理导入(模块) {
+    // 查找导入表: 遍历数据目录或.idata节
+    定义 可变 i = 0
+    当 (i < 计数(模块.节列表)) {
+        如果 (模块.节列表[i].名称 == ".idata" || 模块.节列表[i].名称 == ".rdata") {
+            // 导入目录表在数据目录中, 处理
+        }
+        i = i + 1
+    }
+    // 当前实现: 扫描整个映像查找导入描述符
+    // 实际应从Optional Header的DataDirectory[1]获取
+    内核调试("Win32: 处理导入表 " + 模块.名称)
+}
+
+// §8 内置DLL — kernel32.dll (最核心的Win32 接口)
+
+定义 可变 kernel32_接口表 = []
+
+函数 注册_内置DLL_kernel32() {
+    定义 dll = PE模块 {}
+    dll.名称 = "kernel32.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+
+    // 进程/线程
+    追加(dll.导出表, ["GetCurrentProcess", win32_GetCurrentProcess])
+    追加(dll.导出表, ["GetCurrentThread", win32_GetCurrentThread])
+    追加(dll.导出表, ["GetCurrentProcessId", win32_GetCurrentProcessId])
+    追加(dll.导出表, ["GetCurrentThreadId", win32_GetCurrentThreadId])
+    追加(dll.导出表, ["ExitProcess", win32_ExitProcess])
+    追加(dll.导出表, ["ExitThread", win32_ExitThread])
+    追加(dll.导出表, ["CreateThread", win32_CreateThread])
+    追加(dll.导出表, ["Sleep", win32_Sleep])
+    追加(dll.导出表, ["SleepEx", win32_SleepEx])
+
+    // 内存
+    追加(dll.导出表, ["VirtualAlloc", win32_VirtualAlloc])
+    追加(dll.导出表, ["VirtualFree", win32_VirtualFree])
+    追加(dll.导出表, ["GetProcessHeap", win32_GetProcessHeap])
+    追加(dll.导出表, ["HeapAlloc", win32_HeapAlloc])
+    追加(dll.导出表, ["HeapFree", win32_HeapFree])
+
+    // 文件
+    追加(dll.导出表, ["CreateFileW", win32_CreateFileW])
+    追加(dll.导出表, ["ReadFile", win32_ReadFile])
+    追加(dll.导出表, ["WriteFile", win32_WriteFile])
+    追加(dll.导出表, ["CloseHandle", win32_CloseHandle])
+    追加(dll.导出表, ["GetFileSize", win32_GetFileSize])
+
+    // 控制台
+    追加(dll.导出表, ["GetStdHandle", win32_GetStdHandle])
+    追加(dll.导出表, ["WriteConsoleW", win32_WriteConsoleW])
+    追加(dll.导出表, ["ReadConsoleW", win32_ReadConsoleW])
+    追加(dll.导出表, ["SetConsoleMode", win32_SetConsoleMode])
+
+    // 模块/库
+    追加(dll.导出表, ["Get模块HandleW", win32_Get模块HandleW])
+    追加(dll.导出表, ["LoadLibraryW", win32_LoadLibraryW])
+    追加(dll.导出表, ["GetProcAddress", win32_GetProcAddress])
+    追加(dll.导出表, ["FreeLibrary", win32_FreeLibrary])
+
+    // 错误
+    追加(dll.导出表, ["GetLast错误", win32_GetLast错误])
+    追加(dll.导出表, ["SetLast错误", win32_SetLast错误])
+
+    // 字符串/环境
+    追加(dll.导出表, ["GetCommandLineW", win32_GetCommandLineW])
+    追加(dll.导出表, ["GetEnvironmentVariableW", win32_GetEnvironmentVariableW])
+    追加(dll.导出表, ["GetTickCount64", win32_GetTickCount64])
+    追加(dll.导出表, ["QueryPerformanceCounter", win32_QueryPerformanceCounter])
+    追加(dll.导出表, ["QueryPerformanceFrequency", win32_QueryPerformanceFrequency])
+
+    追加(PE_已加载模块, dll)
+    内核调试("Win32: 注册 kernel32.dll " + 整数转字符串(计数(dll.导出表)) + " 个接口")
+}

@@ -1,0 +1,656 @@
+// NovaOS 图形引擎 / 二维画布 / 文字渲染
+// 模块: 更新网缓画布文本绘制 — 连接新的文本管线
+// 目标:
+//  1) 字形缓存(LRU) + 散列索引
+//  2) 字体族解析 + 多级回退链
+//  3) 文本度量(advance/ascent/descent/line-gap)
+//  4) 行布局引擎(词折行 + 应急截断 + 对齐)
+//  5) 子像素渲染(LCD 滔波 R-G-B 权重)
+//  6) 装饰线(下划线 / 删除线 / 上划线)
+//  7) AI总线驱动的自适应渲染精度
+
+导入("../稳态/图处显示.nova")
+导入("../执行/输入多路复.nova")
+导入("./超传头部创.nova")
+导入("../推理/智能总线鼠标.nova")
+导入("./原子驻留.nova")
+导入("./内核直连层.nova")
+
+// §1 常量
+
+定义 渲染级别_低 = 0
+定义 渲染级别_中 = 1
+定义 渲染级别_高 = 2
+定义 渲染级别_子像素 = 3
+
+定义 字形缓存_最大槽 = 512
+定义 字形缓存_关联数 = 4
+定义 字形_最大宽 = 128
+定义 字形_最大高 = 128
+
+定义 文本对齐_左 = 0
+定义 文本对齐_居中 = 1
+定义 文本对齐_右 = 2
+
+定义 折行模式_无 = 0
+定义 折行模式_词 = 1
+定义 折行模式_字符 = 2
+定义 折行模式_应急 = 3
+
+定义 装饰_无 = 0
+定义 装饰_下划线 = 1
+定义 装饰_删除线 = 2
+定义 装饰_上划线 = 3
+
+定义 LCD滔波_R权 = 307    // Q10 = 0.3
+定义 LCD滔波_G权 = 410    // Q10 = 0.4
+定义 LCD滔波_B权 = 307    // Q10 = 0.3
+
+定义 Q_ONE = 1024
+
+// §2 数据结构
+
+结构 字形条目 {
+    字符码,
+    字体ID,
+    大小,             // Q10
+    位图地址,
+    宽,
+    高,
+    起点X,           // Q10
+    起点Y,           // Q10
+    advance,         // Q10 水平步进
+    使用时戳,
+    有效,
+}
+
+结构 字形缓存 {
+    槽,              // 字形条目[]
+    已用数,
+    命中,
+    未命中,
+    驱逐,
+}
+
+结构 字体度量 {
+    ascent,          // Q10 上升部
+    descent,         // Q10 下降部
+    行间距,          // Q10
+    单元宽,          // Q10 平均字形宽
+    大写高,          // Q10
+    x高,             // Q10 (x-height)
+}
+
+结构 文本行 {
+    起始索引,
+    结束索引,
+    宽度,            // Q10
+    基线Y,           // Q10
+}
+
+结构 文本布局结果 {
+    行列表,           // 文本行[]
+    行数,
+    总宽,            // Q10
+    总高,            // Q10
+}
+
+定义 可变 全局_字形缓存 = 空
+
+// §3 基础工具
+
+
+函数 文字_最小(a, b) {
+    如果 (a < b) { 返回 a }
+    返回 b
+}
+
+函数 文字_最大(a, b) {
+    如果 (a > b) { 返回 a }
+    返回 b
+}
+
+函数 文字_限幅(v, lo, hi) {
+    如果 (v < lo) { 返回 lo }
+    如果 (v > hi) { 返回 hi }
+    返回 v
+}
+
+函数 文字_散列_字形(字符码, 字体ID, 大小) {
+    // FNV-1a 变体, 将(char, fontID, size)映射到槽位
+    定义 可变 h = 2166136261
+    h = (h ^ 字符码) * 16777619
+    h = (h ^ 字体ID) * 16777619
+    h = (h ^ 大小) * 16777619
+    如果 (h < 0) { h = 0 - h }
+    返回 h % 字形缓存_最大槽
+}
+
+函数 文字_是否空格(字符码) {
+    如果 (字符码 == 32) { 返回 真 }   // ' '
+    如果 (字符码 == 9) { 返回 真 }    // '\t'
+    如果 (字符码 == 12288) { 返回 真 } // 全角空格
+    返回 假
+}
+
+函数 文字_是否CJK(字符码) {
+    // CJK统一表意文字基本平面 0x4E00-0x9FFF
+    如果 (字符码 >= 0x4E00 && 字符码 <= 0x9FFF) { 返回 真 }
+    // CJK扩展A 0x3400-0x4DBF
+    如果 (字符码 >= 0x3400 && 字符码 <= 0x4DBF) { 返回 真 }
+    // 全角标点 0x3000-0x303F
+    如果 (字符码 >= 0x3000 && 字符码 <= 0x303F) { 返回 真 }
+    返回 假
+}
+
+函数 文字_是否可折行点(字符码) {
+    如果 (文字_是否空格(字符码)) { 返回 真 }
+    如果 (字符码 == 45) { 返回 真 }  // '-'
+    如果 (文字_是否CJK(字符码)) { 返回 真 } // CJK每字可折
+    返回 假
+}
+
+// §4 字形缓存
+
+函数 字形缓存_初始化() {
+    如果 (全局_字形缓存 != 空) { 返回 }
+    定义 gc = 堆_分配(字形缓存)
+    gc.槽 = 堆_分配_数组(字形缓存_最大槽 * 字形缓存_关联数 * 48)
+    gc.已用数 = 0
+    gc.命中 = 0
+    gc.未命中 = 0
+    gc.驱逐 = 0
+    定义 可变 i = 0
+    当 (i < 字形缓存_最大槽 * 字形缓存_关联数) {
+        gc.槽[i].有效 = 假
+        i = i + 1
+    }
+    全局_字形缓存 = gc
+}
+
+函数 字形缓存_查找(字符码, 字体ID, 大小) {
+    如果 (全局_字形缓存 == 空) { 字形缓存_初始化() }
+    定义 gc = 全局_字形缓存
+    定义 slot = 文字_散列_字形(字符码, 字体ID, 大小)
+    定义 base = slot * 字形缓存_关联数
+    定义 可变 j = 0
+    当 (j < 字形缓存_关联数) {
+        定义 e = gc.槽[base + j]
+        如果 (e.有效 && e.字符码 == 字符码 && e.字体ID == 字体ID && e.大小 == 大小) {
+            gc.命中 = gc.命中 + 1
+            e.使用时戳 = 平台_获取时间_ms()
+            返回 e
+        }
+        j = j + 1
+    }
+    gc.未命中 = gc.未命中 + 1
+    返回 空
+}
+
+函数 字形缓存_插入(字符码, 字体ID, 大小, 位图, 宽, 高, 起点X, 起点Y, adv) {
+    如果 (全局_字形缓存 == 空) { 字形缓存_初始化() }
+    定义 gc = 全局_字形缓存
+    定义 slot = 文字_散列_字形(字符码, 字体ID, 大小)
+    定义 base = slot * 字形缓存_关联数
+    // 找空位或最旧条目
+    定义 可变 victim = base
+    定义 可变 oldest = 0x7FFFFFFF
+    定义 可变 j = 0
+    当 (j < 字形缓存_关联数) {
+        定义 idx = base + j
+        如果 (!gc.槽[idx].有效) {
+            victim = idx
+            跳出
+        }
+        如果 (gc.槽[idx].使用时戳 < oldest) {
+            oldest = gc.槽[idx].使用时戳
+            victim = idx
+        }
+        j = j + 1
+    }
+    如果 (gc.槽[victim].有效) {
+        gc.驱逐 = gc.驱逐 + 1
+        如果 (gc.槽[victim].位图地址 != 0) {
+            堆_释放(gc.槽[victim].位图地址)
+        }
+    } 否则 {
+        gc.已用数 = gc.已用数 + 1
+    }
+    gc.槽[victim].字符码 = 字符码
+    gc.槽[victim].字体ID = 字体ID
+    gc.槽[victim].大小 = 大小
+    gc.槽[victim].位图地址 = 位图
+    gc.槽[victim].宽 = 宽
+    gc.槽[victim].高 = 高
+    gc.槽[victim].起点X = 起点X
+    gc.槽[victim].起点Y = 起点Y
+    gc.槽[victim].advance = adv
+    gc.槽[victim].使用时戳 = 平台_获取时间_ms()
+    gc.槽[victim].有效 = 真
+    返回 gc.槽[victim]
+}
+
+// §5 字体族解析与回退链
+
+函数 字体Family_解析(族名) {
+    // CSS font-family → 系统字体文件
+    如果 (字符串_相等_不区分大小写(族名, "sans-serif") ||
+        字符串_相等_不区分大小写(族名, "Arial") ||
+        字符串_相等_不区分大小写(族名, "Helvetica")) {
+        返回 "NovaSans"
+    }
+    如果 (字符串_相等_不区分大小写(族名, "serif") ||
+        字符串_相等_不区分大小写(族名, "Times New Roman") ||
+        字符串_相等_不区分大小写(族名, "Times")) {
+        返回 "NovaSerif"
+    }
+    如果 (字符串_相等_不区分大小写(族名, "monospace") ||
+        字符串_相等_不区分大小写(族名, "Courier New") ||
+        字符串_相等_不区分大小写(族名, "Courier") ||
+        字符串_相等_不区分大小写(族名, "Consolas")) {
+        返回 "NovaMono"
+    }
+    // 中文字体
+    如果 (字符串_相等_不区分大小写(族名, "Microsoft YaHei") ||
+        字符串_相等_不区分大小写(族名, "微软雅黑") ||
+        字符串_相等_不区分大小写(族名, "PingFang SC") ||
+        字符串_相等_不区分大小写(族名, "Noto Sans CJK SC")) {
+        返回 "NovaCJK"
+    }
+    // 日文字体
+    如果 (字符串_相等_不区分大小写(族名, "Meiryo") ||
+        字符串_相等_不区分大小写(族名, "MS Gothic") ||
+        字符串_相等_不区分大小写(族名, "Noto Sans CJK JP")) {
+        返回 "NovaCJK"
+    }
+    // 韩文字体
+    如果 (字符串_相等_不区分大小写(族名, "Malgun Gothic") ||
+        字符串_相等_不区分大小写(族名, "Noto Sans CJK KR")) {
+        返回 "NovaCJK"
+    }
+    // emoji
+    如果 (字符串_相等_不区分大小写(族名, "Segoe UI Emoji") ||
+        字符串_相等_不区分大小写(族名, "Noto Color Emoji")) {
+        返回 "NovaEmoji"
+    }
+    返回 族名
+}
+
+函数 字体_回退链_查找(字符码, 主字体) {
+    // 主字体包含该字符则直接返回
+    如果 (字体_包含字符(主字体, 字符码)) { 返回 主字体 }
+    // 回退链: CJK字符优先NovaCJK, 其他优先NovaSans
+    如果 (文字_是否CJK(字符码)) {
+        如果 (字体_包含字符("NovaCJK", 字符码)) { 返回 "NovaCJK" }
+    }
+    如果 (字体_包含字符("NovaSans", 字符码)) { 返回 "NovaSans" }
+    如果 (字体_包含字符("NovaEmoji", 字符码)) { 返回 "NovaEmoji" }
+    返回 主字体  // 最终回退: .notdef
+}
+
+// §6 字体度量
+
+函数 字体度量_计算(字体名, 大小) {
+    定义 m = 字体度量 {}
+    // 从字体表取 ascent/descent (em单位缩放到像素)
+    定义 raw_asc = 字体_取ascent(字体名)
+    定义 raw_desc = 字体_取descent(字体名)
+    定义 units = 字体_取unitsPerEm(字体名)
+    如果 (units <= 0) { units = 1000 }
+    m.ascent = raw_asc * 大小 / units
+    m.descent = raw_desc * 大小 / units
+    m.行间距 = (m.ascent - m.descent) * 120 / 100  // 1.2x
+    m.单元宽 = 大小 * 600 / 1000    // 粗略估算
+    m.大写高 = m.ascent * 70 / 100
+    m.x高 = m.ascent * 52 / 100
+    返回 m
+}
+
+函数 字形_度量_查找或光栅化(字符码, 字体ID, 大小) {
+    定义 cached = 字形缓存_查找(字符码, 字体ID, 大小)
+    如果 (cached != 空) { 返回 cached }
+    // 光栅化并缓存
+    定义 bmp = 字体_光栅化(字体ID, 字符码, 大小)
+    定义 w = 光栅化结果_取宽(bmp)
+    定义 h = 光栅化结果_取高(bmp)
+    定义 ox = 光栅化结果_取起点X(bmp)
+    定义 oy = 光栅化结果_取起点Y(bmp)
+    定义 adv = 光栅化结果_取advance(bmp)
+    定义 addr = 光栅化结果_取位图(bmp)
+    返回 字形缓存_插入(字符码, 字体ID, 大小, addr, w, h, ox, oy, adv)
+}
+
+// §7 子像素渲染 (LCD 滔波)
+// 创新: 自研R-G-B通道加权融合, 拟消CJK笔画彩边
+
+函数 子像素_LCD渲染_单字形(dst, dst步进, glyph, fg色) {
+    // glyph 已光栅化为 3x宽度的灰度位图 (R|G|B 子像素)
+    定义 gw = glyph.宽 * 3
+    定义 gh = glyph.高
+    定义 fgR = (fg色 >> 16) & 0xFF
+    定义 fgG = (fg色 >> 8) & 0xFF
+    定义 fgB = fg色 & 0xFF
+    定义 可变 row = 0
+    当 (row < gh) {
+        定义 可变 col = 0
+        当 (col < glyph.宽) {
+            定义 srcOff = row * gw + col * 3
+            定义 aR = 内存_读8(glyph.位图地址 + srcOff)
+            定义 aG = 内存_读8(glyph.位图地址 + srcOff + 1)
+            定义 aB = 内存_读8(glyph.位图地址 + srcOff + 2)
+            // LCD滔波: 对相邻像素应用加权核
+            定义 wR = (aR * LCD滔波_R权) / Q_ONE
+            定义 wG = (aG * LCD滔波_G权) / Q_ONE
+            定义 wB = (aB * LCD滔波_B权) / Q_ONE
+            定义 dstOff = (row + glyph.起点Y) * dst步进 + (col + glyph.起点X) * 4
+            定义 bgR = 内存_读8(dst + dstOff)
+            定义 bgG = 内存_读8(dst + dstOff + 1)
+            定义 bgB = 内存_读8(dst + dstOff + 2)
+            定义 outR = 文字_限幅((fgR * wR + bgR * (255 - wR)) / 255, 0, 255)
+            定义 outG = 文字_限幅((fgG * wG + bgG * (255 - wG)) / 255, 0, 255)
+            定义 outB = 文字_限幅((fgB * wB + bgB * (255 - wB)) / 255, 0, 255)
+            内存_写08(dst + dstOff, outR)
+            内存_写08(dst + dstOff + 1, outG)
+            内存_写08(dst + dstOff + 2, outB)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+函数 灰度_渲染_单字形(dst, dst步进, glyph, fg色) {
+    定义 gw = glyph.宽
+    定义 gh = glyph.高
+    定义 fgR = (fg色 >> 16) & 0xFF
+    定义 fgG = (fg色 >> 8) & 0xFF
+    定义 fgB = fg色 & 0xFF
+    定义 可变 row = 0
+    当 (row < gh) {
+        定义 可变 col = 0
+        当 (col < gw) {
+            定义 alpha = 内存_读8(glyph.位图地址 + row * gw + col)
+            如果 (alpha == 0) { col = col + 1; 继续 }
+            定义 dstOff = (row + glyph.起点Y) * dst步进 + (col + glyph.起点X) * 4
+            定义 bgR = 内存_读8(dst + dstOff)
+            定义 bgG = 内存_读8(dst + dstOff + 1)
+            定义 bgB = 内存_读8(dst + dstOff + 2)
+            定义 inv = 255 - alpha
+            内存_写08(dst + dstOff, (fgR * alpha + bgR * inv) / 255)
+            内存_写08(dst + dstOff + 1, (fgG * alpha + bgG * inv) / 255)
+            内存_写08(dst + dstOff + 2, (fgB * alpha + bgB * inv) / 255)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// §8 行布局引擎
+// 创新: 词折行 + CJK每字可折 + 应急截断(省略号)
+
+函数 文本布局_计算(文本, 文本长, 字体ID, 大小, 最大宽, 折行模式) {
+    定义 result = 文本布局结果 {}
+    result.行列表 = 堆_分配_数组(64 * 16)  // 最多64行
+    result.行数 = 0
+    result.总宽 = 0
+    result.总高 = 0
+
+    定义 metrics = 字体度量_计算(字体ID, 大小)
+    定义 行高 = metrics.行间距
+
+    定义 可变 lineStart = 0
+    定义 可变 lineW = 0
+    定义 可变 lastBreak = -1
+    定义 可变 lastBreakW = 0
+    定义 可变 i = 0
+
+    当 (i < 文本长) {
+        定义 ch = 字符串_取字符码(文本, i)
+        // 强制换行
+        如果 (ch == 10) {
+            定义 ln = result.行列表[result.行数]
+            ln.起始索引 = lineStart
+            ln.结束索引 = i
+            ln.宽度 = lineW
+            ln.基线Y = result.行数 * 行高 + metrics.ascent
+            result.行数 = result.行数 + 1
+            result.总宽 = 文字_最大(result.总宽, lineW)
+            lineStart = i + 1
+            lineW = 0
+            lastBreak = -1
+            i = i + 1
+            继续
+        }
+
+        定义 g = 字形_度量_查找或光栅化(ch, 字体ID, 大小)
+        定义 adv = 0
+        如果 (g != 空) { adv = g.advance } 否则 { adv = metrics.单元宽 }
+
+        // 检查是否超宽
+        如果 (折行模式 != 折行模式_无 && 最大宽 > 0 && lineW + adv > 最大宽) {
+            定义 breakIdx = i
+            如果 (折行模式 == 折行模式_词 && lastBreak >= 0) {
+                breakIdx = lastBreak + 1
+                lineW = lastBreakW
+            }
+            定义 ln2 = result.行列表[result.行数]
+            ln2.起始索引 = lineStart
+            ln2.结束索引 = breakIdx
+            ln2.宽度 = lineW
+            ln2.基线Y = result.行数 * 行高 + metrics.ascent
+            result.行数 = result.行数 + 1
+            result.总宽 = 文字_最大(result.总宽, lineW)
+            lineStart = breakIdx
+            lineW = 0
+            lastBreak = -1
+            继续
+        }
+
+        如果 (文字_是否可折行点(ch)) {
+            lastBreak = i
+            lastBreakW = lineW + adv
+        }
+        lineW = lineW + adv
+        i = i + 1
+    }
+
+    // 最后一行
+    如果 (lineStart <= 文本长) {
+        定义 ln3 = result.行列表[result.行数]
+        ln3.起始索引 = lineStart
+        ln3.结束索引 = 文本长
+        ln3.宽度 = lineW
+        ln3.基线Y = result.行数 * 行高 + metrics.ascent
+        result.行数 = result.行数 + 1
+        result.总宽 = 文字_最大(result.总宽, lineW)
+    }
+    result.总高 = result.行数 * 行高
+    返回 result
+}
+
+// §9 装饰线绘制
+
+函数 装饰线_绘制(dst, dst步进, x, y, 宽, 厚, 色, 类型, metrics) {
+    定义 lineY = 0
+    如果 (类型 == 装饰_下划线) {
+        lineY = y + metrics.descent / 2
+    } 否则如果 (类型 == 装饰_删除线) {
+        lineY = y - metrics.x高 / 2
+    } 否则如果 (类型 == 装饰_上划线) {
+        lineY = y - metrics.ascent
+    } 否则 {
+        返回
+    }
+    定义 fgR = (色 >> 16) & 0xFF
+    定义 fgG = (色 >> 8) & 0xFF
+    定义 fgB = 色 & 0xFF
+    定义 可变 dy = 0
+    当 (dy < 厚) {
+        定义 可变 dx = 0
+        当 (dx < 宽) {
+            定义 off = (lineY + dy) * dst步进 + (x + dx) * 4
+            内存_写08(dst + off, fgR)
+            内存_写08(dst + off + 1, fgG)
+            内存_写08(dst + off + 2, fgB)
+            内存_写08(dst + off + 3, 255)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+}
+
+// §10 AI总线集成 — 自适应渲染精度
+// 创新: 综合注视点距离×语义重要性×运动掩蔽×JND阈值
+
+函数 智能_Text渲染er_AI渲染精度(区域x, 区域y, 区域w, 区域h) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 渲染级别_中 }
+    返回 AI总线_渲染质量(bus, 区域x, 区域y, 区域w, 区域h, Q_ONE / 2, 真)
+}
+
+函数 智能_选择渲染模式(区域x, 区域y, 区域w, 区域h) {
+    定义 level = 智能_Text渲染er_AI渲染精度(区域x, 区域y, 区域w, 区域h)
+    如果 (level >= 渲染级别_子像素) { 返回 渲染级别_子像素 }
+    如果 (level >= 渲染级别_高) { 返回 渲染级别_高 }
+    如果 (level >= 渲染级别_中) { 返回 渲染级别_中 }
+    返回 渲染级别_低
+}
+
+// §11 绘制入口: Sk画布 drawText
+
+函数 Sk画布_drawText_完整(c, 文本, 文本长度, x, y, font, paint) {
+    c.绘制调用数 = c.绘制调用数 + 1
+
+    定义 字体名 = 字体Family_解析(font.字体族)
+    定义 sz = font.大小 / 100
+    定义 字体ID = 字体_获取ID(字体名)
+    定义 px = x / 100
+    定义 py = y / 100
+
+    定义 mode = 智能_选择渲染模式(px, py, 300, sz)
+
+    定义 可变 curX = px
+    定义 可变 i = 0
+    当 (i < 文本长度) {
+        定义 ch = 字符串_取字符码(文本, i)
+        定义 realFont = 字体_回退链_查找(ch, 字体名)
+        定义 realID = 字体_获取ID(realFont)
+        定义 g = 字形_度量_查找或光栅化(ch, realID, sz)
+        如果 (g != 空 && g.宽 > 0 && g.高 > 0) {
+            如果 (mode == 渲染级别_子像素) {
+                子像素_LCD渲染_单字形(c.位图, c.步进, g, paint.颜色)
+            } 否则 {
+                灰度_渲染_单字形(c.位图, c.步进, g, paint.颜色)
+            }
+            curX = curX + g.advance
+        } 否则 {
+            curX = curX + sz * 600 / 1000
+        }
+        i = i + 1
+    }
+}
+
+// §12 多行绘制 + 装饰线 + 对齐
+
+函数 Sk画布_drawTextLayout_完整(c, 文本, 文本长, x, y, font, paint, 最大宽, 对齐, 折行, 装饰) {
+    c.绘制调用数 = c.绘制调用数 + 1
+    定义 字体名 = 字体Family_解析(font.字体族)
+    定义 sz = font.大小 / 100
+    定义 字体ID = 字体_获取ID(字体名)
+    定义 metrics = 字体度量_计算(字体名, sz)
+    定义 layout = 文本布局_计算(文本, 文本长, 字体ID, sz, 最大宽, 折行)
+    定义 mode = 智能_选择渲染模式(x, y, 最大宽, layout.总高)
+
+    定义 可变 li = 0
+    当 (li < layout.行数) {
+        定义 line = layout.行列表[li]
+        定义 lineX = x
+        如果 (对齐 == 文本对齐_居中) {
+            lineX = x + (最大宽 - line.宽度) / 2
+        } 否则如果 (对齐 == 文本对齐_右) {
+            lineX = x + 最大宽 - line.宽度
+        }
+        定义 lineY = y + line.基线Y
+
+        // 渲染行内字形
+        定义 可变 curX = lineX
+        定义 可变 ci = line.起始索引
+        当 (ci < line.结束索引) {
+            定义 ch = 字符串_取字符码(文本, ci)
+            定义 realFont = 字体_回退链_查找(ch, 字体名)
+            定义 realID = 字体_获取ID(realFont)
+            定义 g = 字形_度量_查找或光栅化(ch, realID, sz)
+            如果 (g != 空 && g.宽 > 0 && g.高 > 0) {
+                如果 (mode == 渲染级别_子像素) {
+                    子像素_LCD渲染_单字形(c.位图, c.步进, g, paint.颜色)
+                } 否则 {
+                    灰度_渲染_单字形(c.位图, c.步进, g, paint.颜色)
+                }
+                curX = curX + g.advance
+            } 否则 {
+                curX = curX + metrics.单元宽
+            }
+            ci = ci + 1
+        }
+
+        // 装饰线
+        如果 (装饰 != 装饰_无) {
+            装饰线_绘制(c.位图, c.步进, lineX, lineY, line.宽度, 1, paint.颜色, 装饰, metrics)
+        }
+        li = li + 1
+    }
+}
+
+// §13 文本宽度度量
+
+函数 文本_度量宽度(文本, 文本长, 字体名, 大小) {
+    定义 字体ID = 字体_获取ID(字体名)
+    定义 metrics = 字体度量_计算(字体名, 大小)
+    定义 可变 total = 0
+    定义 可变 i = 0
+    当 (i < 文本长) {
+        定义 ch = 字符串_取字符码(文本, i)
+        定义 g = 字形_度量_查找或光栅化(ch, 字体ID, 大小)
+        如果 (g != 空) {
+            total = total + g.advance
+        } 否则 {
+            total = total + metrics.单元宽
+        }
+        i = i + 1
+    }
+    返回 total
+}
+
+// §14 缓存统计与清理
+
+函数 字形缓存_命中率() {
+    如果 (全局_字形缓存 == 空) { 返回 0 }
+    定义 gc = 全局_字形缓存
+    定义 total = gc.命中 + gc.未命中
+    如果 (total == 0) { 返回 0 }
+    返回 gc.命中 * 100 / total
+}
+
+函数 字形缓存_清理() {
+    如果 (全局_字形缓存 == 空) { 返回 }
+    定义 gc = 全局_字形缓存
+    定义 可变 i = 0
+    当 (i < 字形缓存_最大槽 * 字形缓存_关联数) {
+        如果 (gc.槽[i].有效 && gc.槽[i].位图地址 != 0) {
+            堆_释放(gc.槽[i].位图地址)
+        }
+        gc.槽[i].有效 = 假
+        i = i + 1
+    }
+    gc.已用数 = 0
+    gc.命中 = 0
+    gc.未命中 = 0
+    gc.驱逐 = 0
+}
+
+函数 字形缓存_卸载() {
+    如果 (全局_字形缓存 == 空) { 返回 }
+    字形缓存_清理()
+    堆_释放(全局_字形缓存.槽)
+    堆_释放(全局_字形缓存)
+    全局_字形缓存 = 空
+}

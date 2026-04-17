@@ -1,0 +1,196 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./感知丙甲.nova")
+
+函数 网格_扫描行可用列(occ, 行, 列跨) {
+    如果 (occ == 0) { 返回 0 }
+    定义 可变 c = 0
+    当 (c <= occ.列数 - 列跨) {
+        如果 (网格Occupancy_区域可用(occ, 行, c, 1, 列跨)) { 返回 c }
+        c = c + 1
+    }
+    返回 occ.列数    // 需要扩展隐式列
+}
+
+函数 网格_扫描列可用行(occ, 列, 行跨) {
+    如果 (occ == 0) { 返回 0 }
+    定义 可变 r = 0
+    当 (r <= occ.行数 - 行跨) {
+        如果 (网格Occupancy_区域可用(occ, r, 列, 行跨, 1)) { 返回 r }
+        r = r + 1
+    }
+    返回 occ.行数
+}
+
+// §4 轨道大小计算(Nova标准 §12 完整)
+
+结构 TrackSize {
+    base,    // i32 基础大小 Q10
+    growth_limit,    // i32 增长上限 Q10 (-1=infinity)
+    类型,    // u8 轨道类型
+    fr值,    // i32 fr单位值 Q10
+    最终大小,    // i32 计算后的最终大小
+}
+
+// 完整轨道大小计算
+函数 网格_计算轨道大小(轨道, 轨道数, items, items数, 可用空间, gap, 轴) {
+    如果 (轨道 == 0 || 轨道数 == 0) { 返回 }
+
+    // Step 1: 初始化轨道base size和growth limit
+    定义 可变 i = 0
+    当 (i < 轨道数) {
+        定义 t = 轨道 + i * 大小of(TrackSize)
+        如果 (t.类型 == 0) {  // 固定
+            t.base = t.fr值; t.growth_limit = t.fr值
+        } 否则 如果 (t.类型 == 3) {  // auto
+            t.base = 0; t.growth_limit = -1  // infinity
+        } 否则 如果 (t.类型 == 5) {  // min-content
+            t.base = 0; t.growth_limit = 0
+        } 否则 如果 (t.类型 == 6) {  // max-content
+            t.base = 0; t.growth_limit = -1
+        } 否则 如果 (t.类型 == 4) {  // minmax
+            t.base = t.base; t.growth_limit = t.growth_limit
+        } 否则 如果 (t.类型 == 2) {  // fr
+            t.base = 0; t.growth_limit = -1
+        }
+        i = i + 1
+    }
+
+    // Step 2: 根据项目约束调整base size
+    // 2a: 处理跨单轨道的项目
+    i = 0
+    当 (i < items数) {
+        定义 item = items + i * 大小of(网格Placement)
+        定义 跨度 = 如果(轴 == 0, item.列跨, item.行跨)
+        如果 (跨度 == 1) {
+            定义 轨道idx = 如果(轴 == 0, item.列起始 - 1, item.行起始 - 1)
+            如果 (轨道idx >= 0 && 轨道idx < 轨道数) {
+                定义 t = 轨道 + 轨道idx * 大小of(TrackSize)
+                // 获取项目min-content/max-content大小
+                定义 minC = 0    // item.minContentSize(轴)
+                定义 maxC = 0    // item.maxContentSize(轴)
+                // 更新base size
+                如果 (minC > t.base) { t.base = minC }
+                // 更新growth limit
+                如果 (t.growth_limit >= 0 && maxC > t.growth_limit) { t.growth_limit = maxC }
+            }
+        }
+        i = i + 1
+    }
+
+    // 2b: 处理跨多轨道的项目(更复杂：需要分配额外空间到各轨道)
+    i = 0
+    当 (i < items数) {
+        定义 item = items + i * 大小of(网格Placement)
+        定义 跨度 = 如果(轴 == 0, item.列跨, item.行跨)
+        如果 (跨度 > 1) {
+            定义 起始 = 如果(轴 == 0, item.列起始 - 1, item.行起始 - 1)
+            如果 (起始 < 0) { i = i + 1; 继续 }
+            // 计算跨越轨道的当前总大小
+            定义 可变 当前总 = 0
+            定义 可变 j = 0
+            当 (j < 跨度 && 起始 + j < 轨道数) {
+                定义 t = 轨道 + (起始 + j) * 大小of(TrackSize)
+                当前总 = 当前总 + t.base
+                j = j + 1
+            }
+            当前总 = 当前总 + (跨度 - 1) * gap
+            // 如果项目需要更多空间，均匀分配额外空间
+            定义 需要 = 0    // item.minContentSize(轴)
+            如果 (需要 > 当前总) {
+                定义 额外 = (需要 - 当前总) / 跨度
+                j = 0
+                当 (j < 跨度 && 起始 + j < 轨道数) {
+                    定义 t = 轨道 + (起始 + j) * 大小of(TrackSize)
+                    t.base = t.base + 额外
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Step 3: 确保growth_limit >= base
+    i = 0
+    当 (i < 轨道数) {
+        定义 t = 轨道 + i * 大小of(TrackSize)
+        如果 (t.growth_limit >= 0 && t.growth_limit < t.base) {
+            t.growth_limit = t.base
+        }
+        i = i + 1
+    }
+
+    // Step 4: fr分配剩余空间
+    定义 可变 已用 = 0
+    定义 可变 fr总 = 0
+    i = 0
+    当 (i < 轨道数) {
+        定义 t = 轨道 + i * 大小of(TrackSize)
+        如果 (t.类型 == 2) {  // fr
+            fr总 = fr总 + t.fr值
+        } 否则 {
+            已用 = 已用 + t.base
+        }
+        i = i + 1
+    }
+    已用 = 已用 + (轨道数 - 1) * gap
+
+    如果 (fr总 > 0 && 可用空间 > 已用) {
+        定义 剩余 = 可用空间 - 已用
+        定义 每fr = 剩余 * 1024 / fr总
+        i = 0
+        当 (i < 轨道数) {
+            定义 t = 轨道 + i * 大小of(TrackSize)
+            如果 (t.类型 == 2) {
+                t.base = t.fr值 * 每fr / 1024
+                如果 (t.base < 0) { t.base = 0 }
+            }
+            i = i + 1
+        }
+    }
+
+    // Step 5: 拉伸auto轨道
+    定义 可变 auto数 = 0
+    已用 = 0
+    i = 0
+    当 (i < 轨道数) {
+        定义 t = 轨道 + i * 大小of(TrackSize)
+        已用 = 已用 + t.base
+        如果 (t.类型 == 3) { auto数 = auto数 + 1 }
+        i = i + 1
+    }
+    已用 = 已用 + (轨道数 - 1) * gap
+
+    如果 (auto数 > 0 && 可用空间 > 已用) {
+        定义 额外每auto = (可用空间 - 已用) / auto数
+        i = 0
+        当 (i < 轨道数) {
+            定义 t = 轨道 + i * 大小of(TrackSize)
+            如果 (t.类型 == 3) { t.base = t.base + 额外每auto }
+            i = i + 1
+        }
+    }
+
+    // Step 6: 写入最终大小
+    i = 0
+    当 (i < 轨道数) {
+        定义 t = 轨道 + i * 大小of(TrackSize)
+        t.最终大小 = t.base
+        i = i + 1
+    }
+}
+
+定义 可变 AI_网格扫描行_调用数 = 0
+定义 可变 AI_网格扫描行_异常数 = 0
+
+函数 AI_网格扫描行_监控() {
+    AI_网格扫描行_调用数 = AI_网格扫描行_调用数 + 1
+    返回 AI_网格扫描行_异常数 == 0
+}
+
+函数 AI_网格扫描行_健康检查() {
+    如果 (AI_网格扫描行_调用数 > 0 && AI_网格扫描行_异常数 * 100 / AI_网格扫描行_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

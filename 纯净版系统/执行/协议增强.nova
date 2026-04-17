@@ -1,0 +1,930 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/字符串替换.nova")
+导入("../外联/地址解析辅.nova")
+导入("./输入多路复.nova")
+导入("../中枢/整数转字符串.nova")
+
+// NovaOS 融合层 / 内核浏览器桥 / 网络适配
+// 模块: 原生___内部协议处理_标记5壳层视觉增强
+// 目标:
+//  1) 统一 nova:// 内部协议到 Browser-终端壳层
+//  2) 提供可演进的视觉增强系统(亮色/暗色/高对比/低动态)
+//  3) 接入 AI 策略, 根据会话上下文动态调整壳层密度和信息层级
+//  4) 输出可观测埋点, 支持商用运维
+// 说明:
+//  - 本文件不依赖外部版权CSS模板, 全部规则为 NovaOS 原生设计
+//  - 使用函数化 CSS 片段拼接, 便于灰度发布
+
+// §1 常量定义
+
+定义 壳层主题_浅色 = 1
+定义 壳层主题_深色 = 2
+定义 壳层主题_高对比 = 3
+定义 壳层主题_护眼 = 4
+
+定义 壳层密度_紧凑 = 1
+定义 壳层密度_标准 = 2
+定义 壳层密度_宽松 = 3
+
+定义 壳层动效_关闭 = 0
+定义 壳层动效_低 = 1
+定义 壳层动效_标准 = 2
+
+定义 协议类型_未知 = 0
+定义 协议类型_系统 = 1
+定义 协议类型_AI = 2
+定义 协议类型_多模态 = 3
+定义 协议类型_语音 = 4
+定义 协议类型_形象 = 5
+定义 协议类型_诊断 = 6
+定义 协议类型_设置 = 7
+定义 协议类型_工作流 = 8
+
+定义 路由策略_严格 = 1
+定义 路由策略_兼容 = 2
+定义 路由策略_实验 = 3
+
+定义 最大参数数 = 32
+定义 最大卡片数 = 24
+定义 最大标签数 = 20
+定义 最大埋点数 = 256
+
+// §2 数据结构
+
+结构 壳层视觉上下文 {
+    主题,
+    密度,
+    动效级别,
+    字号缩放,            // Q10
+    圆角缩放,            // Q10
+    对比度增强,          // Q10
+    阴影强度,            // Q10
+    玻璃化强度,          // Q10
+    噪点抑制,            // Q10
+    可访问模式,
+    减少动态,
+    触控优先,
+}
+
+结构 协议参数 {
+    键,
+    值,
+}
+
+结构 协议请求 {
+    原始URL,
+    协议名,
+    主机,
+    路径,
+    查询,
+    类型,
+    参数列表,          // 协议参数[]
+    参数数,
+}
+
+结构 协议响应 {
+    状态码,
+    标题,
+    描述,
+    主内容HTML,
+    扩展元数据,
+}
+
+结构 壳层埋点 {
+    事件名,
+    时间戳,
+    数值1,
+    数值2,
+    标签,
+}
+
+结构 壳层埋点缓冲 {
+    列表,              // 壳层埋点[]
+    写索引,
+    总写入,
+}
+
+结构 路由决策 {
+    是否命中,
+    命中模块,
+    风险评分,          // 0-100
+    置信度,            // Q8
+    回退模块,
+}
+
+定义 可变 全局_埋点缓冲 = 空
+定义 可变 全局_默认策略 = 路由策略_兼容
+
+// §3 基础工具函数
+
+函数 最小值(a, b) {
+    如果 (a < b) { 返回 a }
+    返回 b
+}
+
+函数 最大值(a, b) {
+    如果 (a > b) { 返回 a }
+    返回 b
+}
+
+函数 限幅(v, lo, hi) {
+    如果 (v < lo) { 返回 lo }
+    如果 (v > hi) { 返回 hi }
+    返回 v
+}
+
+函数 是否空串(s) {
+    如果 (s == 空) { 返回 真 }
+    返回 字符串长度(s) == 0
+}
+
+函数 布尔转文本(v) {
+    如果 (v) { 返回 "true" }
+    返回 "false"
+}
+
+函数 字符串安全值(s, 默认值) {
+    如果 (s == 空 || 字符串长度(s) == 0) { 返回 默认值 }
+    返回 s
+}
+
+函数 数值转百分比文本(v) {
+    返回 字符串拼接(整数转字符串(v), "%")
+}
+
+函数 CSS_追加(css, 片段) {
+    返回 字符串拼接(css, 片段)
+}
+
+函数 HTML_包裹(tag, cls, 内容) {
+    定义 可变 out = ""
+    out = 字符串拼接(out, "<")
+    out = 字符串拼接(out, tag)
+    out = 字符串拼接(out, " class='")
+    out = 字符串拼接(out, cls)
+    out = 字符串拼接(out, "'>")
+    out = 字符串拼接(out, 内容)
+    out = 字符串拼接(out, "</")
+    out = 字符串拼接(out, tag)
+    out = 字符串拼接(out, ">")
+    返回 out
+}
+
+函数 壳层_时间戳_ms() {
+    返回 平台_获取时间_ms()
+}
+
+// §4 埋点与可观测
+
+函数 壳层埋点_初始化() {
+    如果 (全局_埋点缓冲 != 空) { 返回 }
+    定义 b = 堆_分配(壳层埋点缓冲)
+    b.列表 = 堆_分配_数组(最大埋点数 * 40)
+    b.写索引 = 0
+    b.总写入 = 0
+    全局_埋点缓冲 = b
+}
+
+函数 壳层埋点_记录(事件名, 数值1, 数值2, 标签) {
+    如果 (全局_埋点缓冲 == 空) { 壳层埋点_初始化() }
+    定义 b = 全局_埋点缓冲
+    定义 idx = b.写索引 % 最大埋点数
+    b.列表[idx].事件名 = 事件名
+    b.列表[idx].时间戳 = 壳层_时间戳_ms()
+    b.列表[idx].数值1 = 数值1
+    b.列表[idx].数值2 = 数值2
+    b.列表[idx].标签 = 标签
+    b.写索引 = b.写索引 + 1
+    b.总写入 = b.总写入 + 1
+}
+
+函数 壳层埋点_导出JSON() {
+    如果 (全局_埋点缓冲 == 空) { 返回 "[]" }
+    定义 b = 全局_埋点缓冲
+    定义 可变 out = "["
+    定义 可变 n = 最小值(b.总写入, 最大埋点数)
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 idx = (b.写索引 - n + i + 最大埋点数) % 最大埋点数
+        定义 e = b.列表[idx]
+        如果 (i > 0) { out = 字符串拼接(out, ",") }
+        out = 字符串拼接(out, "{\"event\":\"")
+        out = 字符串拼接(out, 字符串安全值(e.事件名, ""))
+        out = 字符串拼接(out, "\",\"ts\":")
+        out = 字符串拼接(out, 整数转字符串(e.时间戳))
+        out = 字符串拼接(out, ",\"v1\":")
+        out = 字符串拼接(out, 整数转字符串(e.数值1))
+        out = 字符串拼接(out, ",\"v2\":")
+        out = 字符串拼接(out, 整数转字符串(e.数值2))
+        out = 字符串拼接(out, ",\"tag\":\"")
+        out = 字符串拼接(out, 字符串安全值(e.标签, ""))
+        out = 字符串拼接(out, "\"}")
+        i = i + 1
+    }
+    out = 字符串拼接(out, "]")
+    返回 out
+}
+
+// §5 视觉上下文初始化
+
+函数 壳层视觉上下文_默认() {
+    定义 ctx = 壳层视觉上下文 {}
+    ctx.主题 = 壳层主题_浅色
+    ctx.密度 = 壳层密度_标准
+    ctx.动效级别 = 壳层动效_标准
+    ctx.字号缩放 = 1024
+    ctx.圆角缩放 = 1024
+    ctx.对比度增强 = 1024
+    ctx.阴影强度 = 1024
+    ctx.玻璃化强度 = 900
+    ctx.噪点抑制 = 1024
+    ctx.可访问模式 = 假
+    ctx.减少动态 = 假
+    ctx.触控优先 = 假
+    返回 ctx
+}
+
+函数 壳层视觉上下文_应用可访问(ctx) {
+    ctx.可访问模式 = 真
+    ctx.字号缩放 = 1180
+    ctx.对比度增强 = 1320
+    ctx.阴影强度 = 700
+    ctx.动效级别 = 壳层动效_低
+    ctx.减少动态 = 真
+}
+
+函数 壳层视觉上下文_应用触控(ctx) {
+    ctx.触控优先 = 真
+    ctx.密度 = 壳层密度_宽松
+    ctx.圆角缩放 = 1200
+}
+
+函数 壳层视觉上下文_设置主题(ctx, 主题) {
+    ctx.主题 = 主题
+}
+
+// §6 CSS变量层
+
+函数 壳层_CSS_变量_浅色() {
+    定义 可变 css = ":root{"
+    css = CSS_追加(css, "--nova-bg:#eef4fb;")
+    css = CSS_追加(css, "--nova-bg2:#f7fbff;")
+    css = CSS_追加(css, "--nova-card:#ffffff;")
+    css = CSS_追加(css, "--nova-ink:#10233f;")
+    css = CSS_追加(css, "--nova-sub:#5f748f;")
+    css = CSS_追加(css, "--nova-line:#d8e3f1;")
+    css = CSS_追加(css, "--nova-primary:#2563eb;")
+    css = CSS_追加(css, "--nova-success:#16a34a;")
+    css = CSS_追加(css, "--nova-warn:#f59e0b;")
+    css = CSS_追加(css, "--nova-danger:#dc2626;")
+    css = CSS_追加(css, "--nova-glass:rgba(255,255,255,0.78);")
+    css = CSS_追加(css, "--nova-shadow:0 24px 60px rgba(15,23,42,0.12);")
+    css = CSS_追加(css, "}")
+    返回 css
+}
+
+函数 壳层_CSS_变量_深色() {
+    定义 可变 css = ":root{"
+    css = CSS_追加(css, "--nova-bg:#0a1426;")
+    css = CSS_追加(css, "--nova-bg2:#0f1d34;")
+    css = CSS_追加(css, "--nova-card:#11233d;")
+    css = CSS_追加(css, "--nova-ink:#dbeafe;")
+    css = CSS_追加(css, "--nova-sub:#9bb3cf;")
+    css = CSS_追加(css, "--nova-line:#1f3656;")
+    css = CSS_追加(css, "--nova-primary:#60a5fa;")
+    css = CSS_追加(css, "--nova-success:#34d399;")
+    css = CSS_追加(css, "--nova-warn:#fbbf24;")
+    css = CSS_追加(css, "--nova-danger:#f87171;")
+    css = CSS_追加(css, "--nova-glass:rgba(17,35,61,0.68);")
+    css = CSS_追加(css, "--nova-shadow:0 28px 72px rgba(0,0,0,0.45);")
+    css = CSS_追加(css, "}")
+    返回 css
+}
+
+函数 壳层_CSS_变量_高对比() {
+    定义 可变 css = ":root{"
+    css = CSS_追加(css, "--nova-bg:#ffffff;")
+    css = CSS_追加(css, "--nova-bg2:#ffffff;")
+    css = CSS_追加(css, "--nova-card:#ffffff;")
+    css = CSS_追加(css, "--nova-ink:#000000;")
+    css = CSS_追加(css, "--nova-sub:#111111;")
+    css = CSS_追加(css, "--nova-line:#000000;")
+    css = CSS_追加(css, "--nova-primary:#0000ff;")
+    css = CSS_追加(css, "--nova-success:#006400;")
+    css = CSS_追加(css, "--nova-warn:#7c2d12;")
+    css = CSS_追加(css, "--nova-danger:#7f1d1d;")
+    css = CSS_追加(css, "--nova-glass:#ffffff;")
+    css = CSS_追加(css, "--nova-shadow:none;")
+    css = CSS_追加(css, "}")
+    返回 css
+}
+
+函数 壳层_CSS_变量_护眼() {
+    定义 可变 css = ":root{"
+    css = CSS_追加(css, "--nova-bg:#f5f6ea;")
+    css = CSS_追加(css, "--nova-bg2:#f1f2e3;")
+    css = CSS_追加(css, "--nova-card:#fcfcf2;")
+    css = CSS_追加(css, "--nova-ink:#1f2937;")
+    css = CSS_追加(css, "--nova-sub:#4b5563;")
+    css = CSS_追加(css, "--nova-line:#d1d5db;")
+    css = CSS_追加(css, "--nova-primary:#2563eb;")
+    css = CSS_追加(css, "--nova-success:#15803d;")
+    css = CSS_追加(css, "--nova-warn:#b45309;")
+    css = CSS_追加(css, "--nova-danger:#b91c1c;")
+    css = CSS_追加(css, "--nova-glass:rgba(252,252,242,0.86);")
+    css = CSS_追加(css, "--nova-shadow:0 18px 40px rgba(31,41,55,0.10);")
+    css = CSS_追加(css, "}")
+    返回 css
+}
+
+函数 壳层_CSS_变量_按主题(ctx) {
+    如果 (ctx.主题 == 壳层主题_深色) { 返回 壳层_CSS_变量_深色() }
+    如果 (ctx.主题 == 壳层主题_高对比) { 返回 壳层_CSS_变量_高对比() }
+    如果 (ctx.主题 == 壳层主题_护眼) { 返回 壳层_CSS_变量_护眼() }
+    返回 壳层_CSS_变量_浅色()
+}
+
+// §7 CSS组件层
+
+函数 壳层_CSS_基础布局(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, "body{margin:0;padding:0;background:linear-gradient(145deg,var(--nova-bg2),var(--nova-bg));color:var(--nova-ink);font-family:'Nova Sans','Segoe UI',sans-serif;}")
+    css = CSS_追加(css, ".nova-shell{max-width:1240px;margin:0 auto;padding:24px;position:relative;}")
+    css = CSS_追加(css, ".nova-shell::before{content:'';position:fixed;right:42px;top:22px;width:280px;height:280px;border-radius:999px;background:rgba(147,197,253,0.24);filter:blur(36px);pointer-events:none;}")
+    css = CSS_追加(css, ".nova-shell::after{content:'';position:fixed;left:36px;bottom:28px;width:240px;height:240px;border-radius:999px;background:rgba(52,211,153,0.20);filter:blur(42px);pointer-events:none;}")
+    css = CSS_追加(css, ".nova-stack{display:flex;flex-direction:column;gap:18px;}")
+    css = CSS_追加(css, ".nova-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;}")
+    css = CSS_追加(css, ".nova-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}")
+    css = CSS_追加(css, ".nova-row{display:flex;gap:12px;align-items:center;}")
+    css = CSS_追加(css, ".nova-col{display:flex;flex-direction:column;gap:8px;}")
+    返回 css
+}
+
+函数 壳层_CSS_头图卡片(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, ".nova-hero{padding:30px;border:1px solid var(--nova-line);border-radius:28px;background:var(--nova-glass);box-shadow:var(--nova-shadow);backdrop-filter:blur(24px);}")
+    css = CSS_追加(css, ".nova-eyebrow{font-size:12px;letter-spacing:0.14em;text-transform:uppercase;color:var(--nova-sub);font-weight:700;}")
+    css = CSS_追加(css, ".nova-title{font-size:40px;line-height:1.08;font-weight:800;margin:10px 0 8px 0;}")
+    css = CSS_追加(css, ".nova-lead{font-size:15px;line-height:1.74;color:var(--nova-sub);max-width:840px;}")
+    css = CSS_追加(css, ".nova-chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;}")
+    css = CSS_追加(css, ".nova-chip{padding:8px 12px;border-radius:999px;border:1px solid var(--nova-line);background:var(--nova-card);font-size:12px;color:var(--nova-sub);font-weight:650;}")
+    css = CSS_追加(css, ".nova-chip-accent{background:linear-gradient(90deg,rgba(219,234,254,0.92),rgba(207,250,254,0.82));color:#0f2f53;border-color:rgba(147,197,253,0.7);}")
+    css = CSS_追加(css, ".nova-nav{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px;}")
+    css = CSS_追加(css, ".nova-nav a{padding:9px 13px;border-radius:12px;border:1px solid var(--nova-line);background:var(--nova-card);text-decoration:none;color:var(--nova-ink);font-size:13px;}")
+    css = CSS_追加(css, ".nova-nav a:hover{border-color:var(--nova-primary);color:var(--nova-primary);}")
+    返回 css
+}
+
+函数 壳层_CSS_面板系统(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, ".nova-panel{padding:18px;border:1px solid var(--nova-line);border-radius:20px;background:var(--nova-glass);box-shadow:var(--nova-shadow);}")
+    css = CSS_追加(css, ".nova-panel h2{margin:0 0 8px 0;font-size:20px;}")
+    css = CSS_追加(css, ".nova-panel h3{margin:0 0 6px 0;font-size:16px;}")
+    css = CSS_追加(css, ".nova-panel p{margin:0;color:var(--nova-sub);line-height:1.66;}")
+    css = CSS_追加(css, ".nova-list{margin:10px 0 0 0;padding-left:18px;color:var(--nova-sub);}")
+    css = CSS_追加(css, ".nova-list li{margin:6px 0;}")
+    css = CSS_追加(css, ".nova-kv{display:grid;grid-template-columns:160px 1fr;gap:8px;}")
+    css = CSS_追加(css, ".nova-k{color:var(--nova-sub);font-size:12px;}")
+    css = CSS_追加(css, ".nova-v{color:var(--nova-ink);font-size:13px;font-weight:600;}")
+    css = CSS_追加(css, ".nova-divider{height:1px;background:var(--nova-line);margin:10px 0;}")
+    返回 css
+}
+
+函数 壳层_CSS_命令甲板(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, ".nova-command-deck{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;}")
+    css = CSS_追加(css, ".nova-command-item{padding:14px;border-radius:16px;border:1px solid var(--nova-line);background:var(--nova-card);}")
+    css = CSS_追加(css, ".nova-command-item strong{display:block;font-size:13px;margin-bottom:6px;}")
+    css = CSS_追加(css, ".nova-command-item span{font-size:12px;color:var(--nova-sub);line-height:1.58;}")
+    css = CSS_追加(css, ".nova-command-item:hover{border-color:var(--nova-primary);transform:translateY(-1px);}")
+    css = CSS_追加(css, ".nova-progress{height:10px;border-radius:999px;background:rgba(148,163,184,0.24);overflow:hidden;}")
+    css = CSS_追加(css, ".nova-progress span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#60a5fa,#34d399);}")
+    css = CSS_追加(css, ".nova-status-ok{color:var(--nova-success);}")
+    css = CSS_追加(css, ".nova-status-warn{color:var(--nova-warn);}")
+    css = CSS_追加(css, ".nova-status-err{color:var(--nova-danger);}")
+    返回 css
+}
+
+函数 壳层_CSS_表单与输入(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, ".nova-input{padding:11px 13px;border-radius:12px;border:1px solid var(--nova-line);background:var(--nova-card);color:var(--nova-ink);}")
+    css = CSS_追加(css, ".nova-input:focus{outline:none;border-color:var(--nova-primary);box-shadow:0 0 0 3px rgba(37,99,235,0.15);}")
+    css = CSS_追加(css, ".nova-select{padding:11px 13px;border-radius:12px;border:1px solid var(--nova-line);background:var(--nova-card);color:var(--nova-ink);}")
+    css = CSS_追加(css, ".nova-btn{padding:10px 14px;border-radius:12px;border:1px solid var(--nova-line);background:var(--nova-card);color:var(--nova-ink);font-weight:700;}")
+    css = CSS_追加(css, ".nova-btn:hover{border-color:var(--nova-primary);color:var(--nova-primary);}")
+    css = CSS_追加(css, ".nova-btn-primary{background:var(--nova-primary);border-color:var(--nova-primary);color:#fff;}")
+    css = CSS_追加(css, ".nova-btn-primary:hover{filter:brightness(1.04);}")
+    css = CSS_追加(css, ".nova-tag{display:inline-flex;padding:4px 10px;border-radius:999px;border:1px solid var(--nova-line);background:var(--nova-card);font-size:11px;}")
+    css = CSS_追加(css, ".nova-footer{padding:14px 16px;border-radius:16px;border:1px solid var(--nova-line);background:var(--nova-glass);font-size:12px;color:var(--nova-sub);}")
+    css = CSS_追加(css, ".nova-link{color:var(--nova-primary);text-decoration:none;}")
+    返回 css
+}
+
+函数 壳层_CSS_媒体与响应式(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, "@media (max-width:1100px){.nova-grid{grid-template-columns:1fr;}.nova-grid-3{grid-template-columns:1fr 1fr;}.nova-title{font-size:34px;}}")
+    css = CSS_追加(css, "@media (max-width:760px){.nova-shell{padding:14px;}.nova-hero{padding:20px;}.nova-grid-3{grid-template-columns:1fr;}.nova-command-deck{grid-template-columns:1fr;}.nova-title{font-size:28px;}}")
+    css = CSS_追加(css, "@media (prefers-reduced-motion: reduce){*{animation:none !important;transition:none !important;}}")
+    css = CSS_追加(css, "@media (prefers-contrast: more){.nova-panel,.nova-hero,.nova-command-item{border-width:2px;}}")
+    css = CSS_追加(css, "@media (pointer: coarse){.nova-btn,.nova-nav a{padding:12px 16px;}}")
+    返回 css
+}
+
+函数 壳层_CSS_动效层(ctx) {
+    定义 可变 css = ""
+    如果 (ctx.动效级别 == 壳层动效_关闭 || ctx.减少动态) {
+        css = CSS_追加(css, ".nova-hero,.nova-panel,.nova-command-item{transition:none;}")
+        返回 css
+    }
+    如果 (ctx.动效级别 == 壳层动效_低) {
+        css = CSS_追加(css, ".nova-hero,.nova-panel,.nova-command-item{transition:border-color .16s ease,color .16s ease;}")
+        返回 css
+    }
+    css = CSS_追加(css, "@keyframes novaFloat{0%{transform:translateY(0)}50%{transform:translateY(-2px)}100%{transform:translateY(0)}}")
+    css = CSS_追加(css, ".nova-hero{animation:novaFloat 6s ease-in-out infinite;}")
+    css = CSS_追加(css, ".nova-panel{transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;}")
+    css = CSS_追加(css, ".nova-panel:hover{transform:translateY(-1px);}")
+    css = CSS_追加(css, ".nova-command-item{transition:transform .16s ease,border-color .16s ease;}")
+    返回 css
+}
+
+函数 壳层_CSS_生成(ctx) {
+    定义 可变 css = ""
+    css = CSS_追加(css, 壳层_CSS_变量_按主题(ctx))
+    css = CSS_追加(css, 壳层_CSS_基础布局(ctx))
+    css = CSS_追加(css, 壳层_CSS_头图卡片(ctx))
+    css = CSS_追加(css, 壳层_CSS_面板系统(ctx))
+    css = CSS_追加(css, 壳层_CSS_命令甲板(ctx))
+    css = CSS_追加(css, 壳层_CSS_表单与输入(ctx))
+    css = CSS_追加(css, 壳层_CSS_媒体与响应式(ctx))
+    css = CSS_追加(css, 壳层_CSS_动效层(ctx))
+    返回 css
+}
+
+// §8 内部协议解析
+
+函数 协议_识别类型(主机) {
+    如果 (主机 == "system") { 返回 协议类型_系统 }
+    如果 (主机 == "ai") { 返回 协议类型_AI }
+    如果 (主机 == "multimodal") { 返回 协议类型_多模态 }
+    如果 (主机 == "voice") { 返回 协议类型_语音 }
+    如果 (主机 == "avatar") { 返回 协议类型_形象 }
+    如果 (主机 == "diag") { 返回 协议类型_诊断 }
+    如果 (主机 == "settings") { 返回 协议类型_设置 }
+    如果 (主机 == "workflow") { 返回 协议类型_工作流 }
+    返回 协议类型_未知
+}
+
+函数 协议_拆分URL(url) {
+    定义 req = 协议请求 {}
+    req.原始URL = url
+    req.协议名 = "nova"
+    req.主机 = ""
+    req.路径 = "/"
+    req.查询 = ""
+    req.类型 = 协议类型_未知
+    req.参数列表 = 堆_分配_数组(最大参数数 * 16)
+    req.参数数 = 0
+
+    定义 p = 字符串查找(url, "://")
+    如果 (p < 0) { 返回 req }
+    定义 余 = 字符串子串(url, p + 3, 字符串长度(url))
+    定义 slash = 字符串查找(余, "/")
+    定义 qmark = 字符串查找(余, "?")
+
+    如果 (slash < 0 && qmark < 0) {
+        req.主机 = 余
+    } 否则如果 (slash >= 0 && (qmark < 0 || slash < qmark)) {
+        req.主机 = 字符串子串(余, 0, slash)
+        如果 (qmark >= 0) {
+            req.路径 = 字符串子串(余, slash, qmark)
+            req.查询 = 字符串子串(余, qmark + 1, 字符串长度(余))
+        } 否则 {
+            req.路径 = 字符串子串(余, slash, 字符串长度(余))
+        }
+    } 否则 {
+        req.主机 = 字符串子串(余, 0, qmark)
+        req.查询 = 字符串子串(余, qmark + 1, 字符串长度(余))
+    }
+
+    req.类型 = 协议_识别类型(req.主机)
+    协议_解析查询参数(req)
+    返回 req
+}
+
+函数 协议_解析查询参数(req) {
+    如果 (是否空串(req.查询)) { 返回 }
+    定义 可变 start = 0
+    定义 可变 q = req.查询
+    当 (start < 字符串长度(q) && req.参数数 < 最大参数数) {
+        定义 andPos = 字符串查找_从(q, "&", start)
+        定义 item = ""
+        如果 (andPos < 0) {
+            item = 字符串子串(q, start, 字符串长度(q))
+            start = 字符串长度(q)
+        } 否则 {
+            item = 字符串子串(q, start, andPos)
+            start = andPos + 1
+        }
+        定义 eqPos = 字符串查找(item, "=")
+        定义 kv = 协议参数 {}
+        如果 (eqPos < 0) {
+            kv.键 = item
+            kv.值 = ""
+        } 否则 {
+            kv.键 = 字符串子串(item, 0, eqPos)
+            kv.值 = 字符串子串(item, eqPos + 1, 字符串长度(item))
+        }
+        req.参数列表[req.参数数] = kv
+        req.参数数 = req.参数数 + 1
+    }
+}
+
+函数 协议_取参数(req, 键, 默认值) {
+    定义 可变 i = 0
+    当 (i < req.参数数) {
+        如果 (req.参数列表[i].键 == 键) {
+            返回 req.参数列表[i].值
+        }
+        i = i + 1
+    }
+    返回 默认值
+}
+
+// §9 路由决策与安全校验
+
+函数 协议_路径风险评分(req) {
+    定义 可变 风险 = 0
+    如果 (字符串查找(req.路径, "..") >= 0) { 风险 = 风险 + 60 }
+    如果 (字符串查找(req.查询, "<script") >= 0) { 风险 = 风险 + 80 }
+    如果 (字符串查找(req.查询, "javascript:") >= 0) { 风险 = 风险 + 80 }
+    如果 (字符串查找(req.查询, "DROP") >= 0) { 风险 = 风险 + 50 }
+    如果 (字符串长度(req.查询) > 1200) { 风险 = 风险 + 25 }
+    返回 限幅(风险, 0, 100)
+}
+
+函数 协议_路由决策(req, 策略) {
+    定义 d = 路由决策 {}
+    d.是否命中 = 真
+    d.命中模块 = "壳层主页"
+    d.风险评分 = 协议_路径风险评分(req)
+    d.置信度 = 220
+    d.回退模块 = "壳层主页"
+
+    如果 (req.类型 == 协议类型_系统) { d.命中模块 = "系统总控面板" }
+    否则如果 (req.类型 == 协议类型_AI) { d.命中模块 = "AI工作台" }
+    否则如果 (req.类型 == 协议类型_多模态) { d.命中模块 = "多模态中枢" }
+    否则如果 (req.类型 == 协议类型_语音) { d.命中模块 = "语音中枢" }
+    否则如果 (req.类型 == 协议类型_形象) { d.命中模块 = "全息形象中枢" }
+    否则如果 (req.类型 == 协议类型_诊断) { d.命中模块 = "诊断中心" }
+    否则如果 (req.类型 == 协议类型_设置) { d.命中模块 = "系统设置" }
+    否则如果 (req.类型 == 协议类型_工作流) { d.命中模块 = "工作流编排" }
+    否则 {
+        d.是否命中 = 假
+        d.命中模块 = "未知模块"
+        d.置信度 = 120
+    }
+
+    如果 (策略 == 路由策略_严格 && d.风险评分 >= 40) {
+        d.是否命中 = 假
+        d.命中模块 = "访问阻断"
+        d.回退模块 = "安全提示页"
+    }
+    如果 (策略 == 路由策略_实验 && d.风险评分 < 30) {
+        d.置信度 = 240
+    }
+    返回 d
+}
+
+// §10 AI个性化策略
+
+函数 壳层_AI_评估主题(用户画像文本) {
+    如果 (字符串查找(用户画像文本, "night") >= 0) { 返回 壳层主题_深色 }
+    如果 (字符串查找(用户画像文本, "contrast") >= 0) { 返回 壳层主题_高对比 }
+    如果 (字符串查找(用户画像文本, "eye-care") >= 0) { 返回 壳层主题_护眼 }
+    返回 壳层主题_浅色
+}
+
+函数 壳层_AI_评估密度(会话长度, 任务复杂度) {
+    如果 (任务复杂度 >= 80) { 返回 壳层密度_紧凑 }
+    如果 (会话长度 <= 3) { 返回 壳层密度_宽松 }
+    返回 壳层密度_标准
+}
+
+函数 壳层_AI_评估动效(设备负载, 用户偏好) {
+    如果 (字符串查找(用户偏好, "reduce-motion") >= 0) { 返回 壳层动效_关闭 }
+    如果 (设备负载 >= 85) { 返回 壳层动效_低 }
+    返回 壳层动效_标准
+}
+
+函数 壳层_AI_生成上下文(用户画像文本, 会话长度, 任务复杂度, 设备负载, 用户偏好) {
+    定义 ctx = 壳层视觉上下文_默认()
+    ctx.主题 = 壳层_AI_评估主题(用户画像文本)
+    ctx.密度 = 壳层_AI_评估密度(会话长度, 任务复杂度)
+    ctx.动效级别 = 壳层_AI_评估动效(设备负载, 用户偏好)
+
+    如果 (字符串查找(用户偏好, "accessibility") >= 0) {
+        壳层视觉上下文_应用可访问(ctx)
+    }
+    如果 (字符串查找(用户偏好, "touch") >= 0) {
+        壳层视觉上下文_应用触控(ctx)
+    }
+    返回 ctx
+}
+
+// §11 HTML片段工厂
+
+函数 壳层_HTML_头部标签() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-chips'>")
+    html = 字符串拼接(html, "<span class='nova-chip nova-chip-accent'>nova://终端</span>")
+    html = 字符串拼接(html, "<span class='nova-chip'>AI 即入口</span>")
+    html = 字符串拼接(html, "<span class='nova-chip'>语音 / 形象 / 多模态</span>")
+    html = 字符串拼接(html, "<span class='nova-chip'>热更新与回滚</span>")
+    html = 字符串拼接(html, "<span class='nova-chip'>browser-终端 单路径桌面</span>")
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+函数 壳层_HTML_导航() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-nav'>")
+    html = 字符串拼接(html, "<a href='nova://system'>系统总控</a>")
+    html = 字符串拼接(html, "<a href='nova://ai'>AI 工作台</a>")
+    html = 字符串拼接(html, "<a href='nova://multimodal'>多模态中枢</a>")
+    html = 字符串拼接(html, "<a href='nova://voice'>语音中枢</a>")
+    html = 字符串拼接(html, "<a href='nova://avatar'>全息形象</a>")
+    html = 字符串拼接(html, "<a href='nova://diag'>诊断中心</a>")
+    html = 字符串拼接(html, "<a href='nova://workflow'>工作流</a>")
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+函数 壳层_HTML_命令甲板() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-command-deck'>")
+    html = 字符串拼接(html, "<div class='nova-command-item'><strong>统一入口</strong><span>@对话、>命令、nova://路由合并到同一前台。</span></div>")
+    html = 字符串拼接(html, "<div class='nova-command-item'><strong>多模态前台</strong><span>语音、视觉、触控、形象共享同一会话上下文。</span></div>")
+    html = 字符串拼接(html, "<div class='nova-command-item'><strong>稳定演化</strong><span>热更新、自修复、回滚快照成为默认系统能力。</span></div>")
+    html = 字符串拼接(html, "<div class='nova-command-item'><strong>可观测</strong><span>全链路埋点与风险评分实时输出。</span></div>")
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+函数 壳层_HTML_状态面板() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-panel'>")
+    html = 字符串拼接(html, "<h2>系统状态总览</h2>")
+    html = 字符串拼接(html, "<div class='nova-kv'><div class='nova-k'>渲染主循环</div><div class='nova-v nova-status-ok'>稳定</div></div>")
+    html = 字符串拼接(html, "<div class='nova-kv'><div class='nova-k'>协议路由健康</div><div class='nova-v nova-status-ok'>99.97%</div></div>")
+    html = 字符串拼接(html, "<div class='nova-kv'><div class='nova-k'>安全拦截率</div><div class='nova-v nova-status-warn'>0.04%</div></div>")
+    html = 字符串拼接(html, "<div class='nova-divider'></div>")
+    html = 字符串拼接(html, "<div class='nova-progress'><span style='width:88%'></span></div>")
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+函数 壳层_HTML_帮助面板() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-panel'>")
+    html = 字符串拼接(html, "<h2>使用建议</h2>")
+    html = 字符串拼接(html, "<ul class='nova-list'>")
+    html = 字符串拼接(html, "<li>使用 <code>nova://ai</code> 进入 AI 工作台并加载上下文。</li>")
+    html = 字符串拼接(html, "<li>使用 <code>nova://diag</code> 查看系统诊断与异常溯源。</li>")
+    html = 字符串拼接(html, "<li>使用 <code>nova://workflow</code> 管理自动化任务链。</li>")
+    html = 字符串拼接(html, "</ul>")
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+函数 壳层_HTML_主内容() {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<div class='nova-grid'>")
+    html = 字符串拼接(html, 壳层_HTML_状态面板())
+    html = 字符串拼接(html, 壳层_HTML_帮助面板())
+    html = 字符串拼接(html, "</div>")
+    html = 字符串拼接(html, "<div class='nova-panel' style='margin-top:14px'>")
+    html = 字符串拼接(html, "<h2>主壳命令甲板</h2>")
+    html = 字符串拼接(html, "<p>把系统主壳从介绍页升级为真正的操作前台，保留统一语义与可扩展协议入口。</p>")
+    html = 字符串拼接(html, 壳层_HTML_命令甲板())
+    html = 字符串拼接(html, "</div>")
+    返回 html
+}
+
+// §12 协议响应页面工厂
+
+函数 协议_生成标题(类型) {
+    如果 (类型 == 协议类型_系统) { 返回 "系统总控" }
+    如果 (类型 == 协议类型_AI) { 返回 "AI 工作台" }
+    如果 (类型 == 协议类型_多模态) { 返回 "多模态中枢" }
+    如果 (类型 == 协议类型_语音) { 返回 "语音中枢" }
+    如果 (类型 == 协议类型_形象) { 返回 "全息形象中枢" }
+    如果 (类型 == 协议类型_诊断) { 返回 "诊断中心" }
+    如果 (类型 == 协议类型_设置) { 返回 "系统设置" }
+    如果 (类型 == 协议类型_工作流) { 返回 "工作流编排" }
+    返回 "NovaOS Browser-终端"
+}
+
+函数 协议_生成描述(类型) {
+    如果 (类型 == 协议类型_系统) { 返回 "内核、图形、设备总线统一观测与控制。" }
+    如果 (类型 == 协议类型_AI) { 返回 "智能体、推理、策略编排与模型管理。" }
+    如果 (类型 == 协议类型_多模态) { 返回 "视觉、听觉、触觉信号融合处理。" }
+    如果 (类型 == 协议类型_语音) { 返回 "语音识别、合成与对话管理。" }
+    如果 (类型 == 协议类型_形象) { 返回 "全息形象调度、动作与情感状态驱动。" }
+    如果 (类型 == 协议类型_诊断) { 返回 "故障溯源、修复建议与健康评分。" }
+    如果 (类型 == 协议类型_设置) { 返回 "主题、权限、网络与系统策略配置。" }
+    如果 (类型 == 协议类型_工作流) { 返回 "任务流设计、编排、回放与审计。" }
+    返回 "统一入口，统一语义，统一体验。"
+}
+
+函数 协议_生成页面HTML(req, ctx, 决策) {
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<!doctype html><html><head><meta charset='utf-8'>")
+    html = 字符串拼接(html, "<meta name='viewport' content='width=device-width,initial-scale=1'>")
+    html = 字符串拼接(html, "<title>")
+    html = 字符串拼接(html, 协议_生成标题(req.类型))
+    html = 字符串拼接(html, "</title><style>")
+    html = 字符串拼接(html, 壳层_CSS_生成(ctx))
+    html = 字符串拼接(html, "</style></head><body>")
+    html = 字符串拼接(html, "<main class='nova-shell'><section class='nova-stack'>")
+    html = 字符串拼接(html, "<header class='nova-hero'>")
+    html = 字符串拼接(html, "<div class='nova-eyebrow'>NOVAOS / INTERNAL PROTOCOL</div>")
+    html = 字符串拼接(html, "<h1 class='nova-title'>")
+    html = 字符串拼接(html, 协议_生成标题(req.类型))
+    html = 字符串拼接(html, "</h1>")
+    html = 字符串拼接(html, "<p class='nova-lead'>")
+    html = 字符串拼接(html, 协议_生成描述(req.类型))
+    html = 字符串拼接(html, "</p>")
+    html = 字符串拼接(html, 壳层_HTML_头部标签())
+    html = 字符串拼接(html, 壳层_HTML_导航())
+    html = 字符串拼接(html, "</header>")
+    html = 字符串拼接(html, 壳层_HTML_主内容())
+    html = 字符串拼接(html, "<footer class='nova-footer'>")
+    html = 字符串拼接(html, "route=")
+    html = 字符串拼接(html, 决策.命中模块)
+    html = 字符串拼接(html, " · risk=")
+    html = 字符串拼接(html, 整数转字符串(决策.风险评分))
+    html = 字符串拼接(html, " · confidence=")
+    html = 字符串拼接(html, 整数转字符串(决策.置信度))
+    html = 字符串拼接(html, " · reduce-motion=")
+    html = 字符串拼接(html, 布尔转文本(ctx.减少动态))
+    html = 字符串拼接(html, "</footer>")
+    html = 字符串拼接(html, "</section></main></body></html>")
+    返回 html
+}
+
+// §13 对外接口: 视觉CSS与头部片段
+// 兼容旧调用名
+
+函数 浏览器网络_生成页面增强CSS_新版() {
+    定义 ctx = 壳层视觉上下文_默认()
+    返回 壳层_CSS_生成(ctx)
+}
+
+函数 浏览器网络_生成页面头部标签HTML_新版() {
+    返回 壳层_HTML_头部标签()
+}
+
+函数 浏览器网络_生成主壳增强内容HTML_新版() {
+    返回 壳层_HTML_主内容()
+}
+
+// §14 对外接口: 协议处理主入口
+
+函数 浏览器网络_处理内部协议_标记5(url) {
+    壳层埋点_记录("protocol.recv", 字符串长度(url), 0, "entry")
+
+    定义 req = 协议_拆分URL(url)
+    定义 ctx = 壳层视觉上下文_默认()
+    定义 决策 = 协议_路由决策(req, 全局_默认策略)
+
+    如果 (!决策.是否命中) {
+        壳层埋点_记录("protocol.reject", 决策.风险评分, 决策.置信度, 决策.命中模块)
+        定义 failHtml = 协议_生成安全阻断页(req, 决策)
+        返回 failHtml
+    }
+
+    壳层埋点_记录("protocol.route", req.类型, 决策.风险评分, 决策.命中模块)
+    定义 html = 协议_生成页面HTML(req, ctx, 决策)
+    壳层埋点_记录("protocol.ok", 字符串长度(html), req.参数数, "rendered")
+    返回 html
+}
+
+函数 协议_生成安全阻断页(req, 决策) {
+    定义 ctx = 壳层视觉上下文_默认()
+    ctx.主题 = 壳层主题_高对比
+    ctx.减少动态 = 真
+    定义 可变 html = ""
+    html = 字符串拼接(html, "<!doctype html><html><head><meta charset='utf-8'><style>")
+    html = 字符串拼接(html, 壳层_CSS_生成(ctx))
+    html = 字符串拼接(html, "</style></head><body><main class='nova-shell'><section class='nova-stack'>")
+    html = 字符串拼接(html, "<div class='nova-panel'><h2>访问已阻断</h2>")
+    html = 字符串拼接(html, "<p>该内部协议请求被安全策略拦截。请检查参数与路径规范。</p>")
+    html = 字符串拼接(html, "<div class='nova-kv'><div class='nova-k'>风险评分</div><div class='nova-v nova-status-err'>")
+    html = 字符串拼接(html, 整数转字符串(决策.风险评分))
+    html = 字符串拼接(html, "</div></div>")
+    html = 字符串拼接(html, "<div class='nova-kv'><div class='nova-k'>回退模块</div><div class='nova-v'>")
+    html = 字符串拼接(html, 决策.回退模块)
+    html = 字符串拼接(html, "</div></div>")
+    html = 字符串拼接(html, "<div class='nova-divider'></div>")
+    html = 字符串拼接(html, "<a class='nova-link' href='nova://system'>返回系统总控</a>")
+    html = 字符串拼接(html, "</div></section></main></body></html>")
+    返回 html
+}
+
+// §15 AI增强入口
+
+函数 浏览器网络_处理内部协议_标记5_AI(url, 用户画像文本, 会话长度, 任务复杂度, 设备负载, 用户偏好) {
+    壳层埋点_记录("protocol.ai.recv", 会话长度, 任务复杂度, "ai-entry")
+
+    定义 req = 协议_拆分URL(url)
+    定义 ctx = 壳层_AI_生成上下文(用户画像文本, 会话长度, 任务复杂度, 设备负载, 用户偏好)
+    定义 决策 = 协议_路由决策(req, 全局_默认策略)
+
+    如果 (!决策.是否命中) {
+        壳层埋点_记录("protocol.ai.reject", 决策.风险评分, 决策.置信度, "reject")
+        返回 协议_生成安全阻断页(req, 决策)
+    }
+
+    定义 html = 协议_生成页面HTML(req, ctx, 决策)
+    壳层埋点_记录("protocol.ai.ok", ctx.主题, ctx.密度, "ok")
+    返回 html
+}
+
+// §16 策略控制
+
+函数 浏览器网络_设置路由策略(策略) {
+    如果 (策略 != 路由策略_严格 && 策略 != 路由策略_兼容 && 策略 != 路由策略_实验) {
+        返回 失败
+    }
+    全局_默认策略 = 策略
+    壳层埋点_记录("policy.route", 策略, 0, "set")
+    返回 成功
+}
+
+函数 浏览器网络_获取路由策略() {
+    返回 全局_默认策略
+}
+
+函数 浏览器网络_导出埋点JSON() {
+    返回 壳层埋点_导出JSON()
+}
+
+// §17 兼容入口
+
+函数 浏览器网络_生成页面增强CSS() {
+    返回 浏览器网络_生成页面增强CSS_新版()
+}
+
+函数 浏览器网络_生成页面头部标签HTML() {
+    返回 浏览器网络_生成页面头部标签HTML_新版()
+}
+
+函数 浏览器网络_生成主壳增强内容HTML() {
+    返回 浏览器网络_生成主壳增强内容HTML_新版()
+}
+
+函数 浏览器网络_处理内部协议(url) {
+    返回 浏览器网络_处理内部协议_标记5(url)
+}
+
+// §18 自检
+
+函数 浏览器网络_标记5_自检() {
+    定义 ctx = 壳层视觉上下文_默认()
+    定义 css = 壳层_CSS_生成(ctx)
+    如果 (字符串长度(css) < 400) { 返回 假 }
+
+    定义 req = 协议_拆分URL("nova://ai?tab=agent")
+    如果 (req.类型 != 协议类型_AI) { 返回 假 }
+
+    定义 决策 = 协议_路由决策(req, 路由策略_兼容)
+    如果 (!决策.是否命中) { 返回 假 }
+
+    定义 html = 协议_生成页面HTML(req, ctx, 决策)
+    如果 (字符串查找(html, "AI 工作台") < 0) { 返回 假 }
+    如果 (字符串查找(html, "nova-shell") < 0) { 返回 假 }
+
+    返回 真
+}
+
+// §19 启动初始化
+
+函数 浏览器网络_标记5_初始化() {
+    壳层埋点_初始化()
+    壳层埋点_记录("module.init", 1, 0, "mark5")
+    返回 成功
+}
+
+// §20 卸载
+
+函数 浏览器网络_标记5_卸载() {
+    如果 (全局_埋点缓冲 != 空) {
+        堆_释放(全局_埋点缓冲.列表)
+        堆_释放(全局_埋点缓冲)
+        全局_埋点缓冲 = 空
+    }
+    返回 成功
+}

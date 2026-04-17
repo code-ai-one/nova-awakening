@@ -1,0 +1,480 @@
+// Contain_解析 — NovaOS 企业级CSS Containment与content-visibility子系统
+// 理论基础: CVCP (Containment Visibility Control Protocol)
+//   CSS Containment + content-visibility + 懒加载 + 虚拟滚动统一管理。
+//   通过布局隔离、渲染跳过、视口感知、AI滚动预测，实现大规模DOM场景的极致性能。
+// 创新公式:
+//   SkipRender(e) = offscreen(e) ∧ (auto_cv(e) ∨ lazy(e)) → skip_paint(e)
+//   ContainCost(e) = (1 - contain_flags(e)/15) × subtree_cost(e)
+//   ScrollPredict(Δt) = velocity × Δt + 0.5 × accel × Δt²
+// 架构: 12部分 — 常量/数据结构/contain解析/contain应用/content-visibility/
+//            视口观察器/懒加载/虚拟滚动/滚动预测/AI优化/统计/全局接口
+
+导入("./内核直连层.nova")
+导入("../推理/通信总线.nova")
+导入("../中枢/内核打印.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+导入("../中枢/字符串替换.nova")
+
+// 第1部分: 常量定义
+
+// CSS contain 位标志
+定义 CONTAIN_NONE         = 0
+定义 CONTAIN_SIZE         = 1
+定义 CONTAIN_LAYOUT       = 2
+定义 CONTAIN_STYLE        = 4
+定义 CONTAIN_PAINT        = 8
+定义 CONTAIN_STRICT       = 15    // size | layout | style | paint
+定义 CONTAIN_CONTENT      = 14    // layout | style | paint
+定义 CONTAIN_INLINE_SIZE  = 16
+
+// content-visibility状态
+定义 CV_VISIBLE           = 0
+定义 CV_HIDDEN            = 1
+定义 CV_AUTO              = 2
+
+// 懒加载状态
+定义 LAZY_NONE            = 0
+定义 LAZY_LOADING         = 1
+定义 LAZY_LOADED          = 2
+定义 LAZY_ERROR           = 3
+
+// 视口距离阈值
+定义 视口边距_默认       = 200
+定义 视口边距_懒加载     = 1250
+定义 虚拟滚动缓冲区       = 500
+定义 最大观察元素数         = 4096
+定义 AI_CV优化阈值        = 0.6
+
+// 第2部分: 数据结构
+
+结构 ContainmentInfo {
+    标志,                    // u32 CONTAIN_xxx位掩码
+    是独立布局上下文,
+    建立层叠上下文,
+    裁剪溢出,
+    固有大小,
+    样式隔离,
+    inline_size隔离,
+}
+
+结构 ContentVisibility信息 {
+    状态,                    // u32 CV_xxx
+    是屏幕内,
+    观察器索引,              // u32 IntersectionObserver中的索引
+    上次可见时间,
+    跳过渲染次数,
+    估算子树成本,            // f64 子树渲染估算成本
+}
+
+结构 懒加载信息 {
+    状态,                    // u32 LAZY_xxx
+    原始URL,
+    距离视口,                // f64 距视口达像素
+    触发时间,
+    已加载大小,
+}
+
+结构 视口矩形 {
+    x, y, 宽, 高,
+}
+
+结构 滚动状态 {
+    当前Y,                    // f64
+    速度Y,                    // f64 像素/秒
+    加速度Y,                  // f64
+    上次时间,
+    累计滚动距离,            // f64
+}
+
+结构 CVCP统计 {
+    contain解析次数,
+    contain应用次数,
+    cv_auto元素数,
+    cv_跳过渲染次数,
+    懒加载触发数,
+    懒加载完成数,
+    虚拟滚动回收数,
+    虚拟滚动创建数,
+    AI优化触发数,
+    节省渲染时间,
+}
+
+// 第3部分: 全局状态
+
+定义 可变 全局CVCP统计 = CVCP统计 {}
+定义 可变 全局视口 = 视口矩形 { x: 0, y: 0, 宽: 1920, 高: 1080 }
+定义 可变 全局滚动 = 滚动状态 {}
+
+// 第4部分: CSS contain 解析与应用
+
+函数 Contain_解析(值字符串) {
+    全局CVCP统计.contain解析次数 = 全局CVCP统计.contain解析次数 + 1
+    如果 (值字符串 == 0) { 返回 CONTAIN_NONE }
+    如果 (字符串_相等(值字符串, "none")) { 返回 CONTAIN_NONE }
+    如果 (字符串_相等(值字符串, "strict")) { 返回 CONTAIN_STRICT }
+    如果 (字符串_相等(值字符串, "content")) { 返回 CONTAIN_CONTENT }
+
+    定义 可变 result = 0
+    如果 (字符串_包含(值字符串, "size")) { result = result | CONTAIN_SIZE }
+    如果 (字符串_包含(值字符串, "layout")) { result = result | CONTAIN_LAYOUT }
+    如果 (字符串_包含(值字符串, "style")) { result = result | CONTAIN_STYLE }
+    如果 (字符串_包含(值字符串, "paint")) { result = result | CONTAIN_PAINT }
+    如果 (字符串_包含(值字符串, "inline-size")) { result = result | CONTAIN_INLINE_SIZE }
+    返回 result
+}
+
+函数 Contain_应用(元素, flags) {
+    如果 (元素 == 0) { 返回 }
+    定义 info = 堆_分配(ContainmentInfo)
+    如果 (info == 0) { 返回 }
+    info.标志 = flags
+    info.是独立布局上下文 = (flags & CONTAIN_LAYOUT) != 0
+    info.建立层叠上下文 = (flags & CONTAIN_PAINT) != 0
+    info.裁剪溢出 = (flags & CONTAIN_PAINT) != 0
+    info.固有大小 = (flags & CONTAIN_SIZE) != 0
+    info.样式隔离 = (flags & CONTAIN_STYLE) != 0
+    info.inline_size隔离 = (flags & CONTAIN_INLINE_SIZE) != 0
+    元素.包含信息 = info
+    全局CVCP统计.contain应用次数 = 全局CVCP统计.contain应用次数 + 1
+}
+
+函数 Contain_需要布局子元素(元素) {
+    如果 (元素 == 0) { 返回 真 }
+    如果 (元素.包含信息 == 0) { 返回 真 }
+    定义 info = 元素.包含信息
+    // size containment且元素已有确定大小 → 可跳过子元素布局
+    如果 (info.固有大小 && 元素.已确定大小) {
+        返回 假
+    }
+    返回 真
+}
+
+函数 Contain_需要绘制子元素(元素) {
+    如果 (元素 == 0) { 返回 真 }
+    // content-visibility: hidden 跳过绘制
+    如果 (元素.cv信息 != 0 && 元素.cv信息.状态 == CV_HIDDEN) {
+        全局CVCP统计.cv_跳过渲染次数 = 全局CVCP统计.cv_跳过渲染次数 + 1
+        返回 假
+    }
+    // content-visibility: auto 且屏幕外 → 跳过
+    如果 (元素.cv信息 != 0 && 元素.cv信息.状态 == CV_AUTO) {
+        如果 (!元素.cv信息.是屏幕内) {
+            元素.cv信息.跳过渲染次数 = 元素.cv信息.跳过渲染次数 + 1
+            全局CVCP统计.cv_跳过渲染次数 = 全局CVCP统计.cv_跳过渲染次数 + 1
+            返回 假
+        }
+    }
+    返回 真
+}
+
+函数 Contain_获取有效标志(元素) {
+    如果 (元素 == 0 || 元素.包含信息 == 0) { 返回 CONTAIN_NONE }
+    返回 元素.包含信息.标志
+}
+
+// 第5部分: content-visibility 解析与应用
+
+函数 ContentVisibility_解析(值字符串) {
+    如果 (值字符串 == 0) { 返回 CV_VISIBLE }
+    如果 (字符串_相等(值字符串, "visible")) { 返回 CV_VISIBLE }
+    如果 (字符串_相等(值字符串, "hidden")) { 返回 CV_HIDDEN }
+    如果 (字符串_相等(值字符串, "auto")) { 返回 CV_AUTO }
+    返回 CV_VISIBLE
+}
+
+函数 ContentVisibility_应用(元素, cv状态) {
+    如果 (元素 == 0) { 返回 }
+    定义 info = 堆_分配(ContentVisibility信息)
+    如果 (info == 0) { 返回 }
+    info.状态 = cv状态
+    info.是屏幕内 = 真  // 初始假设可见
+    info.观察器索引 = 0
+    info.上次可见时间 = 平台_获取高精度时间()
+    info.跳过渲染次数 = 0
+    info.估算子树成本 = 0.0
+    元素.cv信息 = info
+
+    如果 (cv状态 == CV_AUTO) {
+        // auto需要注册IntersectionObserver
+        视口观察器_注册(元素)
+        全局CVCP统计.cv_auto元素数 = 全局CVCP统计.cv_auto元素数 + 1
+    }
+    如果 (cv状态 == CV_HIDDEN) {
+        // hidden暗含 contain: size layout style paint
+        Contain_应用(元素, CONTAIN_STRICT)
+    }
+}
+
+函数 ContentVisibility_更新可见性(元素, 是可见) {
+    如果 (元素 == 0 || 元素.cv信息 == 0) { 返回 }
+    定义 旧状态 = 元素.cv信息.是屏幕内
+    元素.cv信息.是屏幕内 = 是可见
+    如果 (是可见 && !旧状态) {
+        // 从屏幕外进入屏幕内 → 需要重新渲染
+        元素.cv信息.上次可见时间 = 平台_获取高精度时间()
+        元素_标记需要绘制(元素)
+    }
+}
+
+// 第6部分: 视口观察器 (IntersectionObserver模拟)
+
+定义 可变 观察元素列表 = 0
+定义 可变 观察元素数量 = 0
+
+函数 视口观察器_初始化() {
+    观察元素列表 = 堆_分配_数组(最大观察元素数 * 8)
+    观察元素数量 = 0
+}
+
+函数 视口观察器_注册(元素) {
+    如果 (观察元素列表 == 0) { 视口观察器_初始化() }
+    如果 (观察元素数量 >= 最大观察元素数) { 返回 }
+    内存_分64(观察元素列表 + 观察元素数量 * 8, 元素)
+    如果 (元素.cv信息 != 0) {
+        元素.cv信息.观察器索引 = 观察元素数量
+    }
+    观察元素数量 = 观察元素数量 + 1
+}
+
+函数 视口观察器_更新(视口, 边距) {
+    // 检查所有观察元素是否在视口内(含边距)
+    定义 可变 i = 0
+    当 (i < 观察元素数量) {
+        定义 元素 = 内存_读64(观察元素列表 + i * 8)
+        如果 (元素 != 0) {
+            定义 元素y = 元素.布局y
+            定义 元素高 = 元素.布局高
+            定义 可见 = (元素y + 元素高 > 视口.y - 边距) &&
+                            (元素y < 视口.y + 视口.高 + 边距)
+            ContentVisibility_更新可见性(元素, 可见)
+        }
+        i = i + 1
+    }
+}
+
+函数 视口观察器_注销(元素) {
+    如果 (观察元素列表 == 0 || 元素 == 0) { 返回 }
+    如果 (元素.cv信息 == 0) { 返回 }
+    定义 idx = 元素.cv信息.观察器索引
+    如果 (idx < 观察元素数量) {
+        // 用最后一个填充空位
+        观察元素数量 = 观察元素数量 - 1
+        如果 (idx < 观察元素数量) {
+            定义 最后 = 内存_读64(观察元素列表 + 观察元素数量 * 8)
+            内存_分64(观察元素列表 + idx * 8, 最后)
+            如果 (最后 != 0 && 最后.cv信息 != 0) {
+                最后.cv信息.观察器索引 = idx
+            }
+        }
+    }
+}
+
+// 第7部分: 原生懒加载
+
+函数 LazyLoad_解析属性(值字符串) {
+    如果 (值字符串 == 0) { 返回 LAZY_NONE }
+    如果 (字符串_相等(值字符串, "lazy")) { 返回 LAZY_LOADING }
+    如果 (字符串_相等(值字符串, "eager")) { 返回 LAZY_NONE }
+    返回 LAZY_NONE  // 默认eager
+}
+
+函数 LazyLoad_应用(元素, url) {
+    如果 (元素 == 0) { 返回 }
+    定义 info = 堆_分配(懒加载信息)
+    如果 (info == 0) { 返回 }
+    info.状态 = LAZY_LOADING
+    info.原始URL = url
+    info.距离视口 = 99999.0
+    info.触发时间 = 0
+    info.已加载大小 = 0
+    元素.懒加载信息 = info
+    全局CVCP统计.懒加载触发数 = 全局CVCP统计.懒加载触发数 + 1
+}
+
+函数 LazyLoad_检查触发(元素, 视口) {
+    如果 (元素 == 0 || 元素.懒加载信息 == 0) { 返回 假 }
+    如果 (元素.懒加载信息.状态 != LAZY_LOADING) { 返回 假 }
+
+    // 计算元素距视口距离
+    定义 元素y = 元素.布局y
+    定义 视口底 = 视口.y + 视口.高
+    定义 距离 = 元素y - 视口底
+    如果 (距离 < 0) { 距离 = 0.0 }  // 已在视口内
+    元素.懒加载信息.距离视口 = 距离
+
+    如果 (距离 < 视口边距_懒加载) {
+        // 触发加载
+        元素.懒加载信息.触发时间 = 平台_获取高精度时间()
+        返回 真
+    }
+    返回 假
+}
+
+函数 LazyLoad_完成(元素, 大小) {
+    如果 (元素 == 0 || 元素.懒加载信息 == 0) { 返回 }
+    元素.懒加载信息.状态 = LAZY_LOADED
+    元素.懒加载信息.已加载大小 = 大小
+    全局CVCP统计.懒加载完成数 = 全局CVCP统计.懒加载完成数 + 1
+}
+
+// 第8部分: 虚拟滚动
+
+函数 VirtualScroll_计算可见范围(视口, 项高, 总项数) {
+    // 给定视口和固定项高，计算需要渲染的范围
+    如果 (项高 <= 0) { 返回 { 开始: 0, 结束: 0 } }
+
+    定义 滚动偏移 = 视口.y
+    定义 可见高 = 视口.高 + 虚拟滚动缓冲区 * 2
+
+    定义 可变 开始索引 = (滚动偏移 - 虚拟滚动缓冲区) / 项高
+    如果 (开始索引 < 0) { 开始索引 = 0 }
+
+    定义 可变 结束索引 = (滚动偏移 + 视口.高 + 虚拟滚动缓冲区) / 项高 + 1
+    如果 (结束索引 > 总项数) { 结束索引 = 总项数 }
+
+    返回 { 开始: 开始索引, 结束: 结束索引 }
+}
+
+函数 VirtualScroll_回收节点(元素列表, 总数, 可见开始, 可见结束) {
+    // 回收可见范围外的节点
+    定义 可变 回收数 = 0
+    定义 可变 i = 0
+    当 (i < 总数) {
+        如果 (i < 可见开始 || i >= 可见结束) {
+            定义 元素 = 内存_读64(元素列表 + i * 8)
+            如果 (元素 != 0 && 元素.已渲染) {
+                元素_移除渲染(元素)
+                回收数 = 回收数 + 1
+            }
+        }
+        i = i + 1
+    }
+    全局CVCP统计.虚拟滚动回收数 = 全局CVCP统计.虚拟滚动回收数 + 回收数
+    返回 回收数
+}
+
+函数 VirtualScroll_创建节点(元素列表, 可见开始, 可见结束, 创建回调) {
+    // 创建可见范围内未渲染的节点
+    定义 可变 创建数 = 0
+    定义 可变 i = 可见开始
+    当 (i < 可见结束) {
+        定义 元素 = 内存_读64(元素列表 + i * 8)
+        如果 (元素 == 0 || !元素.已渲染) {
+            创建回调(i)
+            创建数 = 创建数 + 1
+        }
+        i = i + 1
+    }
+    全局CVCP统计.虚拟滚动创建数 = 全局CVCP统计.虚拟滚动创建数 + 创建数
+    返回 创建数
+}
+
+// 第9部分: 滚动预测 (CVCP加速度模型)
+
+函数 滚动预测_更新(新Y, 当前时间) {
+    // ScrollPredict(Δt) = velocity × Δt + 0.5 × accel × Δt²
+    定义 dt = 当前时间 - 全局滚动.上次时间
+    如果 (dt > 0 && 全局滚动.上次时间 > 0) {
+        定义 新速度 = (新Y - 全局滚动.当前Y) / dt
+        全局滚动.加速度Y = (新速度 - 全局滚动.速度Y) / dt
+        全局滚动.速度Y = 新速度
+    }
+    全局滚动.累计滚动距离 = 全局滚动.累计滚动距离 + ((新Y - 全局滚动.当前Y) > 0 ? (新Y - 全局滚动.当前Y) : -(新Y - 全局滚动.当前Y))
+    全局滚动.当前Y = 新Y
+    全局滚动.上次时间 = 当前时间
+}
+
+函数 滚动预测_预测位置(时间差) {
+    // s = v*t + 0.5*a*t²
+    返回 全局滚动.当前Y +
+           全局滚动.速度Y * 时间差 +
+           0.5 * 全局滚动.加速度Y * 时间差 * 时间差
+}
+
+函数 滚动预测_是向下滚动() {
+    返回 全局滚动.速度Y > 0
+}
+
+// 第10部分: AI性能优化 (CVCP智能调度)
+
+函数 AI_CVCP优化分析(元素) {
+    如果 (元素 == 0) { 返回 }
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+
+    // 构建特征: 元素子树大小/屏幕外距离/contain状态/滚动速度
+    定义 feature = Tensor_创建(8)
+    Tensor_写(feature, 0, 元素.子树大小 / 1000.0)
+    Tensor_写(feature, 1, Contain_获取有效标志(元素) / 15.0)
+    Tensor_写(feature, 2, 全局滚动.速度Y / 10000.0)
+    Tensor_写(feature, 3, 全局CVCP统计.cv_跳过渲染次数 / 10000.0)
+    Tensor_写(feature, 4, 全局CVCP统计.懒加载触发数 / 1000.0)
+    Tensor_写(feature, 5, 全局CVCP统计.虚拟滚动回收数 / 1000.0)
+    Tensor_写(feature, 6, 观察元素数量 / 最大观察元素数)
+    Tensor_写(feature, 7, 0.0)
+
+    定义 建议 = AI总线_推理(bus, "CVCP_性能优化", feature)
+    定义 风险 = AI总线_风险评分(bus, "CVCP_渲染风险", feature)
+    Tensor_释放(feature)
+
+    全局CVCP统计.AI优化触发数 = 全局CVCP统计.AI优化触发数 + 1
+
+    如果 (建议 > AI_CV优化阈值 && 风险 < 0.3) {
+        // 建议1: 大子树元素添加contain
+        如果 (元素.子树大小 > 100 && Contain_获取有效标志(元素) == CONTAIN_NONE) {
+            Contain_应用(元素, CONTAIN_CONTENT)
+        }
+        // 建议2: 屏幕外大元素添加content-visibility: auto
+        如果 (元素.子树大小 > 50 && 元素.cv信息 == 0) {
+            ContentVisibility_应用(元素, CV_AUTO)
+        }
+    }
+}
+
+// 第11部分: 统计与全局接口
+
+函数 CVCP_获取统计() {
+    返回 {
+        contain解析次数: 全局CVCP统计.contain解析次数,
+        contain应用次数: 全局CVCP统计.contain应用次数,
+        cv_auto元素数: 全局CVCP统计.cv_auto元素数,
+        cv_跳过渲染次数: 全局CVCP统计.cv_跳过渲染次数,
+        懒加载触发数: 全局CVCP统计.懒加载触发数,
+        懒加载完成数: 全局CVCP统计.懒加载完成数,
+        虚拟滚动回收数: 全局CVCP统计.虚拟滚动回收数,
+        虚拟滚动创建数: 全局CVCP统计.虚拟滚动创建数,
+        AI优化触发数: 全局CVCP统计.AI优化触发数,
+        节省渲染时间: 全局CVCP统计.节省渲染时间
+    }
+}
+
+函数 CVCP_打印统计() {
+    定义 s = CVCP_获取统计()
+    内核打印("═══ CVCP性能统计 ═══")
+    内核打印("contain[解析/应用]={}/{}",
+        s.contain解析次数, s.contain应用次数)
+    内核打印("CV[auto元素/跳过渲染]={}/{}",
+        s.cv_auto元素数, s.cv_跳过渲染次数)
+    内核打印("懒加载[触发/完成]={}/{}",
+        s.懒加载触发数, s.懒加载完成数)
+    内核打印("虚拟滚动[回收/创建]={}/{}",
+        s.虚拟滚动回收数, s.虚拟滚动创建数)
+    内核打印("AI优化={} 节省时间={}ms",
+        s.AI优化触发数, s.节省渲染时间)
+}
+
+函数 CVCP_重置统计() {
+    全局CVCP统计 = CVCP统计 {}
+}
+
+// 第12部分: 视口更新统一入口
+
+函数 CVCP_视口更新(新视口) {
+    全局视口 = 新视口
+    // 更新观察器
+    视口观察器_更新(全局视口, 视口边距_默认)
+    // 更新滚动预测
+    滚动预测_更新(新视口.y, 平台_获取高精度时间())
+}

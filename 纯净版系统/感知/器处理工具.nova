@@ -1,0 +1,119 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+导入("./渲染管线计.nova")
+导入("./文档事件.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+
+
+函数 Browser_处理工具栏点击(browser, x, y) {
+    // 地址栏区域
+    如果 (y >= browser.标签栏高度 && y < browser.工具栏高度) {
+        browser.地址栏聚焦 = 真
+    }
+}
+
+函数 Browser_处理地址栏按键(browser, 键码, 修饰) {
+    如果 (键码 == 0x0D) {
+        // Enter: 导航到地址栏URL
+        browser.地址栏聚焦 = 假
+        Browser_导航(browser, browser.地址栏文本)
+    }
+    否则 如果 (键码 == 0x1B) {
+        // Escape: 取消
+        browser.地址栏聚焦 = 假
+    }
+    否则 如果 (键码 == 0x08) {
+        // Backspace: 删除最后一个字符
+        定义 长度 = 字符串_长度(browser.地址栏文本)
+        如果 (长度 > 0) {
+            browser.地址栏文本 = 字符串_子串(browser.地址栏文本, 0, 长度 - 1)
+        }
+    }
+    否则 如果 (键码 >= 0x20 && 键码 <= 0x7E) {
+        // 可打印ASCII字符: 追加
+        定义 字符缓冲 = 堆_分配(2)
+        内存_写8(字符缓冲, 键码)
+        内存_写8(字符缓冲 + 1, 0)
+        browser.地址栏文本 = 字符串_连接(browser.地址栏文本, 字符缓冲)
+    }
+}
+
+// §7 帧合成 — 将浏览器UI和网页内容合成到帧缓冲
+// (对应  Compositor)
+
+函数 Browser_合成帧(browser) {
+ 定义 win = browser.平台窗口
+ 定义 tab = Browser_获取当前标签(browser)
+
+ // 后缓冲清白
+ 内存_填充(win.后缓冲, 0xF0, win.帧缓冲大小)
+
+ Browser_绘制标签栏(browser)
+
+ Browser_绘制地址栏(browser)
+
+ 如果 (tab != 0 && tab.位图 != 0) {
+ 定义 内容起始y = browser.工具栏高度
+ 定义 内容高 = win.高 - browser.工具栏高度 - browser.状态栏高度
+ // 将标签页位图复制到后缓冲
+ 定义 可变 y = 0
+ 当 (y < 内容高 && y < tab.位图.高) {
+ 定义 src行 = tab.位图.像素数据 + y * tab.位图.行字节数
+ 定义 dst行 = win.后缓冲 + (内容起始y + y) * win.帧缓冲行字节
+ 内存_复制(dst行, src行, tab.位图.行字节数)
+ y = y + 1
+ }
+ }
+
+ Browser_绘制状态栏(browser)
+}
+
+函数 Browser_绘制标签栏(browser) {
+ // 绘制标签栏: 颜色块+标题文本
+ 定义 win = browser.平台窗口
+ 定义 可变 x = 0
+ 定义 标签宽 = 200
+ 定义 可变 i = 0
+ 当 (i < browser.标签数量) {
+ 定义 tab = 内存_读64(browser.标签列表 + i * 8)
+ 定义 可变 颜色 = 0xFFDDDDDD // 非活跃
+ 如果 (i == browser.当前标签) { 颜色 = 0xFFFFFFFF } // 活跃
+ // 填充标签区域
+ Browser_填充矩形(win.后缓冲, win.帧缓冲行字节, x, 0, 标签宽, browser.标签栏高度, 颜色)
+ x = x + 标签宽 + 2
+ i = i + 1
+ }
+}
+
+函数 Browser_绘制地址栏(browser) {
+ 定义 win = browser.平台窗口
+ 定义 y = browser.标签栏高度
+ // 地址栏背景
+ Browser_填充矩形(win.后缓冲, win.帧缓冲行字节, 0, y, win.宽, browser.地址栏高度, 0xFFF0F0F0)
+ // 地址输入框
+ 定义 输入框颜色 = 0xFFFFFFFF
+ 如果 (browser.地址栏聚焦) { 输入框颜色 = 0xFFE8F0FE }
+ Browser_填充矩形(win.后缓冲, win.帧缓冲行字节, 80, y + 5, win.宽 - 160, browser.地址栏高度 - 10, 输入框颜色)
+}
+
+函数 Browser_绘制状态栏(browser) {
+ 定义 win = browser.平台窗口
+ 定义 y = win.高 - browser.状态栏高度
+ Browser_填充矩形(win.后缓冲, win.帧缓冲行字节, 0, y, win.宽, browser.状态栏高度, 0xFFF5F5F5)
+}
+
+函数 Browser_填充矩形(后缓冲, 行字节, x, y, w, h, argb颜色) {
+ 定义 可变 dy = 0
+ 当 (dy < h) {
+ 定义 可变 dx = 0
+ 定义 行偏移 = 后缓冲 + (y + dy) * 行字节 + x * 4
+ 当 (dx < w) {
+ 内存_写32(行偏移 + dx * 4, argb颜色)
+ dx = dx + 1
+ }
+ dy = dy + 1
+ }
+}

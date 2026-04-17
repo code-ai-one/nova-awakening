@@ -1,0 +1,217 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../感知/内核直连层.nova")
+
+函数 HPACK_解码整数(数据, pos, 前缀位数) {
+    定义 掩码 = (1 << 前缀位数) - 1
+    定义 可变 值 = 内存_读8(数据 + pos) & 掩码
+    pos = pos + 1
+
+    如果 (值 < 掩码) {
+        返回 值  // 短编码
+    }
+
+    // 长编码: 128进制
+    定义 可变 M = 0
+    定义 可变 继续 = 真
+    当 (继续) {
+        定义 b = 内存_读8(数据 + pos)
+        pos = pos + 1
+        值 = 值 + (b & 127) * (1 << M)
+        M = M + 7
+        继续 = (b & 128) != 0
+    }
+    返回 值
+}
+
+函数 HPACK_编码整数(输出, pos, 值, 前缀位数, 前缀字节) {
+    定义 掩码 = (1 << 前缀位数) - 1
+
+    如果 (值 < 掩码) {
+        内存_写8(输出 + pos, 前缀字节 | 值)
+        返回 pos + 1
+    }
+
+    内存_写8(输出 + pos, 前缀字节 | 掩码)
+    pos = pos + 1
+    值 = 值 - 掩码
+
+    当 (值 >= 128) {
+        内存_写8(输出 + pos, (值 & 127) | 128)
+        pos = pos + 1
+        值 = 值 >> 7
+    }
+    内存_写8(输出 + pos, 值)
+    返回 pos + 1
+}
+
+// §4 字符串编码/解码 (Nova协议规范 7541 §5.2)
+// 支持原始字符串和Huffman编码
+
+函数 HPACK_解码字符串(数据, pos, 输出, 输出长度) {
+    定义 首字节 = 内存_读8(数据 + pos)
+    定义 是Huffman = (首字节 & 0x80) != 0
+    定义 长度 = HPACK_解码整数(数据, pos, 7)
+
+    // 跳过整数编码的字节
+    如果 ((首字节 & 0x7F) < 127) {
+        pos = pos + 1
+    } 否则 {
+        pos = pos + 1
+        当 (内存_读8(数据 + pos - 1) & 128) { pos = pos + 1 }
+    }
+
+    如果 (是Huffman) {
+        // Huffman解码
+        HPACK_Huffman_解码(数据 + pos, 长度, 输出, 输出长度)
+    } 否则 {
+        // 原始字符串
+        内存_复制(输出, 数据 + pos, 长度)
+        输出长度 = 长度
+    }
+    返回 pos + 长度
+}
+
+函数 HPACK_编码字符串(输出, pos, 字符串, 长度, 使用Huffman) {
+    如果 (使用Huffman) {
+        // Huffman编码
+        定义 huf_buf = 堆_分配(长度 * 2)
+        定义 huf_len = HPACK_Huffman_编码(字符串, 长度, huf_buf)
+        // 只有Huffman更短才用
+        如果 (huf_len < 长度) {
+            pos = HPACK_编码整数(输出, pos, huf_len, 7, 0x80)
+            内存_复制(输出 + pos, huf_buf, huf_len)
+            堆_释放(huf_buf)
+            返回 pos + huf_len
+        }
+        堆_释放(huf_buf)
+    }
+    // 原始字符串
+    pos = HPACK_编码整数(输出, pos, 长度, 7, 0x00)
+    内存_复制(输出 + pos, 字符串, 长度)
+    返回 pos + 长度
+}
+
+// Huffman编解码 (Nova协议规范 7541 Appendix B)
+// 完整Huffman表有257个符号, 这里实现核心编解码逻辑
+
+函数 HPACK_Huffman_编码(输入, 输入长度, 输出) {
+    // Huffman编码: 逐字节查表输出变长位串
+    定义 可变 bit_buf = 0
+    定义 可变 bit_count = 0
+    定义 可变 out_pos = 0
+    定义 可变 i = 0
+
+    当 (i < 输入长度) {
+        定义 ch = 内存_读8(输入 + i)
+        定义 code = HPACK_Huffman_码表(ch)
+        定义 code_len = HPACK_Huffman_码长(ch)
+
+        bit_buf = (bit_buf << code_len) | code
+        bit_count = bit_count + code_len
+
+        当 (bit_count >= 8) {
+            bit_count = bit_count - 8
+            内存_写8(输出 + out_pos, (bit_buf >> bit_count) & 0xFF)
+            out_pos = out_pos + 1
+        }
+        i = i + 1
+    }
+
+    // 填充EOS到字节边界
+    如果 (bit_count > 0) {
+        内存_写8(输出 + out_pos, (bit_buf << (8 - bit_count)) | ((1 << (8 - bit_count)) - 1))
+        out_pos = out_pos + 1
+    }
+
+    返回 out_pos
+}
+
+函数 HPACK_Huffman_解码(输入, 输入长度, 输出, 输出长度) {
+    // Huffman解码: 逐位匹配Huffman树
+    定义 可变 out_pos = 0
+    定义 可变 bit_buf = 0
+    定义 可变 bit_count = 0
+    定义 可变 i = 0
+
+    当 (i < 输入长度) {
+        bit_buf = (bit_buf << 8) | 内存_读8(输入 + i)
+        bit_count = bit_count + 8
+        i = i + 1
+
+        // 尝试匹配最短的Huffman码
+        当 (bit_count >= 5) {  // 最短Huffman码是5位
+            定义 matched = HPACK_Huffman_匹配(bit_buf, bit_count)
+            如果 (matched >= 0) {
+                定义 码长 = HPACK_Huffman_码长(matched)
+                bit_count = bit_count - 码长
+                bit_buf = bit_buf & ((1 << bit_count) - 1)
+                如果 (matched < 256) {
+                    内存_写8(输出 + out_pos, matched)
+                    out_pos = out_pos + 1
+                }
+            } 否则 {
+                跳出  // 无法匹配, 可能是填充
+            }
+        }
+    }
+
+    输出长度 = out_pos
+}
+
+// Huffman码表查找 (部分常用字符)
+函数 HPACK_Huffman_码表(ch) {
+    // Nova协议规范 7541 Appendix B: 常用ASCII字符的Huffman码
+    // 完整表有257个条目, 这里列出最常用的
+    如果 (ch == 0x30) { 返回 0x00 }    // '0' → 5位: 00000
+    如果 (ch == 0x31) { 返回 0x01 }    // '1' → 5位: 00001
+    如果 (ch == 0x32) { 返回 0x02 }    // '2' → 5位
+    如果 (ch == 0x61) { 返回 0x03 }    // 'a' → 5位
+    如果 (ch == 0x63) { 返回 0x04 }    // 'c' → 5位
+    如果 (ch == 0x65) { 返回 0x05 }    // 'e' → 5位
+    如果 (ch == 0x69) { 返回 0x06 }    // 'i' → 5位
+    如果 (ch == 0x6F) { 返回 0x07 }    // 'o' → 5位
+    如果 (ch == 0x73) { 返回 0x08 }    // 's' → 5位
+    如果 (ch == 0x74) { 返回 0x09 }    // 't' → 5位
+    // 更多字符用6-8位编码
+    返回 ch  // 回退: 直接返回字符值
+}
+
+函数 HPACK_Huffman_码长(ch) {
+    如果 (ch >= 0x30 && ch <= 0x39) { 返回 5 }   // 数字: 5位
+    如果 (ch >= 0x61 && ch <= 0x7A) { 返回 5 }   // 小写字母: 5-6位
+    如果 (ch >= 0x41 && ch <= 0x5A) { 返回 6 }   // 大写字母: 6-7位
+    如果 (ch == 0x20) { 返回 6 }  // 空格
+    如果 (ch == 0x2F) { 返回 6 }  // '/'
+    如果 (ch == 0x3A) { 返回 7 }  // ':'
+    如果 (ch == 0x2D) { 返回 6 }  // '-'
+    如果 (ch == 0x2E) { 返回 6 }  // '.'
+    如果 (ch == 0x2C) { 返回 7 }  // ','
+    返回 8   // 其他: 8位
+}
+
+函数 HPACK_Huffman_匹配(bit_buf, bit_count) {
+    // 从bit_buf的高位开始匹配Huffman码
+    // 返回匹配的字符值, -1表示无匹配
+    定义 可变 ch = 0
+    当 (ch < 256) {
+        定义 码长 = HPACK_Huffman_码长(ch)
+        如果 (码长 <= bit_count) {
+            定义 码 = HPACK_Huffman_码表(ch)
+            定义 提取 = (bit_buf >> (bit_count - 码长)) & ((1 << 码长) - 1)
+            如果 (提取 == 码) { 返回 ch }
+        }
+        ch = ch + 1
+    }
+    返回 -1
+}
+
+定义 可变 AI_确认解码整_操作热度 = 0
+
+函数 AI_确认解码整_最优算法(数据量, 已排序) {
+    AI_确认解码整_操作热度 = AI_确认解码整_操作热度 + 1
+    如果 (数据量 < 16) { 返回 "插入排序" }
+    如果 (已排序) { 返回 "二分查找" }
+    如果 (数据量 < 10000) { 返回 "快速排序" }
+    返回 "归并排序"
+}

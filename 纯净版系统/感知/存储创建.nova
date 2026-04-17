@@ -1,0 +1,150 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/辅助存根.nova")
+
+// 对应: nova/renderer/modules/storage/ (
+// content/browser/dom_storage/ (
+// 网络模块 (
+// Web 存储 接口:
+// local存储: 持久化键值存储(同源, 5-10MB限制)
+// session存储: 会话级键值存储(标签页关闭即清除)
+// storage.getItem(key) / setItem(key, value) / removeItem(key)
+// storage.clear() / storage.length / storage.key(index)
+// window.onstorage: 跨标签页存储变化事件
+// Cookie 接口:
+// document.cookie = "name=value; expires=...; path=/; domain=...; secure; SameSite=..."
+// Cookie属性: Name/Value/Domain/Path/Expires/MaxAge/Secure/HttpOnly/SameSite
+// SameSite: Strict/Lax/None
+// Partitioned Cookie (CHIPS): 第三方cookie分区
+// Cookie Store 接口: cookieStore.get/set/delete (异步)
+// 【Nova特色】AI存储优化:
+// ① AI预测需要预加载的存储项
+// ② AI检测存储滥用(指纹追踪)
+
+// §1 存储 (local存储 / session存储)
+
+结构 存储Entry {
+ 键,
+ 值,
+ 键长度,
+ 值长度,
+ 下一个,    // u64 存储Entry*
+}
+
+结构 存储 {
+ 头,    // u64 存储Entry*
+ 数量,
+ 已用字节,
+ 最大字节,    // u32 5MB = 5242880
+ 是持久,    // 布尔 true=local存储 false=session存储
+ 源,    // u64 origin字符串
+}
+
+函数 存储_创建(是持久, 源, 最大字节) {
+ 定义 s = 堆_分配(存储)
+ s.头 = 0; s.数量 = 0; s.已用字节 = 0
+ s.最大字节 = 最大字节; s.是持久 = 是持久
+ s.源 = 如果(源 != 0, 字符串_复制(源), 0)
+ 返回 s
+}
+
+// storage.length
+函数 存储_length(s) {
+ 如果 (s == 0) { 返回 0 }
+ 返回 s.数量
+}
+
+// storage.key(index)
+函数 存储_key(s, index) {
+ 如果 (s == 0 || index >= s.数量) { 返回 0 }
+ 定义 可变 entry = s.头
+ 定义 可变 i = 0
+ 当 (entry != 0 && i < index) {
+ entry = entry.下一个; i = i + 1
+ }
+ 如果 (entry != 0) { 返回 entry.键 }
+ 返回 0
+}
+
+// storage.getItem(key)
+函数 存储_getItem(s, key) {
+ 如果 (s == 0 || key == 0) { 返回 0 }
+ 定义 可变 entry = s.头
+ 当 (entry != 0) {
+ 如果 (字符串_相等(entry.键, key)) { 返回 entry.值 }
+ entry = entry.下一个
+ }
+ 返回 0
+}
+
+// storage.setItem(key, value)
+函数 存储_setItem(s, key, value) {
+ 如果 (s == 0 || key == 0 || value == 0) { 返回 }
+ 定义 新大小 = 字节长度(key) + 字节长度(value)
+
+ // 检查是否已有同key
+ 定义 可变 entry = s.头
+ 当 (entry != 0) {
+ 如果 (字符串_相等(entry.键, key)) {
+ // 更新值
+ 定义 旧大小 = entry.键长度 + entry.值长度
+ 如果 (s.已用字节 - 旧大小 + 新大小 > s.最大字节) {
+ // QuotaExceeded错误
+ 返回
+ }
+ s.已用字节 = s.已用字节 - 旧大小 + 新大小
+ 定义 旧值 = entry.值
+ entry.值 = 字符串_复制(value)
+ entry.值长度 = 字节长度(value)
+ // 触发storage事件(跨标签页)
+ 存储_触发事件(s, key, 旧值, value)
+ 返回
+ }
+ entry = entry.下一个
+ }
+
+ // 新增
+ 如果 (s.已用字节 + 新大小 > s.最大字节) { 返回 }
+ 定义 新entry = 堆_分配(存储Entry)
+ 新entry.键 = 字符串_复制(key)
+ 新entry.值 = 字符串_复制(value)
+ 新entry.键长度 = 字节长度(key)
+ 新entry.值长度 = 字节长度(value)
+ 新entry.下一个 = s.头; s.头 = 新entry
+ s.数量 = s.数量 + 1
+ s.已用字节 = s.已用字节 + 新大小
+ 存储_触发事件(s, key, 0, value)
+}
+
+// storage.removeItem(key)
+函数 存储_removeItem(s, key) {
+ 如果 (s == 0 || key == 0) { 返回 }
+ 定义 可变 prev = 0
+ 定义 可变 entry = s.头
+ 当 (entry != 0) {
+ 如果 (字符串_相等(entry.键, key)) {
+ 如果 (prev == 0) { s.头 = entry.下一个 }
+ 否则 { prev.下一个 = entry.下一个 }
+ s.数量 = s.数量 - 1
+ s.已用字节 = s.已用字节 - entry.键长度 - entry.值长度
+ 存储_触发事件(s, key, entry.值, 0)
+ 返回
+ }
+ prev = entry; entry = entry.下一个
+ }
+}
+
+// storage.clear()
+函数 存储_clear(s) {
+ 如果 (s == 0) { 返回 }
+ s.头 = 0; s.数量 = 0; s.已用字节 = 0
+ 存储_触发事件(s, 0, 0, 0)
+}
+
+函数 存储_触发事件(s, key, oldValue, newValue) {
+ 如果 (s == 0) { 返回 }
+ // 创建存储事件并dispatch到其他同源窗口
+ // 事件.key / 事件.oldValue / 事件.newValue / 事件.url / 事件.storageArea
+}

@@ -1,0 +1,158 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./函数创建.nova")
+导入("./内核直连层.nova")
+导入("./动画时间线.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/创建甲.nova")
+
+// §2 关键帧 (Keyframe)
+// @keyframes name { 0% { ... } 50% { ... } 100% { ... } }
+
+结构 Keyframe {
+    偏移,    // i32 0-10000 (0%-100%)
+    缓动,    // u64 TimingFunction*
+    属性数量,
+    属性列表,    // u64 [属性ID, 值] 对数组
+}
+
+结构 KeyframeEffect {
+    名称,    // u64 动画名称
+    关键帧,    // u64 Keyframe*数组
+    关键帧数量,
+    // 目标
+    目标元素,    // u64 元素*
+    // Timing
+    持续时间,    // u64 毫秒
+    延迟,    // i64 毫秒(可以为负)
+    结束延迟,
+    迭代次数,    // i32 ×100 (100=1次, -100=infinite)
+    方向,    // u32 0=normal 1=reverse 2=alternate 3=alternate-reverse
+    填充模式,    // u32 0=none 1=forwards 2=backwards 3=both
+    缓动,    // u64 TimingFunction*
+}
+
+结构 KeyframeProperty {
+    属性ID,    // u32 CSS属性ID
+    值类型,    // u32 0=数字 1=颜色 2=长度 3=关键字
+    数字值,    // i32 ×100
+    颜色值,    // u32 ARGB
+}
+
+
+函数 KeyframeEffect_创建(名称, 目标, 持续时间) {
+    定义 ke = 堆_分配(KeyframeEffect)
+    ke.名称 = 字符串_复制(名称)
+    ke.目标元素 = 目标
+    ke.关键帧 = 堆_分配_数组(16 * 32)
+    ke.关键帧数量 = 0
+    ke.持续时间 = 持续时间
+    ke.延迟 = 0
+    ke.结束延迟 = 0
+    ke.迭代次数 = 100    // 1次
+    ke.方向 = 0
+    ke.填充模式 = 0
+    ke.缓动 = TimingFunction_创建(缓动_ease)
+    返回 ke
+}
+
+函数 KeyframeEffect_添加关键帧(ke, 偏移) {
+    如果 (ke.关键帧数量 >= 16) { 返回 0 }
+    定义 kf = 堆_分配(Keyframe)
+    kf.偏移 = 偏移
+    kf.缓动 = ke.缓动
+    kf.属性数量 = 0
+    kf.属性列表 = 堆_分配_数组(32 * 12)
+    内存_写64(ke.关键帧 + ke.关键帧数量 * 8, kf)
+    ke.关键帧数量 = ke.关键帧数量 + 1
+    返回 kf
+}
+
+函数 Keyframe_添加属性(kf, 属性ID, 值类型, 数字值, 颜色值) {
+    如果 (kf.属性数量 >= 32) { 返回 }
+    定义 偏移 = kf.属性列表 + kf.属性数量 * 12
+    内存_写32(偏移, 属性ID)
+    内存_写32(偏移 + 4, 值类型)
+    如果 (值类型 == 1) {
+        内存_写32(偏移 + 8, 颜色值)
+    } 否则 {
+        内存_写32(偏移 + 8, 数字值)
+    }
+    kf.属性数量 = kf.属性数量 + 1
+}
+
+// §3 Animation对象 (Web Animations 接口)
+
+定义 动画状态_空闲     = 0
+定义 动画状态_播放中   = 1
+定义 动画状态_暂停     = 2
+定义 动画状态_完成     = 3
+
+结构 Animation {
+    效果,    // u64 KeyframeEffect*
+    时间线,    // u64 AnimationTimeline*
+    开始时间,    // i64 毫秒(-1=未设置)
+    当前时间,    // i64 毫秒
+    播放速率,    // i32 ×100 (100=1x, 200=2x, -100=反向)
+    状态,    // u32 动画状态_xxx
+    ID,
+    完成回调,    // u64 承诺 resolve
+    取消回调,
+}
+
+定义 可变 动画_下一个ID = 1
+
+函数 Animation_创建(效果) {
+    定义 anim = 堆_分配(Animation)
+    anim.效果 = 效果
+    anim.时间线 = 0
+    anim.开始时间 = -1
+    anim.当前时间 = 0
+    anim.播放速率 = 100
+    anim.状态 = 动画状态_空闲
+    anim.ID = 动画_下一个ID
+    动画_下一个ID = 动画_下一个ID + 1
+    anim.完成回调 = 0
+    anim.取消回调 = 0
+    返回 anim
+}
+
+函数 Animation_play(anim) {
+    如果 (anim.状态 == 动画状态_播放中) { 返回 }
+    anim.状态 = 动画状态_播放中
+    如果 (anim.开始时间 < 0) {
+        anim.开始时间 = 平台_获取高精度时间() / 1000    // 微秒→毫秒
+    }
+    // 注册到全局动画列表
+    AnimationTimeline_注册(anim)
+}
+
+函数 Animation_pause(anim) {
+    如果 (anim.状态 != 动画状态_播放中) { 返回 }
+    anim.状态 = 动画状态_暂停
+    anim.当前时间 = Animation_计算当前时间(anim)
+}
+
+函数 Animation_cancel(anim) {
+    anim.状态 = 动画状态_空闲
+    anim.开始时间 = -1
+    anim.当前时间 = 0
+}
+
+函数 Animation_finish(anim) {
+    如果 (anim.效果 == 0) { 返回 }
+    定义 ke = anim.效果
+    如果 (anim.播放速率 >= 0) {
+        anim.当前时间 = ke.持续时间
+    } 否则 {
+        anim.当前时间 = 0
+    }
+    anim.状态 = 动画状态_完成
+}
+
+函数 Animation_计算当前时间(anim) {
+    如果 (anim.状态 == 动画状态_暂停) { 返回 anim.当前时间 }
+    如果 (anim.开始时间 < 0) { 返回 0 }
+    定义 现在 = 平台_获取高精度时间() / 1000
+    返回 (现在 - anim.开始时间) * anim.播放速率 / 100
+}

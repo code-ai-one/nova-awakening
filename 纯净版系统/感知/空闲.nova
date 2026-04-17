@@ -1,0 +1,137 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/创建甲.nova")
+
+// §5 requestIdleCallback
+
+结构 IdleCallback {
+    ID,
+    回调,    // u64 Nova函数*(接收IdleDeadline参数)
+    超时,    // u32 毫秒(0=无超时)
+    入队时间,
+    已取消,
+    下一个,
+}
+
+结构 IdleDeadline {
+    帧结束时间,    // u64 本帧预算结束的绝对时间
+    didTimeout,    // 布尔 因timeout到期而强制执行
+}
+
+定义 可变 Idle_链头 = 0
+定义 可变 Idle_下一ID = 1
+
+// requestIdleCallback(callback, {timeout}) → id
+
+函数 requestIdleCallback(回调, 超时) {
+    如果 (回调 == 0) { 返回 0 }
+    定义 entry = 堆_分配(IdleCallback)
+    entry.ID = Idle_下一ID; Idle_下一ID = Idle_下一ID + 1
+    entry.回调 = 回调; entry.超时 = 超时
+    entry.入队时间 = 平台_获取高精度时间()
+    entry.已取消 = 假
+    entry.下一个 = Idle_链头; Idle_链头 = entry
+    返回 entry.ID
+}
+
+// cancelIdleCallback(id)
+函数 cancelIdleCallback(id) {
+    定义 可变 entry = Idle_链头
+    当 (entry != 0) {
+        如果 (entry.ID == id) { entry.已取消 = 真; 返回 }
+        entry = entry.下一个
+    }
+}
+
+// 执行空闲回调(帧渲染完成后, 有剩余时间时调用)
+函数 Idle_执行(帧结束时间, 现在) {
+    定义 可变 prev = 0
+    定义 可变 entry = Idle_链头
+    当 (entry != 0) {
+        定义 next = entry.下一个
+        如果 (entry.已取消) {
+            如果 (prev == 0) { Idle_链头 = next }
+            否则 { prev.下一个 = next }
+            entry = next; 继续
+        }
+
+        // 检查是否超时
+        定义 已超时 = 假
+        如果 (entry.超时 > 0) {
+            已超时 = (现在 - entry.入队时间 >= entry.超时)
+        }
+
+        // 检查是否有空闲时间
+        定义 剩余时间 = 帧结束时间 - 现在
+        如果 (剩余时间 > 0 || 已超时) {
+            // 创建IdleDeadline
+            定义 deadline = 堆_分配(IdleDeadline)
+            deadline.帧结束时间 = 帧结束时间; deadline.didTimeout = 已超时
+            // 调用 entry.回调(deadline)
+            // 移除
+            如果 (prev == 0) { Idle_链头 = next }
+            否则 { prev.下一个 = next }
+            entry = next; 继续
+        }
+
+        prev = entry; entry = next
+    }
+}
+
+// IdleDeadline.timeRemaining()
+函数 IdleDeadline_timeRemaining(deadline) {
+    如果 (deadline == 0) { 返回 0 }
+    定义 现在 = 平台_获取高精度时间()
+    定义 剩余 = deadline.帧结束时间 - 现在
+    如果 (剩余 < 0) { 返回 0 }
+    返回 剩余
+}
+
+// §6 宏任务队列
+
+结构 MacroTask {
+    回调,    // u64 Nova函数*
+    优先级,    // u8 TASK_PRIORITY_xxx
+    入队时间,
+    下一个,
+}
+
+// 多优先级队列
+定义 可变 宏任务_用户阻塞 = 0    // 最高优先级
+定义 可变 宏任务_用户可见 = 0
+定义 可变 宏任务_后台 = 0
+
+函数 事件Loop_入队宏任务(回调, 优先级) {
+    如果 (回调 == 0) { 返回 }
+    定义 task = 堆_分配(MacroTask)
+    task.回调 = 回调; task.优先级 = 优先级
+    task.入队时间 = 平台_获取高精度时间(); task.下一个 = 0
+
+    如果 (优先级 == TASK_PRIORITY_USER_BLOCKING) {
+        task.下一个 = 宏任务_用户阻塞; 宏任务_用户阻塞 = task
+    } 否则 如果 (优先级 == TASK_PRIORITY_USER_VISIBLE) {
+        task.下一个 = 宏任务_用户可见; 宏任务_用户可见 = task
+    } 否则 {
+        task.下一个 = 宏任务_后台; 宏任务_后台 = task
+    }
+}
+
+函数 事件Loop_取宏任务() {
+    // 优先级: user-blocking > user-visible > background
+    如果 (宏任务_用户阻塞 != 0) {
+        定义 task = 宏任务_用户阻塞
+        宏任务_用户阻塞 = task.下一个
+        返回 task
+    }
+    如果 (宏任务_用户可见 != 0) {
+        定义 task = 宏任务_用户可见
+        宏任务_用户可见 = task.下一个
+        返回 task
+    }
+    如果 (宏任务_后台 != 0) {
+        定义 task = 宏任务_后台
+        宏任务_后台 = task.下一个
+        返回 task
+    }
+    返回 0
+}

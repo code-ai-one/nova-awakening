@@ -1,0 +1,580 @@
+// §4 HTMLOutput元素
+
+// NFOC理论 — Nova表单输出控件智能沿管理 (Nova Form Output Control)
+// 创新点: 约束传播 + 值缓存 + 度量插值渲染 + AI表单预测
+
+定义 METER_区域_最优 = 0
+定义 METER_区域_次优 = 1
+定义 METER_区域_差 = 2
+定义 Q10_单位 = 1024
+定义 PROGRESS_动画帧数 = 60
+定义 FIELDSET_最大子控件 = 256
+
+定义 可变 NFOC_创建总数 = 0
+定义 可变 NFOC_更新总数 = 0
+定义 可变 NFOC_度量渲染 = 0
+定义 可变 NFOC_AI预测总数 = 0
+定义 可变 NFOC_约束传播数 = 0
+
+
+
+函数 Output_设置值(o, 新值) {
+    如果 (o == 0) { 返回 }
+    o.值 = 新值
+    NFOC_更新总数 = NFOC_更新总数 + 1
+    // 同步到DOM文本内容
+    如果 (o.节点 != 0) {
+        节点_设置文本内容(o.节点, 新值)
+    }
+}
+
+函数 Output_获取值(o) {
+    如果 (o == 0) { 返回 "" }
+    返回 o.值
+}
+
+函数 Output_重置(o) {
+    如果 (o == 0) { 返回 }
+    o.值 = o.defaultValue
+    如果 (o.节点 != 0) {
+        节点_设置文本内容(o.节点, o.defaultValue)
+    }
+}
+
+函数 Output_设置默认值(o, dv) {
+    如果 (o == 0) { 返回 }
+    o.defaultValue = dv
+}
+
+// htmlFor解析: 按空格分割关联ID列表
+函数 Output_解析htmlFor(o) {
+    如果 (o == 0 || o.htmlFor == 0) { 返回 [0, 0] }
+    定义 ids = 堆_分配(32 * 8)  // 最多32个ID
+    定义 可变 数量 = 0
+    定义 长 = 字符串_长度(o.htmlFor)
+    定义 可变 i = 0
+    当 (i < 长 && 数量 < 32) {
+        当 (i < 长 && 内存_读8(o.htmlFor + i) == 0x20) { i = i + 1 }
+        如果 (i >= 长) { 断开 }
+        定义 起 = i
+        当 (i < 长 && 内存_读8(o.htmlFor + i) != 0x20) { i = i + 1 }
+        定义 id = 字符串_子串(o.htmlFor, 起, i - 起)
+        内存_写64(ids + 数量 * 8, id)
+        数量 = 数量 + 1
+    }
+    返回 [ids, 数量]
+}
+
+函数 Output_觉察关联控件(o, doc) {
+    如果 (o == 0 || doc == 0) { 返回 }
+    定义 parsed = Output_解析htmlFor(o)
+    定义 ids = parsed[0]
+    定义 数量 = parsed[1]
+    如果 (ids == 0 || 数量 == 0) { 返回 }
+    定义 可变 i = 0
+    当 (i < 数量) {
+        定义 id = 内存_读64(ids + i * 8)
+        定义 elem = 文档_通过ID查找(doc, id)
+        如果 (elem != 0) {
+            // 注册监听
+            节点_添加监听(elem, "input", Output_关联输入回调, o)
+        }
+        i = i + 1
+    }
+}
+
+函数 Output_关联输入回调(事件, o) {
+    如果 (o == 0 || 事件 == 0) { 返回 }
+    // 简单值传播: 将关联控件的值复制到output
+    定义 src = 事件.目标
+    如果 (src != 0) {
+        Output_设置值(o, 节点_获取属性(src, "value"))
+    }
+}
+
+// validity接口 (始终有效)
+函数 Output_checkValidity(o) {
+    // 检查output元素的约束有效性
+    如果 (o == 0) { 返回 真 }
+    // output元素本身不参与表单验证, 但检查自定义约束
+    如果 (o.自定义校验消息 != 空 && o.自定义校验消息 != "") { 返回 假 }
+    返回 真
+}
+函数 Output_reportValidity(o) {
+    // 检查有效性并触发UI报告(气泡提示)
+    定义 有效 = Output_checkValidity(o)
+    如果 (!有效 && o != 0) {
+        // 触发invalid事件
+        DOM_触发事件(o, "invalid")
+    }
+    返回 有效
+}
+函数 Output_获取校验消息(o) { 返回 "" }
+
+
+函数 Progress_设置值(p, v) {
+    如果 (p == 0) { 返回 }
+    如果 (v < 0) { v = 0 }
+    如果 (v > p.max) { v = p.max }
+    p.value = v
+    p.是确定 = 真
+    NFOC_更新总数 = NFOC_更新总数 + 1
+}
+
+函数 Progress_设置最大值(p, m) {
+    如果 (p == 0) { 返回 }
+    如果 (m <= 0) { m = Q10_单位 }  // 默认1.0
+    p.max = m
+    如果 (p.value > m) { p.value = m }
+}
+
+函数 Progress_设置不确定(p) {
+    如果 (p == 0) { 返回 }
+    p.是确定 = 假
+    p.value = 0
+}
+
+函数 Progress_获取百分比(p) {
+    如果 (p == 0 || !p.是确定 || p.max == 0) { 返回 -1 }
+    返回 p.value * 100 / p.max
+}
+
+// 不确定模式动画
+结构 ProgressAnimation {
+    当前帧,
+    总帧数,
+    起始位置,  // Q10
+    结束位置,  // Q10
+    循环,
+}
+
+函数 Progress_创建动画() {
+    定义 a = 堆_分配(ProgressAnimation)
+    a.当前帧 = 0
+    a.总帧数 = PROGRESS_动画帧数
+    a.起始位置 = 0
+    a.结束位置 = Q10_单位
+    a.循环 = 真
+    返回 a
+}
+
+函数 Progress_动画推进(anim) {
+    如果 (anim == 0) { 返回 0 }
+    anim.当前帧 = anim.当前帧 + 1
+    如果 (anim.当前帧 >= anim.总帧数) {
+        如果 (anim.循环) { anim.当前帧 = 0 }
+        否则 { anim.当前帧 = anim.总帧数 - 1 }
+    }
+    // 三角波形: 0→max→0
+    定义 半 = anim.总帧数 / 2
+    如果 (半 == 0) { 返回 0 }
+    如果 (anim.当前帧 < 半) {
+        返回 anim.起始位置 + (anim.结束位置 - anim.起始位置) * anim.当前帧 / 半
+    }
+    返回 anim.结束位置 - (anim.结束位置 - anim.起始位置) * (anim.当前帧 - 半) / 半
+}
+
+
+函数 Meter_设置值(m, v) {
+    如果 (m == 0) { 返回 }
+    如果 (v < m.min) { v = m.min }
+    如果 (v > m.max) { v = m.max }
+    m.value = v
+    NFOC_更新总数 = NFOC_更新总数 + 1
+}
+
+函数 Meter_设置范围(m, min_v, max_v) {
+    如果 (m == 0) { 返回 }
+    如果 (min_v > max_v) { 返回 }  // 无效
+    m.min = min_v
+    m.max = max_v
+    如果 (m.low < m.min) { m.low = m.min }
+    如果 (m.high > m.max) { m.high = m.max }
+    如果 (m.value < m.min) { m.value = m.min }
+    如果 (m.value > m.max) { m.value = m.max }
+}
+
+函数 Meter_设置阈值(m, low, high, opt) {
+    如果 (m == 0) { 返回 }
+    如果 (low < m.min) { low = m.min }
+    如果 (high > m.max) { high = m.max }
+    如果 (low > high) { low = high }  // 安全纠正
+    m.low = low
+    m.high = high
+    m.optimum = opt
+    如果 (m.optimum < m.min) { m.optimum = m.min }
+    如果 (m.optimum > m.max) { m.optimum = m.max }
+}
+
+函数 Meter_获取填充比例(m) {
+    如果 (m == 0) { 返回 0 }
+    定义 范围 = m.max - m.min
+    如果 (范围 <= 0) { 返回 0 }
+    返回 (m.value - m.min) * Q10_单位 / 范围
+}
+
+// 渲染颜色查找
+函数 Meter_获取颜色(m) {
+    定义 z = Meter_区域(m)
+    如果 (z == METER_区域_最优) { 返回 0x4CAF50 }  // 绿
+    如果 (z == METER_区域_次优) { 返回 0xFFC107 }  // 黄
+    返回 0xF44336  // 红
+}
+
+// 度量条渲染描述
+结构 MeterRenderDesc {
+    x, y, 宽, 高,
+    填充比例,   // Q10
+    填充颜色,   // RGB
+    背景颜色,   // RGB
+    边框圆角,
+}
+
+函数 Meter_生成渲染描述(m, x, y, 宽, 高) {
+    定义 d = 堆_分配(MeterRenderDesc)
+    d.x = x; d.y = y; d.宽 = 宽; d.高 = 高
+    d.填充比例 = Meter_获取填充比例(m)
+    d.填充颜色 = Meter_获取颜色(m)
+    d.背景颜色 = 0xE0E0E0
+    d.边框圆角 = 4
+    NFOC_度量渲染 = NFOC_度量渲染 + 1
+    返回 d
+}
+
+
+函数 FieldSet_创建() {
+    定义 fs = 堆_分配(HTMLFieldSet元素)
+    fs.节点 = 0; fs.name = 0; fs.disabled = 假; fs.form = 0
+    NFOC_创建总数 = NFOC_创建总数 + 1
+    返回 fs
+}
+
+函数 Legend_创建() {
+    定义 lg = 堆_分配(HTMLLegend元素)
+    lg.节点 = 0; lg.form = 0
+    NFOC_创建总数 = NFOC_创建总数 + 1
+    返回 lg
+}
+
+函数 FieldSet_获取第一个Legend(fs) {
+    如果 (fs == 0 || fs.节点 == 0) { 返回 0 }
+    定义 子 = 节点_第一子(fs.节点)
+    当 (子 != 0) {
+        如果 (节点_标签名相等(子, "legend")) { 返回 子 }
+        子 = 节点_下一兄弟(子)
+    }
+    返回 0
+}
+
+函数 FieldSet_是在Legend内(节点, legend节点) {
+    如果 (节点 == 0 || legend节点 == 0) { 返回 假 }
+    定义 可变 p = 节点_父(节点)
+    当 (p != 0) {
+        如果 (p == legend节点) { 返回 真 }
+        p = 节点_父(p)
+    }
+    返回 假
+}
+
+函数 FieldSet_传播disabled(fs) {
+    如果 (fs == 0 || fs.节点 == 0) { 返回 }
+    定义 legend = FieldSet_获取第一个Legend(fs)
+    FieldSet_递归传播dis(fs.节点, fs.disabled, legend)
+    NFOC_约束传播数 = NFOC_约束传播数 + 1
+}
+
+函数 FieldSet_递归传播dis(节点, disabled, legend) {
+    如果 (节点 == 0) { 返回 }
+    定义 子 = 节点_第一子(节点)
+    当 (子 != 0) {
+        // 第一个legend内的控件不受影响
+        如果 (legend != 0 && FieldSet_是在Legend内(子, legend)) {
+            子 = 节点_下一兄弟(子)
+            继续
+        }
+        // 如果是表单控件，设置disabled
+        如果 (节点_是表单控件(子)) {
+            节点_设置属性(子, "disabled", disabled)
+        }
+        // 递归子树
+        FieldSet_递归传播dis(子, disabled, legend)
+        子 = 节点_下一兄弟(子)
+    }
+}
+
+函数 FieldSet_设置disabled(fs, v) {
+    如果 (fs == 0) { 返回 }
+    fs.disabled = v
+    FieldSet_传播disabled(fs)
+}
+
+// elements集合: 收集fieldset内所有子控件
+函数 FieldSet_获取元素集合(fs) {
+    如果 (fs == 0 || fs.节点 == 0) { 返回 [0, 0] }
+    定义 结果 = 堆_分配(FIELDSET_最大子控件 * 8)
+    定义 可变 数量 = 0
+    FieldSet_收集控件(fs.节点, 结果, 数量)
+    返回 [结果, 数量]
+}
+
+函数 FieldSet_收集控件(节点, 结果, 数量) {
+    如果 (节点 == 0) { 返回 数量 }
+    定义 子 = 节点_第一子(节点)
+    当 (子 != 0 && 数量 < FIELDSET_最大子控件) {
+        如果 (节点_是表单控件(子)) {
+            内存_写64(结果 + 数量 * 8, 子)
+            数量 = 数量 + 1
+        }
+        数量 = FieldSet_收集控件(子, 结果, 数量)
+        子 = 节点_下一兄弟(子)
+    }
+    返回 数量
+}
+
+
+函数 NFOC_查找关联表单(节点) {
+    如果 (节点 == 0) { 返回 0 }
+    // 先查找form属性指定的ID
+    定义 formId = 节点_获取属性(节点, "form")
+    如果 (formId != 0 && 字符串_长度(formId) > 0) {
+        定义 doc = 节点_获取文档(节点)
+        如果 (doc != 0) {
+            定义 f = 文档_通过ID查找(doc, formId)
+            如果 (f != 0 && 节点_标签名相等(f, "form")) { 返回 f }
+        }
+    }
+    // 否则向上找最近的form祖先
+    定义 可变 p = 节点_父(节点)
+    当 (p != 0) {
+        如果 (节点_标签名相等(p, "form")) { 返回 p }
+        p = 节点_父(p)
+    }
+    返回 0
+}
+
+函数 NFOC_解析标签关联(节点) {
+    如果 (节点 == 0) { 返回 0 }
+    定义 id = 节点_获取属性(节点, "id")
+    如果 (id == 0 || 字符串_长度(id) == 0) { 返回 0 }
+    定义 doc = 节点_获取文档(节点)
+    如果 (doc == 0) { 返回 0 }
+    // 查找 label[for=id]
+    定义 labels = 文档_查询全部(doc, "label")
+    如果 (labels == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < labels.长度) {
+        定义 lbl = labels.元素[i]
+        定义 forAttr = 节点_获取属性(lbl, "for")
+        如果 (forAttr != 0 && 字符串_相等(forAttr, id)) {
+            返回 lbl
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+
+函数 Progress_设置ARIA(p) {
+    如果 (p == 0 || p.节点 == 0) { 返回 }
+    节点_设置属性(p.节点, "role", "progressbar")
+    如果 (p.是确定) {
+        定义 百分比 = Progress_获取百分比(p)
+        节点_设置属性(p.节点, "aria-valuenow", 百分比)
+        节点_设置属性(p.节点, "aria-valuemin", 0)
+        节点_设置属性(p.节点, "aria-valuemax", 100)
+    } 否则 {
+        节点_移除属性(p.节点, "aria-valuenow")
+    }
+}
+
+函数 Meter_设置ARIA(m) {
+    如果 (m == 0 || m.节点 == 0) { 返回 }
+    节点_设置属性(m.节点, "role", "meter")
+    节点_设置属性(m.节点, "aria-valuenow", m.value)
+    节点_设置属性(m.节点, "aria-valuemin", m.min)
+    节点_设置属性(m.节点, "aria-valuemax", m.max)
+}
+
+
+函数 NFOC_AI提取特征(m, p) {
+    定义 t = Tensor_创建(10)
+    如果 (t == 0) { 返回 0 }
+    Tensor_写(t, 0, NFOC_创建总数)
+    Tensor_写(t, 1, NFOC_更新总数)
+    Tensor_写(t, 2, NFOC_度量渲染)
+    Tensor_写(t, 3, NFOC_约束传播数)
+    如果 (m != 0) {
+        Tensor_写(t, 4, m.value)
+        Tensor_写(t, 5, Meter_区域(m))
+    }
+    如果 (p != 0) {
+        Tensor_写(t, 6, p.value)
+        Tensor_写(t, 7, p.max)
+        如果 (p.是确定) { Tensor_写(t, 8, 1) } 否则 { Tensor_写(t, 8, 0) }
+    }
+    Tensor_写(t, 9, NFOC_AI预测总数)
+    返回 t
+}
+
+函数 NFOC_AI预测下一值(m) {
+    如果 (m == 0) { 返回 0 }
+    定义 t = NFOC_AI提取特征(m, 0)
+    如果 (t == 0) { 返回 m.value }
+    定义 结果 = AI总线_推理("nfoc_meter", t)
+    全局AI总线.发布("nfoc_predict", "value", 结果)
+    Tensor_释放(t)
+    NFOC_AI预测总数 = NFOC_AI预测总数 + 1
+    返回 结果
+}
+
+函数 NFOC_AI异常检测(m, p) {
+    定义 t = NFOC_AI提取特征(m, p)
+    如果 (t == 0) { 返回 0 }
+    定义 异常 = AI总线_异常检测("nfoc_form", t)
+    Tensor_释放(t)
+    返回 异常
+}
+
+
+函数 NFOC_获取统计() {
+    返回 [
+        NFOC_创建总数,
+        NFOC_更新总数,
+        NFOC_度量渲染,
+        NFOC_AI预测总数,
+        NFOC_约束传播数
+    ]
+}
+
+函数 NFOC_重置统计() {
+    NFOC_创建总数 = 0
+    NFOC_更新总数 = 0
+    NFOC_度量渲染 = 0
+    NFOC_AI预测总数 = 0
+    NFOC_约束传播数 = 0
+}
+
+
+函数 NFOC_自检() {
+    // Meter区域测试
+    定义 m = Meter_创建()
+    Meter_设置范围(m, 0, 100)
+    Meter_设置阈值(m, 25, 75, 50)
+    m.value = 50
+    如果 (Meter_区域(m) != METER_区域_最优) { 返回 假 }
+    m.value = 10
+    如果 (Meter_区域(m) == METER_区域_最优) { 返回 假 }
+
+    // Progress百分比测试
+    定义 p = Progress_创建()
+    Progress_设置值(p, 512)
+    如果 (Progress_获取百分比(p) != 50) { 返回 假 }
+
+    // Output重置测试
+    定义 o = Output_创建()
+    Output_设置默认值(o, "hello")
+    Output_设置值(o, "world")
+    Output_重置(o)
+    如果 (!字符串_相等(Output_获取值(o), "hello")) { 返回 假 }
+
+    返回 真
+}
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+导入("../推理/文档特征.nova")
+
+结构 HTMLOutput元素 {
+    节点,
+    name,
+    htmlFor,    // u64 关联input的ID列表(空格分隔)
+    值,
+    defaultValue,
+    form,
+}
+
+函数 Output_创建() {
+    定义 o = 堆_分配(HTMLOutput元素)
+    o.节点 = 0; o.name = 0; o.htmlFor = 0
+    o.值 = ""; o.defaultValue = ""; o.form = 0
+    返回 o
+}
+
+// §5 HTNova多层感知器rogress元素
+
+结构 HTNova多层感知器rogress元素 {
+    节点,
+    value,    // i32 Q10 (当前值)
+    max,    // i32 Q10 (最大值, 默认1024=1.0)
+    // 不确定模式: 不设置value属性
+    是确定,
+}
+
+函数 Progress_创建() {
+    定义 p = 堆_分配(HTNova多层感知器rogress元素)
+    p.节点 = 0; p.value = 0; p.max = 1024; p.是确定 = 假
+    返回 p
+}
+
+函数 Progress_position(p) {
+    如果 (p == 0 || !p.是确定 || p.max == 0) { 返回 -1 }
+    返回 p.value * 1024 / p.max    // Q10: 0-1024
+}
+
+// §6 HTMLMeter元素
+
+结构 HTMLMeter元素 {
+    节点,
+    value,    // i32 Q10
+    min,
+    max,
+    low,    // i32 低阈值
+    high,    // i32 高阈值
+    optimum,    // i32 最优值
+}
+
+函数 Meter_创建() {
+    定义 m = 堆_分配(HTMLMeter元素)
+    m.节点 = 0; m.value = 0; m.min = 0; m.max = 1024
+    m.low = 0; m.high = 1024; m.optimum = 512
+    返回 m
+}
+
+// 获取度量区域: 根据value相对于low/high/optimum确定颜色
+// 返回: 0=最优(绿) 1=次优(黄) 2=差(红)
+函数 Meter_区域(m) {
+    如果 (m == 0) { 返回 0 }
+    // 最优值在low-high之间
+    如果 (m.optimum >= m.low && m.optimum <= m.high) {
+        如果 (m.value >= m.low && m.value <= m.high) { 返回 0 }
+        返回 1
+    }
+    // 最优值在low以下
+    如果 (m.optimum < m.low) {
+        如果 (m.value <= m.low) { 返回 0 }
+        如果 (m.value <= m.high) { 返回 1 }
+        返回 2
+    }
+    // 最优值在high以上
+    如果 (m.value >= m.high) { 返回 0 }
+    如果 (m.value >= m.low) { 返回 1 }
+    返回 2
+}
+
+// §7 HTMLFieldSet元素 / HTMLLegend元素
+
+结构 HTMLFieldSet元素 {
+    节点,
+    name,
+    disabled,    // 布尔 禁用fieldset内所有控件(除第一个legend内的)
+    form,
+}
+
+结构 HTMLLegend元素 {
+    节点,
+    form,    // u64 关联的form(通过最近的fieldset)
+}

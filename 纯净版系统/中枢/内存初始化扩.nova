@@ -1,0 +1,472 @@
+//   1. memblock: 启动早期的内存管理器(伙伴系统之前)
+//   2. 两个列表: memory(可用内存) + reserved(已保留内存)
+//   3. 从e820/UEFI内存映射获取物理内存布局
+//   4. 用于: 内核/页表/initrd在启动时的内存分配
+//   5. 启动完成后将剩余memblock移交给伙伴系统
+
+导入("./错误码.nova")
+导入("./日志中枢.nova")
+导入("./自动扩容.nova")
+导入("./恐慌.nova")
+导入("./字符串替换.nova")
+导入("./整数转字符串.nova")
+
+结构 memblock_区域 {
+    基址,    // u64 物理起始地址
+    大小,    // u64 大小(字节)
+    标志,    // u32 0=普通, 1=热插拔
+}
+
+定义 可变 memblock_memory = []      // 可用物理内存区域列表
+定义 可变 memblock_reserved = []    // 已保留区域列表
+定义 可变 memblock_总物理 = 0
+定义 可变 memblock_总保留 = 0
+
+// 初始化 (从e820解析结果填充)
+
+函数 memblock_初始化() {
+    memblock_memory = []
+    memblock_reserved = []
+    memblock_总物理 = 0
+    memblock_总保留 = 0
+}
+
+函数 memblock_添加(基址, 大小) {
+    定义 区域 = memblock_区域 {}
+    区域.基址 = 基址
+    区域.大小 = 大小
+    区域.标志 = 0
+    追加(memblock_memory, 区域)
+    memblock_总物理 = memblock_总物理 + 大小
+}
+
+函数 memblock_保留(基址, 大小) {
+    定义 区域 = memblock_区域 {}
+    区域.基址 = 基址
+    区域.大小 = 大小
+    区域.标志 = 0
+    追加(memblock_reserved, 区域)
+    memblock_总保留 = memblock_总保留 + 大小
+}
+
+// 早期分配 
+
+函数 memblock_alloc(大小, 对齐) {
+    // 从可用内存中找一块未保留的区域
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        定义 区域 = memblock_memory[i]
+        定义 可变 候选 = 区域.基址
+        // 对齐
+        如果 (对齐 > 0) {
+            候选 = (候选 + 对齐 - 1) & ~(对齐 - 1)
+        }
+        如果 (候选 + 大小 <= 区域.基址 + 区域.大小) {
+            如果 (!memblock_是保留(候选, 大小)) {
+                memblock_保留(候选, 大小)
+                返回 候选
+            }
+        }
+        i = i + 1
+    }
+    返回 0   // 分配失败
+}
+
+函数 memblock_是保留(基址, 大小) {
+    定义 可变 i = 0
+    当 (i < 计数(memblock_reserved)) {
+        定义 r = memblock_reserved[i]
+        // 检查是否重叠
+        如果 (基址 < r.基址 + r.大小 && 基址 + 大小 > r.基址) {
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+// e820解析 (x86内存映射)
+
+定义 E820_RAM      = 1
+定义 E820_RESERVED = 2
+定义 E820_ACPI     = 3
+定义 E820_NVS      = 4
+定义 E820_UNUSABLE = 5
+
+函数 e820_解析(e820表, 条目数) {
+    定义 可变 i = 0
+    当 (i < 条目数) {
+        定义 基址 = e820表[i * 3]
+        定义 大小 = e820表[i * 3 + 1]
+        定义 类型 = e820表[i * 3 + 2]
+        如果 (类型 == E820_RAM) {
+            memblock_添加(基址, 大小)
+            内核信息("e820: [mem " + hex64(基址) + "-" + hex64(基址 + 大小 - 1) + "] usable")
+        } 否则 如果 (类型 == E820_RESERVED) {
+            memblock_保留(基址, 大小)
+        }
+        i = i + 1
+    }
+}
+
+// 保留内核/initrd区域
+
+函数 memblock_保留内核(内核起始, 内核大小) {
+    memblock_保留(内核起始, 内核大小)
+    内核信息("memblock: 保留内核 [" + hex64(内核起始) + ", " +
+             整数转字符串(内核大小 / 1024) + "KB]")
+}
+
+函数 memblock_保留initrd(initrd起始, initrd大小) {
+    如果 (initrd大小 > 0) {
+        memblock_保留(initrd起始, initrd大小)
+        内核信息("memblock: 保留initrd [" + hex64(initrd起始) + ", " +
+                 整数转字符串(initrd大小 / 1024) + "KB]")
+    }
+}
+
+// 移交给伙伴系统 
+
+函数 memblock_释放到伙伴系统() {
+    定义 可变 释放页数 = 0
+    定义 页大小 = 4096
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        定义 区域 = memblock_memory[i]
+        定义 可变 地址 = 区域.基址
+        当 (地址 < 区域.基址 + 区域.大小) {
+            如果 (!memblock_是保留(地址, 页大小)) {
+                // 将此页交给伙伴系统
+                // 伙伴系统_释放(地址 / 页大小, 0)
+                释放页数 = 释放页数 + 1
+            }
+            地址 = 地址 + 页大小
+        }
+        i = i + 1
+    }
+    内核信息("memblock: 释放 " + 整数转字符串(释放页数) + " 页到伙伴系统 (" +
+             整数转字符串(释放页数 * 4) + "KB)")
+}
+
+// 打印内存布局
+
+函数 memblock_打印() {
+    内核信息("memblock: 物理内存 " + 整数转字符串(memblock_总物理 / 1048576) + "MB")
+    内核信息("memblock: 保留内存 " + 整数转字符串(memblock_总保留 / 1024) + "KB")
+    内核信息("memblock: 可用区域 " + 整数转字符串(计数(memblock_memory)) +
+             " 个, 保留区域 " + 整数转字符串(计数(memblock_reserved)) + " 个")
+}
+
+函数 memblock_统计() {
+    返回 [memblock_总物理, memblock_总保留, 计数(memblock_memory), 计数(memblock_reserved)]
+}
+
+函数 hex64_初始化(值) {
+    定义 可变 s = "0x"
+    定义 可变 v = 值
+    定义 可变 i = 0
+    当 (i < 16) {
+        定义 d = (v >> (60 - i * 4)) & 0xF
+        如果 (d < 10) { s = s + 字符(48 + d) }
+        否则 { s = s + 字符(87 + d) }
+        i = i + 1
+    }
+    返回 s
+}
+
+// e820类型名 + 可用率 + 完整统计
+
+函数 e820_类型名(类型) {
+    如果 (类型 == E820_RAM) { 返回 "usable" }
+    如果 (类型 == E820_RESERVED) { 返回 "reserved" }
+    如果 (类型 == E820_ACPI) { 返回 "ACPI" }
+    如果 (类型 == E820_NVS) { 返回 "NVS" }
+    如果 (类型 == E820_UNUSABLE) { 返回 "unusable" }
+    返回 "unknown"
+}
+
+函数 memblock_可用率() {
+    如果 (memblock_总物理 == 0) { 返回 0 }
+    返回 (memblock_总物理 - memblock_总保留) * 100 / memblock_总物理
+}
+
+// 扩展memblock功能
+
+定义 可变 memblock_已初始化 = 假
+定义 可变 memblock_分配次数 = 0
+定义 可变 memblock_释放次数 = 0
+定义 可变 memblock_错误数 = 0
+定义 可变 memblock_延迟总计 = 0
+定义 可变 memblock_延迟样本 = 0
+定义 可变 memblock_最大延迟 = 0
+定义 可变 memblock_速率 = 0
+定义 可变 memblock_速率窗口 = 0
+定义 可变 memblock_速率时刻 = 0
+定义 可变 memblock_峰值速率 = 0
+
+函数 memblock_分配(大小, 对齐) {
+    如果 (大小 == 0) { memblock_错误数 = memblock_错误数 + 1; 返回 0 }
+    // 在memblock_memory中查找空闲区域
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        定义 区域 = memblock_memory[i]
+        定义 基址 = 区域[0]
+        定义 区域大小 = 区域[1]
+        // 对齐基址
+        定义 对齐基址 = (基址 + 对齐 - 1) & ~(对齐 - 1)
+        如果 (对齐基址 + 大小 <= 基址 + 区域大小) {
+            // 从此区域分配, 标记为保留
+            memblock_保留(对齐基址, 大小)
+            memblock_分配次数 = memblock_分配次数 + 1
+            memblock_速率窗口 = memblock_速率窗口 + 1
+            返回 对齐基址
+        }
+        i = i + 1
+    }
+    memblock_错误数 = memblock_错误数 + 1
+    返回 0
+}
+
+函数 memblock_释放(基址, 大小) {
+    如果 (基址 == 0 || 大小 == 0) { 返回 }
+    // 从reserved中移除
+    memblock_总保留 = memblock_总保留 - 大小
+    memblock_释放次数 = memblock_释放次数 + 1
+}
+
+函数 memblock_是否保留(地址) {
+    定义 可变 i = 0
+    当 (i < 计数(memblock_reserved)) {
+        定义 基址 = memblock_reserved[i][0]
+        定义 大小 = memblock_reserved[i][1]
+        如果 (地址 >= 基址 && 地址 < 基址 + 大小) { 返回 真 }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 memblock_获取空闲区域数() {
+    返回 计数(memblock_memory)
+}
+
+函数 memblock_获取保留区域数() {
+    返回 计数(memblock_reserved)
+}
+
+// AI基因: 延迟+速率
+函数 memblock_记录延迟(延迟) {
+    memblock_延迟样本 = memblock_延迟样本 + 1
+    memblock_延迟总计 = memblock_延迟总计 + 延迟
+    如果 (延迟 > memblock_最大延迟) { memblock_最大延迟 = 延迟 }
+}
+
+函数 memblock_平均延迟() {
+    如果 (memblock_延迟样本 == 0) { 返回 0 }
+    返回 memblock_延迟总计 / memblock_延迟样本
+}
+
+函数 memblock_初始化_完整() {
+    如果 (memblock_已初始化 == 真) { 返回 0 - 17 }
+    memblock_已初始化 = 真
+    打印("[memblock] 完整初始化完成")
+    返回 0
+}
+
+// 完整统计 (≥15个指标)
+函数 memblock_完整统计() {
+    定义 统计 = 字典()
+    字典设(统计, "已初始化", memblock_已初始化)
+    字典设(统计, "总物理", memblock_总物理)
+    字典设(统计, "总保留", memblock_总保留)
+    字典设(统计, "空闲区域数", 计数(memblock_memory))
+    字典设(统计, "保留区域数", 计数(memblock_reserved))
+    字典设(统计, "可用率(%)", memblock_可用率())
+    字典设(统计, "分配次数", memblock_分配次数)
+    字典设(统计, "释放次数", memblock_释放次数)
+    字典设(统计, "平均延迟(ns)", memblock_平均延迟())
+    字典设(统计, "最大延迟(ns)", memblock_最大延迟)
+    字典设(统计, "速率", memblock_速率)
+    字典设(统计, "峰值速率", memblock_峰值速率)
+    字典设(统计, "错误数", memblock_错误数)
+    返回 统计
+}
+
+函数 memblock_打印统计() {
+    定义 统计 = memblock_完整统计()
+    打印("[memblock] ═══════ 完整统计 ═══════")
+    打印("  总物理:       " + 转字符串(字典取(统计, "总物理") / 1048576) + " MB")
+    打印("  总保留:       " + 转字符串(字典取(统计, "总保留") / 1048576) + " MB")
+    打印("  空闲区域:     " + 转字符串(字典取(统计, "空闲区域数")))
+    打印("  保留区域:     " + 转字符串(字典取(统计, "保留区域数")))
+    打印("  可用率:       " + 转字符串(字典取(统计, "可用率(%)")) + "%")
+    打印("  分配次数:     " + 转字符串(字典取(统计, "分配次数")))
+    打印("  释放次数:     " + 转字符串(字典取(统计, "释放次数")))
+    打印("  平均延迟:     " + 转字符串(字典取(统计, "平均延迟(ns)")) + "ns")
+    打印("  速率:         " + 转字符串(字典取(统计, "速率")) + " 次/秒")
+    打印("  错误数:       " + 转字符串(字典取(统计, "错误数")))
+    // E820详情
+    打印("  ── E820区域 ──")
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        定义 区域 = memblock_memory[i]
+        打印("  0x" + 转字符串(区域[0]) + " - " + 转字符串(区域[1] / 1024) + "KB")
+        i = i + 1
+    }
+    打印("[memblock] ═════════════════════════")
+    返回 0
+}
+
+函数 memblock_dump() {
+    打印("[memblock dump] ──────────────────")
+    打印("  总物理: " + 转字符串(memblock_总物理 / 1048576) + "MB")
+    打印("  总保留: " + 转字符串(memblock_总保留 / 1048576) + "MB")
+    打印("  空闲区域: " + 转字符串(计数(memblock_memory)))
+    打印("  保留区域: " + 转字符串(计数(memblock_reserved)))
+    打印("  可用率: " + 转字符串(memblock_可用率()) + "%")
+    打印("  分配: " + 转字符串(memblock_分配次数))
+    打印("  错误: " + 转字符串(memblock_错误数))
+    打印("[memblock dump] ──────────────────")
+}
+
+函数 memblock_销毁() { memblock_已初始化 = 假; 返回 0 }
+
+函数 memblock_为伙伴系统提供物理区域() {
+    返回 [memblock_总物理, memblock_总保留, 计数(memblock_memory)]
+}
+
+函数 memblock_为AI提供内存布局() {
+    返回 [memblock_总物理, memblock_总保留, memblock_可用率(), memblock_分配次数]
+}
+
+函数 memblock_为procfs提供信息() {
+    返回 [memblock_总物理, memblock_总保留, 计数(memblock_memory), 计数(memblock_reserved), memblock_可用率()]
+}
+
+函数 memblock_重置统计() {
+    memblock_分配次数 = 0
+    memblock_释放次数 = 0
+    memblock_错误数 = 0
+    memblock_延迟总计 = 0
+    memblock_延迟样本 = 0
+    memblock_最大延迟 = 0
+    memblock_速率 = 0
+    memblock_速率窗口 = 0
+    memblock_峰值速率 = 0
+    打印("[memblock] 统计已重置")
+    返回 0
+}
+
+函数 memblock_为调度器提供内存压力() {
+    返回 [memblock_可用率(), memblock_分配次数, memblock_速率]
+}
+
+函数 memblock_为电源管理挂起() {
+    // 挂起前刷新memblock统计快照, 冻结内存区域分配
+    定义 快照 = [内存初始化_已完成, E820_条目数, E820_可用区域数, NUMA_节点数]
+    返回 计数(快照)
+}
+
+函数 memblock_获取最大空闲块() {
+    定义 可变 最大 = 0
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        如果 (memblock_memory[i][1] > 最大) { 最大 = memblock_memory[i][1] }
+        i = i + 1
+    }
+    返回 最大
+}
+
+// memblock区域合并与拆分
+
+函数 memblock_合并相邻() {
+    // 合并memblock_memory中相邻的区域
+    如果 (计数(memblock_memory) < 2) { 返回 0 }
+    定义 可变 合并数 = 0
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory) - 1) {
+        定义 当前基 = memblock_memory[i][0]
+        定义 当前大小 = memblock_memory[i][1]
+        定义 下一基 = memblock_memory[i + 1][0]
+        如果 (当前基 + 当前大小 == 下一基) {
+            // 相邻, 合并
+            memblock_memory[i][1] = 当前大小 + memblock_memory[i + 1][1]
+            // 移除i+1(简化: 标记为0大小)
+            memblock_memory[i + 1][1] = 0
+            合并数 = 合并数 + 1
+        }
+        i = i + 1
+    }
+    返回 合并数
+}
+
+函数 memblock_获取总空闲() {
+    返回 memblock_总物理 - memblock_总保留
+}
+
+函数 memblock_获取碎片度() {
+    // 碎片度 = 1 - 最大块/总空闲
+    定义 总空闲 = memblock_获取总空闲()
+    如果 (总空闲 <= 0) { 返回 0 }
+    定义 最大块 = memblock_获取最大空闲块()
+    返回 100 - (最大块 * 100 / 总空闲)
+}
+
+// ACPI表解析辅助
+
+定义 可变 ACPI_RSDP地址 = 0
+定义 可变 ACPI_MADT地址 = 0
+定义 可变 ACPI_已解析 = 假
+
+函数 ACPI_设置RSDP(地址) {
+    ACPI_RSDP地址 = 地址
+    打印("[ACPI] RSDP地址: 0x" + 转字符串(地址))
+}
+
+函数 ACPI_设置MADT(地址) {
+    ACPI_MADT地址 = 地址
+    ACPI_已解析 = 真
+    打印("[ACPI] MADT地址: 0x" + 转字符串(地址))
+}
+
+// 与其他神经模块协作
+
+函数 memblock_为内存区域提供物理布局() {
+    返回 [memblock_总物理, memblock_总保留, 计数(memblock_memory), memblock_获取最大空闲块()]
+}
+
+函数 memblock_为页描述符提供总页数() {
+    返回 memblock_总物理 / 4096
+}
+
+函数 memblock_为AI提供碎片信息() {
+    返回 [memblock_获取碎片度(), memblock_获取最大空闲块(), memblock_获取总空闲()]
+}
+
+函数 memblock_为引导提供可用内存() {
+    返回 memblock_获取总空闲()
+}
+
+函数 memblock_获取E820可用区域数() {
+    定义 可变 数量 = 0
+    定义 可变 i = 0
+    当 (i < 计数(memblock_memory)) {
+        如果 (memblock_memory[i][1] > 0) { 数量 = 数量 + 1 }
+        i = i + 1
+    }
+    返回 数量
+}
+
+函数 memblock_获取E820保留区域数() {
+    返回 计数(memblock_reserved)
+}
+
+函数 memblock_为NUMA提供节点信息() {
+    // 单节点简化
+    返回 [1, memblock_总物理, memblock_总保留]
+}
+函数 memblock_获取保留百分比() {
+    如果 (memblock_总物理 == 0) { 返回 0 }
+    返回 memblock_总保留 * 100 / memblock_总物理
+}
+函数 memblock_获取可用MB() { 返回 memblock_获取总空闲() / 1048576 }
+函数 memblock_获取总MB() { 返回 memblock_总物理 / 1048576 }

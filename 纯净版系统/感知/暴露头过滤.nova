@@ -1,0 +1,146 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("./兼容桥.nova")
+导入("../外联/安全发送.nova")
+导入("./样式解析.nova")
+导入("./内核直连层.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../执行/底层系统调.nova")
+导入("../外联/安全创建.nova")
+导入("../外联/域名初始化.nova")
+
+// §7 暴露头过滤
+
+// CORS安全列表响应头(脚本默认可读):
+//   缓存-Control, Content-Language, Content-Length, Content-Type,
+//   Expires, Last-Modified, Pragma
+// 其他头需要 Access-Control-Expose-Headers 授权
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 CORS_头可暴露(头名, expose_headers) {
+    // CORS安全列表
+    如果 (字符串_相等_忽略大小写(头名, "cache-control")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "content-language")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "content-length")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "content-type")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "expires")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "last-modified")) { 返回 真 }
+    如果 (字符串_相等_忽略大小写(头名, "pragma")) { 返回 真 }
+    // 检查Access-Control-Expose-Headers
+    如果 (expose_headers != 0) {
+        如果 (字符串_相等(expose_headers, "*")) { 返回 真 }
+        如果 (字符串_包含_忽略大小写(expose_headers, 头名)) { 返回 真 }
+    }
+    返回 假
+}
+
+// 辅助
+函数 字符串_相等_忽略大小写(a, b) {
+    如果 (a == 0 || b == 0) { 返回 a == b }
+    定义 la = 字节长度(a); 定义 lb = 字节长度(b)
+    如果 (la != lb) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < la) {
+        定义 ca = 字节取(a, i); 定义 cb = 字节取(b, i)
+        如果 (ca >= 0x41 && ca <= 0x5A) { ca = ca + 32 }
+        如果 (cb >= 0x41 && cb <= 0x5A) { cb = cb + 32 }
+        如果 (ca != cb) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+函数 字符串_包含_忽略大小写(haystack, needle) {
+    // 滑动窗口: 在haystack中查找needle(忽略大小写)
+    如果 (haystack == 0 || needle == 0) { 返回 假 }
+    定义 hlen = 字节长度(haystack)
+    定义 nlen = 字节长度(needle)
+    如果 (nlen == 0) { 返回 真 }
+    如果 (nlen > hlen) { 返回 假 }
+    定义 可变 i = 0
+    当 (i <= hlen - nlen) {
+        定义 可变 j = 0
+        定义 可变 匹配 = 真
+        当 (j < nlen) {
+            定义 ca = 字节取(haystack, i + j)
+            定义 cb = 字节取(needle, j)
+            如果 (ca >= 0x41 && ca <= 0x5A) { ca = ca + 32 }
+            如果 (cb >= 0x41 && cb <= 0x5A) { cb = cb + 32 }
+            如果 (ca != cb) { 匹配 = 假; j = nlen }
+            j = j + 1
+        }
+        如果 (匹配) { 返回 真 }
+        i = i + 1
+    }
+    返回 假
+}
+函数 HTTP_获取响应头(响应, 头名) {
+    如果 (响应 == 0 || 头名 == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < 响应.头数) {
+        如果 (字符串_相等_忽略大小写(响应.头名[i], 头名)) {
+            返回 响应.头值[i]
+        }
+        i = i + 1
+    }
+    返回 0
+}
+函数 字符串转整数(s) {
+    如果 (s == 0) { 返回 0 }
+    定义 可变 i = 0
+    定义 可变 result = 0
+    当 (i < 字节长度(s) && 字节取(s, i) >= 0x30 && 字节取(s, i) <= 0x39) {
+        result = result * 10 + (字节取(s, i) - 0x30)
+        i = i + 1
+    }
+    返回 result
+}
+函数 整数转字符串(n) {
+    定义 缓冲 = 堆_分配(20)
+    定义 可变 val = n
+    如果 (val == 0) { 内存_写8(缓冲, 0x30); 内存_写8(缓冲 + 1, 0); 返回 缓冲 }
+    定义 可变 负 = 假
+    如果 (val < 0) { 负 = 真; val = 0 - val }
+    定义 可变 i = 0
+    定义 临时 = 堆_分配(20)
+    当 (val > 0) { 内存_写8(临时 + i, (val % 10) + 0x30); val = val / 10; i = i + 1 }
+    定义 可变 pos = 0
+    如果 (负) { 内存_写8(缓冲, 0x2D); pos = 1 }
+    定义 可变 j = i - 1
+    当 (j >= 0) { 内存_写8(缓冲 + pos, 内存_读8(临时 + j)); pos = pos + 1; j = j - 1 }
+    内存_写8(缓冲 + pos, 0)
+    堆_释放(临时)
+    返回 缓冲
+}
+函数 取数_完整链路(req) {
+    // 完整的取数链路: Service工线拦截 → 缓存 → 网络请求
+    如果 (req == 0) { 返回 0 }
+    // 1. 检查Service工线
+    定义 sw = Service工线_获取当前()
+    如果 (sw != 0) {
+        定义 resp = Service工线_fetch事件(sw, req)
+        如果 (resp != 0) { 返回 resp }
+    }
+    // 2. 检查HTTP缓存
+    定义 cached = HTTP缓存_查找(req.url)
+    如果 (cached != 0 && HTTP缓存_新鲜(cached)) {
+        返回 cached.响应
+    }
+    // 3. 发起网络请求
+    定义 host = URL_提取主机(req.url)
+    定义 ip = 域名_解析(host)
+    如果 (ip == 0) { 返回 0 }
+    定义 port = URL_提取端口(req.url)
+    定义 fd = 平台_tcp_连接(ip, port)
+    如果 (fd < 0) { 返回 0 }
+    定义 tls = 安全_创建会话(fd, host)
+    安全_握手(tls)
+    定义 resp = HTTP_发送请求(fd, tls, req)
+    安全_关闭(tls); 系统调用_close(fd)
+    // 4. 缓存响应
+    如果 (resp != 0 && HTTP缓存_可缓存(resp)) {
+        HTTP缓存_存储(req.url, resp)
+    }
+    返回 resp
+}

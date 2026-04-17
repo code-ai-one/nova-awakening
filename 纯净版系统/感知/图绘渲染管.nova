@@ -1,0 +1,148 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+//       webgl_rendering_context_base.cc (~5000行)
+//       webgl2_rendering_context.cc 
+//       webgl_program.cc (~800行)
+//       webgl_shader.cc 
+//       webgl_buffer.cc (~400行)
+//       webgl_texture.cc (~600行)
+//       webgl_framebuffer.cc 
+// 图绘: 浏览器中的OpenGL ES 2.0/3.0
+//   const gl = canvas.getContext('webgl2')
+//   — 着色器编译 (GLSL ES)
+//   — 顶点缓冲 / 索引缓冲 / 帧缓冲
+//   — 纹理 (2D / CubeMap / 3D)
+//   — 统一变量(uniform) / 属性(attribute)
+//   — 绘制调用(draw数组s / draw元素s)
+//   — 帧缓冲对象(FBO / 离屏渲染)
+//   — 图绘2: UBO / VAO / Transform Feedback / MSAA
+// 渲染管线:
+//   顶点数据 → 顶点着色器 → 图元装配 → 光栅化 → 片段着色器 → 帧缓冲
+
+// §1 GL常量(精选)
+
+定义 GL_ARRAY_BUFFER         = 0x8892
+定义 GL_元素_ARRAY_BUFFER = 0x8893
+定义 GL_UNIFORM_BUFFER       = 0x8A11
+定义 GL_STATIC_DRAW          = 0x88E4
+定义 GL_DYNAMIC_DRAW         = 0x88E8
+定义 GL_STREAM_DRAW          = 0x88E0
+
+定义 GL_VERTEX_SHADER   = 0x8B31
+定义 GL_FRAGMENT_SHADER = 0x8B30
+
+定义 GL_FLOAT           = 0x1406
+定义 GL_INT             = 0x1404
+定义 GL_UNSIGNED_INT    = 0x1405
+定义 GL_UNSIGNED_SHORT  = 0x1403
+定义 GL_UNSIGNED_BYTE   = 0x1401
+
+定义 GL_TRIANGLES       = 0x0004
+定义 GL_TRIANGLE_STRIP  = 0x0005
+定义 GL_TRIANGLE_FAN    = 0x0006
+定义 GL_LINES           = 0x0001
+定义 GL_LINE_STRIP      = 0x0003
+定义 GL_POINTS          = 0x0000
+
+定义 GL_TEXTURE_2D      = 0x0DE1
+定义 GL_TEXTURE_CUBE_MAP = 0x8513
+定义 GL_TEXTURE_3D      = 0x806F
+
+定义 GL_RGBA            = 0x1908
+定义 GL_RGB             = 0x1907
+定义 GL_RGBA8           = 0x8058
+定义 GL_DEPTH_COMPONENT = 0x1902
+
+定义 GL_FRAMEBUFFER     = 0x8D40
+定义 GL_RENDERBUFFER    = 0x8D41
+定义 GL_COLOR_ATTACHMENT0 = 0x8CE0
+定义 GL_DEPTH_ATTACHMENT  = 0x8D00
+
+定义 GL_BLEND           = 0x0BE2
+定义 GL_DEPTH_TEST      = 0x0B71
+定义 GL_CULL_FACE       = 0x0B44
+定义 GL_SCISSOR_TEST    = 0x0C11
+定义 GL_STENCIL_TEST    = 0x0B90
+
+定义 GL_COMPILE_STATUS  = 0x8B81
+定义 GL_LINK_STATUS     = 0x8B82
+
+// §2 图绘对象
+
+结构 GLBuffer {
+    id,
+    目标,    // u32 GL_ARRAY_BUFFER 等
+    数据,
+    大小,
+    用法,    // u32 GL_STATIC_DRAW 等
+}
+
+结构 GLShader {
+    id,
+    类型,    // u32 GL_VERTEX_SHADER / GL_FRAGMENT_SHADER
+    源码,
+    已编译,
+    错误日志,
+}
+
+结构 GLProgram {
+    id,
+    顶点着色器,    // u64 GLShader*
+    片段着色器,
+    已链接,
+    错误日志,
+    // Uniform位置
+    uniform列表,    // u64 [名称, 位置, 类型, 值] 数组
+    uniform数量,
+    // Attribute位置
+    attribute列表,
+    attribute数量,
+}
+
+结构 GLTexture {
+    id,
+    目标,    // u32 GL_TEXTURE_2D等
+    宽,
+    高,
+    格式,
+    数据,
+    // 采样参数
+    min_filter,
+    mag_filter,
+    wrap_s,
+    wrap_t,
+    已生成mipmap,
+}
+
+结构 GLFramebuffer {
+    id,
+    颜色附件,    // u64 GLTexture* 或 GL渲染buffer*
+    深度附件,
+    模板附件,
+    宽,
+    高,
+}
+
+结构 GL渲染buffer {
+    id,
+    格式,
+    宽,
+    高,
+    数据,
+}
+
+// 图绘2: Vertex 数组 Object
+结构 GLVAO {
+    id,
+    // 顶点属性绑定
+    属性启用,    // u64 位掩码
+    属性缓冲,    // u64 GLBuffer*数组 (每个属性绑定的缓冲)
+    属性偏移,    // u64 u32数组
+    属性步长,    // u64 u32数组
+    属性类型,    // u64 u32数组
+    属性大小,    // u64 u32数组 (分量数:1-4)
+    属性数量,
+    // 索引缓冲
+    索引缓冲,    // u64 GLBuffer*
+}

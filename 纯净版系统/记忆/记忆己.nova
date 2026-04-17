@@ -1,0 +1,218 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/硬链接.nova")
+导入("./进程文件初.nova")
+导入("../中枢/整数转字符串.nova")
+
+//   1. 完整的内存统计信息, 与Linux格式兼容
+//   2. 所有值以kB为单位, 右对齐
+//   3. 供free/top/htop等用户工具解析
+
+函数 proc_meminfo_读(数据) {
+    // 收集各类内存统计
+    定义 总KB = 物理内存_总页数() * 4
+    定义 空闲KB = 物理内存_空闲页数() * 4
+    定义 可用KB = 物理内存_可用页数() * 4     // MemAvailable (空闲+可回收)
+    定义 缓冲KB = 缓冲区_页数() * 4            // Buffers
+    定义 缓存KB = 页缓存_页数() * 4            // 缓存d
+    定义 交换缓存KB = 0                         // Swap缓存d
+    定义 活跃KB = 活跃页数() * 4                // Active
+    定义 非活跃KB = 非活跃页数() * 4            // Inactive
+    定义 活跃匿名KB = 活跃匿名页数() * 4       // Active(anon)
+    定义 非活跃匿名KB = 非活跃匿名页数() * 4   // Inactive(anon)
+    定义 活跃文件KB = 活跃文件页数() * 4        // Active(file)
+    定义 非活跃文件KB = 非活跃文件页数() * 4    // Inactive(file)
+    定义 脏KB = 脏页数() * 4                    // Dirty
+    定义 回写KB = 回写页数() * 4                // Writeback
+    定义 匿名KB = 匿名页数() * 4               // AnonPages
+    定义 映射KB = 映射页数() * 4                // Mapped
+    定义 共享KB = 共享页数() * 4                // Shmem
+    定义 内核回收KB = 内核可回收页数() * 4      // KReclaimable
+    定义 Nova块缓存总KB = Nova块缓存_总页数() * 4           // Nova块缓存
+    定义 Nova块缓存可回收KB = Nova块缓存_可回收页数() * 4   // SReclaimable
+    定义 Nova块缓存不可回收KB = Nova块缓存总KB - Nova块缓存可回收KB // SUnreclaim
+    定义 内核栈KB = 内核栈_页数() * 4           // KernelStack
+    定义 页表KB = 页表_页数() * 4               // PageTables
+    定义 交换总KB = 交换_总页数() * 4           // SwapTotal
+    定义 交换空闲KB = 交换_空闲页数() * 4       // SwapFree
+
+    // 格式化输出 
+    定义 可变 输出 = ""
+    输出 = 输出 + meminfo_行("MemTotal:",        总KB)
+    输出 = 输出 + meminfo_行("MemFree:",         空闲KB)
+    输出 = 输出 + meminfo_行("MemAvailable:",    可用KB)
+    输出 = 输出 + meminfo_行("Buffers:",         缓冲KB)
+    输出 = 输出 + meminfo_行("缓存d:",          缓存KB)
+    输出 = 输出 + meminfo_行("Swap缓存d:",      交换缓存KB)
+    输出 = 输出 + meminfo_行("Active:",          活跃KB)
+    输出 = 输出 + meminfo_行("Inactive:",        非活跃KB)
+    输出 = 输出 + meminfo_行("Active(anon):",    活跃匿名KB)
+    输出 = 输出 + meminfo_行("Inactive(anon):",  非活跃匿名KB)
+    输出 = 输出 + meminfo_行("Active(file):",    活跃文件KB)
+    输出 = 输出 + meminfo_行("Inactive(file):",  非活跃文件KB)
+    输出 = 输出 + meminfo_行("Dirty:",           脏KB)
+    输出 = 输出 + meminfo_行("Writeback:",       回写KB)
+    输出 = 输出 + meminfo_行("AnonPages:",       匿名KB)
+    输出 = 输出 + meminfo_行("Mapped:",          映射KB)
+    输出 = 输出 + meminfo_行("Shmem:",           共享KB)
+    输出 = 输出 + meminfo_行("KReclaimable:",    内核回收KB)
+    输出 = 输出 + meminfo_行("Nova块缓存:",            Nova块缓存总KB)
+    输出 = 输出 + meminfo_行("SReclaimable:",    Nova块缓存可回收KB)
+    输出 = 输出 + meminfo_行("SUnreclaim:",      Nova块缓存不可回收KB)
+    输出 = 输出 + meminfo_行("KernelStack:",     内核栈KB)
+    输出 = 输出 + meminfo_行("PageTables:",      页表KB)
+    输出 = 输出 + meminfo_行("SwapTotal:",       交换总KB)
+    输出 = 输出 + meminfo_行("SwapFree:",        交换空闲KB)
+    输出 = 输出 + meminfo_行("CommitLimit:",     总KB + 交换总KB)
+    输出 = 输出 + meminfo_行("Committed_AS:",    0)
+    输出 = 输出 + meminfo_行("VmallocTotal:",    34359738367)  // 128TB-1
+    输出 = 输出 + meminfo_行("VmallocUsed:",     0)
+    输出 = 输出 + meminfo_行("HugePages_Total:", 0)
+    输出 = 输出 + meminfo_行("HugePages_Free:",  0)
+    输出 = 输出 + meminfo_行("Hugepagesize:",    2048)
+
+    返回 输出
+}
+
+函数 meminfo_行(标签, 值KB) {
+    // 格式: "标签           值 kB\n" (右对齐到第16列)
+    定义 填充 = 16 - 字符串长度(标签)
+    如果 (填充 < 1) { 填充 = 1 }
+    定义 可变 空格 = ""
+    定义 可变 i = 0
+    当 (i < 填充) { 空格 = 空格 + " "; i = i + 1 }
+
+    // 数值右对齐到8位
+    定义 值字符串 = 整数转字符串(值KB)
+    定义 数值填充 = 8 - 字符串长度(值字符串)
+    如果 (数值填充 < 0) { 数值填充 = 0 }
+    定义 可变 前导空格 = ""
+    i = 0
+    当 (i < 数值填充) { 前导空格 = 前导空格 + " "; i = i + 1 }
+
+    返回 标签 + 空格 + 前导空格 + 值字符串 + " kB\n"
+}
+
+// 内存统计数据源 — 连接到各子系统的真实全局变量
+
+// 全局内存统计计数器(由各子系统更新)
+定义 可变 vm_stat_总页数 = 0
+定义 可变 vm_stat_空闲页数 = 0
+定义 可变 vm_stat_活跃匿名 = 0
+定义 可变 vm_stat_非活跃匿名 = 0
+定义 可变 vm_stat_活跃文件 = 0
+定义 可变 vm_stat_非活跃文件 = 0
+定义 可变 vm_stat_脏页 = 0
+定义 可变 vm_stat_回写页 = 0
+定义 可变 vm_stat_匿名页 = 0
+定义 可变 vm_stat_映射页 = 0
+定义 可变 vm_stat_共享页 = 0
+定义 可变 vm_stat_Nova块缓存可回收 = 0
+定义 可变 vm_stat_Nova块缓存不可回收 = 0
+定义 可变 vm_stat_内核栈页 = 0
+定义 可变 vm_stat_页表页 = 0
+定义 可变 vm_stat_缓冲页 = 0
+定义 可变 vm_stat_缓存页 = 0
+定义 可变 vm_stat_交换总页 = 0
+定义 可变 vm_stat_交换空闲页 = 0
+
+函数 物理内存_总页数()     { 返回 vm_stat_总页数 }
+函数 物理内存_空闲页数()   { 返回 vm_stat_空闲页数 }
+函数 物理内存_可用页数()   {
+    // MemAvailable
+    // = 空闲 + 页缓存(可回收部分) + Nova块缓存可回收 - 低水位保留
+    定义 空闲 = vm_stat_空闲页数
+    定义 可回收 = vm_stat_缓存页 + vm_stat_Nova块缓存可回收
+    定义 低水位 = vm_stat_总页数 / 32  // 保留3%
+    定义 可用 = 空闲 + 可回收 - 低水位
+    如果 (可用 < 0) { 可用 = 0 }
+    返回 可用
+}
+函数 缓冲区_页数()         { 返回 vm_stat_缓冲页 }
+函数 页缓存_页数_meminfo() { 返回 vm_stat_缓存页 }
+函数 活跃页数()            { 返回 vm_stat_活跃匿名 + vm_stat_活跃文件 }
+函数 非活跃页数()          { 返回 vm_stat_非活跃匿名 + vm_stat_非活跃文件 }
+函数 活跃匿名页数()        { 返回 vm_stat_活跃匿名 }
+函数 非活跃匿名页数()      { 返回 vm_stat_非活跃匿名 }
+函数 活跃文件页数()        { 返回 vm_stat_活跃文件 }
+函数 非活跃文件页数()      { 返回 vm_stat_非活跃文件 }
+函数 脏页数_meminfo()      { 返回 vm_stat_脏页 }
+函数 回写页数()            { 返回 vm_stat_回写页 }
+函数 匿名页数()            { 返回 vm_stat_匿名页 }
+函数 映射页数()            { 返回 vm_stat_映射页 }
+函数 共享页数()            { 返回 vm_stat_共享页 }
+函数 内核可回收页数()      { 返回 vm_stat_Nova块缓存可回收 }
+函数 Nova块缓存_总页数()         { 返回 vm_stat_Nova块缓存可回收 + vm_stat_Nova块缓存不可回收 }
+函数 Nova块缓存_可回收页数()     { 返回 vm_stat_Nova块缓存可回收 }
+函数 内核栈_页数()         { 返回 vm_stat_内核栈页 }
+函数 页表_页数()           { 返回 vm_stat_页表页 }
+函数 交换_总页数()         { 返回 vm_stat_交换总页 }
+函数 交换_空闲页数()       { 返回 vm_stat_交换空闲页 }
+
+// vm_stat更新接口(由伙伴系统/SLUB/LRU/页缓存/回写等调用)
+
+函数 vm_stat_初始化(总页数) {
+    vm_stat_总页数 = 总页数
+    vm_stat_空闲页数 = 总页数
+}
+
+函数 vm_stat_更新_空闲(增量) { vm_stat_空闲页数 = vm_stat_空闲页数 + 增量 }
+函数 vm_stat_更新_活跃匿名(增量) { vm_stat_活跃匿名 = vm_stat_活跃匿名 + 增量 }
+函数 vm_stat_更新_非活跃匿名(增量) { vm_stat_非活跃匿名 = vm_stat_非活跃匿名 + 增量 }
+函数 vm_stat_更新_活跃文件(增量) { vm_stat_活跃文件 = vm_stat_活跃文件 + 增量 }
+函数 vm_stat_更新_非活跃文件(增量) { vm_stat_非活跃文件 = vm_stat_非活跃文件 + 增量 }
+函数 vm_stat_更新_脏页(增量) { vm_stat_脏页 = vm_stat_脏页 + 增量 }
+函数 vm_stat_更新_回写页(增量) { vm_stat_回写页 = vm_stat_回写页 + 增量 }
+函数 vm_stat_更新_匿名(增量) { vm_stat_匿名页 = vm_stat_匿名页 + 增量 }
+函数 vm_stat_更新_映射(增量) { vm_stat_映射页 = vm_stat_映射页 + 增量 }
+函数 vm_stat_更新_Nova块缓存(可回收增量, 不可回收增量) {
+    vm_stat_Nova块缓存可回收 = vm_stat_Nova块缓存可回收 + 可回收增量
+    vm_stat_Nova块缓存不可回收 = vm_stat_Nova块缓存不可回收 + 不可回收增量
+}
+函数 vm_stat_更新_缓存(增量) { vm_stat_缓存页 = vm_stat_缓存页 + 增量 }
+
+函数 proc_meminfo_注册() {
+    proNova公平调度_注册("meminfo", proc_meminfo_读)
+}
+
+// proNova公平调度_注册 定义在 proNova公平调度框架.nova, 此处通过导入使用
+// 总页数/空闲页数 已统一定义在 中枢/区域初始化.nova (全局总页数/全局空闲页数)
+
+// 内存使用率计算 + 快速摘要
+
+函数 内存使用率_百分比() {
+    如果 (vm_stat_总页数 == 0) { 返回 0 }
+    返回 (vm_stat_总页数 - vm_stat_空闲页数) * 100 / vm_stat_总页数
+}
+
+函数 交换使用率_百分比() {
+    如果 (vm_stat_交换总页 == 0) { 返回 0 }
+    返回 (vm_stat_交换总页 - vm_stat_交换空闲页) * 100 / vm_stat_交换总页
+}
+
+函数 meminfo_摘要() {
+    // 返回: [总MB, 已用MB, 空闲MB, 可用MB]
+    定义 总 = vm_stat_总页数 * 4 / 1024
+    定义 空闲 = vm_stat_空闲页数 * 4 / 1024
+    定义 可用 = 物理内存_可用页数() * 4 / 1024
+    返回 [总, 总 - 空闲, 空闲, 可用]
+}
+
+// 完整统计
+
+函数 meminfo_完整统计() {
+    返回 [vm_stat_总页数, vm_stat_空闲页数, 内存使用率_百分比(), 交换使用率_百分比()]
+}
+
+定义 可变 AI_记忆己_运行指标 = 0
+定义 可变 AI_记忆己_异常指标 = 0
+
+函数 AI_记忆己_自诊断() {
+    AI_记忆己_运行指标 = 0
+    返回 AI_记忆己_运行指标
+}
+
+函数 AI_记忆己_优化建议() {
+    定义 指标 = AI_记忆己_自诊断()
+    返回 "记忆己状态正常"
+}

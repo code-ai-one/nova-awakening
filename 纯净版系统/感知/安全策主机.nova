@@ -1,0 +1,113 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../标准/原生字符串.nova")
+导入("./内核直连层.nova")
+导入("./来源从地址.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/字符串替换.nova")
+
+函数 CSP_主机匹配(模式, 主机) {
+    // "*.example.com" 匹配 "a.example.com"
+    如果 (字符串_前缀匹配(模式, "*.")) {
+        定义 域名后缀 = 字符串_截取(模式, 2, 字节长度(模式))
+        返回 字符串_后缀匹配(主机, 域名后缀)
+    }
+    返回 字符串_相等(模式, 主机)
+}
+
+函数 CSP_报告违规(策略, 指令类型, 资源URL) {
+    // 构建违规报告序列, 发送到report-uri
+    如果 (策略 == 0) { 返回 }
+    定义 report_uri = 策略.report_uri
+    如果 (report_uri == 0) { 返回 }
+    // 构建序列报告
+    定义 json = 堆_分配(1024)
+    如果 (json == 0) { 返回 0 }
+    定义 可变 pos = 0
+    pos = 字符串_追加(json, pos, "{\"csp-report\":{")
+    pos = 字符串_追加(json, pos, "\"document-uri\":\"")
+    pos = 字符串_追加(json, pos, 策略.文档URI)
+    pos = 字符串_追加(json, pos, "\",\"violated-directive\":\"")
+    pos = 字符串_追加(json, pos, 指令类型)
+    pos = 字符串_追加(json, pos, "\",\"blocked-uri\":\"")
+    pos = 字符串_追加(json, pos, 资源URL)
+    pos = 字符串_追加(json, pos, "\",\"disposition\":\"")
+    如果 (策略.仅报告) { pos = 字符串_追加(json, pos, "report") }
+    否则 { pos = 字符串_追加(json, pos, "enforce") }
+    pos = 字符串_追加(json, pos, "\"}}")
+    内存_写8(json + pos, 0)
+    // 发送POST请求到report-uri
+    取数_POST_序列(report_uri, json, pos)
+    堆_释放(json)
+}
+
+// §4 CORS — 跨域资源共享
+// CORS允许服务器声明哪些源可以跨域访问:
+//   Access-Control-Allow-Origin: https://example.com
+//   Access-Control-Allow-Methods: GET, POST
+//   Access-Control-Allow-Headers: Content-Type
+//   Access-Control-Max-Age: 86400
+// 预检请求(Preflight):
+//   非简单请求先发OPTIONS请求, 服务器返回CORS头
+//   简单请求: GET/HEAD/POST + 标准Content-Type
+// 流程:
+//   1. 浏览器发起跨域请求
+//   2. 如果是复杂请求 → 先发预检OPTIONS
+//   3. 检查响应中的CORS头
+//   4. 头匹配 → 允许访问; 不匹配 → 阻止JS读取响应
+
+// 请求模式
+定义 请求模式_同源     = 0     // same-origin (fetch默认)
+定义 请求模式_CORS     = 1     // cors
+定义 请求模式_无CORS   = 2     // no-cors (img/script/link)
+定义 请求模式_导航     = 3     // navigate
+
+// CORS检查结果
+定义 CORS_允许         = 0
+定义 CORS_阻止_无头    = 1     // 响应无CORS头
+定义 CORS_阻止_源不匹配 = 2   // Allow-Origin不匹配
+定义 CORS_阻止_方法    = 3     // 方法不允许
+定义 CORS_阻止_头      = 4     // 自定义头不允许
+
+结构 CORS响应头 {
+    允许源,    // u64 "https://example.com" 或 "*"
+    允许方法,    // u64 "GET, POST, PUT"
+    允许头,    // u64 "Content-Type, Authorization"
+    允许凭证,    // 布尔 Access-Control-Allow-Credentials
+    最大缓存,    // u32 秒
+    暴露头,    // u64 Access-Control-Expose-Headers
+}
+
+// 是否需要预检
+函数 CORS_需要预检(方法, 自定义头列表) {
+    // 简单方法: GET, HEAD, POST
+    如果 (字符串_相等(方法, "GET") || 字符串_相等(方法, "HEAD")) { 返回 假 }
+    如果 (字符串_相等(方法, "POST")) {
+        // POST + 标准Content-Type → 不需要预检
+        返回 自定义头列表 != 0    // 有自定义头就需要
+    }
+    返回 真    // PUT/DELETE/PATCH等都需要
+}
+
+// 检查CORS响应
+函数 CORS_检查(请求源, cors头) {
+    如果 (cors头 == 0) { 返回 CORS_阻止_无头 }
+
+    // 检查Allow-Origin
+    如果 (cors头.允许源 == 0) { 返回 CORS_阻止_无头 }
+    如果 (!字符串_相等(cors头.允许源, "*")) {
+        // 非通配符, 必须精确匹配
+        定义 允许的源 = Origin_从URL(cors头.允许源)
+        如果 (!Origin_同源(请求源, 允许的源)) {
+            返回 CORS_阻止_源不匹配
+        }
+    }
+
+    // 如果允许凭证(cookies), 不能用通配符*
+    如果 (cors头.允许凭证 && 字符串_相等(cors头.允许源, "*")) {
+        返回 CORS_阻止_源不匹配    // 安全规则: credentials+*不允许
+    }
+
+    返回 CORS_允许
+}

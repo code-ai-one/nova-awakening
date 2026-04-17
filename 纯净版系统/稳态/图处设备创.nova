@@ -1,0 +1,152 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("./图处枚举.nova")
+导入("./能力探测通.nova")
+
+// §4 图处设备创建+能力探测
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 图处_创建设备(总线, 设备号, 功能号, 厂商ID, 设备ID, 子类) {
+    定义 gpu = 图处设备 {}
+    gpu.PCI总线 = 总线
+    gpu.PCI设备 = 设备号
+    gpu.PCI功能 = 功能号
+    gpu.厂商ID = 厂商ID
+    gpu.设备ID = 设备ID
+    gpu.类代码 = PCI_CLASS_显示
+    gpu.子类代码 = 子类
+    gpu.已初始化 = 假
+
+    // 读取子系统ID
+    定义 子系统 = PCI_配置读32(总线, 设备号, 功能号, 0x2C)
+    gpu.子系统厂商ID = 子系统 & 0xFFFF
+    gpu.子系统设备ID = (子系统 >> 16) & 0xFFFF
+
+    // 读取修订版本
+    定义 修订 = PCI_配置读32(总线, 设备号, 功能号, 0x08)
+    gpu.修订版本 = 修订 & 0xFF
+
+    // ★ 读取BAR地址(图处的MMIO映射基地址)
+    gpu.BAR0_地址 = PCI_读BAR(总线, 设备号, 功能号, 0)
+    gpu.BAR0_大小 = PCI_BAR大小(总线, 设备号, 功能号, 0)
+    gpu.BAR1_地址 = PCI_读BAR(总线, 设备号, 功能号, 1)
+    gpu.BAR1_大小 = PCI_BAR大小(总线, 设备号, 功能号, 1)
+    gpu.BAR2_地址 = PCI_读BAR(总线, 设备号, 功能号, 2)
+    gpu.BAR2_大小 = PCI_BAR大小(总线, 设备号, 功能号, 2)
+
+    // ★ 根据厂商ID识别图处类型和能力
+    图处_识别厂商(gpu)
+
+    // ★ 探测具体能力(通过MMIO读取图处内部寄存器)
+    图处_探测能力(gpu)
+
+    返回 gpu
+}
+
+// §5 厂商识别 — 根据PCI ID确定驱动类型
+
+函数 图处_识别厂商(gpu) {
+    如果 (gpu.厂商ID == 图处_VENDOR_NVIDIA) {
+        gpu.厂商名 = "NVIDIA"
+        gpu.驱动类型 = "nova-nv"    // NovaOS原生NVIDIA驱动
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_COMPUTE | 图处_CAP_DISPLAY
+        图处_识别NVIDIA型号(gpu)
+
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_AMD) {
+        gpu.厂商名 = "AMD"
+        gpu.驱动类型 = "nova-amd"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_COMPUTE | 图处_CAP_DISPLAY
+        图处_识别AMD型号(gpu)
+
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_INTEL) {
+        gpu.厂商名 = "Intel"
+        gpu.驱动类型 = "nova-intel"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_DISPLAY
+        图处_识别Intel型号(gpu)
+
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_VIRTIO) {
+        gpu.厂商名 = "VirtIO"
+        gpu.驱动类型 = "virtio-gpu"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_DISPLAY
+        gpu.型号名 = "VirtIO 图处"
+
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_QEMU) {
+        gpu.厂商名 = "QEMU"
+        gpu.驱动类型 = "bochs-drm"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_DISPLAY
+        gpu.型号名 = "QEMU stdvga (Bochs)"
+
+    } 否则 如果 (gpu.厂商ID == 图处_VENDOR_VMWARE) {
+        gpu.厂商名 = "VMware"
+        gpu.驱动类型 = "vmwgfx"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_3D | 图处_CAP_DISPLAY
+        gpu.型号名 = "VMware S显基"
+
+    } 否则 {
+        gpu.厂商名 = "Unknown(0x" + 整数转十六进制(gpu.厂商ID) + ")"
+        gpu.驱动类型 = "generic-fb"
+        gpu.能力 = 图处_CAP_2D | 图处_CAP_DISPLAY
+        gpu.型号名 = "Generic 图处"
+    }
+}
+
+// §6 具体型号识别(设备ID查表)
+
+函数 图处_识别NVIDIA型号(gpu) {
+    定义 did = gpu.设备ID
+    // NVIDIA设备ID范围(版, 实际有数千个)
+    // GeForce RTX 40系列: 0x2680-0x27FF
+    // GeForce RTX 30系列: 0x2200-0x24FF
+    // GeForce RTX 20系列: 0x1E00-0x1FFF
+    // Tesla/A100/H100:    0x20B0-0x20FF
+    如果 (did >= 0x2680 && did <= 0x27FF) {
+        gpu.型号名 = "GeForce RTX 40系列"
+        gpu.能力 = gpu.能力 | 图处_CAP_智能_ACCEL | 图处_CAP_RAY_TRACE | 图处_CAP_VULKAN
+        gpu.计算单元数 = 128   // SM数(估算)
+    } 否则 如果 (did >= 0x2200 && did <= 0x24FF) {
+        gpu.型号名 = "GeForce RTX 30系列"
+        gpu.能力 = gpu.能力 | 图处_CAP_智能_ACCEL | 图处_CAP_RAY_TRACE | 图处_CAP_VULKAN
+        gpu.计算单元数 = 84
+    } 否则 如果 (did >= 0x20B0 && did <= 0x20FF) {
+        gpu.型号名 = "NVIDIA Data Center 图处"
+        gpu.能力 = gpu.能力 | 图处_CAP_智能_ACCEL | 图处_CAP_VULKAN
+        gpu.计算单元数 = 108
+    } 否则 {
+        gpu.型号名 = "NVIDIA 图处(0x" + 整数转十六进制(did) + ")"
+        gpu.计算单元数 = 0
+    }
+}
+
+函数 图处_识别AMD型号(gpu) {
+    定义 did = gpu.设备ID
+    // AMD RDNA3: 0x744C-0x747F (RX 7900系列)
+    // AMD RDNA2: 0x73A0-0x73FF (RX 6000系列)
+    // AMD CDNA:  0x7400+ (Instinct MI系列)
+    如果 (did >= 0x744C && did <= 0x747F) {
+        gpu.型号名 = "Radeon RX 7000系列"
+        gpu.能力 = gpu.能力 | 图处_CAP_智能_ACCEL | 图处_CAP_RAY_TRACE | 图处_CAP_VULKAN
+        gpu.计算单元数 = 96
+    } 否则 如果 (did >= 0x73A0 && did <= 0x73FF) {
+        gpu.型号名 = "Radeon RX 6000系列"
+        gpu.能力 = gpu.能力 | 图处_CAP_RAY_TRACE | 图处_CAP_VULKAN
+        gpu.计算单元数 = 80
+    } 否则 {
+        gpu.型号名 = "AMD 图处(0x" + 整数转十六进制(did) + ")"
+        gpu.计算单元数 = 0
+    }
+}
+
+函数 图处_识别Intel型号(gpu) {
+    定义 did = gpu.设备ID
+    // Intel Arc: 0x56A0-0x56FF
+    // Intel UHD: 0x4600-0x46FF, 0x9A00-0x9AFF
+    如果 (did >= 0x56A0 && did <= 0x56FF) {
+        gpu.型号名 = "Intel Arc"
+        gpu.能力 = gpu.能力 | 图处_CAP_COMPUTE | 图处_CAP_RAY_TRACE | 图处_CAP_VULKAN
+        gpu.计算单元数 = 32
+    } 否则 {
+        gpu.型号名 = "Intel集成显卡(0x" + 整数转十六进制(did) + ")"
+        gpu.计算单元数 = 0
+    }
+}

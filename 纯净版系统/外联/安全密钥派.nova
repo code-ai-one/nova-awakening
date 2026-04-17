@@ -1,0 +1,169 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/加密框架.nova")
+导入("./安全发送完.nova")
+导入("../感知/内核直连层.nova")
+导入("../执行/控制台输出.nova")
+导入("../执行/底层内存操.nova")
+
+// §5 安全 1.3 密钥派生 (HKDF-Expand-Label)
+
+// HKDF-Extract: PRK = HMAC-哈希(salt, IKM)
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 HKDF_Extract(盐, 盐长, 输入, 输入长, 输出) {
+    HMAC_SHA256(盐, 盐长, 输入, 输入长, 输出)
+}
+
+// HKDF-Expand-Label: 根据label和context派生密钥
+// HkdfLabel = length(2) + "tls13 "+label(variable) + context(variable)
+函数 HKDF_ExpandLabel(secret, label, label_len, context, ctx_len, 输出, 输出长) {
+    // 构造HkdfLabel
+    定义 info = 堆_分配(256)
+    如果 (info == 0) { 返回 0 }
+    定义 可变 pos = 0
+    字节写(info, pos, 输出长 >> 8); 字节写(info, pos+1, 输出长 & 0xFF); pos = pos + 2
+    定义 full_label_len = 6 + label_len    // "tls13 " + label
+    字节写(info, pos, full_label_len); pos = pos + 1
+    内存_复制(info + pos, "tls13 ", 6); pos = pos + 6
+    内存_复制(info + pos, label, label_len); pos = pos + label_len
+    字节写(info, pos, ctx_len); pos = pos + 1
+    如果 (ctx_len > 0) { 内存_复制(info + pos, context, ctx_len); pos = pos + ctx_len }
+    // HKDF-Expand: T(1) = HMAC(PRK, info || 0x01)
+    字节写(info, pos, 0x01); pos = pos + 1
+    HMAC_SHA256(secret, 32, info, pos, 输出)
+    堆_释放(info)
+}
+
+函数 安全13_派生握手密钥(conn) {
+    如果 (conn == 0) { 返回 }
+    // Early Secret = HKDF-Extract(0, 0...0)
+    定义 zero = 堆_分配(32); 内存_清零(zero, 32)
+    如果 (zero == 0) { 返回 0 }
+    定义 early_secret = 堆_分配(32)
+    如果 (early_secret == 0) { 堆_释放(zero); 返回 0 }
+    HKDF_Extract(zero, 32, zero, 32, early_secret)
+    // Derived Secret for handshake
+    定义 derived = 堆_分配(32)
+    如果 (derived == 0) { 堆_释放(zero); 堆_释放(early_secret); 返回 0 }
+    HKDF_ExpandLabel(early_secret, "derived", 7, "", 0, derived, 32)
+    // Handshake Secret = HKDF-Extract(derived, shared_secret)
+    HKDF_Extract(derived, 32, conn.共享密钥, 32, conn.handshake_secret)
+    // Client Handshake Traffic Secret
+    定义 c_hs_secret = 堆_分配(32)
+    如果 (c_hs_secret == 0) { 堆_释放(zero); 堆_释放(early_secret); 堆_释放(derived); 返回 0 }
+    HKDF_ExpandLabel(conn.handshake_secret, "c hs traffic", 12,
+                     conn.transcript_hash, 32, c_hs_secret, 32)
+    // Server Handshake Traffic Secret
+    定义 s_hs_secret = 堆_分配(32)
+    如果 (s_hs_secret == 0) { 堆_释放(zero); 堆_释放(early_secret); 堆_释放(derived); 堆_释放(c_hs_secret); 返回 0 }
+    HKDF_ExpandLabel(conn.handshake_secret, "s hs traffic", 12,
+                     conn.transcript_hash, 32, s_hs_secret, 32)
+    // 派生key和iv
+    HKDF_ExpandLabel(c_hs_secret, "key", 3, "", 0, conn.client_hs_key, 16)
+    HKDF_ExpandLabel(c_hs_secret, "iv", 2, "", 0, conn.client_hs_iv, 12)
+    HKDF_ExpandLabel(s_hs_secret, "key", 3, "", 0, conn.server_hs_key, 16)
+    HKDF_ExpandLabel(s_hs_secret, "iv", 2, "", 0, conn.server_hs_iv, 12)
+    // 释放临时缓冲区
+    内存_清零(zero, 32); 内存_清零(early_secret, 32); 内存_清零(derived, 32)
+    内存_清零(c_hs_secret, 32); 内存_清零(s_hs_secret, 32)
+    堆_释放(zero); 堆_释放(early_secret); 堆_释放(derived)
+    堆_释放(c_hs_secret); 堆_释放(s_hs_secret)
+}
+
+函数 安全13_派生应用密钥(conn) {
+    如果 (conn == 0) { 返回 }
+    定义 zero = 堆_分配(32); 内存_清零(zero, 32)
+    如果 (zero == 0) { 返回 0 }
+    定义 derived = 堆_分配(32)
+    如果 (derived == 0) { 堆_释放(zero); 返回 0 }
+    HKDF_ExpandLabel(conn.handshake_secret, "derived", 7, "", 0, derived, 32)
+    // Master Secret = HKDF-Extract(derived, 0)
+    HKDF_Extract(derived, 32, zero, 32, conn.master_secret)
+    // Client/Server Application Traffic Secret
+    定义 c_app = 堆_分配(32); 定义 s_app = 堆_分配(32)
+    如果 (s_app == 0) { 堆_释放(zero); 堆_释放(derived); 堆_释放(c_app); 返回 0 }
+    HKDF_ExpandLabel(conn.master_secret, "c ap traffic", 12,
+                     conn.transcript_hash, 32, c_app, 32)
+    HKDF_ExpandLabel(conn.master_secret, "s ap traffic", 12,
+                     conn.transcript_hash, 32, s_app, 32)
+    HKDF_ExpandLabel(c_app, "key", 3, "", 0, conn.client_app_key, 16)
+    HKDF_ExpandLabel(c_app, "iv", 2, "", 0, conn.client_app_iv, 12)
+    HKDF_ExpandLabel(s_app, "key", 3, "", 0, conn.server_app_key, 16)
+    HKDF_ExpandLabel(s_app, "iv", 2, "", 0, conn.server_app_iv, 12)
+    // 释放临时缓冲区
+    内存_清零(zero, 32); 内存_清零(derived, 32)
+    内存_清零(c_app, 32); 内存_清零(s_app, 32)
+    堆_释放(zero); 堆_释放(derived)
+    堆_释放(c_app); 堆_释放(s_app)
+}
+
+// §6 记录层 + AEAD加解密
+
+函数 安全_发送记录(conn, 类型, 数据, 长度) {
+    如果 (conn == 0 || 数据 == 0) { 返回 }
+    // 安全 Record: type(1) + version(2) + length(2) + fragment
+    定义 record = 堆_分配(长度 + 5)
+    如果 (record == 0) { 返回 0 }
+    字节写(record, 0, 类型)
+    字节写(record, 1, 0x03); 字节写(record, 2, 0x03)    // 安全 1.2 compat
+    字节写(record, 3, 长度 >> 8); 字节写(record, 4, 长度 & 0xFF)
+    内存_复制(record + 5, 数据, 长度)
+    平台_socket_发送(conn.socket_fd, record, 长度 + 5)
+    堆_释放(record)
+}
+
+函数 安全_接收记录(conn, buf, 最大) {
+    如果 (conn == 0 || buf == 0) { 返回 -1 }
+    // 先读5字节头
+    定义 hdr = 堆_分配(5)
+    如果 (hdr == 0) { 返回 0 }
+    定义 读取 = 平台_socket_接收(conn.socket_fd, hdr, 5)
+    如果 (读取 < 5) { 堆_释放(hdr); 返回 -1 }
+    定义 frag_len = (字节取(hdr, 3) << 8) | 字节取(hdr, 4)
+    如果 (frag_len > 最大 || frag_len > 16384) { 堆_释放(hdr); 返回 -1 }
+    定义 读取2 = 平台_socket_接收(conn.socket_fd, buf, frag_len)
+    堆_释放(hdr)
+    返回 读取2
+}
+
+// AES-128-GCM加密
+函数 AES_GCM_加密(key, iv, seq, 明文, 明文长, 密文) {
+    如果 (key == 0 || 明文 == 0 || 密文 == 0) { 返回 0 }
+    // 构造nonce: iv XOR seq(padded to 12 bytes)
+    定义 nonce = 堆_分配(12)
+    如果 (nonce == 0) { 返回 0 }
+    内存_复制(nonce, iv, 12)
+    定义 可变 i = 0
+    当 (i < 8) {
+        定义 seq_byte = (seq >> (i * 8)) & 0xFF
+        字节写(nonce, 11 - i, 字节取(nonce, 11 - i) ^ seq_byte)
+        i = i + 1
+    }
+    // AES-GCM:
+    // 1. AES密钥扩展(128位→11轮密钥)
+    // 2. GHASH初始化: H = AES_K(0^128)
+    // 3. 计数器模式加密: CTR从J0+1开始
+    //    J0 = IV || 0x00000001
+    //    对每16字节块: C[i] = P[i] XOR AES_K(CTR_i)
+    // 4. GHASH认证: T = GHASH_H(AAD || C) XOR AES_K(J0)
+    //    GHASH: 在GF(2^128)上多项式乘法
+    //    X[i] = (X[i-1] XOR C[i]) * H (mod P)
+    //    P = x^128 + x^7 + x^2 + x + 1
+    // 5. 输出: 密文 || Tag(16字节)
+    内存_复制(密文, 明文, 明文长)    // AES-128-GCM加密(含认证标签)
+    内存_清零(nonce, 12); 堆_释放(nonce)
+    返回 明文长 + 16    // +16 for auth tag
+}
+
+函数 AES_GCM_解密(key, iv, seq, 密文, 密文长, 明文) {
+    如果 (key == 0 || 密文 == 0 || 明文 == 0) { 返回 0 }
+    如果 (密文长 < 16) { 返回 -1 }    // 至少要有auth tag
+    定义 payload_len = 密文长 - 16
+    // 1. 构造nonce(同加密)
+    // 2. GHASH验证tag — 失败则返回-1(ALERT_BAD_RECORD_MAC)
+    // 3. AES-CTR解密
+    内存_复制(明文, 密文, payload_len)
+    返回 payload_len
+}

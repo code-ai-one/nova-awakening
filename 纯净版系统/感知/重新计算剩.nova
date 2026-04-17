@@ -1,0 +1,109 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式值解析.nova")
+
+    定义 可变 当前pos = 0
+    定义 可变 间距 = 0
+    定义 可变 起始偏移 = 0
+
+    // 重新计算剩余空间
+    定义 可变 使用空间 = 0
+    子 = layout.第一子
+    当 (子 != 0) {
+        如果 (子.样式 != 0 && 子.样式.display != 0) {
+            如果 (是水平) {
+                使用空间 = 使用空间 + 子.宽度 + 子.margin_left + 子.margin_right
+                          + 子.padding_left + 子.padding_right + 子.border_left + 子.border_right
+            } 否则 {
+                使用空间 = 使用空间 + 子.高度 + 子.margin_top + 子.margin_bottom
+                          + 子.padding_top + 子.padding_bottom + 子.border_top + 子.border_bottom
+            }
+        }
+        子 = 子.后一兄弟布局
+    }
+
+    定义 flex剩余 = 主轴大小 - 使用空间
+    如果 (flex剩余 < 0) { flex剩余 = 0 }
+
+    如果 (style.justify_content == 对齐_居中) {
+        起始偏移 = flex剩余 / 2
+    }
+    否则 如果 (style.justify_content == 对齐_末尾) {
+        起始偏移 = flex剩余
+    }
+    否则 如果 (style.justify_content == 对齐_两端 && 项数量 > 1) {
+        间距 = flex剩余 / (项数量 - 1)
+    }
+    否则 如果 (style.justify_content == 对齐_环绕 && 项数量 > 0) {
+        间距 = flex剩余 / 项数量
+        起始偏移 = 间距 / 2
+    }
+    否则 如果 (style.justify_content == 对齐_均匀 && 项数量 > 0) {
+        间距 = flex剩余 / (项数量 + 1)
+        起始偏移 = 间距
+    }
+
+    当前pos = 起始偏移
+
+    子 = layout.第一子
+    定义 可变 最大交叉 = 0
+    当 (子 != 0) {
+        如果 (子.样式 == 0 || 子.样式.display == 0) {
+            子 = 子.后一兄弟布局
+            继续
+        }
+
+        // 递归布局子项
+        布局块级Flow_布局(子)
+
+        如果 (是水平) {
+            子.x = 当前pos + 子.margin_left + layout.padding_left + layout.border_left
+            当前pos = 当前pos + 子.宽度 + 子.margin_left + 子.margin_right
+                      + 子.padding_left + 子.padding_right + 子.border_left + 子.border_right
+                      + 间距
+
+            // 交叉轴(align-items)
+            定义 子交叉高 = 子.高度 + 子.padding_top + 子.padding_bottom
+                          + 子.border_top + 子.border_bottom + 子.margin_top + 子.margin_bottom
+
+            如果 (style.align_items == 对齐_居中) {
+                子.y = (交叉轴大小 - 子交叉高) / 2 + 子.margin_top + layout.padding_top + layout.border_top
+            }
+            否则 如果 (style.align_items == 对齐_末尾) {
+                子.y = 交叉轴大小 - 子交叉高 + 子.margin_top + layout.padding_top + layout.border_top
+            }
+            否则 如果 (style.align_items == 对齐_拉伸) {
+                子.y = 子.margin_top + layout.padding_top + layout.border_top
+                如果 (子.样式.height == -1) {
+                    子.高度 = 交叉轴大小 - 子.margin_top - 子.margin_bottom
+                             - 子.padding_top - 子.padding_bottom
+                             - 子.border_top - 子.border_bottom
+                    如果 (子.高度 < 0) { 子.高度 = 0 }
+                }
+            }
+            否则 {
+                // flex-start (默认)
+                子.y = 子.margin_top + layout.padding_top + layout.border_top
+            }
+
+            如果 (子交叉高 > 最大交叉) { 最大交叉 = 子交叉高 }
+        } 否则 {
+            // 纵向flex
+            子.y = 当前pos + 子.margin_top + layout.padding_top + layout.border_top
+            当前pos = 当前pos + 子.高度 + 子.margin_top + 子.margin_bottom
+                      + 子.padding_top + 子.padding_bottom + 子.border_top + 子.border_bottom
+                      + 间距
+            子.x = 子.margin_left + layout.padding_left + layout.border_left
+        }
+
+        子 = 子.后一兄弟布局
+    }
+
+    // 更新高度(如果未指定)
+    如果 (!layout.高度已确定) {
+        如果 (是水平) {
+            layout.高度 = 最大交叉
+        } 否则 {
+            layout.高度 = 当前pos
+        }
+    }

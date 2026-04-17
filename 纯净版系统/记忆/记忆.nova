@@ -1,0 +1,94 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+
+//   1. Nova文件节点是VFS核心抽象: 每个文件/目录/设备都有唯一Nova文件节点
+//   2. i_op(Nova文件节点_operations): 目录操作(lookup/mkdir/unlink)
+//   3. i_fop(file_operations): 文件操作(read/write/llseek/Nova内存映射)
+//   4. 引用计数(i_count): 打开文件/Nova路径缓存引用时+1
+//   5. Nova文件节点缓存: 用哈希表按(sb,ino)快速查找,LRU淘汰
+//   6. 脏Nova文件节点链表: 修改后的Nova文件节点排队等待回写
+//   7. 文件类型编码在i_mode高4位(S_IFMT):
+
+// 文件类型 
+// 编码在mode的高4位,与Nova接口标准兼容
+
+定义 S_IFMT   = 0o170000    // 文件类型掩码
+定义 S_IFSOCK = 0o140000    // 套接字
+定义 S_IFLNK  = 0o120000    // 符号链接
+定义 S_IFREG  = 0o100000    // 普通文件
+定义 S_IFBLK  = 0o060000    // 块设备
+定义 S_IFDIR  = 0o040000    // 目录
+定义 S_IFCHR  = 0o020000    // 字符设备
+定义 S_IFIFO  = 0o010000    // 管道/FIFO
+
+// 权限位
+定义 S_ISUID  = 0o004000    // Set UID
+定义 S_ISGID  = 0o002000    // Set GID
+定义 S_ISVTX  = 0o001000    // Sticky bit
+定义 S_IRWXU  = 0o000700    // 用户读写执行
+定义 S_IRUSR  = 0o000400
+定义 S_IWUSR  = 0o000200
+定义 S_IXUSR  = 0o000100
+定义 S_IRWXG  = 0o000070    // 组读写执行
+定义 S_IRGRP  = 0o000040
+定义 S_IWGRP  = 0o000020
+定义 S_IXGRP  = 0o000010
+定义 S_IRWXO  = 0o000007    // 其他人读写执行
+定义 S_IROTH  = 0o000004
+定义 S_IWOTH  = 0o000002
+定义 S_IXOTH  = 0o000001
+
+// 向后兼容的类型常量
+定义 类型_普通文件 = S_IFREG
+定义 类型_目录 = S_IFDIR
+定义 类型_符号链接 = S_IFLNK
+定义 类型_字符设备 = S_IFCHR
+定义 类型_块设备 = S_IFBLK
+定义 类型_管道 = S_IFIFO
+定义 类型_套接字 = S_IFSOCK
+
+函数 S_ISREG(mode) { 返回 (mode & S_IFMT) == S_IFREG }
+函数 S_ISDIR(mode) { 返回 (mode & S_IFMT) == S_IFDIR }
+函数 S_ISLNK(mode) { 返回 (mode & S_IFMT) == S_IFLNK }
+函数 S_ISCHR(mode) { 返回 (mode & S_IFMT) == S_IFCHR }
+函数 S_ISBLK(mode) { 返回 (mode & S_IFMT) == S_IFBLK }
+函数 S_ISFIFO(mode) { 返回 (mode & S_IFMT) == S_IFIFO }
+函数 S_ISSOCK(mode) { 返回 (mode & S_IFMT) == S_IFSOCK }
+
+// Nova文件节点_operations: 目录/文件元操作 
+// 由具体文件系统(ext4/ramfs等)实现
+
+结构 Nova文件节点操作表 {
+    lookup,    // u64 fn(dir_Nova文件节点, Nova路径项, flags) → Nova路径项
+    create,    // u64 fn(dir_Nova文件节点, Nova路径项, mode) → error
+    mkdir,    // u64 fn(dir_Nova文件节点, Nova路径项, mode) → error
+    rmdir,    // u64 fn(dir_Nova文件节点, Nova路径项) → error
+    unlink,    // u64 fn(dir_Nova文件节点, Nova路径项) → error
+    rename,    // u64 fn(old_dir, old_Nova路径项, new_dir, new_Nova路径项) → error
+    symlink,    // u64 fn(dir_Nova文件节点, Nova路径项, symname) → error
+    link,    // u64 fn(old_Nova路径项, dir_Nova文件节点, new_Nova路径项) → error
+    readlink,    // u64 fn(Nova路径项, buffer, buflen) → bytes_read
+    getattr,    // u64 fn(path, kstat, request_mask) → error
+    setattr,    // u64 fn(Nova路径项, iattr) → error
+    permission,    // u64 fn(Nova文件节点, mask) → error
+}
+
+// file_operations: 文件数据操作 
+
+结构 文件操作表 {
+    read,    // u64 fn(file, buf, count, offset) → bytes_read
+    write,    // u64 fn(file, buf, count, offset) → bytes_written
+    llseek,    // u64 fn(file, offset, whence) → new_offset
+    readdir,    // u64 fn(file, dirent_callback) → error  (iterate_shared)
+    open,    // u64 fn(Nova文件节点, file) → error
+    release,    // u64 fn(Nova文件节点, file) → error (close)
+    fsync,    // u64 fn(file, start, end, datasync) → error
+    Nova内存映射,    // u64 fn(file, vma) → error
+    Nova设备控制,    // u64 fn(file, cmd, arg) → error (unlocked_Nova设备控制)
+    poll,    // u64 fn(file, poll_table) → mask
+}
+
+// Nova文件节点结构 
+
+结构 Nova文件节点 {
+}

@@ -1,0 +1,255 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./网格扫描行.nova")
+导入("./内核直连层.nova")
+导入("../执行/控制台输出.nova")
+
+// §2 repeat(auto-fill / auto-fit)
+
+// repeat()展开逻辑
+// repeat(3, 1fr)         → 1fr 1fr 1fr
+// repeat(auto-fill, 200px) → 根据容器宽度计算重复次数
+// repeat(auto-fit, minmax(200px, 1fr)) → 同上但折叠空轨道
+
+定义 REPEAT_FIXED    = 0    // repeat(N, ...)
+定义 REPEAT_AUTO_FILL = 1
+定义 REPEAT_AUTO_FIT  = 2
+
+结构 RepeatTrack {
+    模式,    // u8 REPEAT_xxx
+    次数,    // u32 固定模式的重复次数
+    // 模板轨道
+    模板,    // [8]网格TrackDef
+    模板数,
+}
+
+结构 网格TrackDef {
+    类型,    // u8 轨道_固定/fr/auto/minmax/...
+    值,    // i32 Q10: 像素/fr值
+    最小值,    // i32 minmax的最小值
+    最大值,    // i32 minmax的最大值
+    线名,    // u64 可选的线名
+}
+
+
+函数 网格_展开repeat(repeat, 容器大小, gap) {
+    如果 (repeat == 0) { 返回 0 }
+
+    如果 (repeat.模式 == REPEAT_FIXED) {
+        返回 repeat.次数
+    }
+
+    // auto-fill/auto-fit: 计算能放多少轨道
+    // 计算单次重复的固定大小
+    定义 可变 单次大小 = 0
+    定义 可变 i = 0
+    当 (i < repeat.模板数) {
+        如果 (repeat.模板[i].类型 == 0) {  // 固定
+            单次大小 = 单次大小 + repeat.模板[i].值
+        } 否则 如果 (repeat.模板[i].类型 == 4) {  // minmax
+            单次大小 = 单次大小 + repeat.模板[i].最小值
+        } 否则 {
+            单次大小 = 单次大小 + 0  // fr/auto按0计
+        }
+        i = i + 1
+    }
+
+    如果 (单次大小 <= 0) { 返回 1 }
+    // 可用空间 = 容器大小
+    // 次数 = floor((容器大小 + gap) / (单次大小 + gap))
+    定义 次数 = (容器大小 + gap) / (单次大小 + gap)
+    如果 (次数 < 1) { 次数 = 1 }
+    返回 次数
+}
+
+// §3 自动放置算法(Nova标准 §8.5 完整)
+
+定义 FLOW_ROW         = 0
+定义 FLOW_COLUMN      = 1
+定义 FLOW_ROW_DENSE   = 2
+定义 FLOW_COLUMN_DENSE = 3
+
+结构 网格Occupancy {
+    // 占用位图: 每位代表一个单元格
+    行数,
+    列数,
+    位图,    // u64 u8*数组 (行数 * 列数 bits)
+    位图大小,
+}
+
+函数 网格Occupancy_创建(行数, 列数) {
+    定义 occ = 堆_分配(网格Occupancy)
+    occ.行数 = 行数; occ.列数 = 列数
+    occ.位图大小 = (行数 * 列数 + 7) / 8
+    occ.位图 = 堆_分配(occ.位图大小)
+    内存_填充(occ.位图, 0, occ.位图大小)
+    返回 occ
+}
+
+函数 网格Occupancy_占用(occ, 行, 列) {
+    如果 (occ == 0 || 行 >= occ.行数 || 列 >= occ.列数) { 返回 }
+    定义 bit = 行 * occ.列数 + 列
+    定义 byte_idx = bit / 8
+    定义 bit_idx = bit % 8
+    定义 old = 字节取(occ.位图, byte_idx)
+    字节写(occ.位图, byte_idx, old | (1 << bit_idx))
+}
+
+函数 网格Occupancy_已占用(occ, 行, 列) {
+    如果 (occ == 0 || 行 >= occ.行数 || 列 >= occ.列数) { 返回 真 }
+    定义 bit = 行 * occ.列数 + 列
+    定义 byte_idx = bit / 8
+    定义 bit_idx = bit % 8
+    返回 (字节取(occ.位图, byte_idx) & (1 << bit_idx)) != 0
+}
+
+函数 网格Occupancy_区域可用(occ, 行起, 列起, 行跨, 列跨) {
+    定义 可变 r = 0
+    当 (r < 行跨) {
+        定义 可变 c = 0
+        当 (c < 列跨) {
+            如果 (网格Occupancy_已占用(occ, 行起 + r, 列起 + c)) { 返回 假 }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    返回 真
+}
+
+函数 网格Occupancy_占用区域(occ, 行起, 列起, 行跨, 列跨) {
+    定义 可变 r = 0
+    当 (r < 行跨) {
+        定义 可变 c = 0
+        当 (c < 列跨) {
+            网格Occupancy_占用(occ, 行起 + r, 列起 + c)
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+// 自动放置: 项目结构
+结构 网格Placement {
+    行起始,    // i32 -1=auto
+    行结束,    // i32 -1=auto
+    列起始,
+    列结束,
+    行跨,    // u32 span值(默认1)
+    列跨,
+    已放置,
+}
+
+// Nova标准 §8.5 自动放置算法
+函数 网格_自动放置(items, items数, occ, flow) {
+    如果 (items == 0 || occ == 0) { 返回 }
+
+    // Phase 1: 放置所有非auto项(已在布局网格.nova中处理)
+    定义 可变 i = 0
+    当 (i < items数) {
+        定义 item = items + i * 大小of(网格Placement)
+        如果 (item.行起始 >= 0 && item.列起始 >= 0) {
+            item.已放置 = 真
+            网格Occupancy_占用区域(occ, item.行起始 - 1, item.列起始 - 1, item.行跨, item.列跨)
+        }
+        i = i + 1
+    }
+
+    // Phase 2: 放置有一个维度确定的项
+    i = 0
+    当 (i < items数) {
+        定义 item = items + i * 大小of(网格Placement)
+        如果 (!item.已放置) {
+            如果 (item.行起始 >= 0 && item.列起始 < 0) {
+                // 行确定,列auto → 在该行扫描可用列
+                定义 放置列 = 网格_扫描行可用列(occ, item.行起始 - 1, item.列跨)
+                item.列起始 = 放置列 + 1; item.列结束 = 放置列 + item.列跨 + 1
+                item.已放置 = 真
+                网格Occupancy_占用区域(occ, item.行起始 - 1, 放置列, item.行跨, item.列跨)
+            } 否则 如果 (item.列起始 >= 0 && item.行起始 < 0) {
+                // 列确定,行auto → 在该列扫描可用行
+                定义 放置行 = 网格_扫描列可用行(occ, item.列起始 - 1, item.行跨)
+                item.行起始 = 放置行 + 1; item.行结束 = 放置行 + item.行跨 + 1
+                item.已放置 = 真
+                网格Occupancy_占用区域(occ, 放置行, item.列起始 - 1, item.行跨, item.列跨)
+            }
+        }
+        i = i + 1
+    }
+
+    // Phase 3: 放置完全auto项
+    定义 可变 游标行 = 0
+    定义 可变 游标列 = 0
+    定义 是dense = (flow == FLOW_ROW_DENSE || flow == FLOW_COLUMN_DENSE)
+
+    i = 0
+    当 (i < items数) {
+        定义 item = items + i * 大小of(网格Placement)
+        如果 (!item.已放置) {
+            如果 (是dense) { 游标行 = 0; 游标列 = 0 }
+
+            如果 (flow == FLOW_ROW || flow == FLOW_ROW_DENSE) {
+                // 行优先扫描
+                定义 可变 找到 = 假
+                定义 可变 r = 游标行
+                当 (r < occ.行数 && !找到) {
+                    定义 起始列 = 如果(r == 游标行, 游标列, 0)
+                    定义 可变 c = 起始列
+                    当 (c <= occ.列数 - item.列跨 && !找到) {
+                        如果 (网格Occupancy_区域可用(occ, r, c, item.行跨, item.列跨)) {
+                            item.行起始 = r + 1; item.列起始 = c + 1
+                            item.行结束 = r + item.行跨 + 1; item.列结束 = c + item.列跨 + 1
+                            item.已放置 = 真
+                            网格Occupancy_占用区域(occ, r, c, item.行跨, item.列跨)
+                            游标行 = r; 游标列 = c + item.列跨
+                            如果 (游标列 >= occ.列数) { 游标行 = 游标行 + 1; 游标列 = 0 }
+                            找到 = 真
+                        }
+                        c = c + 1
+                    }
+                    r = r + 1
+                }
+                // 如果没找到,扩展隐式行
+                如果 (!找到) {
+                    item.行起始 = occ.行数 + 1; item.列起始 = 1
+                    item.行结束 = occ.行数 + item.行跨 + 1; item.列结束 = item.列跨 + 1
+                    item.已放置 = 真
+                }
+            } 否则 {
+                // 列优先扫描(grid-auto-flow: column)
+                定义 可变 找到 = 假
+                定义 可变 c = 游标列
+                当 (c < occ.列数 && !找到) {
+                    定义 起始行 = 如果(c == 游标列, 游标行, 0)
+                    定义 可变 r = 起始行
+                    当 (r <= occ.行数 - item.行跨 && !找到) {
+                        如果 (网格Occupancy_区域可用(occ, r, c, item.行跨, item.列跨)) {
+                            item.行起始 = r + 1; item.列起始 = c + 1
+                            item.已放置 = 真
+                            网格Occupancy_占用区域(occ, r, c, item.行跨, item.列跨)
+                            游标行 = r + item.行跨; 游标列 = c
+                            找到 = 真
+                        }
+                        r = r + 1
+                    }
+                    c = c + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+定义 可变 AI_感知丙甲_调用数 = 0
+定义 可变 AI_感知丙甲_异常数 = 0
+
+函数 AI_感知丙甲_监控() {
+    AI_感知丙甲_调用数 = AI_感知丙甲_调用数 + 1
+    返回 AI_感知丙甲_异常数 == 0
+}
+
+函数 AI_感知丙甲_健康检查() {
+    如果 (AI_感知丙甲_调用数 > 0 && AI_感知丙甲_异常数 * 100 / AI_感知丙甲_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

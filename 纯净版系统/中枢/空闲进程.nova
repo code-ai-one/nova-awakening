@@ -1,0 +1,210 @@
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("./时钟中枢.nova")
+导入("./整数转字符串.nova")
+导入("../引导/特权指令.nova")
+导入("./每处理器.nova")
+导入("./运行队列初.nova")
+导入("../引导/处理标识查.nova")
+
+//   1. 每个CPU一个idle进程(swapper/N), PID=0
+//   2. idle循环: 检查need_resched → 无则进入低功耗状态
+//   3. C-state选择: C1(PAUSE/MWAIT) → C2(HLT) → C3(深睡)
+//   4. MWAIT: 比HLT更高效(不触发中断退出延迟)
+//   5. tick_nohz: 空闲时停止定时器tick(节能)
+
+定义 可变 idle_进入次数 = 0
+定义 可变 idle_总时间_ns = 0
+定义 可变 idle_上次进入 = 0
+
+定义 CSTATE_C0 = 0    // 活跃(非idle)
+定义 CSTATE_C1 = 1    // 轻度空闲(PAUSE/MWAIT)
+定义 CSTATE_C2 = 2    // 中度空闲(HLT)
+定义 CSTATE_C3 = 3    // 深度空闲(进入前保存状态)
+
+定义 可变 当前C状态 = CSTATE_C0
+
+// idle进程主循环 
+// 每个CPU的swapper进程永远运行这个循环
+
+函数 idle循环() {
+    当 (真) {
+        // 1. 检查是否有进程需要调度
+        当 (!需要调度()) {
+            // 2. 记录idle开始时间
+            idle_上次进入 = sched_clock()
+            idle_进入次数 = idle_进入次数 + 1
+
+            // 3. 通知tick子系统: 进入idle, 可以停止tick
+            tick_nohz_idle_enter()
+
+            // 4. 选择C-state并进入低功耗
+            idle_进入低功耗()
+
+            // 5. 被中断唤醒后, 恢复tick
+            tick_nohz_idle_exit()
+
+            // 6. 统计idle时间
+            定义 退出时间 = sched_clock()
+            idle_总时间_ns = idle_总时间_ns + (退出时间 - idle_上次进入)
+            当前C状态 = CSTATE_C0
+        }
+
+        // 7. 有进程需要调度: 调用schedule()
+        调度()
+    }
+}
+
+// 低功耗状态选择和进入
+
+函数 idle_进入低功耗() {
+    // 选择C-state(基于预计idle时长)
+    定义 rq = 当前CPU运行队列()
+    定义 预计空闲 = 0
+    如果 (rq != 空) { 预计空闲 = rq.avg_idle }
+
+    如果 (预计空闲 < 1000) {
+        // 极短idle: 用PAUSE (最低延迟退出)
+        当前C状态 = CSTATE_C1
+        idle_c1_pause()
+    } 否则 如果 (预计空闲 < 100000) {
+        // 短idle: 用HLT
+        当前C状态 = CSTATE_C2
+        idle_c2_hlt()
+    } 否则 {
+        // 长idle: 深度HLT (可扩展为MWAIT C6)
+        当前C状态 = CSTATE_C3
+        idle_c2_hlt()  // C3状态降级为C2(HLT指令)
+    }
+}
+
+函数 idle_c1_pause() {
+    // C1: 最轻量级 — 单条PAUSE指令
+    // 延迟~10ns, 适合极短空闲
+    暂停()   // rep nop (0xF3 0x90)
+}
+
+函数 idle_c2_hlt() {
+    // C2: HLT — 停止CPU直到下一个中断
+    // 必须先开中断(否则永远不会被唤醒)
+    开中断()
+    停机()    // hlt (0xF4)
+}
+
+// idle进程创建 
+// 每个CPU一个, PID=0, 名称=swapper/N
+
+函数 idle进程_创建(CPU号) {
+    定义 名称 = "swapper/" + 整数转字符串(CPU号)
+    // idle进程不通过fork创建, 直接初始化task_struct
+    // PID=0, 最低优先级, 绑定到指定CPU
+    定义 rq = 获取运行队列(CPU号)
+    如果 (rq != 空) {
+        // rq.idle = idle_task
+        // rq.curr = idle_task (初始时CPU运行idle)
+    }
+    返回 成功
+}
+
+// tick_nohz: idle时停止定时器tick
+
+函数 tick_nohz_idle_enter() {
+    // 进入idle: 如果没有即将到期的定时器, 停止周期性tick
+    定义 下次到期 = 定时器_最近到期()
+    如果 (下次到期 > 读取毫秒() + 10) {
+        // 超过10ms才有下次定时器, 值得停止tick
+        接口C_定时器_停止()
+        // 设置one-shot模式在下次定时器到期时唤醒
+        接口C_定时器_设置单次(下次到期 - 读取毫秒())
+    }
+}
+
+函数 tick_nohz_idle_exit() {
+    // 退出idle: 恢复周期性tick
+    接口C_定时器_恢复周期()
+}
+
+// 辅助
+
+函数 需要调度() {
+    定义 当前 = 获取当前进程()
+    如果 (当前 == 空) { 返回 假 }
+    返回 进程_需要调度标志(当前)
+}
+
+函数 idle_统计() {
+    返回 [idle_进入次数, idle_总时间_ns, 当前C状态]
+}
+
+// C-state统计 
+
+定义 可变 cstate_使用次数 = [0, 0, 0, 0]  // C0-C3
+定义 可变 cstate_总时间 = [0, 0, 0, 0]    // 各C-state总时间ns
+
+函数 idle_记录cstate(状态, 持续时间_ns) {
+    如果 (状态 >= 0 && 状态 <= 3) {
+        cstate_使用次数[状态] = cstate_使用次数[状态] + 1
+        cstate_总时间[状态] = cstate_总时间[状态] + 持续时间_ns
+    }
+}
+
+函数 idle_cstate统计() {
+    返回 [cstate_使用次数, cstate_总时间]
+}
+
+// MWAIT支持检测 
+
+定义 可变 MWAIT_可用 = 假
+
+函数 idle_检测MWAIT() {
+    // CPUID.01H:ECX[3] = MONITOR/MWAIT支持
+    定义 ecx = CPUID查询(1, 0)[2]
+    如果 ((ecx & (1 << 3)) != 0) {
+        MWAIT_可用 = 真
+        内核信息("idle: MWAIT指令可用, 启用低延迟idle")
+    } 否则 {
+        内核信息("idle: MWAIT不可用, 使用HLT")
+    }
+}
+
+函数 idle_c1_mwait() {
+    如果 (!MWAIT_可用) { idle_c1_pause(); 返回 }
+    // MONITOR/MWAIT: 监控内存地址变化后进入低功耗
+    汇编 {
+        "lea rax, [rsp]"
+        "xor ecx, ecx"
+        "xor edx, edx"
+        "monitor"
+        "xor eax, eax"
+        "mwait"
+    }
+}
+
+// idle占比计算
+
+函数 idle_占比() {
+    定义 总时间 = sched_clock()
+    如果 (总时间 == 0) { 返回 0 }
+    返回 idle_总时间_ns * 100 / 总时间
+}
+
+函数 idle_完整统计() {
+    返回 [idle_进入次数, idle_总时间_ns, 当前C状态,
+           MWAIT_可用, idle_占比(),
+           cstate_使用次数[0], cstate_使用次数[1],
+           cstate_使用次数[2], cstate_使用次数[3]]
+}
+
+// C-state名称 + idle时间格式化
+
+函数 cstate_名称(状态) {
+    如果 (状态 == CSTATE_C0) { 返回 "C0-Active" }
+    如果 (状态 == CSTATE_C1) { 返回 "C1-Pause" }
+    如果 (状态 == CSTATE_C2) { 返回 "C2-HLT" }
+    如果 (状态 == CSTATE_C3) { 返回 "C3-Deep" }
+    返回 "Unknown"
+}
+
+函数 idle_总时间_ms() {
+    返回 idle_总时间_ns / 1000000
+}

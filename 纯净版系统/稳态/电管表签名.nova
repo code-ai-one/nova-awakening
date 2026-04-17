@@ -1,0 +1,111 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+
+// NovaOS ACPI子系统 — 硬件发现/电源管理/散热控制
+// ACPI(Advanced Configuration and Power Interface)是PC硬件的
+// 统一发现和管理协议。没有ACPI = 无法:
+//   - 发现CPU数量/内存布局/中断路由
+//   - 关机/重启/休眠/待机
+//   - 管理电池/散热/风扇
+//   - 管理CPU频率(省电/性能)
+// 核心: 解析BIOS/UEFI提供的ACPI表(RSDP→XSDT→各子表)
+
+// §1 ACPI表签名
+
+定义 ACPI_SIG_RSDP = "RSD PTR "   // 根系统描述指针
+定义 ACPI_SIG_RSDT = "RSDT"       // 根系统描述表(32位)
+定义 ACPI_SIG_XSDT = "XSDT"       // 扩展系统描述表(64位)
+定义 ACPI_SIG_FADT = "FACP"       // 固定ACPI描述表
+定义 ACPI_SIG_MADT = "接口C"       // 多接口C描述表
+定义 ACPI_SIG_HPET = "HPET"       // 高精度事件定时器
+定义 ACPI_SIG_MCFG = "MCFG"       // PCI Express配置空间
+定义 ACPI_SIG_DSDT = "DSDT"       // 差异系统描述表(AML代码)
+定义 ACPI_SIG_SSDT = "SSDT"       // 辅助系统描述表
+定义 ACPI_SIG_BGRT = "BGRT"       // 启动图形资源表
+定义 ACPI_SIG_SRAT = "SRAT"       // 系统资源亲和表(NUMA)
+定义 ACPI_SIG_SLIT = "SLIT"       // 系统局部性信息表
+
+// MADT条目类型
+定义 MADT_LOCAL_接口C       = 0     // 处理器本地接口C
+定义 MADT_IO_接口C          = 1     // I/O 接口C
+定义 MADT_INT_OVERRIDE     = 2     // 中断源覆盖
+定义 MADT_NMI              = 3     // NMI源
+定义 MADT_LOCAL_接口C_NMI   = 4     // 本地接口C NMI
+定义 MADT_LOCAL_接口C_OVERRIDE = 5  // 本地接口C地址覆盖
+定义 MADT_X2接口C           = 9     // x2接口C
+
+// FADT标志
+定义 ACPI_FADT_WBINVD     = 0x01
+定义 ACPI_FADT_C1_SUPPORTED = 0x04
+定义 ACPI_FADT_SLEEP_BUTTON = 0x20
+定义 ACPI_FADT_RESET_REG   = 0x400
+定义 ACPI_FADT_HW_REDUCED  = 0x100000
+
+// 电源状态
+定义 ACPI_S0 = 0    // 工作
+定义 ACPI_S1 = 1    // 待机(CPU停止, RAM刷新)
+定义 ACPI_S3 = 3    // 挂起到RAM(STR)
+定义 ACPI_S4 = 4    // 休眠到磁盘(STD)
+定义 ACPI_S5 = 5    // 软关机
+
+// §2 数据结构
+
+结构 ACPI_RSDP {
+    签名,    // 字符串 "RSD PTR "
+    校验和,
+    OEM_ID,    // 字符串 6字节
+    版本,    // u8 0=ACPI1.0, 2=ACPI2.0+
+    RSDT地址,
+    XSDT地址,    // u64 ACPI2.0+
+}
+
+结构 ACPI表头 {
+    签名,    // 字符串 4字节
+    长度,
+    版本,
+    校验和,
+    OEM_ID,    // 字符串 6字节
+    OEM表ID,    // 字符串 8字节
+    OEM版本,
+    创建者ID,
+    创建者版本,
+}
+
+结构 ACPI_CPU {
+    接口C_ID,
+    处理器ID,
+    已启用,
+    是BSP,
+}
+
+结构 ACPI_IO接口C {
+    ID,
+    地址,
+    GSI基,    // u32 全局系统中断基
+}
+
+结构 ACPI_FADT信息 {
+    SCI中断,    // u16 SCI中断号
+    SMI命令端口,    // u32 SMI命令I/O端口
+    ACPI使能值,
+    ACPI禁用值,
+    PM1a事件块,
+    PM1b事件块,
+    PM1a控制块,
+    PM1b控制块,
+    PM定时器块,
+    PM定时器长度,    // u8 4=32位
+    世纪寄存器,
+    复位寄存器,
+    复位值,
+    标志,
+    DSDT地址,
+}
+
+结构 散热区域 {
+    名称,
+    当前温度,    // u32 毫摄氏度
+    临界温度,    // u32 超过则关机
+    被动温度,    // u32 超过则降频
+    风扇策略,    // u32 0=关 1=低 2=中 3=高
+}

@@ -1,0 +1,256 @@
+导入("../内存/显存管理.nova")
+导入("../内核编译/内核编译器.nova")
+// [循环导入已解耦] 导入("../核心/FFI桥接.nova") — 函数由链接器全局解析
+导入("../核心/设备管理.nova")
+导入("../../../标准库/基础.nova")
+导入("../../../运行时/解释器/VM_GPU内建.nova")
+
+// Nova · 平台层 · GPU张量计算
+// 高层GPU计算接口 — 直接对接标准库张量/矩阵/神经网络
+// 真实GPU加速: GEMM/卷积/激活/归约/softmax
+// NVIDIA cuBLAS/cuDNN + AMD rocBLAS/MIOpen 统一抽象
+
+// 计算精度
+定义 精度_FP32 = 0 // 单精度 (所有GPU)
+定义 精度_FP16 = 1 // 半精度 (Pascal+/Vega+)
+定义 精度_BF16 = 2 // BF16 (Ampere+/MI200+)
+定义 精度_FP64 = 3 // 双精度
+定义 精度_INT8 = 4 // 量化推理
+定义 精度_TF32 = 5 // TensorFloat-32 (Ampere+)
+
+// 张量布局
+定义 布局_行优先 = 0 // Row-major (C风格)
+定义 布局_列优先 = 1 // Column-major (Fortran/BLAS)
+定义 布局_NHWC = 2 // 通道最后 (推理优化)
+定义 布局_NCHW = 3 // 通道优先 (训练标准)
+
+// GPU张量
+// [显存块, 形状, 步长, 精度, 布局, 设备ID, 元素数, 字节数]
+函数 张量计算_GPU张量_创建(显存mgr, 形状, 精度) { 定义 可变 元素数 = 1
+ 定义 可变 i = 0
+ 当 (i < 计数(形状)) {
+ 元素数 = 元素数 * 形状[i]
+ i = i + 1
+ }
+
+ // 精度→字节
+ 定义 字节大小表 = [4, 2, 2, 8, 1, 4]
+ 定义 每元素字节 = 字节大小表[精度]
+ 定义 总字节 = 元素数 * 每元素字节
+
+ // 分配显存
+ 定义 块 = GPU显存_分配(显存mgr, 总字节, GPU内存_设备)
+ 如果 (块 == 空) { 返回 空 }
+
+ // 计算步长 (行优先)
+ 定义 可变 步长 = []
+ 定义 可变 stride = 1
+ i = 计数(形状) - 1
+ 当 (i >= 0) {
+ 追加(步长, stride)
+ stride = stride * 形状[i]
+ i = i - 1
+ }
+ // 反转步长
+ 定义 可变 步长正序 = []
+ i = 计数(步长) - 1
+ 当 (i >= 0) {
+ 追加(步长正序, 步长[i])
+ i = i - 1
+ }
+
+ 返回 [块, 形状, 步长正序, 精度, 布局_行优先, 0, 元素数, 总字节]
+}
+
+函数 张量计算_GPU张量_形状(t) { 返回 t[1] }
+函数 GPU张量_精度(t) { 返回 t[3] }
+函数 张量计算_GPU张量_元素数(t) { 返回 t[6] }
+函数 GPU张量_指针(t) { 返回 GPU内存块_指针(t[0]) }
+函数 GPU张量_字节(t) { 返回 t[7] }
+
+// 从CPU上传张量
+函数 GPU张量_上传(显存mgr, 张量, CPU数据) { 返回 GPU显存_传输(显存mgr, GPU张量_指针(张量), CPU数据, GPU张量_字节(张量), GPU传输_主机到设备)
+}
+
+// 下载张量到CPU
+函数 GPU张量_下载(显存mgr, 张量, CPU缓冲) { 返回 GPU显存_传输(显存mgr, CPU缓冲, GPU张量_指针(张量), GPU张量_字节(张量), GPU传输_设备到主机)
+}
+
+// 释放张量
+函数 GPU张量_释放(显存mgr, 张量) {
+ GPU显存_释放(显存mgr, 张量[0])
+}
+
+// BLAS操作 (矩阵运算 — AI训练核心)
+
+// 加载BLAS库
+函数 GPU_加载BLAS(厂商) { 如果 (厂商 == GPU_厂商_NVIDIA) { 定义 lib = GPU_加载CUDA候选([
+ "cublas64_12.dll",
+ "libcublas.so.12",
+ "libcublas.so"
+ ])
+ 返回 lib
+ }
+ 如果 (厂商 == GPU_厂商_AMD) { 定义 lib = GPU_加载ROCm候选([
+ "rocblas.dll",
+ "librocblas.so"
+ ])
+ 返回 lib
+ }
+ 返回 0
+}
+
+// GEMM: C = alpha*A*B + beta*C
+// 矩阵乘法 — 神经网络前向传播/反向传播的核心
+函数 GPU_通用矩阵乘(gpu管理器, A, B, C, alpha, beta, 转置A, 转置B) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+ 定义 blas_lib = GPU_加载BLAS(厂商)
+ 如果 (blas_lib == 0) { 返回 假 }
+
+ 定义 形状A = GPU张量_形状(A)
+ 定义 形状B = GPU张量_形状(B)
+
+ 定义 M = 形状A[0]
+ 定义 K = 形状A[1]
+ 定义 N = 形状B[1]
+
+ 如果 (厂商 == GPU_厂商_NVIDIA) {
+ // cublasCreate(&handle)
+ 定义 handle = 外部调用(blas_lib,  "cublasCreate_v2", 0, 0, 0, 0, 0)
+ // cublasSgemm(handle, transA, transB, M, N, K, &alpha, A, lda, B, ldb, &beta, C, ldc)
+ 定义 可变 opA = 0 // CUBLAS_OP_N
+ 如果 (转置A) { opA = 1 } // CUBLAS_OP_T
+ 定义 可变 opB = 0
+ 如果 (转置B) { opB = 1 }
+
+ 如果 (GPU张量_精度(A) == 精度_FP32) {
+ 外部调用(blas_lib, "cublasSgemm_v2", handle,
+ opA, opB, M, N, K,
+ alpha, GPU张量_指针(A), K,
+ GPU张量_指针(B), N,
+ beta, GPU张量_指针(C), N)
+ } 否则 如果 (GPU张量_精度(A) == 精度_FP16) {
+ // cublasHgemm for FP16
+ 外部调用(blas_lib, "cublasHgemm", handle,
+ opA, opB, M, N, K,
+ alpha, GPU张量_指针(A), K,
+ GPU张量_指针(B), N,
+ beta, GPU张量_指针(C), N)
+ }
+ 外部调用(blas_lib,  "cublasDestroy_v2",  handle, 0, 0, 0, 0)
+ 返回 真
+ }
+
+ 如果 (厂商 == GPU_厂商_AMD) { 定义 handle = 外部调用(blas_lib,  "rocblas_create_handle", 0, 0, 0, 0, 0)
+ 定义 可变 opA = 111 // rocblas_operation_none
+ 如果 (转置A) { opA = 112 } // rocblas_operation_transpose
+ 定义 可变 opB = 111
+ 如果 (转置B) { opB = 112 }
+
+ 外部调用(blas_lib, "rocblas_sgemm", handle,
+ opA, opB, M, N, K,
+ alpha, GPU张量_指针(A), K,
+ GPU张量_指针(B), N,
+ beta, GPU张量_指针(C), N)
+ 外部调用(blas_lib,  "rocblas_destroy_handle",  handle, 0, 0, 0, 0)
+ 返回 真
+ }
+
+ 返回 假
+}
+
+// 批量GEMM (多头注意力核心)
+函数 GPU_批量GEMM(gpu管理器, A列, B列, C列, alpha, beta, 批量数) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+ 定义 blas_lib = GPU_加载BLAS(厂商)
+ 如果 (blas_lib == 0) { 返回 假 }
+
+ 如果 (厂商 == GPU_厂商_NVIDIA) { 定义 handle = 外部调用(blas_lib,  "cublasCreate_v2", 0, 0, 0, 0, 0)
+ 定义 形状A = GPU张量_形状(A列[0])
+ 定义 M = 形状A[0]
+ 定义 K = 形状A[1]
+ 定义 N = GPU张量_形状(B列[0])[1]
+
+ // cublasSgemmBatched
+ 外部调用(blas_lib, "cublasSgemmStridedBatched", handle, 0
+, M, N, K,
+ alpha, GPU张量_指针(A列[0]), K, M * K,
+ GPU张量_指针(B列[0]), N, K * N,
+ beta, GPU张量_指针(C列[0]), N, M * N,
+ 批量数)
+ 外部调用(blas_lib,  "cublasDestroy_v2",  handle, 0, 0, 0, 0)
+ 返回 真
+ }
+
+ // AMD rocBLAS类似接口
+ 如果 (厂商 == GPU_厂商_AMD) { 定义 handle = 外部调用(blas_lib,  "rocblas_create_handle", 0, 0, 0, 0, 0)
+ 定义 形状A = GPU张量_形状(A列[0])
+ 外部调用(blas_lib, "rocblas_sgemm_strided_batched", handle,
+ 111, 111, 形状A[0], GPU张量_形状(B列[0])[1], 形状A[1],
+ alpha, GPU张量_指针(A列[0]), 形状A[1], 形状A[0] * 形状A[1],
+ GPU张量_指针(B列[0]), GPU张量_形状(B列[0])[1], 形状A[1] * GPU张量_形状(B列[0])[1],
+ beta, GPU张量_指针(C列[0]), GPU张量_形状(B列[0])[1], 形状A[0] * GPU张量_形状(B列[0])[1],
+ 批量数)
+ 外部调用(blas_lib,  "rocblas_destroy_handle",  handle, 0, 0, 0, 0)
+ 返回 真
+ }
+
+ 返回 假
+}
+
+// 元素级操作 (激活函数/归约 — 自定义内核)
+
+// 预置CUDA/HIP内核源码
+定义 GPU_激活_ReLU源码 = "__global__ void relu(float* data, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if(i < n) data[i] = data[i] > 0 ? data[i] : 0; }"
+定义 GPU_激活_GELU源码 = "__global__ void gelu(float* data, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if(i < n) { float x = data[i]; data[i] = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); } }"
+定义 GPU_softmax源码 = "__global__ void softmax(float* data, int rows, int cols) { int row = blockIdx.x; extern __shared__ float shared[]; float maxval = -1e38f; for(int i = threadIdx.x; i < cols; i += blockDim.x) { float v = data[row*cols+i]; if(v > maxval) maxval = v; } shared[threadIdx.x] = maxval; __syncthreads(); maxval = shared[0]; for(int i=1; i<blockDim.x; i++) if(shared[i]>maxval) maxval=shared[i]; float sum = 0; for(int i = threadIdx.x; i < cols; i += blockDim.x) { data[row*cols+i] = expf(data[row*cols+i] - maxval); sum += data[row*cols+i]; } __syncthreads(); shared[threadIdx.x] = sum; __syncthreads(); sum = 0; for(int i=0; i<blockDim.x; i++) sum += shared[i]; for(int i = threadIdx.x; i < cols; i += blockDim.x) data[row*cols+i] /= sum; }"
+定义 GPU_归约_求和源码 = "__global__ void reduce_sum(float* data, float* result, int n) { extern __shared__ float shared[]; int tid = threadIdx.x; int i = blockIdx.x * blockDim.x + threadIdx.x; shared[tid] = (i < n) ? data[i] : 0; __syncthreads(); for(int s = blockDim.x/2; s > 0; s >>= 1) { if(tid < s) shared[tid] += shared[tid+s]; __syncthreads(); } if(tid == 0) atomicAdd(result, shared[0]); }"
+
+// 内核缓存
+定义 可变 GPU_内核缓存 = 字典()
+
+函数 GPU_获取或编译内核(gpu管理器, 名称, 源码) { 定义 缓存 = 字典获取(GPU_内核缓存, 名称)
+ 如果 (缓存 != 空 且 GPU内核_就绪(缓存)) { 返回 缓存 }
+
+ 定义 内核 = GPU内核_创建(名称, 源码)
+ 定义 结果 = GPU内核_编译(内核, gpu管理器, [])
+ 如果 (结果) {
+ 字典设置(GPU_内核缓存, 名称, 内核)
+ }
+ 返回 内核
+}
+
+// GPU ReLU
+函数 GPU_线性整流(gpu管理器, 张量) { 定义 内核 = GPU_获取或编译内核(gpu管理器, "relu", GPU_激活_ReLU源码)
+ 如果 (!GPU内核_就绪(内核)) { 返回 假 }
+
+ 定义 n = GPU张量_元素数(张量)
+ 定义 block = [256, 1, 1]
+ 定义 grid = [(n + 255) / 256, 1, 1]
+ 返回 GPU内核_启动(内核,  grid,  block,  [GPU张量_指针(张量), n], 0 , 0)
+}
+
+// GPU GELU
+函数 GPU_高斯误差线性(gpu管理器, 张量) { 定义 内核 = GPU_获取或编译内核(gpu管理器, "gelu", GPU_激活_GELU源码)
+ 如果 (!GPU内核_就绪(内核)) { 返回 假 }
+
+ 定义 n = GPU张量_元素数(张量)
+ 返回 GPU内核_启动(内核,  [(n + 255) / 256, 1, 1],  [256, 1, 1],  [GPU张量_指针(张量), n], 0 , 0)
+}
+
+// GPU Softmax
+函数 GPU_归一化指数(gpu管理器, 张量, 行数, 列数) { 定义 内核 = GPU_获取或编译内核(gpu管理器, "softmax", GPU_softmax源码)
+ 如果 (!GPU内核_就绪(内核)) { 返回 假 }
+
+ 定义 共享内存 = 256 * 4 // 256 floats
+ 返回 GPU内核_启动(内核,  [行数, 1, 1],  [256, 1, 1],
+ [GPU张量_指针(张量), 行数, 列数],  共享内存, 0)
+}
+
+// GPU 归约求和
+函数 GPU_归约求和(gpu管理器, 输入张量, 结果张量) { 定义 内核 = GPU_获取或编译内核(gpu管理器, "reduce_sum", GPU_归约_求和源码)
+ 如果 (!GPU内核_就绪(内核)) { 返回 假 }
+
+ 定义 n = GPU张量_元素数(输入张量)
+ 定义 共享内存 = 256 * 4
+ 返回 GPU内核_启动(内核,  [(n + 255) / 256, 1, 1],  [256, 1, 1],
+ [GPU张量_指针(输入张量), GPU张量_指针(结果张量), n],  共享内存, 0)
+}

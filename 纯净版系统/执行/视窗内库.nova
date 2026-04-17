@@ -1,0 +1,228 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// §9 内置DLL — ntdll.dll / user32.dll / gdi32.dll / msvcrt.dll
+
+函数 注册_内置DLL_ntdll() {
+    定义 dll = PE模块 {}
+    dll.名称 = "ntdll.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    追加(dll.导出表, ["RtlInitUnicodeString", win32_RtlInitUnicodeString])
+    追加(dll.导出表, ["NtClose", win32_CloseHandle])
+    追加(dll.导出表, ["NtQueryInformationProcess", win32_NtQueryInformationProcess])
+    追加(PE_已加载模块, dll)
+}
+
+函数 注册_内置DLL_user32() {
+    定义 dll = PE模块 {}
+    dll.名称 = "user32.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    追加(dll.导出表, ["MessageBoxW", win32_MessageBoxW])
+    追加(dll.导出表, ["MessageBoxA", win32_MessageBoxA])
+    追加(dll.导出表, ["CreateWindowExW", win32_CreateWindowExW])
+    追加(dll.导出表, ["ShowWindow", win32_ShowWindow])
+    追加(dll.导出表, ["GetMessageW", win32_GetMessageW])
+    追加(dll.导出表, ["DispatchMessageW", win32_DispatchMessageW])
+    追加(dll.导出表, ["DefWindowProcW", win32_DefWindowProcW])
+    追加(dll.导出表, ["PostQuitMessage", win32_PostQuitMessage])
+    追加(PE_已加载模块, dll)
+}
+
+函数 注册_内置DLL_gdi32() {
+    定义 dll = PE模块 {}
+    dll.名称 = "gdi32.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    追加(dll.导出表, ["Create字体W", win32_CreateFontW])
+    追加(dll.导出表, ["SelectObject", win32_SelectObject])
+    追加(dll.导出表, ["TextOutW", win32_TextOutW])
+    追加(PE_已加载模块, dll)
+}
+
+函数 注册_内置DLL_msvcrt() {
+    定义 dll = PE模块 {}
+    dll.名称 = "msvcrt.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    // C运行时
+    追加(dll.导出表, ["printf", win32_printf])
+    追加(dll.导出表, ["puts", win32_puts])
+    追加(dll.导出表, ["malloc", win32_malloc])
+    追加(dll.导出表, ["free", win32_free])
+    追加(dll.导出表, ["exit", win32_exit])
+    追加(dll.导出表, ["memcpy", win32_memcpy])
+    追加(dll.导出表, ["memset", win32_memset])
+    追加(dll.导出表, ["strlen", win32_strlen])
+    追加(dll.导出表, ["strcpy", win32_strcpy])
+    追加(PE_已加载模块, dll)
+}
+
+函数 注册_内置DLL_advapi32() {
+    定义 dll = PE模块 {}
+    dll.名称 = "advapi32.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    追加(dll.导出表, ["RegOpenKeyExW", win32_RegOpenKeyExW])
+    追加(dll.导出表, ["RegCloseKey", win32_RegCloseKey])
+    追加(PE_已加载模块, dll)
+}
+
+函数 注册_内置DLL_ws2_32() {
+    定义 dll = PE模块 {}
+    dll.名称 = "ws2_32.dll"
+    dll.是DLL = 真
+    dll.基地址 = Win32_DLL_基址
+    Win32_DLL_基址 = Win32_DLL_基址 + 0x100000
+    dll.导出表 = []
+    追加(dll.导出表, ["WSAStartup", win32_WSAStartup])
+    追加(dll.导出表, ["WSACleanup", win32_WSACleanup])
+    追加(dll.导出表, ["socket", win32_socket])
+    追加(dll.导出表, ["connect", win32_connect])
+    追加(dll.导出表, ["send", win32_send])
+    追加(dll.导出表, ["recv", win32_recv])
+    追加(dll.导出表, ["closesocket", win32_closesocket])
+    追加(PE_已加载模块, dll)
+}
+
+函数 win32_MessageBoxW(hwnd, text, caption, type) {
+    内核信息("Win32 MessageBox: [对话框]")
+    返回 1   // IDOK
+}
+函数 win32_MessageBoxA(hwnd, text, caption, type) { 返回 win32_MessageBoxW(hwnd, text, caption, type) }
+
+函数 win32_RtlInitUnicodeString(dest, src) {
+    // UNICODE_STRING初始化: Length + MaxLength + Buffer指针
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0
+}
+
+函数 win32_NtQueryInformationProcess(handle, info_class, info, info_len, ret_len) {
+    // 返回进程信息: PID/基址址/命令行
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0  // STATUS_SUCCESS
+}
+
+定义 可变 _win32_窗口表 = []    // [[句柄, 类名, 标题, x, y, 宽, 高, 可见], ...]
+定义 可变 _win32_消息队列 = []  // [[窗口, 消息, wParam, lParam], ...]
+定义 可变 _win32_下一句柄 = 0x10000
+定义 可变 _win32_程序运行 = 真
+
+函数 win32_CreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam) {
+    定义 hwnd = _win32_下一句柄
+    _win32_下一句柄 = _win32_下一句柄 + 1
+    追加(_win32_窗口表, [hwnd, lpClassName, lpWindowName, x, y, nWidth, nHeight, 假])
+    内核调试("Win32: CreateWindowExW '" + lpWindowName + "' hwnd=0x" + 整数转十六进制(hwnd))
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 hwnd
+}
+
+函数 win32_ShowWindow(hwnd, nCmdShow) {
+    // 查找窗口并设置可见性
+    定义 可变 i = 0
+    当 (i < 计数(_win32_窗口表)) {
+        如果 (_win32_窗口表[i][0] == hwnd) {
+            _win32_窗口表[i][7] = (nCmdShow != 0)  // SW_HIDE=0
+            内核调试("Win32: ShowWindow hwnd=0x" + 整数转十六进制(hwnd) + " show=" + 整数转字符串(nCmdShow))
+            i = 计数(_win32_窗口表)
+        }
+        i = i + 1
+    }
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 1
+}
+
+函数 win32_GetMessageW(lpMsg, hwnd, wMsgFilterMin, wMsgFilterMax) {
+    // 从消息队列取消息, WM_QUIT时返回0
+    如果 (!_win32_程序运行) { 返回 0 }  // WM_QUIT
+    如果 (计数(_win32_消息队列) > 0) {
+        定义 msg = _win32_消息队列[0]
+        // 移除队列头
+        定义 可变 新队列 = []
+        定义 可变 j = 1
+        当 (j < 计数(_win32_消息队列)) { 追加(新队列, _win32_消息队列[j]); j = j + 1 }
+        _win32_消息队列 = 新队列
+        返回 1
+    }
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 1  // 有消息
+}
+
+函数 win32_DispatchMessageW(lpMsg) {
+    // 将消息分发到窗口过程(WndProc)
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0
+}
+
+函数 win32_DefWindowProcW(hwnd, msg, wParam, lParam) {
+    // 默认窗口过程: 处理未被应用程序处理的消息
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0
+}
+
+函数 win32_PostQuitMessage(nExitCode) {
+    // 发送WM_QUIT到消息队列, 终止消息循环
+    _win32_程序运行 = 假
+    追加(_win32_消息队列, [0, 0x0012, nExitCode, 0])  // WM_QUIT=0x0012
+    内核调试("Win32: PostQuitMessage code=" + 整数转字符串(nExitCode))
+    Win32_接口调用数 = Win32_接口调用数 + 1
+}
+
+定义 可变 _win32_GDI对象表 = []  // [[句柄, 类型, 数据], ...]
+定义 可变 _win32_下一GDI句柄 = 0x80000
+
+函数 win32_CreateFontW(nHeight, nWidth, nEscapement, nOrientation, fnWeight, fdwItalic, fdwUnderline, fdwStrikeOut, fdwCharSet, fdwOutputPrecision, fdwClipPrecision, fdwQuality, fdwPitchAndFamily, lpszFace) {
+    定义 h = _win32_下一GDI句柄
+    _win32_下一GDI句柄 = _win32_下一GDI句柄 + 1
+    追加(_win32_GDI对象表, [h, "字体", [nHeight, fnWeight, lpszFace]])
+    内核调试("Win32: CreateFontW '" + lpszFace + "' h=" + 整数转字符串(nHeight))
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 h
+}
+
+函数 win32_SelectObject(hdc, hgdiobj) {
+    // 选择GDI对象到设备上下文
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0  // 返回之前的对象句柄
+}
+
+函数 win32_TextOutW(hdc, x, y, lpString, c) {
+    // 在指定位置绘制文本
+    内核调试("Win32: TextOutW at (" + 整数转字符串(x) + "," + 整数转字符串(y) + ")")
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 1  // 成功
+}
+
+定义 可变 _win32_注册表 = []  // [[键路径, 句柄, [值...]], ...]
+定义 可变 _win32_下一注册表句柄 = 0xF0000
+
+函数 win32_RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult) {
+    // 打开注册表键 → Nova配置存储映射
+    定义 h = _win32_下一注册表句柄
+    _win32_下一注册表句柄 = _win32_下一注册表句柄 + 1
+    追加(_win32_注册表, [lpSubKey, h, []])
+    内核调试("Win32: RegOpenKeyExW '" + lpSubKey + "'")
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0  // ERROR_SUCCESS
+}
+
+函数 win32_RegCloseKey(hKey) {
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0  // ERROR_SUCCESS
+}
+
+函数 win32_WSACleanup() {
+    Win32_接口调用数 = Win32_接口调用数 + 1
+    返回 0
+}

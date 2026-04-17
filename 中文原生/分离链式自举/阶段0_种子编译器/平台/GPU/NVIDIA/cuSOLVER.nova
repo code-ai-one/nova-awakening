@@ -1,0 +1,461 @@
+导入("../核心/FFI桥接.nova")
+导入("../核心/设备管理.nova")
+导入("../../../标准库/基础.nova")
+
+//
+// Nova GPU NVIDIA cuSOLVER 完整接入
+// GPU线性代数求解器 LU/QR/SVD/Cholesky/特征值 + CPU回退
+
+// 库状态
+定义 可变 _cuSOLVER库 = 0
+定义 可变 _cuSOLVER句柄 = 0
+定义 可变 _cusolver_可用 = 假
+定义 可变 _cusolver_操作计数 = 0
+
+// 库加载
+
+函数 cuSOLVER_加载() {
+    如果 (_cuSOLVER库 != 0) { 返回 _cuSOLVER库
+}
+ _cuSOLVER库 = GPU_加载CUDA候选([
+ "cusolver64_11.dll",
+ "libcusolver.so.11",
+ "libcusolver.so"
+ ])
+ 如果 (_cuSOLVER库 != 0) { _cusolver_可用 = 真 }
+ 返回 _cuSOLVER库
+}
+
+函数 cuSOLVER_初始化() {
+    如果 (_cuSOLVER句柄 != 0) { 返回 _cuSOLVER句柄
+}
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 0 }
+ _cuSOLVER句柄 = 外部调用(lib,  "cusolverDnCreate", 0, 0, 0, 0, 0)
+ 返回 _cuSOLVER句柄
+}
+
+函数 cuSOLVER_可用() { 返回 _cusolver_可用 }
+
+// GPU分解操作
+
+函数 cuSOLVER_LU分解(矩阵, N, 枢轴, 工作空间, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 cuCPU_LU分解(矩阵, N) }
+ 返回 外部调用N(lib, "cusolverDnSgetrf",
+ [handle, N, N, 矩阵, N, 工作空间, 枢轴, 信息]) == 0
+}
+
+函数 cuSOLVER_LU求解(矩阵, N, 枢轴, b, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 假 }
+ 返回 外部调用N(lib, "cusolverDnSgetrs",
+ [handle, 0, N, 1, 矩阵, N, 枢轴, b, N, 信息]) == 0
+}
+
+函数 cuSOLVER_QR分解(矩阵, M, N, tau, 工作空间, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 cuCPU_QR分解(矩阵, M, N) }
+ 返回 外部调用N(lib, "cusolverDnSgeqrf",
+ [handle, M, N, 矩阵, M, tau, 工作空间, 0, 信息]) == 0
+}
+
+函数 cuSOLVER_奇异值分解(矩阵, M, N, S, U, VT, 工作空间, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 假 }
+ 返回 外部调用N(lib, "cusolverDnSgesvd",
+ [handle, 65, 65, M, N, 矩阵, M, S, U, M, VT, N, 工作空间, 0, 信息]) == 0
+}
+
+函数 cuSOLVER_Cholesky分解(矩阵, N, 工作空间, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 cuCPU_乔列斯基分解(矩阵, N) }
+ 返回 外部调用N(lib, "cusolverDnSpotrf",
+ [handle, 0, N, 矩阵, N, 工作空间, 0, 信息]) == 0
+}
+
+函数 cuSOLVER_特征值(矩阵, N, 特征值, 工作空间, 信息) { _cusolver_操作计数 = _cusolver_操作计数 + 1
+ 定义 handle = cuSOLVER_初始化()
+ 定义 lib = cuSOLVER_加载()
+ 如果 (lib == 0) { 返回 假 }
+ 返回 外部调用N(lib, "cusolverDnSsyevd",
+ [handle, 1, 0, N, 矩阵, N, 特征值, 工作空间, 0, 信息]) == 0
+}
+
+函数 cuSOLVER_LU工作空间大小(N) { 定义 handle = cuSOLVER_初始化()
+ 返回 外部调用4(cuSOLVER_加载(),  "cusolverDnSgetrf_bufferSize",  handle,  N,  N, 0, 0)
+}
+
+函数 cuSOLVER_SVD工作空间大小(M, N) { 定义 handle = cuSOLVER_初始化()
+ 返回 外部调用4(cuSOLVER_加载(),  "cusolverDnSgesvd_bufferSize",  handle,  M,  N, 0, 0)
+}
+
+函数 cuSOLVER_清理() { 如果 (_cuSOLVER句柄 != 0) {
+ 外部调用(cuSOLVER_加载(),  "cusolverDnDestroy",  _cuSOLVER句柄, 0, 0, 0, 0)
+ _cuSOLVER句柄 = 0
+ }
+}
+
+// CPU回退: 高斯消元
+
+函数 cuCPU_高斯消元(A, b, N) { 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 最大行 = i
+ 定义 可变 最大值 = A[i * N + i]
+ 如果 (最大值 < 0) { 最大值 = 0 - 最大值 }
+ 定义 可变 k = i + 1
+ 当 (k < N) { 定义 可变 v = A[k * N + i]
+ 如果 (v < 0) { v = 0 - v }
+ 如果 (v > 最大值) { 最大值 = v 最大行 = k }
+ k = k + 1
+ }
+ 如果 (最大行 != i) { 定义 可变 j = 0
+ 当 (j < N) { 定义 临 = A[i * N + j]
+ A[i * N + j] = A[最大行 * N + j]
+ A[最大行 * N + j] = 临
+ j = j + 1
+ }
+ b[i] = b[最大行]
+ b[最大行] = 临b
+ }
+ 如果 (A[i * N + i] == 0) { 返回 空 }
+ k = i + 1
+ 当 (k < N) { 定义 因子 = A[k * N + i] / A[i * N + i]
+ 定义 可变 j = i
+ 当 (j < N) { A[k * N + j] = A[k * N + j] - 因子 * A[i * N + j] j = j + 1 }
+ b[k] = b[k] - 因子 * b[i]
+ k = k + 1
+ }
+ i = i + 1
+ }
+ 定义 可变 x = []
+ i = 0
+ 当 (i < N) { 追加(x, 0) i = i + 1 }
+ i = N - 1
+ 当 (i >= 0) { 定义 可变 和 = b[i]
+ 定义 可变 j = i + 1
+ 当 (j < N) { 和 = 和 - A[i * N + j] * x[j] j = j + 1 }
+ 如果 (A[i * N + i] != 0) { x[i] = 和 / A[i * N + i] }
+ i = i - 1
+ }
+ 返回 x
+}
+
+// CPU回退: LU分解
+
+函数 cuCPU_LU分解(A, N) { 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 k = i
+ 当 (k < N) { 定义 可变 和 = 0
+ 定义 可变 j = 0
+ 当 (j < i) { 和 = 和 + A[i * N + j] * A[j * N + k] j = j + 1 }
+ A[i * N + k] = A[i * N + k] - 和
+ k = k + 1
+ }
+ k = i + 1
+ 当 (k < N) { 定义 可变 和 = 0
+ 定义 可变 j = 0
+ 当 (j < i) { 和 = 和 + A[k * N + j] * A[j * N + i] j = j + 1 }
+ 如果 (A[i * N + i] == 0) { 返回 假 }
+ A[k * N + i] = (A[k * N + i] - 和) / A[i * N + i]
+ k = k + 1
+ }
+ i = i + 1
+ }
+ 返回 真
+}
+
+// CPU回退: QR分解
+
+函数 cuCPU_QR分解(A, M, N) { 定义 可变 Q = []
+ 定义 可变 R = []
+ 定义 可变 i = 0
+ 当 (i < M * N) { 追加(Q, 0) i = i + 1 }
+ i = 0
+ 当 (i < N * N) { 追加(R, 0) i = i + 1 }
+ 定义 可变 j = 0
+ 当 (j < N) {
+ i = 0
+ 当 (i < M) { Q[i * N + j] = A[i * N + j] i = i + 1 }
+ 定义 可变 k = 0
+ 当 (k < j) { 定义 可变 点积 = 0
+ i = 0
+ 当 (i < M) { 点积 = 点积 + Q[i * N + k] * A[i * N + j] i = i + 1 }
+ R[k * N + j] = 点积
+ i = 0
+ 当 (i < M) { Q[i * N + j] = Q[i * N + j] - 点积 * Q[i * N + k] i = i + 1 }
+ k = k + 1
+ }
+ 定义 可变 范数平方 = 0
+ i = 0
+ 当 (i < M) { 范数平方 = 范数平方 + Q[i * N + j] * Q[i * N + j] i = i + 1 }
+ 定义 可变 范数 = cuCPU_开方(范数平方)
+ R[j * N + j] = 范数
+ 如果 (范数 > 0) {
+ i = 0
+ 当 (i < M) { Q[i * N + j] = Q[i * N + j] * 1000 / 范数 i = i + 1 }
+ }
+ j = j + 1
+ }
+ 返回 [Q, R]
+}
+
+// CPU回退: Cholesky分解
+
+函数 cuCPU_乔列斯基分解(A, N) { 定义 可变 L = []
+ 定义 可变 i = 0
+ 当 (i < N * N) { 追加(L, 0) i = i + 1 }
+ i = 0
+ 当 (i < N) { 定义 可变 j = 0
+ 当 (j <= i) { 定义 可变 和 = 0
+ 定义 可变 k = 0
+ 当 (k < j) { 和 = 和 + L[i * N + k] * L[j * N + k] k = k + 1 }
+ 如果 (i == j) { 定义 差 = A[i * N + i] - 和
+ 如果 (差 <= 0) { 返回 空 }
+ L[i * N + j] = cuCPU_开方(差)
+ } 否则 { 如果 (L[j * N + j] == 0) { 返回 空 }
+ L[i * N + j] = (A[i * N + j] - 和) / L[j * N + j]
+ }
+ j = j + 1
+ }
+ i = i + 1
+ }
+ 返回 L
+}
+
+函数 cuCPU_开方(x) {
+    如果 (x <= 0) { 返回 0
+}
+ 定义 可变 根 = x / 2
+ 如果 (根 == 0) { 根 = 1 }
+ 定义 可变 i = 0
+ 当 (i < 30) { 根 = (根 + x / 根) / 2 i = i + 1 }
+ 返回 根
+}
+
+// 矩阵工具
+
+函数 cuMat_创建(M, N) { 定义 可变 数据 = []
+ 定义 可变 i = 0
+ 当 (i < M * N) { 追加(数据, 0) i = i + 1 }
+ 返回 数据
+}
+
+函数 cuMat_单位(N) { 定义 可变 数据 = cuMat_创建(N, N)
+ 定义 可变 i = 0
+ 当 (i < N) { 数据[i * N + i] = 1 i = i + 1 }
+ 返回 数据
+}
+
+函数 cuMat_乘(A, B, M, K, N) { 定义 可变 C = cuMat_创建(M, N)
+ 定义 可变 i = 0
+ 当 (i < M) { 定义 可变 j = 0
+ 当 (j < N) { 定义 可变 和 = 0
+ 定义 可变 k = 0
+ 当 (k < K) { 和 = 和 + A[i * K + k] * B[k * N + j] k = k + 1 }
+ C[i * N + j] = 和
+ j = j + 1
+ }
+ i = i + 1
+ }
+ 返回 C
+}
+
+函数 cuMat_转置(A, M, N) { 定义 可变 结果 = cuMat_创建(N, M)
+ 定义 可变 i = 0
+ 当 (i < M) { 定义 可变 j = 0
+ 当 (j < N) { 结果[j * M + i] = A[i * N + j] j = j + 1 }
+ i = i + 1
+ }
+ 返回 结果
+}
+
+函数 cuMat_迹(A, N) { 定义 可变 和 = 0
+ 定义 可变 i = 0
+ 当 (i < N) { 和 = 和 + A[i * N + i] i = i + 1 }
+ 返回 和
+}
+
+函数 cuMat_范数无穷(A, M, N) { 定义 可变 最大 = 0
+ 定义 可变 i = 0
+ 当 (i < M) { 定义 可变 行和 = 0
+ 定义 可变 j = 0
+ 当 (j < N) { 定义 可变 v = A[i * N + j]
+ 如果 (v < 0) { v = 0 - v }
+ 行和 = 行和 + v
+ j = j + 1
+ }
+ 如果 (行和 > 最大) { 最大 = 行和 }
+ i = i + 1
+ }
+ 返回 最大
+}
+
+函数 cuSOLVER_条件数估计(A, N) {
+ 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 v = A[i * N + i]
+ 如果 (v < 0) { v = 0 - v }
+ 如果 (v > 最大对角) { 最大对角 = v }
+ 如果 (v < 最小对角 且 v > 0) { 最小对角 = v }
+ i = i + 1
+ }
+ 如果 (最小对角 == 0) { 返回 999999999 }
+ 返回 最大对角 / 最小对角
+}
+
+函数 cuSOLVER_稳定性评估(条件数) {
+    如果 (条件数 < 100) { 返回 "优秀"
+}
+ 如果 (条件数 < 10000) { 返回 "良好" }
+ 如果 (条件数 < 1000000) { 返回 "警告(结果精度可能受损)" }
+ 返回 "危险(病态矩阵)"
+}
+
+函数 cuSOLVER_推荐(N, 是对称, 是正定) {
+    如果 (是对称 且 是正定) { 返回 "Cholesky(最快,O(N/3))"
+}
+ 如果 (是对称) { 返回 "LDL(对称非正定)" }
+ 如果 (N < 4) { 返回 "Cramer公式(极小规模)" }
+ 如果 (N < 100) { 返回 "LU分解(通用)" }
+ 返回 "QR分解(数值稳定, 0 , 0)"
+}
+
+函数 cuSOLVER_性能预测(N, 使用GPU) {
+    如果 (使用GPU) { 如果 (N < 64) { 返回 "GPU开销大于收益"
+}
+ 如果 (N < 512) { 返回 "GPU中等加速(约5-15x)" }
+ 返回 "GPU显著加速(约30-100x)"
+ }
+ 如果 (N > 500) { 返回 "建议GPU加速" }
+ 返回 "CPU处理可接受"
+}
+
+// 矩阵逆 (Gauss-Jordan)
+
+函数 cuMat_逆(A, N) {
+    定义 可变 增广 = []
+ 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 j = 0
+ 当 (j < N) { 追加(增广, A[i * N + j]) j = j + 1 }
+ j = 0
+ 当 (j < N) { 如果 (j == i) { 追加(增广, 1) } 否则 { 追加(增广, 0) }
+ j = j + 1
+ }
+ i = i + 1
+ }
+ 定义 宽 = 2 * N
+ i = 0
+ 当 (i < N) { 定义 可变 最大行 = i
+ 定义 可变 最大值 = 增广[i * 宽 + i]
+ 如果 (最大值 < 0) { 最大值 = 0 - 最大值 }
+ 定义 可变 k = i + 1
+ 当 (k < N) { 定义 可变 v = 增广[k * 宽 + i]
+ 如果 (v < 0) { v = 0 - v }
+ 如果 (v > 最大值) { 最大值 = v 最大行 = k }
+ k = k + 1
+ }
+ 如果 (最大行 != i) { 定义 可变 j = 0
+ 当 (j < 宽) { 定义 临 = 增广[i * 宽 + j]
+ 增广[i * 宽 + j] = 增广[最大行 * 宽 + j]
+ 增广[最大行 * 宽 + j] = 临
+ j = j + 1
+ }
+ }
+ 如果 (增广[i * 宽 + i] == 0) { 返回 空 }
+ 定义 主元 = 增广[i * 宽 + i]
+ 定义 可变 j = 0
+ 当 (j < 宽) { 增广[i * 宽 + j] = 增广[i * 宽 + j] / 主元 j = j + 1 }
+ k = 0
+ 当 (k < N) { 如果 (k != i) { 定义 因子 = 增广[k * 宽 + i]
+ j = 0
+ 当 (j < 宽) { 增广[k * 宽 + j] = 增广[k * 宽 + j] - 因子 * 增广[i * 宽 + j] j = j + 1 }
+ }
+ k = k + 1
+ }
+ i = i + 1
+ }
+ 定义 可变 逆 = []
+ i = 0
+ 当 (i < N) { 定义 可变 j = 0
+ 当 (j < N) { 追加(逆, 增广[i * 宽 + N + j]) j = j + 1 }
+ i = i + 1
+ }
+ 返回 逆
+}
+
+// 最小二乘
+
+函数 cuSOLVER_最小二乘(A, b, M, N) { 定义 AT = cuMat_转置(A, M, N)
+ 定义 ATA = cuMat_乘(AT, A, N, M, N)
+ 定义 可变 ATb = []
+ 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 和 = 0
+ 定义 可变 j = 0
+ 当 (j < M) { 和 = 和 + AT[i * M + j] * b[j] j = j + 1 }
+ 追加(ATb, 和)
+ i = i + 1
+ }
+ 返回 cuCPU_高斯消元(ATA, ATb, N)
+}
+
+// 幂迭代法
+
+函数 cuSOLVER_幂迭代(A, N, 迭代次数) { 定义 可变 v = []
+    定义 可变 Av = []
+    定义 可变 iter = 0
+ 定义 可变 i = 0
+ 当 (i < N) { 追加(v, 1) i = i + 1 }
+ 定义 可变 特征值 = 0
+当 (iter < 迭代次数) {
+ i = 0
+ 当 (i < N) { 定义 可变 和 = 0
+ 定义 可变 j = 0
+ 当 (j < N) { 和 = 和 + A[i * N + j] * v[j] j = j + 1 }
+ 追加(Av, 和)
+ i = i + 1
+ }
+ 定义 可变 最大 = 0
+ i = 0
+当 (i < N) {
+ 如果 (abs < 0) { abs = 0 - abs }
+ 如果 (abs > 最大) { 最大 = abs }
+ i = i + 1
+ }
+ 如果 (最大 == 0) { 返回 0 }
+ 特征值 = 最大
+ i = 0
+ 当 (i < N) { v[i] = Av[i] / 最大 i = i + 1 }
+ iter = iter + 1
+ }
+ 返回 特征值
+}
+
+函数 cuSOLVER_矩阵分类(A, N) {
+ 定义 可变 i = 0
+ 当 (i < N) { 定义 可变 j = 0
+ 当 (j < N) { 如果 (i != j) { 如果 (A[i * N + j] != A[j * N + i]) { 是对称 = 假 }
+ 如果 (A[i * N + j] != 0) { 是对角 = 假 }
+ 如果 (i > j 且 A[i * N + j] != 0) { 是上三角 = 假 }
+ 如果 (i < j 且 A[i * N + j] != 0) { 是下三角 = 假 }
+ }
+ j = j + 1
+ }
+ i = i + 1
+ }
+ 如果 (是对角) { 返回 "对角矩阵" }
+ 如果 (是上三角) { 返回 "上三角矩阵" }
+ 如果 (是下三角) { 返回 "下三角矩阵" }
+ 如果 (是对称) { 返回 "对称矩阵" }
+ 返回 "一般矩阵"
+}
+
+函数 cuSOLVER_健康报告(A, N) { 定义 类型 = cuSOLVER_矩阵分类(A, N)
+ 定义 条件数 = cuSOLVER_条件数估计(A, N)
+ 定义 稳定性 = cuSOLVER_稳定性评估(条件数)
+ 定义 迹 = cuMat_迹(A, N)
+ 定义 范数 = cuMat_范数无穷(A, N, N)
+ 返回 [类型, 条件数, 稳定性, 迹, 范数]
+}

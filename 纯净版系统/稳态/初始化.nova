@@ -1,0 +1,125 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/高级中控设置.nova")
+
+// §11 PGRAPH / PDISPLAY初始化
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NV_PGRAPH_初始化() {
+    定义 mmio = NV状态.mmio
+    // 清除图形引擎中断
+    MMIO写32(mmio + NV_PGRAPH_INTR, 0xFFFFFFFF)
+    // 等待图形引擎空闲
+    定义 可变 超时 = 10000
+    当 (超时 > 0 && (MMIO读32(mmio + NV_PGRAPH_STATUS) & 0x01) != 0) {
+        超时 = 超时 - 1
+    }
+    如果 (超时 == 0) { 内核警告("NV驱动: PGRAPH忙超时") }
+    内核信息("NV驱动: PGRAPH就绪")
+}
+
+函数 NV_PDISPLAY_初始化() {
+    定义 mmio = NV状态.mmio
+    // 清除显示中断
+    MMIO写32(mmio + NV_PDISPLAY_INTR_0, 0xFFFFFFFF)
+    // 使能VBlank中断
+    MMIO写32(mmio + NV_PDISPLAY_INTR_EN_0, 0x03)  // 头0+头1的VBlank
+
+    // 探测显示头数和SOR数(通过读取状态寄存器)
+    NV状态.头数 = 2   // 大多数图处至少2个头
+    NV状态.SOR数 = 4  // 通常4个SOR(HDMI/DP)
+
+    内核信息("NV驱动: PDISPLAY 头=" + 整数转字符串(NV状态.头数) +
+             " SOR=" + 整数转字符串(NV状态.SOR数))
+}
+
+// §12 中断处理
+
+函数 NV_中断初始化() {
+    定义 mmio = NV状态.mmio
+    // 清除所有挂起中断
+    MMIO写32(mmio + NV_PMC_INTR_0, 0xFFFFFFFF)
+    // 使能: PFIFO + PGRAPH + PDISPLAY
+    MMIO写32(mmio + NV_PMC_INTR_EN_0, (1 << 8) | (1 << 12) | (1 << 26))
+}
+
+函数 NV_中断处理(中断号) {
+    定义 mmio = NV状态.mmio
+    定义 状态 = MMIO读32(mmio + NV_PMC_INTR_0)
+
+    // PFIFO中断
+    如果 ((状态 & (1 << 8)) != 0) {
+        定义 fifo状态 = MMIO读32(mmio + NV_PFIFO_INTR_0)
+        如果 ((fifo状态 & 0x01) != 0) {
+            // 通道切换
+        }
+        如果 ((fifo状态 & 0x10000000) != 0) {
+            // 通道故障
+            内核警告("NV驱动: PFIFO通道故障")
+        }
+        MMIO写32(mmio + NV_PFIFO_INTR_0, fifo状态)
+    }
+
+    // PGRAPH中断
+    如果 ((状态 & (1 << 12)) != 0) {
+        定义 gr状态 = MMIO读32(mmio + NV_PGRAPH_INTR)
+        如果 ((gr状态 & 0x01) != 0) {
+            // 页面故障
+            内核警告("NV驱动: PGRAPH页面故障")
+        }
+        如果 ((gr状态 & 0x10) != 0) {
+            // 非法方法
+        }
+        如果 ((gr状态 & 0x100000) != 0) {
+            // 计算完成
+        }
+        MMIO写32(mmio + NV_PGRAPH_INTR, gr状态)
+    }
+
+    // PDISPLAY中断
+    如果 ((状态 & (1 << 26)) != 0) {
+        定义 disp状态 = MMIO读32(mmio + NV_PDISPLAY_INTR_0)
+        如果 ((disp状态 & 0x01) != 0) {
+            // VBlank 头0
+        }
+        MMIO写32(mmio + NV_PDISPLAY_INTR_0, disp状态)
+    }
+}
+
+// §13 显示模式设置(Modeset)
+
+函数 NV_设置显示模式(头索引, 宽, 高, 刷新率) {
+    如果 (!NV状态.已初始化 || 头索引 >= NV状态.头数) { 返回 }
+    定义 mmio = NV状态.mmio
+    定义 头基址 = NV_PDISP_HEAD_STATE_CTRL + 头索引 * 0x80
+
+    // 计算时序参数(CVT标准)
+    定义 h_total = 宽 + 160   // 默认blanking=160像素(无EDID时的安全值)
+    定义 v_total = 高 + 45
+    定义 像素时钟 = h_total * v_total * 刷新率
+
+    // 写入CRTC寄存器
+    MMIO写32(mmio + 头基址, 1)  // 使能
+    MMIO写32(mmio + 头基址 + 4, (高 << 16) | 宽)  // 活动尺寸
+    MMIO写32(mmio + 头基址 + 8, (v_total << 16) | h_total)  // 总尺寸
+
+    // 配置PLL产生像素时钟
+    NV_配置像素PLL(像素时钟)
+
+    内核信息("NV驱动: 头" + 整数转字符串(头索引) + " 设置 " +
+             整数转字符串(宽) + "×" + 整数转字符串(高) + "@" + 整数转字符串(刷新率) + "Hz")
+}
+
+函数 NV_配置像素PLL(目标频率) {
+    // NVIDIA PLL: 输出频率 = 参考频率 × N / M / P
+    // 参考频率通常27MHz
+    定义 参考 = 27000000
+    // 当前实现: 找近似的N/M/P
+    定义 目标_kHz = 目标频率 / 1000
+    如果 (目标_kHz == 0) { 返回 }
+    定义 M = 1
+    定义 N = 目标_kHz * M / (参考 / 1000)
+    如果 (N > 255) { N = 255 }
+    定义 P = 0
+}

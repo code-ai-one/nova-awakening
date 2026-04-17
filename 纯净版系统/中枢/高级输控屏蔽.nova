@@ -1,0 +1,487 @@
+// GSI屏蔽/取消屏蔽
+
+// §4 NIRC理论 — Nova Interrupt Routing Controller
+// 低耦合高聚合中断屏蔽增强层
+
+定义 NIRC_版本 = "3.0.0-NIRC"
+定义 NIRC_最大中断向量 = 256
+定义 NIRC_NMI向量 = 2
+定义 NIRC_AI阈值 = 0.72
+
+定义 可变 NIRC_屏蔽总数 = 0
+定义 可变 NIRC_取消屏蔽数 = 0
+定义 可变 NIRC_中断触发数 = 0
+定义 可变 NIRC_中断处理数 = 0
+定义 可变 NIRC_EOI数 = 0
+定义 可变 NIRC_AI推理次数 = 0
+定义 可变 NIRC_串行化次数 = 0
+
+// §4.1 中断描述符表 (IDT) 管理
+
+结构 NIRC_IDT条目 {
+    向量号: 0
+    处理器: 0
+    类型: 0          // 0=中断门 1=陷阱门 2=任务门
+    DPL: 0           // 特权级 0-3
+    段选择: 0
+    已启用: 假
+    触发次数: 0
+    最后触发: 0
+}
+
+定义 可变 IDT表 = 0
+定义 可变 IDT大小 = 0
+
+函数 NIRC_IDT初始化() {
+    IDT大小 = NIRC_最大中断向量
+    IDT表 = 分配内存(大小(NIRC_IDT条目) * IDT大小)
+    定义 可变 i = 0
+    当 (i < IDT大小) {
+        IDT表[i].向量号 = i
+        IDT表[i].处理器 = 0
+        IDT表[i].类型 = 0
+        IDT表[i].DPL = 0
+        IDT表[i].段选择 = 0x08
+        IDT表[i].已启用 = 假
+        IDT表[i].触发次数 = 0
+        IDT表[i].最后触发 = 0
+        i = i + 1
+    }
+    内核信息("[NIRC] IDT初始化完成 向量数=" + IDT大小 + "\n")
+}
+
+函数 NIRC_注册中断(向量, 处理器, 类型, DPL) {
+    如果 (向量 >= IDT大小) { 返回 }
+    IDT表[向量].处理器 = 处理器
+    IDT表[向量].类型 = 类型
+    IDT表[向量].DPL = DPL
+    IDT表[向量].已启用 = 真
+}
+
+函数 NIRC_分发中断(向量) {
+    NIRC_中断触发数 = NIRC_中断触发数 + 1
+    如果 (向量 >= IDT大小) { 返回 }
+    定义 条目 = IDT表[向量]
+    如果 (!条目.已启用 || 条目.处理器 == 0) { 返回 }
+    条目.触发次数 = 条目.触发次数 + 1
+    条目.最后触发 = 当前时间_秒()
+    NIRC_中断处理数 = NIRC_中断处理数 + 1
+    // 调用处理器
+    条目.处理器(向量)
+}
+
+// §5 APIC控制
+
+定义 APIC_基址 = 0xFEE00000
+定义 APIC_ID寄存器 = 0x20
+定义 APIC_版本寄存器 = 0x30
+定义 APIC_TPR = 0x80
+定义 APIC_EOI = 0xB0
+定义 APIC_伪向量 = 0xF0
+定义 APIC_ICR低 = 0x300
+定义 APIC_ICR高 = 0x310
+
+函数 NIRC_APIC读(偏移) {
+    返回 内存_读32(APIC_基址 + 偏移)
+}
+
+函数 NIRC_APIC写(偏移, 值) {
+    内存_冉32(APIC_基址 + 偏移, 值)
+}
+
+函数 NIRC_发送EOI() {
+    NIRC_EOI数 = NIRC_EOI数 + 1
+    NIRC_APIC写(APIC_EOI, 0)
+}
+
+函数 NIRC_获取APIC_ID() {
+    返回 (NIRC_APIC读(APIC_ID寄存器) >> 24) & 0xFF
+}
+
+函数 NIRC_设置优先级(优先级) {
+    // TPR: 屏蔽低于此优先级的中断
+    NIRC_APIC写(APIC_TPR, 优先级 & 0xFF)
+}
+
+函数 NIRC_启用APIC() {
+    定义 伪向量 = NIRC_APIC读(APIC_伪向量)
+    NIRC_APIC写(APIC_伪向量, 伪向量 | 0x100)
+    内核信息("[NIRC] APIC已启用\n")
+}
+
+// §6 全系中断屏蔽/恢复
+
+定义 可变 NIRC_全局屏蔽深度 = 0
+定义 可变 NIRC_保存的标志 = 0
+
+函数 NIRC_屏蔽全系中断() {
+    NIRC_屏蔽总数 = NIRC_屏蔽总数 + 1
+    如果 (NIRC_全局屏蔽深度 == 0) {
+        NIRC_保存的标志 = CPU_保存并屏蔽中断()
+    }
+    NIRC_全局屏蔽深度 = NIRC_全局屏蔽深度 + 1
+}
+
+函数 NIRC_恢复全系中断() {
+    NIRC_取消屏蔽数 = NIRC_取消屏蔽数 + 1
+    如果 (NIRC_全局屏蔽深度 <= 0) { 返回 }
+    NIRC_全局屏蔽深度 = NIRC_全局屏蔽深度 - 1
+    如果 (NIRC_全局屏蔽深度 == 0) {
+        CPU_恢复中断标志(NIRC_保存的标志)
+    }
+}
+
+函数 NIRC_是否已屏蔽() {
+    返回 NIRC_全局屏蔽深度 > 0
+}
+
+// §7 IPI（处理器间中断）
+
+函数 NIRC_发送IPI(目标CPU, 向量) {
+    // 用ICR发送IPI
+    NIRC_串行化次数 = NIRC_串行化次数 + 1
+    NIRC_APIC写(APIC_ICR高, (目标CPU & 0xFF) << 24)
+    NIRC_APIC写(APIC_ICR低, 向量 & 0xFF)
+}
+
+函数 NIRC_广播IPI(向量) {
+    // 广播到所有CPU（排除自己）
+    NIRC_串行化次数 = NIRC_串行化次数 + 1
+    NIRC_APIC写(APIC_ICR高, 0)
+    NIRC_APIC写(APIC_ICR低, (向量 & 0xFF) | 0x000C0000)  // 排除自己模式
+}
+
+函数 NIRC_发送INIT_IPI(目标CPU) {
+    NIRC_APIC写(APIC_ICR高, (目标CPU & 0xFF) << 24)
+    NIRC_APIC写(APIC_ICR低, 0x00004500)  // INIT
+}
+
+函数 NIRC_发送STARTUP_IPI(目标CPU, 启动地址) {
+    NIRC_APIC写(APIC_ICR高, (目标CPU & 0xFF) << 24)
+    NIRC_APIC写(APIC_ICR低, 0x00004600 | (启动地址 >> 12))
+}
+
+// §8 AI中断预测
+
+函数 NIRC_AI预测中断负载() {
+    NIRC_AI推理次数 = NIRC_AI推理次数 + 1
+    定义 tensor = Tensor_创建(5)
+    Tensor_写(tensor, 0, NIRC_中断触发数)
+    Tensor_写(tensor, 1, NIRC_中断处理数)
+    Tensor_写(tensor, 2, NIRC_屏蔽总数)
+    Tensor_写(tensor, 3, NIRC_EOI数)
+    Tensor_写(tensor, 4, NIRC_串行化次数)
+    定义 推理 = AI总线_推理(全局AI总线, "nirc_load", tensor)
+    定义 负载 = Tensor_读(推理, 0)
+    Tensor_释放(tensor)
+    Tensor_释放(推理)
+    返回 负载
+}
+
+函数 NIRC_AI异常检测() {
+    定义 tensor = Tensor_创建(4)
+    Tensor_写(tensor, 0, NIRC_中断触发数)
+    Tensor_写(tensor, 1, NIRC_屏蔽总数)
+    Tensor_写(tensor, 2, NIRC_取消屏蔽数)
+    Tensor_写(tensor, 3, NIRC_串行化次数)
+    定义 异常 = AI总线_异常检测(全局AI总线, "nirc_anomaly", tensor)
+    定义 分 = Tensor_读(异常, 0)
+    Tensor_释放(tensor)
+    Tensor_释放(异常)
+    如果 (分 > 0.85) {
+        内核信息("[NIRC] AI异常: 中断负载异常 score=" + 分 + "\n")
+    }
+}
+
+函数 NIRC_AI智能亲和(向量) {
+    定义 负载 = NIRC_AI预测中断负载()
+    如果 (负载 >= NIRC_AI阈值) {
+        // 高负载：分散到其他CPU
+        定义 当前 = NIRC_获取APIC_ID()
+        定义 目标 = (当前 + 1) % 8  // 简化轮转
+        IO接口C_设置IRQ亲和(向量, 目标)
+    }
+}
+
+// §9 初始化与诊断
+
+函数 NIRC_初始化() {
+    NIRC_IDT初始化()
+    NIRC_启用APIC()
+    NIRC_屏蔽总数 = 0
+    NIRC_取消屏蔽数 = 0
+    NIRC_中断触发数 = 0
+    NIRC_中断处理数 = 0
+    NIRC_EOI数 = 0
+    NIRC_AI推理次数 = 0
+    NIRC_串行化次数 = 0
+    NIRC_全局屏蔽深度 = 0
+    内核信息("[NIRC] 中断路由控制器 v" + NIRC_版本 + " 已初始化\n")
+}
+
+函数 NIRC_诊断报告() {
+    内核信息("[NIRC] === 中断路由控制诊断 ===")
+    内核信息("  屏蔽=" + NIRC_屏蔽总数 + " 取消屏蔽=" + NIRC_取消屏蔽数)
+    内核信息("  触发=" + NIRC_中断触发数 + " 处理=" + NIRC_中断处理数)
+    内核信息("  EOI=" + NIRC_EOI数 + " IPI=" + NIRC_串行化次数)
+    内核信息("  AI推理=" + NIRC_AI推理次数 + " 屏蔽深度=" + NIRC_全局屏蔽深度)
+}
+
+函数 NIRC_重置统计() {
+    NIRC_屏蔽总数 = 0
+    NIRC_取消屏蔽数 = 0
+    NIRC_中断触发数 = 0
+    NIRC_中断处理数 = 0
+    NIRC_EOI数 = 0
+    NIRC_AI推理次数 = 0
+    NIRC_串行化次数 = 0
+}
+
+// §10 中断延迟处理(Softirq/Tasklet)
+
+定义 NIRC_最大软中断 = 10
+定义 可变 NIRC_软中断待处理 = 0
+
+结构 NIRC_软中断条目 {
+    处理器: 0
+    数据: 0
+    已启用: 假
+    触发次数: 0
+}
+
+定义 可变 软中断表 = 0
+
+函数 NIRC_软中断初始化() {
+    软中断表 = 分配内存(大小(NIRC_软中断条目) * NIRC_最大软中断)
+    定义 可变 i = 0
+    当 (i < NIRC_最大软中断) {
+        软中断表[i].处理器 = 0
+        软中断表[i].数据 = 0
+        软中断表[i].已启用 = 假
+        软中断表[i].触发次数 = 0
+        i = i + 1
+    }
+    NIRC_软中断待处理 = 0
+}
+
+函数 NIRC_注册软中断(索引, 处理器) {
+    如果 (索引 >= NIRC_最大软中断) { 返回 }
+    软中断表[索引].处理器 = 处理器
+    软中断表[索引].已启用 = 真
+}
+
+函数 NIRC_触发软中断(索引) {
+    如果 (索引 >= NIRC_最大软中断) { 返回 }
+    NIRC_软中断待处理 = NIRC_软中断待处理 | (1 << 索引)
+}
+
+函数 NIRC_处理软中断() {
+    定义 可变 待处理 = NIRC_软中断待处理
+    NIRC_软中断待处理 = 0
+    定义 可变 i = 0
+    当 (i < NIRC_最大软中断) {
+        如果 (待处理 & (1 << i)) {
+            如果 (软中断表[i].已启用 && 软中断表[i].处理器 != 0) {
+                软中断表[i].处理器(软中断表[i].数据)
+                软中断表[i].触发次数 = 软中断表[i].触发次数 + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §11 中断风暴保护
+
+定义 NIRC_风暴阈值 = 10000
+定义 NIRC_风暴窗口_ms = 1000
+定义 可变 NIRC_窗口触发数 = 0
+定义 可变 NIRC_窗口开始时间 = 0
+
+函数 NIRC_检查中断风暴(向量) {
+    定义 现在 = 当前时间_秒()
+    如果 (现在 - NIRC_窗口开始时间 > NIRC_风暴窗口_ms) {
+        NIRC_窗口触发数 = 0
+        NIRC_窗口开始时间 = 现在
+    }
+    NIRC_窗口触发数 = NIRC_窗口触发数 + 1
+    如果 (NIRC_窗口触发数 > NIRC_风暴阈值) {
+        // 中断风暴！临时屏蔽该向量
+        内核信息("[NIRC] 中断风暴检测: 向量=" + 向量 + " 屏蔽\n")
+        定义 GSI = IO接口C_IRQ到GSI(向量)
+        IO接口C_屏蔽GSI(GSI)
+        返回 真
+    }
+    返回 假
+}
+
+函数 NIRC_中断入口(向量) {
+    // 主中断入口：风暴检查 + 分发 + EOI + 软中断
+    如果 (NIRC_检查中断风暴(向量)) { 返回 }
+    NIRC_分发中断(向量)
+    NIRC_发送EOI()
+    NIRC_处理软中断()
+}
+
+// §12 MSI/MSI-X支持
+
+结构 NIRC_MSI条目 {
+    设备ID: 0
+    向量基址: 0
+    向量数: 0
+    目标CPU: 0
+    已启用: 假
+}
+
+定义 NIRC_最大MSI = 64
+定义 可变 MSI表 = 0
+定义 可变 MSI数 = 0
+
+函数 NIRC_MSI初始化() {
+    MSI表 = 分配内存(大小(NIRC_MSI条目) * NIRC_最大MSI)
+    MSI数 = 0
+    定义 可变 i = 0
+    当 (i < NIRC_最大MSI) {
+        MSI表[i].设备ID = 0
+        MSI表[i].向量基址 = 0
+        MSI表[i].向量数 = 0
+        MSI表[i].目标CPU = 0
+        MSI表[i].已启用 = 假
+        i = i + 1
+    }
+}
+
+函数 NIRC_分配MSI向量(设备ID, 数量) {
+    如果 (MSI数 >= NIRC_最大MSI) { 返回 -1 }
+    定义 idx = MSI数
+    MSI数 = MSI数 + 1
+    MSI表[idx].设备ID = 设备ID
+    MSI表[idx].向量基址 = 48 + idx * 数量  // 从向量48开始分配
+    MSI表[idx].向量数 = 数量
+    MSI表[idx].目标CPU = NIRC_获取APIC_ID()
+    MSI表[idx].已启用 = 真
+    返回 MSI表[idx].向量基址
+}
+
+函数 NIRC_启用MSI(设备ID) {
+    定义 可变 i = 0
+    当 (i < MSI数) {
+        如果 (MSI表[i].设备ID == 设备ID) {
+            MSI表[i].已启用 = 真
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 NIRC_禁用MSI(设备ID) {
+    定义 可变 i = 0
+    当 (i < MSI数) {
+        如果 (MSI表[i].设备ID == 设备ID) {
+            MSI表[i].已启用 = 假
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+导入("./类型定义.nova")
+导入("./错误码.nova")
+导入("../推理/值乘.nova")
+导入("./内存初始化.nova")
+导入("./哈希函数.nova")
+导入("./高级输控读.nova")
+导入("./墙钟设置.nova")
+
+函数 IO接口C_屏蔽GSI(GSI号) {
+    如果 (GSI号 >= 最大GSI) { 返回 }
+
+    定义 可变 i = 0
+    当 (i < IO接口C数量) {
+        定义 信息 = IO接口C列表[i]
+        如果 (GSI号 >= 信息.GSI起始 && GSI号 <= 信息.GSI结束) {
+            定义 条目号 = GSI号 - 信息.GSI起始
+            定义 值 = IO接口C_读重定向(信息.基址, 条目号)
+            IO接口C_写重定向(信息.基址, 条目号, 值 | IO接口C_屏蔽)
+            GSI路由表[GSI号].已屏蔽 = 真
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 IO接口C_取消屏蔽GSI(GSI号) {
+    如果 (GSI号 >= 最大GSI) { 返回 }
+
+    定义 可变 i = 0
+    当 (i < IO接口C数量) {
+        定义 信息 = IO接口C列表[i]
+        如果 (GSI号 >= 信息.GSI起始 && GSI号 <= 信息.GSI结束) {
+            定义 条目号 = GSI号 - 信息.GSI起始
+            定义 值 = IO接口C_读重定向(信息.基址, 条目号)
+            IO接口C_写重定向(信息.基址, 条目号, 值 & ~IO接口C_屏蔽)
+            GSI路由表[GSI号].已屏蔽 = 假
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// IRQ到GSI映射(处理ACPI/MADT覆盖)
+
+结构 IRQ覆盖 {
+    源IRQ,
+    目标GSI,
+    触发模式,
+    极性,
+}
+
+定义 可变 IRQ覆盖表 = 数组<IRQ覆盖, 16>
+定义 可变 IRQ覆盖数 = 0
+
+函数 IO接口C_添加IRQ覆盖(源IRQ, 目标GSI, 触发模式, 极性) {
+    如果 (IRQ覆盖数 >= 16) { 返回 }
+    IRQ覆盖表[IRQ覆盖数].源IRQ = 源IRQ
+    IRQ覆盖表[IRQ覆盖数].目标GSI = 目标GSI
+    IRQ覆盖表[IRQ覆盖数].触发模式 = 触发模式
+    IRQ覆盖表[IRQ覆盖数].极性 = 极性
+    IRQ覆盖数 = IRQ覆盖数 + 1
+}
+
+函数 IO接口C_IRQ到GSI(IRQ号) {
+    // 检查覆盖表
+    定义 可变 i = 0
+    当 (i < IRQ覆盖数) {
+        如果 (IRQ覆盖表[i].源IRQ == IRQ号) {
+            返回 IRQ覆盖表[i].目标GSI
+        }
+        i = i + 1
+    }
+    // 默认: 1:1映射
+    返回 IRQ号
+}
+
+// IRQ亲和性设置
+
+函数 IO接口C_设置IRQ亲和(GSI号, 目标CPU) {
+    如果 (GSI号 >= 最大GSI || !GSI路由表[GSI号].已配置) { 返回 }
+
+    定义 可变 i = 0
+    当 (i < IO接口C数量) {
+        定义 信息 = IO接口C列表[i]
+        如果 (GSI号 >= 信息.GSI起始 && GSI号 <= 信息.GSI结束) {
+            定义 条目号 = GSI号 - 信息.GSI起始
+            定义 当前 = IO接口C_读重定向(信息.基址, 条目号)
+
+            // 更新高32位的目标CPU
+            定义 低32 = 当前 & 0xFFFFFFFF
+            定义 高32 = (目标CPU & 0xFF) << 24
+
+            IO接口C_写重定向(信息.基址, 条目号, 低32 | (高32 << 32))
+            GSI路由表[GSI号].目标CPU = 目标CPU
+            返回
+        }
+        i = i + 1
+    }
+}

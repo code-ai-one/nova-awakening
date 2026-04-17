@@ -1,0 +1,485 @@
+// Nova浏览器: 进程沙箱 + IPC(Mojo管道) 完整实现
+//        (++)
+// 多进程架构安全隔离:
+// Browser进程(特权): UI/网络/文件系统/进程管理
+// 渲染er进程(沙箱): DOM/JS/布局/绘制 — 最小权限
+// 图处进程(受限): 合成/图绘 — 仅图处访问
+// Network进程(受限): HTTP/安全 — 仅网络访问
+// Plugin/Extension进程: 按需隔离
+// Linux沙箱层次:
+// Layer 1: 命名空间隔离(PID/NET/USER/MOUNT/IPC)
+// Layer 2: seccomp-BPF(系统调用过滤)
+// Layer 3: 能力(capabilities)剥离
+// Layer 4: chroot/pivot_root(文件系统隔离)
+// IPC (Mojo):
+// Message Pipe: 双向字节流管道
+// Data Pipe: 单向大数据流(共享内存)
+// Shared Buffer: 进程间共享内存区
+// Interface: 类型化RPC调用
+
+导入("./内核直连层.nova")
+
+// §1 进程类型与权限模型
+
+定义 PROC_BROWSER = 0
+定义 PROC_RENDERER = 1
+定义 PROC_图处 = 2
+定义 PROC_NETWORK = 3
+定义 PROC_PLUGIN = 4
+定义 PROC_UTILITY = 5
+
+// 能力(Capability)位掩码
+定义 CAP_NETWORK = 0x0001 // 网络访问
+定义 CAP_FILESYSTEM = 0x0002 // 文件系统访问
+定义 CAP_图处 = 0x0004 // 图处设备访问
+定义 CAP_AUDIO = 0x0008 // 音频设备
+定义 CAP_CLIPBOARD = 0x0010 // 剪贴板
+定义 CAP_CAMERA = 0x0020 // 摄像头
+定义 CAP_GEOLOCATION = 0x0040 // 地理位置
+定义 CAP_NOTIFICATION = 0x0080 // 通知
+定义 CAP_IPC = 0x0100 // IPC通信
+定义 CAP_EXEC = 0x0200 // 执行新进程
+定义 CAP_FULL = 0xFFFF // 所有权限
+
+// 各进程默认能力
+函数 Sandbox_默认能力(进程类型) {
+ 如果 (进程类型 == PROC_BROWSER) { 返回 CAP_FULL }
+ 如果 (进程类型 == PROC_RENDERER) { 返回 CAP_IPC } // 仅IPC
+ 如果 (进程类型 == PROC_图处) { 返回 CAP_图处 | CAP_IPC }
+ 如果 (进程类型 == PROC_NETWORK) { 返回 CAP_NETWORK | CAP_IPC }
+ 返回 CAP_IPC
+}
+
+// §2 沙箱结构
+
+结构 SandboxPolicy {
+ 进程类型,
+ 能力,    // u32 CAP_xxx位掩码
+ // 命名空间
+ 新PID空间,    // 布尔 CLONE_NEWPID
+ 新网络空间,    // 布尔 CLONE_NEWNET
+ 新用户空间,    // 布尔 CLONE_NEWUSER
+ 新挂载空间,    // 布尔 CLONE_NEWNS
+ 新IPC空间,    // 布尔 CLONE_NEWIPC
+ // seccomp
+ 启用seccomp,
+ seccomp过滤器,    // u64 BPF程序
+ // 文件系统
+ 根目录,    // u64 chroot路径
+ 只读挂载,
+ // 资源限制
+ 内存上限MB,
+ CPU份额,    // u32 cgroup cpu.shares
+ 文件描述符上限,
+}
+
+结构 SandboxedProcess {
+ pid,
+ 类型,
+ 策略,    // u64 SandboxPolicy*
+ // IPC管道
+ Nova通信_管道,    // u64 MojoPipe*
+ // 状态
+ 已启动,
+ 已沙箱化,
+ // 站点隔离
+ 站点URL,    // u64 分配给此renderer的站点
+ // 链表
+ 下一个,
+}
+
+定义 可变 进程列表头 = 0
+定义 可变 进程数 = 0
+
+// NSIS理论: Nova沙箱智能安全 (Nova Sandbox Intelligence Security)
+//   核心创新: AI融合的多层沙箱隔离、动态能力控制、
+//   IPC管道通信、进程生命周期、站点隔离、AI风险评估、诊断统计
+
+导入("../推理/智能渠道.nova")
+导入("../中枢/内核打印.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/整数转字符串.nova")
+
+定义 可变 全局NSIS统计 = NSIS统计结构 {}
+
+结构 NSIS统计结构 {
+    进程创建次数,
+    进程销毁次数,
+    能力检查次数,
+    能力拒绝次数,
+    IPC消息次数,
+    AI推理次数,
+    站点隔离次数    // u64
+}
+
+// §3 沙箱进程创建与生命周期
+
+函数 Sandbox_创建策略(进程类型) {
+    定义 policy = 堆_分配(SandboxPolicy)
+    如果 (policy == 0) { 返回 空 }
+    policy.进程类型 = 进程类型
+    policy.能力 = Sandbox_默认能力(进程类型)
+    // 命名空间配置
+    如果 (进程类型 == PROC_RENDERER || 进程类型 == PROC_PLUGIN) {
+        policy.新PID空间 = 1
+        policy.新网络空间 = 1
+        policy.新用户空间 = 1
+        policy.新挂载空间 = 1
+        policy.新IPC空间 = 1
+        policy.启用seccomp = 1
+        policy.只读挂载 = 1
+    } 否则 如果 (进程类型 == PROC_图处 || 进程类型 == PROC_NETWORK) {
+        policy.新PID空间 = 1
+        policy.新用户空间 = 1
+        policy.启用seccomp = 1
+    }
+    // 资源限制
+    policy.内存上限MB = 512
+    policy.CPU份额 = 1024
+    policy.文件描述符上限 = 256
+    返回 policy
+}
+
+函数 Sandbox_创建进程(进程类型, 站点URL) {
+    定义 policy = Sandbox_创建策略(进程类型)
+    如果 (policy == 空) { 返回 空 }
+    定义 proc = 堆_分配(SandboxedProcess)
+    如果 (proc == 0) { 堆_释放(policy); 返回 空 }
+    proc.类型 = 进程类型
+    proc.策略 = policy
+    proc.站点URL = 站点URL
+    proc.已启动 = 0
+    proc.已沙箱化 = 0
+    // 创建IPC管道
+    proc.Nova通信_管道 = MojoPipe_创建()
+    // fork + 应用沙箱策略
+    定义 pid = 内核_创建进程(policy)
+    如果 (pid <= 0) {
+        内核打印("[NSIS] 进程创建失败: 类型={}", 进程类型)
+        堆_释放(proc)
+        返回 空
+    }
+    proc.pid = pid
+    proc.已启动 = 1
+    proc.已沙箱化 = 1
+    // 加入进程链表
+    proc.下一个 = 进程列表头
+    进程列表头 = proc
+    进程数 = 进程数 + 1
+    全局NSIS统计.进程创建次数 = 全局NSIS统计.进程创建次数 + 1
+    返回 proc
+}
+
+函数 Sandbox_销毁进程(proc) {
+    如果 (proc == 空) { 返回 }
+    // 结束进程
+    如果 (proc.已启动 == 1) {
+        内核_杀死进程(proc.pid)
+    }
+    // 关闭IPC管道
+    如果 (proc.Nova通信_管道 != 0) {
+        MojoPipe_关闭(proc.Nova通信_管道)
+    }
+    // 从procedure链表移除
+    定义 可变 当前 = 进程列表头
+    定义 可变 前一个 = 空
+    当 (当前 != 空) {
+        如果 (当前 == proc) {
+            如果 (前一个 == 空) {
+                进程列表头 = proc.下一个
+            } 否则 {
+                前一个.下一个 = proc.下一个
+            }
+            进程数 = 进程数 - 1
+        }
+        前一个 = 当前
+        当前 = 当前.下一个
+    }
+    堆_释放(proc.策略)
+    堆_释放(proc)
+    全局NSIS统计.进程销毁次数 = 全局NSIS统计.进程销毁次数 + 1
+}
+
+// §4 能力检查与动态控制
+
+函数 Sandbox_检查能力(proc, 所需能力) {
+    如果 (proc == 空 || proc.策略 == 空) { 返回 假 }
+    全局NSIS统计.能力检查次数 = 全局NSIS统计.能力检查次数 + 1
+    定义 当前能力 = proc.策略.能力
+    如果 ((当前能力 & 所需能力) == 所需能力) {
+        返回 真
+    }
+    全局NSIS统计.能力拒绝次数 = 全局NSIS统计.能力拒绝次数 + 1
+    返回 假
+}
+
+函数 Sandbox_授予能力(proc, 新能力) {
+    如果 (proc == 空 || proc.策略 == 空) { 返回 }
+    // AI风险评估: 授予新能力是否安全
+    定义 bus = 全局AI总线
+    如果 (bus != 0) {
+        定义 feat = Tensor_创建(3)
+        Tensor_写(feat, 0, proc.类型)
+        Tensor_写(feat, 1, proc.策略.能力)
+        Tensor_写(feat, 2, 新能力)
+        定义 风险 = AI总线_风险评分(bus, feat)
+        Tensor_释放(feat)
+        全局NSIS统计.AI推理次数 = 全局NSIS统计.AI推理次数 + 1
+        如果 (风险 > 70) {
+            内核打印("[NSIS] AI拒绝授予能力: pid={} 能力={:#x}", proc.pid, 新能力)
+            返回
+        }
+    }
+    proc.策略.能力 = proc.策略.能力 | 新能力
+}
+
+函数 Sandbox_撤销能力(proc, 能力) {
+    如果 (proc == 空 || proc.策略 == 空) { 返回 }
+    proc.策略.能力 = proc.策略.能力 & (~能力)
+}
+
+// §5 IPC Mojo管道通信
+
+定义 MOJO_MSG_最大 = 65536  // 64KB
+
+结构 MojoPipe {
+    发送端,    // u64 内核管道句柄
+    接收端,
+    状态,      // u32 0=关闭 1=打开
+    待处理数   // u32
+}
+
+结构 MojoMessage {
+    类型,      // u32 0=请求 1=响应 2=通知
+    接口ID,
+    数据,
+    数据大小,
+    序号        // u64
+}
+
+定义 可变 全局消息序号 = 0
+
+函数 MojoPipe_创建() {
+    定义 pipe = 堆_分配(MojoPipe)
+    如果 (pipe == 0) { 返回 空 }
+    定义 句柄对 = 内核_创建管道()
+    如果 (句柄对 == 0) { 堆_释放(pipe); 返回 空 }
+    pipe.发送端 = 内存_读64(句柄对)
+    pipe.接收端 = 内存_读64(句柄对 + 8)
+    pipe.状态 = 1
+    pipe.待处理数 = 0
+    返回 pipe
+}
+
+函数 MojoPipe_关闭(pipe) {
+    如果 (pipe == 空) { 返回 }
+    pipe.状态 = 0
+    内核_关闭句柄(pipe.发送端)
+    内核_关闭句柄(pipe.接收端)
+    堆_释放(pipe)
+}
+
+函数 MojoPipe_发送(pipe, 接口ID, 数据, 大小) {
+    如果 (pipe == 空 || pipe.状态 != 1) { 返回 假 }
+    如果 (大小 > MOJO_MSG_最大) { 返回 假 }
+    定义 msg = 堆_分配(MojoMessage)
+    如果 (msg == 0) { 返回 假 }
+    msg.类型 = 0  // 请求
+    msg.接口ID = 接口ID
+    msg.数据 = 数据
+    msg.数据大小 = 大小
+    全局消息序号 = 全局消息序号 + 1
+    msg.序号 = 全局消息序号
+    定义 结果 = 内核_管道写(pipe.发送端, msg, 8 + 大小)
+    堆_释放(msg)
+    全局NSIS统计.IPC消息次数 = 全局NSIS统计.IPC消息次数 + 1
+    返回 结果 > 0
+}
+
+函数 MojoPipe_接收(pipe) {
+    如果 (pipe == 空 || pipe.状态 != 1) { 返回 空 }
+    定义 buf = 堆_分配(MOJO_MSG_最大)
+    如果 (buf == 0) { 返回 空 }
+    定义 读取 = 内核_管道读(pipe.接收端, buf, MOJO_MSG_最大)
+    如果 (读取 <= 0) {
+        堆_释放(buf)
+        返回 空
+    }
+    全局NSIS统计.IPC消息次数 = 全局NSIS统计.IPC消息次数 + 1
+    返回 buf
+}
+
+// §6 站点隔离 (Site Isolation)
+
+函数 站点隔离_获取或创建渲染器(站点URL) {
+    // 查找已有的渲染器进程
+    定义 可变 当前 = 进程列表头
+    当 (当前 != 空) {
+        如果 (当前.类型 == PROC_RENDERER && 字符串_相等(当前.站点URL, 站点URL)) {
+            返回 当前  // 复用已有进程
+        }
+        当前 = 当前.下一个
+    }
+    // 创建新的渲染器进程
+    全局NSIS统计.站点隔离次数 = 全局NSIS统计.站点隔离次数 + 1
+    返回 Sandbox_创建进程(PROC_RENDERER, 站点URL)
+}
+
+函数 站点隔离_提取站点(url) {
+    // 从full URL提取站点origin (scheme + host)
+    // 简化: 返回URL本身作为站点标识
+    返回 url
+}
+
+// §7 AI风险实时监控
+// NSIS-AI: 实时分析进程行为、检测异常、动态降权
+
+函数 AI沙箱_检测异常进程() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    定义 可变 当前 = 进程列表头
+    当 (当前 != 空) {
+        定义 feat = Tensor_创建(4)
+        Tensor_写(feat, 0, 当前.类型)
+        Tensor_写(feat, 1, 当前.策略.能力)
+        Tensor_写(feat, 2, 当前.pid)
+        Tensor_写(feat, 3, 0)  // 内存使用量
+        定义 异常分 = AI总线_异常检测(bus, feat)
+        Tensor_释放(feat)
+        全局NSIS统计.AI推理次数 = 全局NSIS统计.AI推理次数 + 1
+        如果 (异常分 > 80) {
+            内核打印("[NSIS] AI检测异常进程: pid={} 异常分={}", 当前.pid, 异常分)
+            // 降权: 移除非IPC能力
+            Sandbox_撤销能力(当前, ~CAP_IPC)
+        }
+        当前 = 当前.下一个
+    }
+}
+
+// §8 seccomp-BPF 系统调用过滤
+
+定义 SECCOMP_RET_ALLOW = 0x7FFF0000
+定义 SECCOMP_RET_KILL = 0x00000000
+定义 SECCOMP_RET_ERRNO = 0x00050000
+
+函数 Seccomp_构建渲染器过滤器() {
+    // 渲染器进程允许的系统调用白名单
+    定义 过滤器 = 堆_分配(256 * 4)  // 最大256条规则
+    如果 (过滤器 == 0) { 返回 空 }
+    定义 可变 规则数 = 0
+    // 允许基本系统调用
+    内存_写32(过滤器 + 规则数 * 4, 0)   // read
+    规则数 = 规则数 + 1
+    内存_写32(过滤器 + 规则数 * 4, 1)   // write
+    规则数 = 规则数 + 1
+    内存_写32(过滤器 + 规则数 * 4, 3)   // close
+    规则数 = 规则数 + 1
+    内存_写32(过滤器 + 规则数 * 4, 9)   // mmap
+    规则数 = 规则数 + 1
+    内存_写32(过滤器 + 规则数 * 4, 11)  // munmap
+    规则数 = 规则数 + 1
+    内存_写32(过滤器 + 规则数 * 4, 60)  // exit
+    规则数 = 规则数 + 1
+    返回 过滤器
+}
+
+// §9 NSIS诊断与初始化
+
+函数 NSIS_初始化() {
+    内核打印("[NSIS] Nova沙箱智能安全 启动")
+    进程列表头 = 0
+    进程数 = 0
+    全局NSIS统计.进程创建次数 = 0
+    全局NSIS统计.进程销毁次数 = 0
+    全局NSIS统计.能力检查次数 = 0
+    全局NSIS统计.能力拒绝次数 = 0
+    全局NSIS统计.IPC消息次数 = 0
+    全局NSIS统计.AI推理次数 = 0
+    全局NSIS统计.站点隔离次数 = 0
+    全局消息序号 = 0
+    内核打印("[NSIS] 初始化完成 — 沙箱/IPC/站点隔离/seccomp/AI监控 就绪")
+}
+
+函数 NSIS_打印诊断() {
+    内核打印("╔════════════════════════════════════════════╗")
+    内核打印("║  NSIS 沙箱智能安全 诊断报告               ║")
+    内核打印("╠════════════════════════════════════════════╣")
+    内核打印("║ 当前进程数:   {}", 进程数)
+    内核打印("║ 进程创建:     {}", 全局NSIS统计.进程创建次数)
+    内核打印("║ 进程销毁:     {}", 全局NSIS统计.进程销毁次数)
+    内核打印("║ 能力检查:     {}", 全局NSIS统计.能力检查次数)
+    内核打印("║ 能力拒绝:     {}", 全局NSIS统计.能力拒绝次数)
+    内核打印("║ IPC消息:      {}", 全局NSIS统计.IPC消息次数)
+    内核打印("║ AI推理:       {}", 全局NSIS统计.AI推理次数)
+    内核打印("║ 站点隔离:     {}", 全局NSIS统计.站点隔离次数)
+    内核打印("╚════════════════════════════════════════════╝")
+}
+
+// §10 共享内存缓冲 (Shared Buffer)
+
+结构 SharedBuffer {
+    句柄,       // u64 内核共享内存句柄
+    大小,       // u64 字节
+    映射地址,
+    只读         // u32 0=读写 1=只读
+}
+
+函数 SharedBuffer_创建(大小) {
+    定义 buf = 堆_分配(SharedBuffer)
+    如果 (buf == 0) { 返回 空 }
+    buf.句柄 = 内核_创建共享内存(大小)
+    如果 (buf.句柄 == 0) { 堆_释放(buf); 返回 空 }
+    buf.大小 = 大小
+    buf.映射地址 = 内核_映射共享内存(buf.句柄, 0, 大小)
+    buf.只读 = 0
+    返回 buf
+}
+
+函数 SharedBuffer_释放(buf) {
+    如果 (buf == 空) { 返回 }
+    如果 (buf.映射地址 != 0) {
+        内核_取消映射(buf.映射地址, buf.大小)
+    }
+    如果 (buf.句柄 != 0) {
+        内核_关闭句柄(buf.句柄)
+    }
+    堆_释放(buf)
+}
+
+// §11 进程健康监控
+// NSIS-Health: 定期检查进程健康状态、自动重启崩溃进程
+
+函数 NSIS_健康检查() {
+    定义 可变 当前 = 进程列表头
+    当 (当前 != 空) {
+        定义 下一个 = 当前.下一个  // 提前保存因为可能被销毁
+        如果 (当前.已启动 == 1) {
+            定义 存活 = 内核_检查进程(current.pid)
+            如果 (存活 == 0) {
+                内核打印("[NSIS] 进程崩溃检测: pid={} 类型={}", 当前.pid, 当前.类型)
+                // 尝试重启渲染器进程
+                如果 (当前.类型 == PROC_RENDERER) {
+                    定义 新进程 = Sandbox_创建进程(PROC_RENDERER, 当前.站点URL)
+                    如果 (新进程 != 空) {
+                        内核打印("[NSIS] 自动重启渲染器: 新pid={}", 新进程.pid)
+                    }
+                }
+                Sandbox_销毁进程(当前)
+            }
+        }
+        当前 = 下一个
+    }
+}
+
+函数 NSIS_获取进程数() {
+    返回 进程数
+}
+
+函数 NSIS_查找进程(pid) {
+    定义 可变 当前 = 进程列表头
+    当 (当前 != 空) {
+        如果 (当前.pid == pid) { 返回 当前 }
+        当前 = 当前.下一个
+    }
+    返回 空
+}

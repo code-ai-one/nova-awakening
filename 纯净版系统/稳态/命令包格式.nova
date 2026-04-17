@@ -1,0 +1,104 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/哈希函数.nova")
+
+// §2 AMD PM4命令包格式
+// AMD 图处使用PM4(Packet Manager 4)命令包格式
+// 类型0: 写寄存器(连续)
+// 类型2: NOP(填充)
+// 类型3: 命令包(draw/dispatch/事件等)
+
+定义 PM4_TYPE0               = 0x00000000   // 寄存器写
+定义 PM4_TYPE2               = 0x80000000   // NOP
+定义 PM4_TYPE3               = 0xC0000000   // 命令
+
+// PM4 Type3 操作码
+定义 PM4_NOP                 = 0x10    // 空操作
+定义 PM4_SET_BASE            = 0x11    // 设置基地址
+定义 PM4_INDEX_BASE          = 0x12    // 索引基地址
+定义 PM4_DRAW_INDEX_2        = 0x27    // 索引绘制
+定义 PM4_DRAW_INDEX_AUTO     = 0x2D    // 自动索引绘制
+定义 PM4_NUM_INSTANCES       = 0x2F    // 实例数
+定义 PM4_INDIRECT_BUFFER     = 0x3F    // 间接缓冲(IB)
+定义 PM4_事件_WRITE         = 0x46    // 事件写
+定义 PM4_事件_WRITE_EOP     = 0x47    // 管线结束事件
+定义 PM4_RELEASE_MEM         = 0x49    // 释放内存(栅栏)
+定义 PM4_SET_SH_REG          = 0x76    // 写着色器寄存器
+定义 PM4_SET_CONTEXT_REG     = 0x69    // 写上下文寄存器
+定义 PM4_SET_UCONFIG_REG     = 0x79    // 写用户配置寄存器
+定义 PM4_DISPATCH_DIRECT     = 0x15    // 直接计算分发
+定义 PM4_DISPATCH_INDIRECT   = 0x16    // 间接计算分发
+定义 PM4_直传_DATA            = 0x50    // 直传数据传输
+定义 PM4_ACQUIRE_MEM         = 0x58    // 内存获取(缓存刷新)
+定义 PM4_WAIT_REG_MEM        = 0x3C    // 等待寄存器/内存值
+定义 PM4_WRITE_DATA          = 0x37    // 写数据到内存/寄存器
+定义 PM4_SURFACE_SYNC        = 0x43    // 表面同步(缓存一致性)
+
+// §3 AMD架构世代 + 型号数据库
+
+定义 AMD_ARCH_GCN1    = 10    // Southern Islands (HD 7000) — 计算1.0
+定义 AMD_ARCH_GCN2    = 20    // Sea Islands (R7/R9 200)
+定义 AMD_ARCH_GCN3    = 30    // Volcanic Islands (R9 300/Fury)
+定义 AMD_ARCH_GCN4    = 40    // Polaris (RX 400/500)
+定义 AMD_ARCH_GCN5    = 50    // Vega (RX Vega 56/64)
+定义 AMD_ARCH_RDNA1   = 100   // Navi 10 (RX 5000)
+定义 AMD_ARCH_RDNA2   = 200   // Navi 21 (RX 6000) — 光追
+定义 AMD_ARCH_RDNA3   = 300   // Navi 31 (RX 7000) — 小芯片
+定义 AMD_ARCH_RDNA4   = 400   // Navi 48 (RX 9000)
+定义 AMD_ARCH_CDNA1   = 1000  // MI100 — 矩阵核心
+定义 AMD_ARCH_CDNA2   = 2000  // MI200/MI250
+定义 AMD_ARCH_CDNA3   = 3000  // MI300
+
+结构 AMD驱动状态 {
+    mmio,
+    gpu,    // 图处设备
+    架构代,
+    显存类型,
+    显存总线宽,
+    // 图处拓扑
+    SE数,    // u32 Shader Engine
+    SH_每SE,    // u32 Shader 数组 per SE
+    CU_每SH,    // u32 Compute Unit per SH
+    CU总数,    // u32 总CU数
+    WGP模式,    // 布尔 RDNA用WGP(2CU=1WGP)
+    // 环缓冲
+    GFX环_地址,
+    GFX环_大小,
+    GFX环_WPTR,
+    计算环_地址,
+    计算环_大小,
+    计算环_WPTR,
+    S直传环_地址,
+    S直传环_大小,
+    S直传环_WPTR,
+    // 中断
+    IH环_地址,
+    IH环_大小,
+    // 显示
+    DCN版本,    // u32 1.0/2.0/3.0/3.5
+    OTG数,    // u32 输出时序发生器数量
+    // 状态
+    已初始化,
+    栅栏值,
+}
+
+定义 可变 AMD状态 = AMD驱动状态 {}
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 AMD_识别完整型号(gpu) {
+    定义 did = gpu.设备ID
+
+    如果 (did >= 0x7500 && did <= 0x75FF) {
+        gpu.型号名 = "RX 9070系列"
+        AMD状态.CU总数 = 64; AMD状态.架构代 = AMD_ARCH_RDNA4
+        AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 256; AMD状态.WGP模式 = 真
+        AMD状态.DCN版本 = 4
+    }
+
+    否则如果 (did == 0x744C) { gpu.型号名 = "RX 7900 XTX"; AMD状态.CU总数 = 96; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 384; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+    否则如果 (did == 0x744D) { gpu.型号名 = "RX 7900 XT"; AMD状态.CU总数 = 84; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 320; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+    否则如果 (did == 0x7470) { gpu.型号名 = "RX 7900 GRE"; AMD状态.CU总数 = 80; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 256; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+    否则如果 (did == 0x7480) { gpu.型号名 = "RX 7800 XT"; AMD状态.CU总数 = 60; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 256; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+    否则如果 (did == 0x7481) { gpu.型号名 = "RX 7700 XT"; AMD状态.CU总数 = 54; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 192; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+    否则如果 (did == 0x7489) { gpu.型号名 = "RX 7600"; AMD状态.CU总数 = 32; AMD状态.架构代 = AMD_ARCH_RDNA3; AMD状态.显存类型 = "GDDR6"; AMD状态.显存总线宽 = 128; AMD状态.WGP模式 = 真; AMD状态.DCN版本 = 3 }
+}

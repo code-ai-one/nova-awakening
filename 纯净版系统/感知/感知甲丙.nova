@@ -1,0 +1,144 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+
+// §6 ICE (NAT穿透)
+
+函数 RTC_开始ICE收集(pc) {
+    如果 (pc == 0) { 返回 }
+    // 1. 收集host候选(本地IP+端口)
+    RTC_收集host候选(pc)
+    // 2. STUN请求(获取server-reflexive候选)
+    RTC_收集srflx候选(pc)
+    // 3. TURN请求(获取relay候选)
+    RTC_收集relay候选(pc)
+    // 4. 收集完成
+    pc.iceGatheringState = ICE_GATHER_COMPLETE
+}
+
+函数 RTC_收集host候选(pc) {
+    如果 (pc == 0) { 返回 }
+    定义 cand = 堆_分配(RTCIceCandidate)
+    cand.类型 = ICE_CAND_HOST; cand.协议 = 0    // 数报
+    cand.IP = "0.0.0.0"; cand.端口 = 0
+    cand.优先级 = 2130706431    // host优先级最高
+    如果 (pc.本地候选数 < 32) {
+        pc.本地候选[pc.本地候选数] = cand; pc.本地候选数 = pc.本地候选数 + 1
+    }
+    // 触发onicecandidate
+    如果 (pc.onicecandidate != 0) {
+        // 调用回调(cand)
+    }
+}
+
+函数 RTC_收集srflx候选(pc) {
+    如果 (pc == 0) { 返回 }
+    // 向STUN服务器发送Binding Request
+    // 获取映射地址(公网IP+端口)
+    定义 可变 i = 0
+    当 (i < pc.iceServers数) {
+        定义 server = pc.iceServers[i]
+        如果 (server != 0 && 字符串_以开头(server, "stun:")) {
+            // 发送STUN Binding Request
+            // 接收Binding Response → XOR-MAPPED-ADDRESS
+        }
+        i = i + 1
+    }
+}
+
+函数 RTC_收集relay候选(pc) {
+    如果 (pc == 0) { 返回 }
+    // 向TURN服务器发送Allocate Request
+    // 获取中继地址
+}
+
+函数 RTC_ICE检查(pc) {
+    如果 (pc == 0) { 返回 }
+    pc.iceConnectionState = ICE_CHECKING
+    // 对本地+远端候选组成候选对
+    // 按优先级排序
+    // 逐对发送STUN Binding检查
+    // 成功 → connected
+    pc.iceConnectionState = ICE_CONNECTED
+    pc.connectionState = CONN_CONNECTED
+}
+
+// §7 RTCRtpTransceiver / Sender / Receiver
+
+结构 RTCRtpTransceiver {
+    mid,
+    sender_track,    // u64 媒体StreamTrack*
+    receiver_track,
+    direction,    // u8 0=sendrecv 1=sendonly 2=recvonly 3=inactive 4=stopped
+    currentDirection,
+    stopped,
+}
+
+结构 RTCRtpSendParameters {
+    编码,    // [4]RTCRtpEncodingParameters
+    编码数,
+    transactionId,
+}
+
+结构 RTCRtpEncodingParameters {
+    active,
+    maxBitrate,
+    maxFramerate,
+    scaleResolutionDownBy,    // i32 Q10
+    rid,
+}
+
+// §8 RTCDataChannel
+
+结构 RTCDataChannel {
+    label,
+    id,
+    ordered,    // 布尔 有序
+    maxPacketLifeTime,    // u16 毫秒(0=不限)
+    maxRetransmits,    // u16 重传次数(0=不限)
+    protocol,
+    negotiated,
+    readyState,    // u8 DC_xxx
+    bufferedAmount,
+    binaryType,    // u8 0=blob 1=arraybuffer
+    // 回调
+    onopen,
+    onclose,
+    onmessage,
+    onerror,
+    onbufferedamountlow,
+    bufferedAmountLowThreshold,
+}
+
+// pc.createDataChannel(label, options)
+函数 RTC_createDataChannel(pc, label, ordered, maxRetransmits) {
+    如果 (pc == 0) { 返回 0 }
+    定义 dc = 堆_分配(RTCDataChannel)
+    dc.label = 字符串_复制(label)
+    dc.ordered = ordered; dc.maxRetransmits = maxRetransmits
+    dc.maxPacketLifeTime = 0; dc.negotiated = 假
+    dc.readyState = DC_CONNECTING; dc.bufferedAmount = 0
+    dc.binaryType = 1    // arraybuffer
+    dc.onopen = 0; dc.onclose = 0; dc.onmessage = 0; dc.onerror = 0
+    如果 (pc.数据通道数 < 16) {
+        pc.数据通道[pc.数据通道数] = dc; pc.数据通道数 = pc.数据通道数 + 1
+    }
+    // 触发negotiationneeded
+    返回 dc
+}
+
+函数 DataChannel_send(dc, 数据, 长度) {
+    如果 (dc == 0 || dc.readyState != DC_OPEN) { 返回 }
+    // 通过SCTP发送数据
+    dc.bufferedAmount = dc.bufferedAmount + 长度
+}
+
+函数 DataChannel_close(dc) {
+    如果 (dc == 0) { 返回 }
+    dc.readyState = DC_CLOSING
+    // 发送SCTP关闭
+    dc.readyState = DC_CLOSED
+    如果 (dc.onclose != 0) {
+        // 触发close事件
+    }
+}

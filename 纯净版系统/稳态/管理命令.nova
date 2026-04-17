@@ -1,0 +1,126 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/字符串替换.nova")
+导入("../引导/端口输入.nova")
+导入("./接收初始化.nova")
+导入("./中断处理.nova")
+导入("../中枢/高级中控设置.nova")
+导入("./快存驱动辅.nova")
+导入("../记忆/复制输入解.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/设备号创建.nova")
+
+// §5 管理命令
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 NVMe_提交管理命令(ctl, sqe) {
+    定义 q = ctl.管理队列
+    定义 尾 = q.SQ尾指针
+    // 写入SQE到提交队列
+    定义 地址 = q.SQ地址 + 尾 * 64
+    内存写32(地址 + 0, sqe.操作码 | (sqe.标志 << 8) | (sqe.命令ID << 16))
+    内存写32(地址 + 4, sqe.NSID)
+    内存写64(地址 + 24, sqe.PRP1)
+    内存写64(地址 + 32, sqe.PRP2)
+    内存写32(地址 + 40, sqe.CDW10)
+    内存写32(地址 + 44, sqe.CDW11)
+    内存写32(地址 + 48, sqe.CDW12)
+
+    // 更新尾指针(门铃)
+    q.SQ尾指针 = (尾 + 1) % q.深度
+    MMIO写32(q.SQ门铃, q.SQ尾指针)
+
+    // 等待CQE
+    返回 NVMe_等待完成(ctl, q, sqe.命令ID)
+}
+
+函数 NVMe_等待完成(ctl, q, cmd_id) {
+    定义 可变 等待 = 0
+    当 (等待 < 100000) {
+        定义 cqe_addr = q.CQ地址 + q.CQ头指针 * 16
+        定义 状态字 = 内存读16(cqe_addr + 14)
+        定义 phase = 状态字 & 1
+
+        如果 (phase == q.Phase位) {
+            // 新的完成条目
+            定义 cid = 内存读16(cqe_addr + 12)
+            定义 状态码 = (状态字 >> 1) & 0x7FF
+
+            // 推进CQ头指针
+            q.CQ头指针 = q.CQ头指针 + 1
+            如果 (q.CQ头指针 >= q.深度) {
+                q.CQ头指针 = 0
+                q.Phase位 = q.Phase位 ^ 1   // 翻转Phase
+            }
+            // 写门铃通知控制器
+            MMIO写32(q.CQ门铃, q.CQ头指针)
+
+            如果 (状态码 != 0) {
+                内核警告("NVMe: 命令失败 ID=" + 整数转字符串(cid) + " 状态=" + 整数转十六进制(状态码))
+                返回 错误_IO
+            }
+            返回 内存读32(cqe_addr)  // 返回结果DW0
+        }
+        延迟_us(10)
+        等待 = 等待 + 1
+    }
+    内核警告("NVMe: 命令超时 ID=" + 整数转字符串(cmd_id))
+    返回 错误_超时
+}
+
+// §6 Identify
+
+函数 NVMe_识别控制器(ctl) {
+    定义 buf = 直传_分配_对齐(4096, 4096)
+    内存填零(buf, 4096)
+
+    定义 sqe = NVMe_SQE {}
+    sqe.操作码 = NVME_ADM_IDENTIFY
+    sqe.命令ID = NVMe_分配命令ID(ctl)
+    sqe.PRP1 = buf
+    sqe.CDW10 = NVME_ID_CNS_CTRL
+
+    NVMe_提交管理命令(ctl, sqe)
+
+    // 解析Identify Controller数据
+    ctl.序列号 = NVMe_读字符串(buf, 4, 23)
+    ctl.型号 = NVMe_读字符串(buf, 24, 63)
+    ctl.固件版本 = NVMe_读字符串(buf, 64, 71)
+
+    内核信息("NVMe: " + ctl.型号 + " SN=" + ctl.序列号 + " FW=" + ctl.固件版本)
+}
+
+函数 NVMe_识别命名空间(ctl) {
+    定义 buf = 直传_分配_对齐(4096, 4096)
+    内存填零(buf, 4096)
+
+    定义 sqe = NVMe_SQE {}
+    sqe.操作码 = NVME_ADM_IDENTIFY
+    sqe.命令ID = NVMe_分配命令ID(ctl)
+    sqe.NSID = 1
+    sqe.PRP1 = buf
+    sqe.CDW10 = NVME_ID_CNS_NS
+
+    NVMe_提交管理命令(ctl, sqe)
+
+    定义 ns = NVMe命名空间 {}
+    ns.NSID = 1
+    // NSZE: 命名空间大小(逻辑块数, offset 0, 8字节)
+    ns.容量 = 内存读64(buf)
+    // FLBAS: 格式化LBA大小(offset 26)
+    定义 flbas = 内存读8(buf + 26)
+    定义 lbaf_idx = flbas & 0xF
+    // LBAF: LBA格式描述符(offset 128 + lbaf_idx * 4)
+    定义 lbaf = 内存读32(buf + 128 + lbaf_idx * 4)
+    定义 lba_ds = (lbaf >> 16) & 0xFF   // 数据大小(2的幂)
+    ns.块大小 = 1 << lba_ds
+
+    ns.名称 = "nvme0n1"
+    追加(ctl.命名空间, ns)
+
+    定义 容量GB = (ns.容量 * ns.块大小) / (1024 * 1024 * 1024)
+    内核信息("NVMe: 命名空间1 容量=" + 整数转字符串(容量GB) + "GB 块大小=" + 整数转字符串(ns.块大小))
+
+    // 注册为块设备
+    块设备_注册("nvme0n1", ns)
+}

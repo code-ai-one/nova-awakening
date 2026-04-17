@@ -1,0 +1,226 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./双解析证书.nova")
+导入("../感知/内核直连层.nova")
+导入("./解析公钥加.nova")
+
+// §2 X.509证书结构 (Nova协议规范 5280 §4.1)
+
+结构 X509证书 {
+    // 原始DER数据
+    der数据,
+    der长度,
+    // TBS (To Be Signed) 区域
+    tbs偏移,
+    tbs长度,
+    // 版本 (v1=0, v2=1, v3=2)
+    版本,
+    // 序列号
+    序列号,
+    // 签名算法OID
+    签名算法,    // u64 OID字符串
+    签名算法长度,
+    // 颁发者 (Issuer)
+    颁发者_CN,    // u64 Common Name字符串
+    颁发者_O,    // u64 Organization
+
+    // 有效期
+    生效时间,    // u64 Unix时间戳(秒)
+    过期时间,
+    // 主题 (Subject)
+    主题_CN,    // u64 Common Name
+    主题_O,
+    // 公钥
+    公钥算法,    // u64 OID字符串
+    公钥数据,    // u64 公钥原始数据
+    公钥长度,
+    // 签名
+    签名数据,
+    签名长度,
+    // 扩展
+    是CA,    // 布尔 basicConstraints: CA=true
+    路径长度约束,    // i32 -1=无约束
+    密钥用途,    // u32 bitfield: 1=digitalSignature 2=keyEncipherment ...
+    SAN列表,    // u64 Subject Alternative Names (域名名称列表)
+    SAN数量,
+}
+
+函数 X509_解析(der数据, der长度) {
+    定义 cert = 堆_分配(X509证书)
+    cert.der数据 = der数据
+    cert.der长度 = der长度
+    cert.是CA = 假
+    cert.路径长度约束 = -1
+    cert.密钥用途 = 0
+    cert.SAN列表 = 0
+    cert.SAN数量 = 0
+
+    // 顶层SEQUENCE
+    定义 top = ASN1_解析元素(der数据, 0, der长度)
+    如果 (top == 0 || top.标签 != ASN1_SEQUENCE) { 返回 0 }
+
+    // TBS Certificate SEQUENCE
+    定义 tbs = ASN1_解析元素(der数据, top.值偏移, der长度)
+    如果 (tbs == 0 || tbs.标签 != ASN1_SEQUENCE) { 返回 0 }
+    cert.tbs偏移 = top.值偏移
+    cert.tbs长度 = tbs.总长度
+
+    定义 可变 pos = tbs.值偏移
+
+    // 版本 [0] EXPLICIT INTEGER (可选)
+    定义 elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_CONTEXT_0) {
+        定义 ver_int = ASN1_解析元素(der数据, elem.值偏移, der长度)
+        cert.版本 = ASN1_读整数(der数据, ver_int)
+        pos = pos + elem.总长度
+        elem = ASN1_解析元素(der数据, pos, der长度)
+    } 否则 {
+        cert.版本 = 0  // v1
+    }
+
+    // 序列号 INTEGER
+    如果 (elem.标签 == ASN1_INTEGER) {
+        cert.序列号 = ASN1_读整数(der数据, elem)
+        pos = pos + elem.总长度
+    }
+
+    // 签名算法 SEQUENCE { OID, NULL }
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_SEQUENCE) {
+        定义 oid_elem = ASN1_解析元素(der数据, elem.值偏移, der长度)
+        如果 (oid_elem.标签 == ASN1_OID) {
+            cert.签名算法 = 堆_分配(128)
+            cert.签名算法长度 = ASN1_读OID(der数据, oid_elem, cert.签名算法, 128)
+        }
+        pos = pos + elem.总长度
+    }
+
+    // 颁发者 SEQUENCE OF SET OF SEQUENCE { OID, String }
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_SEQUENCE) {
+        X509_解析RDN(der数据, elem, cert, 0)  // 0=颁发者
+        pos = pos + elem.总长度
+    }
+
+    // 有效期 SEQUENCE { UTCTime/GeneralizedTime, UTCTime/GeneralizedTime }
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_SEQUENCE) {
+        定义 not_before = ASN1_解析元素(der数据, elem.值偏移, der长度)
+        cert.生效时间 = ASN1_解析时间(der数据, not_before)
+        定义 not_after = ASN1_解析元素(der数据, elem.值偏移 + not_before.总长度, der长度)
+        cert.过期时间 = ASN1_解析时间(der数据, not_after)
+        pos = pos + elem.总长度
+    }
+
+    // 主题 SEQUENCE
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_SEQUENCE) {
+        X509_解析RDN(der数据, elem, cert, 1)  // 1=主题
+        pos = pos + elem.总长度
+    }
+
+    // 主题公钥信息 SEQUENCE
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_SEQUENCE) {
+        X509_解析公钥(der数据, elem, cert)
+        pos = pos + elem.总长度
+    }
+
+    // 扩展 [3] EXPLICIT SEQUENCE (v3)
+    如果 (cert.版本 >= 2) {
+        elem = ASN1_解析元素(der数据, pos, der长度)
+        如果 (elem.标签 == ASN1_CONTEXT_3) {
+            X509_解析扩展(der数据, elem, cert)
+            pos = pos + elem.总长度
+        }
+    }
+
+    // TBS之后: 签名算法 + 签名值
+    pos = top.值偏移 + tbs.总长度
+    // 签名算法 (跳过, 与TBS中的相同)
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    pos = pos + elem.总长度
+    // 签名值 BIT STRING
+    elem = ASN1_解析元素(der数据, pos, der长度)
+    如果 (elem.标签 == ASN1_BIT_STRING) {
+        cert.签名数据 = der数据 + elem.值偏移 + 1  // +1跳过unused bits字节
+        cert.签名长度 = elem.长度 - 1
+    }
+
+    返回 cert
+}
+
+// 解析RDN (Relative Distinguished Name)
+函数 X509_解析RDN(数据, seq_elem, cert, 类型) {
+    定义 可变 pos = seq_elem.值偏移
+    定义 end = seq_elem.值偏移 + seq_elem.长度
+
+    当 (pos < end) {
+        定义 set_elem = ASN1_解析元素(数据, pos, end)
+        如果 (set_elem == 0) { 跳出 }
+        如果 (set_elem.标签 == ASN1_SET) {
+            定义 attr_seq = ASN1_解析元素(数据, set_elem.值偏移, end)
+            如果 (attr_seq != 0 && attr_seq.标签 == ASN1_SEQUENCE) {
+                // OID
+                定义 oid = ASN1_解析元素(数据, attr_seq.值偏移, end)
+                如果 (oid != 0 && oid.标签 == ASN1_OID) {
+                    // 值
+                    定义 val = ASN1_解析元素(数据, attr_seq.值偏移 + oid.总长度, end)
+                    如果 (val != 0) {
+                        // 检查OID: 2.5.4.3 = CommonName, 2.5.4.10 = Organization
+                        如果 (X509_OID是CN(数据, oid)) {
+                            定义 str = 堆_分配(val.长度 + 1)
+                            内存_复制(str, 数据 + val.值偏移, val.长度)
+                            内存_写8(str + val.长度, 0)
+                            如果 (类型 == 0) { cert.颁发者_CN = str }
+                            否则 { cert.主题_CN = str }
+                        }
+                        否则 如果 (X509_OID是O(数据, oid)) {
+                            定义 str = 堆_分配(val.长度 + 1)
+                            内存_复制(str, 数据 + val.值偏移, val.长度)
+                            内存_写8(str + val.长度, 0)
+                            如果 (类型 == 0) { cert.颁发者_O = str }
+                            否则 { cert.主题_O = str }
+                        }
+                    }
+                }
+            }
+        }
+        pos = pos + set_elem.总长度
+    }
+}
+
+函数 X509_OID是CN(数据, oid_elem) {
+    // OID 2.5.4.3 = 55 04 03
+    如果 (oid_elem.长度 == 3) {
+        返回 内存_读8(数据 + oid_elem.值偏移) == 0x55 &&
+               内存_读8(数据 + oid_elem.值偏移 + 1) == 0x04 &&
+               内存_读8(数据 + oid_elem.值偏移 + 2) == 0x03
+    }
+    返回 假
+}
+
+函数 X509_OID是O(数据, oid_elem) {
+    // OID 2.5.4.10 = 55 04 0A
+    如果 (oid_elem.长度 == 3) {
+        返回 内存_读8(数据 + oid_elem.值偏移) == 0x55 &&
+               内存_读8(数据 + oid_elem.值偏移 + 1) == 0x04 &&
+               内存_读8(数据 + oid_elem.值偏移 + 2) == 0x0A
+    }
+    返回 假
+}
+
+定义 可变 AI_证书结构_热点函数 = []
+
+函数 AI_证书结构_JIT候选(函数名, 调用次数) {
+    如果 (调用次数 > 100) {
+        追加(AI_证书结构_热点函数, 函数名)
+        返回 真
+    }
+    返回 假
+}
+
+函数 AI_证书结构_内联建议(函数体大小, 调用次数) {
+    如果 (函数体大小 < 30 && 调用次数 > 50) { 返回 "内联" }
+    返回 "不内联"
+}

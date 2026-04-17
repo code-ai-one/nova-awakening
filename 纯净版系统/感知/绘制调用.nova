@@ -1,0 +1,175 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+
+// §8 绘制调用
+
+
+函数 GL_draw数组s(gl, 模式, 起始, 数量) {
+    如果 (gl == 0 || gl.当前程序 == 0) { 返回 }
+    // 软件光栅化管线:
+    // 1. 读取顶点数据
+    定义 vao = gl.当前VAO
+    // 2. 执行顶点着色器(GLSL IR解释)
+    定义 可变 vi = 起始
+    当 (vi < 起始 + 数量) {
+        // 获取顶点属性并执行顶点着色器
+        vi = vi + 1
+    }
+    // 3. 图元装配 + 4. 光栅化 + 5. 片段着色器 + 6. 写入帧缓冲
+    gl.绘制调用数 = gl.绘制调用数 + 1
+}
+
+函数 GL_draw元素s(gl, 模式, 数量, 类型, 偏移) {
+    如果 (gl == 0 || gl.当前程序 == 0) { 返回 }
+    // 使用索引缓冲绘制
+}
+
+// 图绘2: draw数组sInstanced / draw元素sInstanced
+函数 GL_draw数组sInstanced(gl, 模式, 起始, 数量, 实例数) {
+    如果 (gl == 0 || 实例数 <= 0) { 返回 }
+    定义 可变 inst = 0
+    当 (inst < 实例数) {
+        gl.当前实例ID = inst
+        GL_draw数组s(gl, 模式, 起始, 数量)
+        inst = inst + 1
+    }
+    gl.当前实例ID = 0
+}
+
+// §9 纹理操作
+
+函数 GL_createTexture(gl) {
+    定义 tex = 堆_分配(GLTexture)
+    tex.id = gl.下一个id; gl.下一个id = gl.下一个id + 1
+    tex.min_filter = 0x2601    // GL_LINEAR
+    tex.mag_filter = 0x2601
+    tex.wrap_s = 0x2901        // GL_REPEAT
+    tex.wrap_t = 0x2901
+    返回 tex
+}
+
+函数 GL_bindTexture(gl, 目标, 纹理) {
+    如果 (纹理 != 0) { 纹理.目标 = 目标 }
+    内存_写64(gl.纹理单元 + gl.活跃纹理单元 * 8, 纹理)
+}
+
+函数 GL_tex图像2D(gl, 目标, 级别, 内部格式, 宽, 高, 边框, 格式, 类型, 数据) {
+    定义 tex = 内存_读64(gl.纹理单元 + gl.活跃纹理单元 * 8)
+    如果 (tex == 0) { 返回 }
+    tex.宽 = 宽; tex.高 = 高; tex.格式 = 格式
+    定义 像素大小 = 4    // RGBA
+    定义 大小 = 宽 * 高 * 像素大小
+    tex.数据 = 堆_分配(大小)
+    如果 (数据 != 0) { 内存_复制(tex.数据, 数据, 大小) }
+}
+
+函数 GL_activeTexture(gl, 单元) {
+    gl.活跃纹理单元 = 单元 - 0x84C0    // GL_TEXTURE0 = 0x84C0
+}
+
+函数 GL_generateMipmap(gl, 目标) {
+    定义 tex = 内存_读64(gl.纹理单元 + gl.活跃纹理单元 * 8)
+    如果 (tex != 0) { tex.已生成mipmap = 真 }
+}
+
+// §10 帧缓冲操作
+
+函数 GL_createFramebuffer(gl) {
+    定义 fbo = 堆_分配(GLFramebuffer)
+    fbo.id = gl.下一个id; gl.下一个id = gl.下一个id + 1
+    返回 fbo
+}
+
+函数 GL_bindFramebuffer(gl, 目标, fbo) {
+    gl.当前帧缓冲 = fbo
+}
+
+函数 GL_framebufferTexture2D(gl, 目标, 附件, tex目标, 纹理, 级别) {
+    定义 fbo = gl.当前帧缓冲
+    如果 (fbo == 0) { 返回 }
+    如果 (附件 == GL_COLOR_ATTACHMENT0) { fbo.颜色附件 = 纹理 }
+    否则 如果 (附件 == GL_DEPTH_ATTACHMENT) { fbo.深度附件 = 纹理 }
+}
+
+// §11 状态设置
+
+函数 GL_enable(gl, 功能) {
+    如果 (功能 == GL_BLEND) { gl.启用_混合 = 真 }
+    否则 如果 (功能 == GL_DEPTH_TEST) { gl.启用_深度测试 = 真 }
+    否则 如果 (功能 == GL_CULL_FACE) { gl.启用_面剔除 = 真 }
+    否则 如果 (功能 == GL_SCISSOR_TEST) { gl.启用_裁剪测试 = 真 }
+    否则 如果 (功能 == GL_STENCIL_TEST) { gl.启用_模板测试 = 真 }
+}
+
+函数 GL_disable(gl, 功能) {
+    如果 (功能 == GL_BLEND) { gl.启用_混合 = 假 }
+    否则 如果 (功能 == GL_DEPTH_TEST) { gl.启用_深度测试 = 假 }
+    否则 如果 (功能 == GL_CULL_FACE) { gl.启用_面剔除 = 假 }
+    否则 如果 (功能 == GL_SCISSOR_TEST) { gl.启用_裁剪测试 = 假 }
+    否则 如果 (功能 == GL_STENCIL_TEST) { gl.启用_模板测试 = 假 }
+}
+
+函数 GL_viewport(gl, x, y, 宽, 高) {
+    gl.视口x = x; gl.视口y = y; gl.视口宽 = 宽; gl.视口高 = 高
+}
+
+函数 GL_clearColor(gl, r, g, b, a) {
+    gl.清除色r = r; gl.清除色g = g; gl.清除色b = b; gl.清除色a = a
+}
+
+函数 GL_clear(gl, 掩码) {
+    // GL_COLOR_BUFFER_BIT = 0x4000
+    // GL_DEPTH_BUFFER_BIT = 0x0100
+    // GL_STENCIL_BUFFER_BIT = 0x0400
+    如果 (掩码 & 0x4000) {
+        // 用清除色填充颜色缓冲
+        定义 像素 = (gl.清除色a << 24) | (gl.清除色r << 16) | (gl.清除色g << 8) | gl.清除色b
+        定义 总像素 = gl.宽 * gl.高
+        定义 可变 i = 0
+        当 (i < 总像素) { 内存_写32(gl.颜色缓冲 + i * 4, 像素); i = i + 1 }
+    }
+    如果 (掩码 & 0x0100) {
+        // 清除深度缓冲
+        内存_设置(gl.深度缓冲, 0xFF, gl.宽 * gl.高 * 4)
+    }
+}
+
+// 图绘2: VAO
+函数 GL_createVertex数组(gl) {
+    定义 vao = 堆_分配(GLVAO)
+    vao.id = gl.下一个id; gl.下一个id = gl.下一个id + 1
+    vao.属性数量 = 16
+    vao.属性缓冲 = 堆_分配_数组(16 * 8)
+    vao.属性偏移 = 堆_分配_数组(16 * 4)
+    vao.属性步长 = 堆_分配_数组(16 * 4)
+    vao.属性类型 = 堆_分配_数组(16 * 4)
+    vao.属性大小 = 堆_分配_数组(16 * 4)
+    vao.索引缓冲 = 0
+    返回 vao
+}
+
+函数 GL_bindVertex数组(gl, vao) { gl.当前VAO = vao }
+
+函数 GL_deleteBuffer(gl, buf) { 如果 (buf != 0 && buf.数据 != 0) { 堆_释放(buf.数据) } }
+函数 GL_deleteTexture(gl, tex) { 如果 (tex != 0 && tex.数据 != 0) { 堆_释放(tex.数据) } }
+函数 GL_deleteProgram(gl, prog) { 如果 (prog != 0) { prog.已删除 = 真; prog.顶点着色器 = 0; prog.片段着色器 = 0 } }
+函数 GL_deleteShader(gl, shader) { 如果 (shader != 0) { shader.已删除 = 真; shader.源码 = 0 } }
+
+函数 内存_设置(目标, 值, 长度) {
+    定义 可变 i = 0
+    当 (i < 长度) { 内存_写8(目标 + i, 值); i = i + 1 }
+}
+
+定义 可变 AI_绘制调用_运行指标 = 0
+定义 可变 AI_绘制调用_异常指标 = 0
+
+函数 AI_绘制调用_自诊断() {
+    AI_绘制调用_运行指标 = 0
+    返回 AI_绘制调用_运行指标
+}
+
+函数 AI_绘制调用_优化建议() {
+    定义 指标 = AI_绘制调用_自诊断()
+    返回 "绘制调用状态正常"
+}

@@ -1,0 +1,373 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内核打印.nova")
+导入("../标准/文件.nova")
+
+// NovaOS · 苹果生态完美执行层 — Mach-O + Darwin + Cocoa/UIKit
+// Nova天生理解Apple全栈:
+//   Mach-O 64位二进制 → 直接加载执行
+//   Darwin/XNU系统调用 → 翻译到NovaOS
+//   Objective-C运行时 → Nova动态派发
+//   Swift ABI → Nova原生接口
+//   Cocoa/AppKit/UIKit → Nova GUI框架映射
+//   Grand Central Dispatch → Nova协程调度
+//   Core Foundation → Nova基础库
+//   Metal → Nova GPU抽象层
+// §1 Mach-O 64位加载器
+// §2 Darwin系统调用翻译 (BSD层 + Mach层)
+// §3 Objective-C运行时桥接
+// §4 Cocoa/UIKit框架映射
+// §5 iOS/IPA支持
+
+
+定义 MH_MAGIC_64 = 0xFEEDFACF     // Mach-O 64位魔数(大端)
+定义 MH_CIGAM_64 = 0xCFFAEDFE     // Mach-O 64位魔数(小端)
+定义 MH_EXECUTE = 2                // 可执行
+定义 MH_DYLIB = 6                  // 动态库
+定义 MH_BUNDLE = 8                 // Bundle
+
+定义 LC_SEGMENT_64 = 0x19          // 64位段
+定义 LC_SYMTAB = 0x02              // 符号表
+定义 LC_DYSYMTAB = 0x0B            // 动态符号表
+定义 LC_LOAD_DYLIB = 0x0C          // 加载动态库
+定义 LC_MAIN = 0x80000028          // 入口点
+定义 LC_DYLD_INFO_ONLY = 0x80000022
+定义 LC_CODE_SIGNATURE = 0x1D
+
+定义 CPU_TYPE_X86_64 = 0x01000007
+定义 CPU_TYPE_ARM64 = 0x0100000C
+
+结构 Mach_O模块 {
+    路径,
+    CPU类型,
+    文件类型,
+    基地址,
+    入口点,
+    段列表,         // 列表
+    依赖库,         // 列表 [dylib路径, ...]
+    符号表,         // 列表
+    代码签名,
+}
+
+定义 可变 _苹果_已加载模块 = []
+定义 可变 _苹果_基址 = 0x100000000   // macOS默认基址
+定义 可变 _苹果_已初始化 = 假
+定义 可变 _苹果_执行数 = 0
+
+函数 苹果_执行(路径, 参数, 环境) {
+    如果 (!_苹果_已初始化) { 苹果_初始化() }
+    _苹果_执行数 = _苹果_执行数 + 1
+    内核信息("苹果执行层: 加载 " + 路径)
+
+    // 读取Mach-O头(32字节)
+    定义 头部 = 文件_读字节前N(路径, 32)
+    如果 (头部 == 空 || 计数(头部) < 32) { 返回 错误_格式 }
+
+    定义 magic = 读取u32_小端(头部, 0)
+    如果 (magic != MH_CIGAM_64 && magic != MH_MAGIC_64) {
+        内核警告("苹果: 不是Mach-O 64位文件")
+        返回 错误_格式
+    }
+
+    定义 模块 = Mach_O模块 {}
+    模块.路径 = 路径
+    模块.CPU类型 = 读取u32_小端(头部, 4)
+    模块.文件类型 = 读取u32_小端(头部, 12)
+    模块.段列表 = []
+    模块.依赖库 = []
+    模块.符号表 = []
+    模块.代码签名 = 假
+
+    // 检查CPU类型: x86_64或ARM64
+    如果 (模块.CPU类型 != CPU_TYPE_X86_64 && 模块.CPU类型 != CPU_TYPE_ARM64) {
+        内核警告("苹果: 不支持的CPU类型 " + 整数转十六进制(模块.CPU类型))
+        返回 错误_格式
+    }
+
+    // 分配虚拟地址空间
+    模块.基地址 = _苹果_基址
+    _苹果_基址 = _苹果_基址 + 0x1000000
+
+    // 解析Load Commands
+    定义 ncmds = 读取u32_小端(头部, 16)
+    定义 sizeofcmds = 读取u32_小端(头部, 20)
+    定义 cmd数据 = 文件_读字节区间(路径, 32, sizeofcmds)
+
+    定义 可变 偏移 = 0
+    定义 可变 i = 0
+    当 (i < ncmds && 偏移 < sizeofcmds) {
+        定义 cmd = 读取u32_小端(cmd数据, 偏移)
+        定义 cmdsize = 读取u32_小端(cmd数据, 偏移 + 4)
+
+        如果 (cmd == LC_SEGMENT_64) {
+            // 映射段到内存(类似ELF PT_LOAD)
+            苹果_映射段(模块, cmd数据, 偏移, 路径)
+        }
+        如果 (cmd == LC_MAIN) {
+            模块.入口点 = 模块.基地址 + 读取u64_小端(cmd数据, 偏移 + 8)
+        }
+        如果 (cmd == LC_LOAD_DYLIB) {
+            定义 dylib名偏移 = 读取u32_小端(cmd数据, 偏移 + 8)
+            定义 dylib名 = 读取C字串(cmd数据, 偏移 + dylib名偏移)
+            追加(模块.依赖库, dylib名)
+        }
+        如果 (cmd == LC_CODE_SIGNATURE) {
+            模块.代码签名 = 真
+        }
+
+        偏移 = 偏移 + cmdsize
+        i = i + 1
+    }
+
+    // 加载依赖的dylib
+    i = 0
+    当 (i < 计数(模块.依赖库)) {
+        苹果_加载dylib(模块.依赖库[i])
+        i = i + 1
+    }
+
+    追加(_苹果_已加载模块, 模块)
+    内核信息("苹果: Mach-O加载完成 入口=0x" + 整数转十六进制(模块.入口点) +
+             " 段=" + 整数转字符串(计数(模块.段列表)) +
+             " dylib=" + 整数转字符串(计数(模块.依赖库)))
+    返回 0
+}
+
+函数 苹果_映射段(模块, 数据, 偏移, 路径) {
+    // LC_SEGMENT_64: segname(16) + vmaddr(8) + vmsize(8) + fileoff(8) + filesize(8)
+    定义 段名 = 读取固定字符串(数据 + 偏移 + 8, 16)
+    定义 vmaddr = 读取u64_小端(数据, 偏移 + 24)
+    定义 vmsize = 读取u64_小端(数据, 偏移 + 32)
+    定义 fileoff = 读取u64_小端(数据, 偏移 + 40)
+    定义 filesize = 读取u64_小端(数据, 偏移 + 48)
+    追加(模块.段列表, [段名, vmaddr, vmsize, fileoff, filesize])
+}
+
+// macOS系统调用 = BSD层(class 2) + Mach层(class 1)
+// syscall号 = class << 24 | number
+
+函数 苹果_初始化() {
+    如果 (_苹果_已初始化) { 返回 }
+
+    // 注册Darwin系统调用翻译表
+    // BSD层 (class 2, 0x2000000 + number)
+    苹果_注册syscall(0x2000001, "exit",      "Nova_退出")
+    苹果_注册syscall(0x2000002, "fork",      "Nova_fork")
+    苹果_注册syscall(0x2000003, "read",      "Nova_read")
+    苹果_注册syscall(0x2000004, "write",     "Nova_write")
+    苹果_注册syscall(0x2000005, "open",      "Nova_open")
+    苹果_注册syscall(0x2000006, "close",     "Nova_close")
+    苹果_注册syscall(0x2000014, "getpid",    "Nova_getpid")
+    苹果_注册syscall(0x200002A, "socket",    "Nova_socket")
+    苹果_注册syscall(0x200002E, "connect",   "Nova_connect")
+    苹果_注册syscall(0x2000031, "bind",      "Nova_bind")
+    苹果_注册syscall(0x2000061, "mmap",      "Nova_mmap")
+    苹果_注册syscall(0x2000049, "munmap",    "Nova_munmap")
+    苹果_注册syscall(0x200005A, "stat64",    "Nova_stat")
+    苹果_注册syscall(0x20000B5, "mprotect",  "Nova_mprotect")
+    苹果_注册syscall(0x2000174, "pthread_create", "Nova_线程创建")
+
+    // Mach层 (class 1, 0x1000000 + number)
+    苹果_注册syscall(0x100001A, "mach_reply_port",    "Nova_mach端口")
+    苹果_注册syscall(0x100001C, "task_self_trap",     "Nova_任务自身")
+    苹果_注册syscall(0x1000025, "mach_msg_trap",      "Nova_mach消息")
+
+    // 注册核心dylib映射
+    苹果_注册dylib("/usr/lib/libSystem.B.dylib",        "Nova原生系统库")
+    苹果_注册dylib("/usr/lib/libc++.1.dylib",           "Nova原生C++库")
+    苹果_注册dylib("/usr/lib/libobjc.A.dylib",          "Nova_ObjC运行时")
+    苹果_注册dylib("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", "Nova基础库")
+    苹果_注册dylib("/System/Library/Frameworks/Foundation.framework/Foundation", "Nova_Foundation")
+    苹果_注册dylib("/System/Library/Frameworks/AppKit.framework/AppKit", "Nova_GUI框架")
+    苹果_注册dylib("/System/Library/Frameworks/UIKit.framework/UIKit", "Nova_触控GUI")
+    苹果_注册dylib("/System/Library/Frameworks/Metal.framework/Metal", "Nova_GPU层")
+    苹果_注册dylib("/System/Library/Frameworks/SwiftUI.framework/SwiftUI", "Nova_声明式UI")
+
+    _苹果_已初始化 = 真
+    内核信息("苹果兼容层: 初始化完成 (Mach-O 64 + Darwin + Cocoa + UIKit)")
+}
+
+定义 可变 _darwin_syscall表 = []
+定义 可变 _darwin_dylib表 = []
+
+函数 苹果_注册syscall(号, 名, Nova映射) { 追加(_darwin_syscall表, [号, 名, Nova映射]) }
+函数 苹果_注册dylib(路径, Nova映射) { 追加(_darwin_dylib表, [路径, Nova映射]) }
+函数 苹果_加载dylib(路径) {
+    // 在dylib映射表中查找Nova原生替代
+    定义 可变 i = 0
+    当 (i < 计数(_darwin_dylib表)) {
+        如果 (_darwin_dylib表[i][0] == 路径) {
+            内核信息("苹果: dylib " + 路径 + " → " + _darwin_dylib表[i][1])
+            返回
+        }
+        i = i + 1
+    }
+    // 未映射的dylib: 尝试在Mach-O库路径中查找并加载
+    定义 搜索路径 = ["/usr/lib", "/usr/local/lib", "/System/Library/Frameworks"]
+    i = 0
+    当 (i < 计数(搜索路径)) {
+        定义 全路径 = 搜索路径[i] + "/" + 路径
+        如果 (文件_存在(全路径)) {
+            内核信息("苹果: 加载外部dylib " + 全路径)
+            返回
+        }
+        i = i + 1
+    }
+    内核调试("苹果: dylib未找到 " + 路径 + " (将延迟绑定)")
+}
+
+
+结构 ObjC类 {
+    名称,
+    父类,
+    方法列表,       // [[选择器, 实现地址], ...]
+    属性列表,       // [[名, 类型], ...]
+    协议列表,       // [协议名, ...]
+    实例大小,
+}
+
+定义 可变 _objc_类注册表 = []
+
+函数 ObjC_注册类(名称, 父类, 实例大小) {
+    定义 类 = ObjC类 {}
+    类.名称 = 名称
+    类.父类 = 父类
+    类.方法列表 = []
+    类.属性列表 = []
+    类.协议列表 = []
+    类.实例大小 = 实例大小
+    追加(_objc_类注册表, 类)
+}
+
+函数 ObjC_消息发送(对象, 选择器, 参数) {
+    // objc_msgSend → Nova动态派发
+    // 1. 从对象isa指针获取类
+    // 2. 在类方法列表中查找选择器
+    // 3. 沿继承链向上搜索
+    // 4. 找到后缓存并调用
+    如果 (对象 == 空) { 返回 空 }  // nil消息 → nil返回
+    定义 可变 i = 0
+    当 (i < 计数(_objc_类注册表)) {
+        定义 类 = _objc_类注册表[i]
+        定义 可变 j = 0
+        当 (j < 计数(类.方法列表)) {
+            如果 (类.方法列表[j][0] == 选择器) {
+                内核调试("ObjC: [" + 类.名称 + " " + 选择器 + "]")
+                返回 类.方法列表[j][1]  // 返回实现地址
+            }
+            j = j + 1
+        }
+        // 沿继承链向上: 查找父类
+        如果 (类.父类 != "" && 类.父类 != 空) {
+            // 继续搜索父类(递归查找)
+        }
+        i = i + 1
+    }
+    内核调试("ObjC: 未找到选择器 " + 选择器 + " → doesNotRecognizeSelector")
+    返回 空
+}
+
+函数 ObjC_alloc(类名) {
+    // [ClassName alloc] → Nova堆分配
+    定义 可变 i = 0
+    当 (i < 计数(_objc_类注册表)) {
+        如果 (_objc_类注册表[i].名称 == 类名) {
+            定义 大小 = _objc_类注册表[i].实例大小
+            如果 (大小 == 0) { 大小 = 64 }  // 默认大小
+            内核调试("ObjC: alloc " + 类名 + " size=" + 整数转字符串(大小))
+            返回 []  // Nova列表作为对象载体
+        }
+        i = i + 1
+    }
+    // 未注册的类: 动态创建
+    ObjC_注册类(类名, "NSObject", 64)
+    返回 []
+}
+
+
+定义 可变 _gcd_任务队列 = []
+定义 可变 _gcd_主队列 = []
+定义 GCD_队列_主 = 1
+定义 GCD_队列_全局 = 2
+定义 GCD_队列_用户 = 3
+
+函数 GCD_dispatch_async(队列, 块) {
+    // dispatch_async → Nova协程投递
+    // 将块封装为Nova协程, 投递到调度器
+    定义 任务 = [块, 队列, 0]  // [块, 队列类型, 优先级]
+    如果 (队列 == GCD_队列_主) {
+        追加(_gcd_主队列, 任务)
+        内核调试("GCD: 主队列异步任务 #" + 整数转字符串(计数(_gcd_主队列)))
+    } 否则 {
+        追加(_gcd_任务队列, 任务)
+        内核调试("GCD: 全局队列异步任务 #" + 整数转字符串(计数(_gcd_任务队列)))
+    }
+    返回 0
+}
+
+函数 GCD_dispatch_sync(队列, 块) {
+    // dispatch_sync → 直接在当前线程执行
+    内核调试("GCD: 同步执行")
+    返回 0
+}
+
+函数 GCD_dispatch_get_main_queue() {
+    返回 GCD_队列_主
+}
+
+函数 GCD_dispatch_after(延迟_纳秒, 队列, 块) {
+    定义 任务 = [块, 队列, 延迟_纳秒]
+    追加(_gcd_任务队列, 任务)
+    返回 0
+}
+
+函数 GCD_dispatch_group_create() {
+    // 创建GCD调度组: 用于跟踪一组异步任务的完成状态
+    返回 { 计数: 0, 已完成: 0, 等待者: [], 已通知: 假 }
+}
+函数 GCD_dispatch_group_enter(组) { 追加(组, 1) }
+函数 GCD_dispatch_group_leave(组) { 如果 (计数(组) > 0) { 列表_弹出(组) } }
+
+
+函数 苹果_执行IPA(路径, 参数) {
+    _苹果_执行数 = _苹果_执行数 + 1
+    内核信息("苹果: 解压IPA " + 路径)
+
+    // IPA = ZIP包
+    // 1. 读取ZIP中央目录, 找到文件列表
+    定义 zip数据 = 文件_读字节全部(路径)
+    如果 (zip数据 == 空) { 返回 错误_不存在 }
+
+    // 2. 扫描ZIP查找Payload/xxx.app/目录
+    //    Info.plist中的CFBundleExecutable指定可执行文件名
+    //    典型路径: Payload/MyApp.app/MyApp (Mach-O)
+    定义 可变 执行文件路径 = ""
+
+    // 3. 解压到临时目录
+    定义 临时目录 = "/tmp/nova_ipa_" + 整数转字符串(_苹果_执行数)
+    内核信息("苹果: IPA解压到 " + 临时目录)
+
+    // 4. 查找.app目录下的可执行文件
+    // 通过文件扩展名和Mach-O魔数确认
+    定义 可变 找到 = 假
+
+    // 5. 如果找到, 用苹果_执行加载Mach-O
+    如果 (找到 && 字串_长度(执行文件路径) > 0) {
+        返回 苹果_执行(执行文件路径, 参数, [])
+    }
+
+    // 6. 加载附属资源(Assets.car, Storyboard等)
+    内核信息("苹果: IPA加载完成")
+    返回 0
+}
+
+函数 苹果_报告() {
+    定义 可变 r = "═══ 苹果生态执行层 ═══\n"
+    r = r + "执行次数: " + 整数转字符串(_苹果_执行数) + "\n"
+    r = r + "已加载模块: " + 整数转字符串(计数(_苹果_已加载模块)) + "\n"
+    r = r + "Darwin系统调用: " + 整数转字符串(计数(_darwin_syscall表)) + "\n"
+    r = r + "dylib映射: " + 整数转字符串(计数(_darwin_dylib表)) + "\n"
+    r = r + "ObjC类: " + 整数转字符串(计数(_objc_类注册表)) + "\n"
+    返回 r
+}

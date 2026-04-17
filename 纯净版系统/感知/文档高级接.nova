@@ -1,0 +1,103 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./全局注册.nova")
+导入("../中枢/内存初始化.nova")
+
+// §5 ResizeObserver
+
+结构 ResizeObserver {
+    回调,
+    观察目标,    // u64 [元素*, 上次宽, 上次高] 数组
+    目标数量,
+    目标容量,
+}
+
+函数 ResizeObserver_创建(回调) {
+    定义 ro = 堆_分配(ResizeObserver)
+    ro.回调 = 回调
+    ro.目标容量 = 32
+    ro.观察目标 = 堆_分配_数组(ro.目标容量 * 24)
+    ro.目标数量 = 0
+    返回 ro
+}
+
+函数 ResizeObserver_observe(ro, 目标) {
+    如果 (ro.目标数量 >= ro.目标容量) { 返回 }
+    定义 偏移 = ro.观察目标 + ro.目标数量 * 24
+    内存_写64(偏移, 目标)
+    内存_写32(偏移 + 8, 0)     // 上次宽
+    内存_写32(偏移 + 12, 0)    // 上次高
+    ro.目标数量 = ro.目标数量 + 1
+}
+
+函数 ResizeObserver_检查(ro) {
+    定义 可变 i = 0
+    当 (i < ro.目标数量) {
+        定义 偏移 = ro.观察目标 + i * 24
+        定义 目标 = 内存_读64(偏移)
+        如果 (目标 != 0 && 目标.布局对象 != 0) {
+            定义 layout = 目标.布局对象
+            定义 上次宽 = 内存_读32(偏移 + 8)
+            定义 上次高 = 内存_读32(偏移 + 12)
+            如果 (layout.宽度 != 上次宽 || layout.高度 != 上次高) {
+                // 尺寸变化: 记录新尺寸并通知
+                内存_写32(偏移 + 8, layout.宽度)
+                内存_写32(偏移 + 12, layout.高度)
+                如果 (ro.回调 != 0) {
+                    // 调用回调
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// §6 Selection 接口
+
+结构 Selection {
+    锚节点,    // u64 anchor节点
+    锚偏移,    // u32 anchorOffset
+    焦点节点,    // u64 focus节点
+    焦点偏移,    // u32 focusOffset
+    是折叠的,    // 布尔 isCollapsed
+    范围数量,
+    范围,    // u64 Range*
+}
+
+函数 Selection_创建() {
+    定义 sel = 堆_分配(Selection)
+    sel.锚节点 = 0; sel.锚偏移 = 0
+    sel.焦点节点 = 0; sel.焦点偏移 = 0
+    sel.是折叠的 = 真
+    sel.范围数量 = 0; sel.范围 = 0
+    返回 sel
+}
+
+函数 Selection_collapse(sel, 节点, 偏移) {
+    sel.锚节点 = 节点; sel.锚偏移 = 偏移
+    sel.焦点节点 = 节点; sel.焦点偏移 = 偏移
+    sel.是折叠的 = 真
+    如果 (sel.范围 == 0) { sel.范围 = Range_创建(0) }
+    Range_setStart(sel.范围, 节点, 偏移)
+    Range_setEnd(sel.范围, 节点, 偏移)
+    sel.范围数量 = 1
+}
+
+函数 Selection_extend(sel, 节点, 偏移) {
+    sel.焦点节点 = 节点; sel.焦点偏移 = 偏移
+    sel.是折叠的 = (sel.锚节点 == sel.焦点节点 && sel.锚偏移 == sel.焦点偏移)
+    如果 (sel.范围 != 0) {
+        Range_setEnd(sel.范围, 节点, 偏移)
+    }
+}
+
+函数 Selection_removeAllRanges(sel) {
+    sel.锚节点 = 0; sel.焦点节点 = 0
+    sel.是折叠的 = 真; sel.范围数量 = 0
+}
+
+函数 Selection_toString(sel) {
+    如果 (sel.范围 == 0) { 返回 "" }
+    返回 Range_toString(sel.范围)
+}

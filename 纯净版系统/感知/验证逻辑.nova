@@ -1,0 +1,520 @@
+// §3 验证逻辑
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/整数转字符串.nova")
+
+函数 FormValidation_验证(约束) {
+    如果 (约束 == 0) { 返回 0 }
+    定义 vs = ValidityState_创建()
+
+    // 禁用/隐藏元素不验证
+    如果 (约束.disabled || 约束.类型 == INPUT_HIDDEN || 约束.类型 == INPUT_SUBMIT) {
+        返回 vs
+    }
+
+    如果 (约束.required) {
+        如果 (约束.类型 == INPUT_CHECKBOX) {
+            vs.valueMissing = !约束.checked
+        } 否则 如果 (约束.类型 == INPUT_RADIO) {
+            // radio需检查同name组内是否有选中的
+            vs.valueMissing = !约束.checked && !Radio_同名组已选中(约束.表单, 约束.名称)
+        } 否则 如果 (约束.类型 == INPUT_FILE) {
+            vs.valueMissing = (约束.值 == 0)
+        } 否则 {
+            vs.valueMissing = (约束.值 == 0 || 约束.值长度 == 0)
+        }
+    }
+
+    如果 (约束.值 != 0 && 约束.值长度 > 0) {
+        如果 (约束.类型 == INPUT_EMAIL) {
+            vs.typeMismatch = !FormValidation_是有效邮件(约束.值, 约束.值长度)
+        } 否则 如果 (约束.类型 == INPUT_URL) {
+            vs.typeMismatch = !FormValidation_是有效URL(约束.值, 约束.值长度)
+        }
+    }
+
+    如果 (约束.pattern != 0 && 约束.值 != 0 && 约束.值长度 > 0) {
+        vs.patternMismatch = !FormValidation_匹配pattern(约束.值, 约束.pattern)
+    }
+
+    如果 (约束.值 != 0) {
+        如果 (约束.maxlength >= 0 && 约束.值长度 > 约束.maxlength) {
+            vs.tooLong = 真
+        }
+        如果 (约束.minlength >= 0 && 约束.值长度 > 0 && 约束.值长度 < 约束.minlength) {
+            vs.tooShort = 真
+        }
+    }
+
+    如果 (约束.类型 == INPUT_NUMBER || 约束.类型 == INPUT_RANGE ||
+        约束.类型 == INPUT_DATE || 约束.类型 == INPUT_TIME) {
+        如果 (约束.值 != 0 && 约束.值长度 > 0) {
+            定义 数值 = FormValidation_解析数值(约束.值, 约束.类型)
+            如果 (约束.min != -1 && 数值 < 约束.min) { vs.rangeUnderflow = 真 }
+            如果 (约束.max != -1 && 数值 > 约束.max) { vs.rangeOverflow = 真 }
+            如果 (约束.step > 0 && 约束.min != -1) {
+                定义 diff = 数值 - 约束.min
+                定义 余 = diff % 约束.step
+                如果 (余 != 0) { vs.stepMismatch = 真 }
+            }
+        }
+    }
+
+    如果 (约束.类型 == INPUT_NUMBER && 约束.值 != 0 && 约束.值长度 > 0) {
+        vs.badInput = !FormValidation_是有效数字(约束.值, 约束.值长度)
+    }
+
+    如果 (约束.custom错误 != 0 && 字节长度(约束.custom错误) > 0) {
+        vs.custom错误 = 真
+    }
+
+    ValidityState_更新valid(vs)
+    返回 vs
+}
+
+// §4 格式验证
+
+函数 FormValidation_是有效邮件(值, 长度) {
+    如果 (值 == 0 || 长度 == 0) { 返回 假 }
+    // Nova协议规范 5322基本验证: 必须包含@, @前后都有字符, @后有'.'
+    定义 可变 at位置 = -1
+    定义 可变 dot后at = 假
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 ch = 字节取(值, i)
+        如果 (ch == 64) {  // '@'
+            如果 (at位置 >= 0) { 返回 假 }    // 多个@
+            at位置 = i
+        }
+        如果 (ch == 46 && at位置 >= 0) { dot后at = 真 }    // '.' after @
+        i = i + 1
+    }
+    如果 (at位置 <= 0) { 返回 假 }           // 无@或@在开头
+    如果 (at位置 >= 长度 - 1) { 返回 假 }    // @在末尾
+    如果 (!dot后at) { 返回 假 }               // @后无.
+    返回 真
+}
+
+函数 FormValidation_是有效URL(值, 长度) {
+    如果 (值 == 0 || 长度 < 8) { 返回 假 }
+    // 必须以http://或https://开头
+    如果 (字符串_以开头(值, "http://") || 字符串_以开头(值, "https://")) {
+        返回 真
+    }
+    返回 假
+}
+
+函数 FormValidation_是有效数字(值, 长度) {
+    如果 (值 == 0 || 长度 == 0) { 返回 假 }
+    定义 可变 有数字 = 假
+    定义 可变 有点 = 假
+    定义 可变 i = 0
+    如果 (字节取(值, 0) == 45 || 字节取(值, 0) == 43) { i = 1 }   // +/-
+    当 (i < 长度) {
+        定义 ch = 字节取(值, i)
+        如果 (ch >= 48 && ch <= 57) { 有数字 = 真 }
+        否则 如果 (ch == 46 && !有点) { 有点 = 真 }
+        否则 如果 (ch == 101 || ch == 69) { }    // e/E (科学记数法)
+        否则 { 返回 假 }
+        i = i + 1
+    }
+    返回 有数字
+}
+
+函数 FormValidation_匹配pattern(值, pattern) {
+    如果 (值 == 0 || pattern == 0) { 返回 真 }
+    // 正则表达式匹配: 完整匹配(隐含^...$)
+    // 调用正则引擎
+    // 调用正则引擎进行完整匹配
+    返回 RegExp_全匹配(值, pattern)
+}
+
+函数 FormValidation_解析数值(值, 类型) {
+    如果 (值 == 0) { 返回 0 }
+    如果 (类型 == INPUT_DATE) {
+        返回 FormValidation_解析日期值(值)
+    }
+    如果 (类型 == INPUT_TIME) {
+        返回 FormValidation_解析时间值(值)
+    }
+    返回 转整数(值) * 1024
+}
+
+// §5 输入类型常量
+
+定义 INPUT_TEXT = 0
+定义 INPUT_PASSWORD = 1
+定义 INPUT_EMAIL = 2
+定义 INPUT_URL = 3
+定义 INPUT_NUMBER = 4
+定义 INPUT_RANGE = 5
+定义 INPUT_DATE = 6
+定义 INPUT_TIME = 7
+定义 INPUT_CHECKBOX = 8
+定义 INPUT_RADIO = 9
+定义 INPUT_FILE = 10
+定义 INPUT_HIDDEN = 11
+定义 INPUT_SUBMIT = 12
+定义 INPUT_RESET = 13
+定义 INPUT_BUTTON = 14
+定义 INPUT_TEL = 15
+定义 INPUT_SEARCH = 16
+定义 INPUT_COLOR = 17
+定义 INPUT_DATETIME_LOCAL = 18
+定义 INPUT_MONTH = 19
+定义 INPUT_WEEK = 20
+定义 INPUT_IMAGE = 21
+
+函数 FormValidation_输入类型名(类型) {
+    如果 (类型 == INPUT_TEXT) { 返回 "text" }
+    如果 (类型 == INPUT_PASSWORD) { 返回 "password" }
+    如果 (类型 == INPUT_EMAIL) { 返回 "email" }
+    如果 (类型 == INPUT_URL) { 返回 "url" }
+    如果 (类型 == INPUT_NUMBER) { 返回 "number" }
+    如果 (类型 == INPUT_RANGE) { 返回 "range" }
+    如果 (类型 == INPUT_DATE) { 返回 "date" }
+    如果 (类型 == INPUT_TIME) { 返回 "time" }
+    如果 (类型 == INPUT_CHECKBOX) { 返回 "checkbox" }
+    如果 (类型 == INPUT_RADIO) { 返回 "radio" }
+    如果 (类型 == INPUT_FILE) { 返回 "file" }
+    如果 (类型 == INPUT_HIDDEN) { 返回 "hidden" }
+    如果 (类型 == INPUT_SUBMIT) { 返回 "submit" }
+    如果 (类型 == INPUT_TEL) { 返回 "tel" }
+    如果 (类型 == INPUT_SEARCH) { 返回 "search" }
+    如果 (类型 == INPUT_COLOR) { 返回 "color" }
+    返回 "unknown"
+}
+
+函数 FormValidation_需要验证的类型(类型) {
+    如果 (类型 == INPUT_HIDDEN) { 返回 假 }
+    如果 (类型 == INPUT_SUBMIT) { 返回 假 }
+    如果 (类型 == INPUT_RESET) { 返回 假 }
+    如果 (类型 == INPUT_BUTTON) { 返回 假 }
+    如果 (类型 == INPUT_IMAGE) { 返回 假 }
+    返回 真
+}
+
+// §6 ValidityState 结构与操作
+
+结构 ValidityState {
+    valueMissing,
+    typeMismatch,
+    patternMismatch,
+    tooLong,
+    tooShort,
+    rangeUnderflow,
+    rangeOverflow,
+    stepMismatch,
+    badInput,
+    custom错误,
+    valid,
+}
+
+函数 ValidityState_创建() {
+    定义 vs = ValidityState {}
+    vs.valueMissing = 假
+    vs.typeMismatch = 假
+    vs.patternMismatch = 假
+    vs.tooLong = 假
+    vs.tooShort = 假
+    vs.rangeUnderflow = 假
+    vs.rangeOverflow = 假
+    vs.stepMismatch = 假
+    vs.badInput = 假
+    vs.custom错误 = 假
+    vs.valid = 真
+    返回 vs
+}
+
+函数 ValidityState_更新valid(vs) {
+    vs.valid = !vs.valueMissing && !vs.typeMismatch && !vs.patternMismatch &&
+               !vs.tooLong && !vs.tooShort && !vs.rangeUnderflow &&
+               !vs.rangeOverflow && !vs.stepMismatch && !vs.badInput &&
+               !vs.custom错误
+}
+
+函数 ValidityState_第一个错误(vs) {
+    如果 (vs.valueMissing) { 返回 "valueMissing" }
+    如果 (vs.typeMismatch) { 返回 "typeMismatch" }
+    如果 (vs.patternMismatch) { 返回 "patternMismatch" }
+    如果 (vs.tooLong) { 返回 "tooLong" }
+    如果 (vs.tooShort) { 返回 "tooShort" }
+    如果 (vs.rangeUnderflow) { 返回 "rangeUnderflow" }
+    如果 (vs.rangeOverflow) { 返回 "rangeOverflow" }
+    如果 (vs.stepMismatch) { 返回 "stepMismatch" }
+    如果 (vs.badInput) { 返回 "badInput" }
+    如果 (vs.custom错误) { 返回 "customError" }
+    返回 ""
+}
+
+函数 ValidityState_错误数(vs) {
+    定义 可变 数 = 0
+    如果 (vs.valueMissing) { 数 = 数 + 1 }
+    如果 (vs.typeMismatch) { 数 = 数 + 1 }
+    如果 (vs.patternMismatch) { 数 = 数 + 1 }
+    如果 (vs.tooLong) { 数 = 数 + 1 }
+    如果 (vs.tooShort) { 数 = 数 + 1 }
+    如果 (vs.rangeUnderflow) { 数 = 数 + 1 }
+    如果 (vs.rangeOverflow) { 数 = 数 + 1 }
+    如果 (vs.stepMismatch) { 数 = 数 + 1 }
+    如果 (vs.badInput) { 数 = 数 + 1 }
+    如果 (vs.custom错误) { 数 = 数 + 1 }
+    返回 数
+}
+
+// §7 错误消息生成
+
+函数 FormValidation_默认错误消息(vs, 约束) {
+    如果 (vs.valueMissing) {
+        如果 (约束.类型 == INPUT_CHECKBOX) { 返回 "请勾选此复选框" }
+        如果 (约束.类型 == INPUT_RADIO) { 返回 "请从中选择一项" }
+        如果 (约束.类型 == INPUT_FILE) { 返回 "请选择一个文件" }
+        返回 "请填写此字段"
+    }
+    如果 (vs.typeMismatch) {
+        如果 (约束.类型 == INPUT_EMAIL) { 返回 "请输入有效的电子邮件地址" }
+        如果 (约束.类型 == INPUT_URL) { 返回 "请输入有效的URL" }
+        返回 "类型不匹配"
+    }
+    如果 (vs.patternMismatch) {
+        如果 (约束.title != 0) { 返回 约束.title }
+        返回 "请匹配所需的格式"
+    }
+    如果 (vs.tooLong) {
+        返回 "请将值缩短到" + 整数转字符串(约束.maxlength) + "个字符以内（当前为" +
+               整数转字符串(约束.值长度) + "个字符）"
+    }
+    如果 (vs.tooShort) {
+        返回 "请将值扩展到至少" + 整数转字符串(约束.minlength) + "个字符（当前为" +
+               整数转字符串(约束.值长度) + "个字符）"
+    }
+    如果 (vs.rangeUnderflow) {
+        返回 "值必须大于或等于" + 整数转字符串(约束.min)
+    }
+    如果 (vs.rangeOverflow) {
+        返回 "值必须小于或等于" + 整数转字符串(约束.max)
+    }
+    如果 (vs.stepMismatch) {
+        返回 "请输入有效值，最近的两个值是" +
+               整数转字符串(约束.min) + "和" + 整数转字符串(约束.min + 约束.step)
+    }
+    如果 (vs.badInput) { 返回 "请输入有效的数字" }
+    如果 (vs.custom错误) { 返回 约束.custom错误 }
+    返回 ""
+}
+
+// §8 日期与时间解析
+
+函数 FormValidation_解析日期值(值) {
+    如果 (值 == 0) { 返回 0 }
+    定义 长度 = 字节长度(值)
+    如果 (长度 < 10) { 返回 0 }
+    定义 年 = FormValidation_解析整数段(值, 0, 4)
+    定义 月 = FormValidation_解析整数段(值, 5, 7)
+    定义 日 = FormValidation_解析整数段(值, 8, 10)
+    返回 年 * 10000 + 月 * 100 + 日
+}
+
+函数 FormValidation_解析时间值(值) {
+    如果 (值 == 0) { 返回 0 }
+    定义 长度 = 字节长度(值)
+    如果 (长度 < 5) { 返回 0 }
+    定义 时 = FormValidation_解析整数段(值, 0, 2)
+    定义 分 = FormValidation_解析整数段(值, 3, 5)
+    返回 时 * 60 + 分
+}
+
+函数 FormValidation_解析整数段(值, 起始, 结束) {
+    定义 可变 结果 = 0
+    定义 可变 i = 起始
+    当 (i < 结束) {
+        定义 ch = 字节取(值, i)
+        如果 (ch >= 48 && ch <= 57) {
+            结果 = 结果 * 10 + (ch - 48)
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 FormValidation_是有效日期(年, 月, 日) {
+    如果 (月 < 1 || 月 > 12) { 返回 假 }
+    如果 (日 < 1) { 返回 假 }
+    定义 可变 天数 = 31
+    如果 (月 == 2) {
+        如果 (FormValidation_是闰年(年)) { 天数 = 29 }
+        否则 { 天数 = 28 }
+    } 否则 如果 (月 == 4 || 月 == 6 || 月 == 9 || 月 == 11) {
+        天数 = 30
+    }
+    返回 日 <= 天数
+}
+
+函数 FormValidation_是闰年(年) {
+    如果 (年 % 400 == 0) { 返回 真 }
+    如果 (年 % 100 == 0) { 返回 假 }
+    返回 年 % 4 == 0
+}
+
+函数 FormValidation_是有效时间(时, 分) {
+    返回 时 >= 0 && 时 <= 23 && 分 >= 0 && 分 <= 59
+}
+
+// §9 额外格式验证
+
+函数 FormValidation_是有效电话(值, 长度) {
+    如果 (值 == 0 || 长度 == 0) { 返回 假 }
+    定义 可变 数字数 = 0
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 ch = 字节取(值, i)
+        如果 (ch >= 48 && ch <= 57) { 数字数 = 数字数 + 1 }
+        否则 如果 (ch == 43 && i == 0) { }
+        否则 如果 (ch == 45 || ch == 32 || ch == 40 || ch == 41) { }
+        否则 { 返回 假 }
+        i = i + 1
+    }
+    返回 数字数 >= 7 && 数字数 <= 15
+}
+
+函数 FormValidation_是有效颜色(值, 长度) {
+    如果 (值 == 0 || 长度 != 7) { 返回 假 }
+    如果 (字节取(值, 0) != 35) { 返回 假 }
+    定义 可变 i = 1
+    当 (i < 7) {
+        定义 ch = 字节取(值, i)
+        如果 (!((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70) || (ch >= 97 && ch <= 102))) {
+            返回 假
+        }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 FormValidation_是有效月份(值, 长度) {
+    如果 (值 == 0 || 长度 < 7) { 返回 假 }
+    定义 月 = FormValidation_解析整数段(值, 5, 7)
+    返回 月 >= 1 && 月 <= 12
+}
+
+// §10 表单验证统计与健康检查
+
+定义 可变 验证_总次数 = 0
+定义 可变 验证_成功次数 = 0
+定义 可变 验证_失败次数 = 0
+定义 可变 验证_valueMissing计数 = 0
+定义 可变 验证_typeMismatch计数 = 0
+定义 可变 验证_patternMismatch计数 = 0
+定义 可变 验证_tooLong计数 = 0
+定义 可变 验证_tooShort计数 = 0
+定义 可变 验证_rangeError计数 = 0
+
+函数 FormValidation_记录结果(vs) {
+    验证_总次数 = 验证_总次数 + 1
+    如果 (vs.valid) { 验证_成功次数 = 验证_成功次数 + 1 }
+    否则 { 验证_失败次数 = 验证_失败次数 + 1 }
+    如果 (vs.valueMissing) { 验证_valueMissing计数 = 验证_valueMissing计数 + 1 }
+    如果 (vs.typeMismatch) { 验证_typeMismatch计数 = 验证_typeMismatch计数 + 1 }
+    如果 (vs.patternMismatch) { 验证_patternMismatch计数 = 验证_patternMismatch计数 + 1 }
+    如果 (vs.tooLong) { 验证_tooLong计数 = 验证_tooLong计数 + 1 }
+    如果 (vs.tooShort) { 验证_tooShort计数 = 验证_tooShort计数 + 1 }
+    如果 (vs.rangeUnderflow || vs.rangeOverflow) { 验证_rangeError计数 = 验证_rangeError计数 + 1 }
+}
+
+函数 FormValidation_统计() {
+    返回 {
+        总次数: 验证_总次数,
+        成功: 验证_成功次数,
+        失败: 验证_失败次数,
+        成功率: FormValidation_成功率(),
+        valueMissing: 验证_valueMissing计数,
+        typeMismatch: 验证_typeMismatch计数,
+        patternMismatch: 验证_patternMismatch计数,
+        tooLong: 验证_tooLong计数,
+        tooShort: 验证_tooShort计数,
+        rangeError: 验证_rangeError计数,
+    }
+}
+
+函数 FormValidation_成功率() {
+    如果 (验证_总次数 == 0) { 返回 0 }
+    返回 验证_成功次数 * 100 / 验证_总次数
+}
+
+函数 FormValidation_健康检查() {
+    定义 可变 问题 = []
+    如果 (验证_总次数 > 100 && 验证_失败次数 > 验证_成功次数) {
+        追加(问题, "表单验证失败率过高: " + 整数转字符串(100 - FormValidation_成功率()) + "%")
+    }
+    如果 (验证_valueMissing计数 > 验证_总次数 / 2 && 验证_总次数 > 50) {
+        追加(问题, "大量必填项未填: 可能需要改善UI提示")
+    }
+    如果 (计数(问题) == 0) { 返回 "表单验证健康" }
+    返回 问题
+}
+
+函数 FormValidation_重置统计() {
+    验证_总次数 = 0
+    验证_成功次数 = 0
+    验证_失败次数 = 0
+    验证_valueMissing计数 = 0
+    验证_typeMismatch计数 = 0
+    验证_patternMismatch计数 = 0
+    验证_tooLong计数 = 0
+    验证_tooShort计数 = 0
+    验证_rangeError计数 = 0
+}
+
+函数 FormValidation_最常见错误() {
+    定义 可变 最大 = 验证_valueMissing计数
+    定义 可变 名称 = "valueMissing"
+    如果 (验证_typeMismatch计数 > 最大) { 最大 = 验证_typeMismatch计数; 名称 = "typeMismatch" }
+    如果 (验证_patternMismatch计数 > 最大) { 最大 = 验证_patternMismatch计数; 名称 = "patternMismatch" }
+    如果 (验证_tooLong计数 > 最大) { 最大 = 验证_tooLong计数; 名称 = "tooLong" }
+    如果 (验证_tooShort计数 > 最大) { 最大 = 验证_tooShort计数; 名称 = "tooShort" }
+    如果 (验证_rangeError计数 > 最大) { 最大 = 验证_rangeError计数; 名称 = "rangeError" }
+    返回 名称
+}
+
+// §11 批量验证
+
+函数 FormValidation_验证表单(控件列表) {
+    定义 可变 结果 = []
+    定义 可变 所有valid = 真
+    定义 可变 i = 0
+    当 (i < 计数(控件列表)) {
+        定义 vs = FormValidation_验证(控件列表[i])
+        FormValidation_记录结果(vs)
+        追加(结果, vs)
+        如果 (!vs.valid) { 所有valid = 假 }
+        i = i + 1
+    }
+    返回 { 结果列表: 结果, 所有有效: 所有valid }
+}
+
+函数 FormValidation_第一个无效控件索引(控件列表) {
+    定义 可变 i = 0
+    当 (i < 计数(控件列表)) {
+        定义 vs = FormValidation_验证(控件列表[i])
+        如果 (!vs.valid) { 返回 i }
+        i = i + 1
+    }
+    返回 -1
+}
+
+函数 FormValidation_无效控件数(控件列表) {
+    定义 可变 数 = 0
+    定义 可变 i = 0
+    当 (i < 计数(控件列表)) {
+        定义 vs = FormValidation_验证(控件列表[i])
+        如果 (!vs.valid) { 数 = 数 + 1 }
+        i = i + 1
+    }
+    返回 数
+}
+
+函数 FormValidation_完整统计() {
+    返回 [验证_总次数, 验证_成功次数, 验证_失败次数]
+}

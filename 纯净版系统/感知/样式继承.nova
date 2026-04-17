@@ -1,0 +1,146 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./应用样式声明.nova")
+
+// §4 样式继承 (CSS Inheritance)
+// 某些属性从父元素继承(color, font-size, text-align等)
+
+
+函数 Computed样式_继承(子style, 父style) {
+    如果 (父style == 0) { 返回 }
+    // 继承属性列表(CSS spec定义哪些属性默认继承)
+    子style.color = 父style.color
+    子style.font_size = 父style.font_size
+    子style.font_weight = 父style.font_weight
+    子style.font_family = 父style.font_family
+    子style.font_style = 父style.font_style
+    子style.line_height = 父style.line_height
+    子style.text_align = 父style.text_align
+    子style.text_decoration = 父style.text_decoration
+    子style.white_space = 父style.white_space
+    子style.word_break = 父style.word_break
+    子style.visibility = 父style.visibility
+    子style.cursor = 父style.cursor
+    子style.list_style = 父style.list_style
+    子style.text_transform = 父style.text_transform
+    子style.text_indent = 父style.text_indent
+    子style.letter_spacing = 父style.letter_spacing
+    子style.word_spacing = 父style.word_spacing
+    子style.direction = 父style.direction
+    子style.writing_mode = 父style.writing_mode
+    子style.hyphens = 父style.hyphens
+    子style.tab_size = 父style.tab_size
+    子style.overflow_wrap = 父style.overflow_wrap
+    子style.border_collapse = 父style.border_collapse
+    子style.border_spacing = 父style.border_spacing
+    子style.是继承的 = 真
+}
+
+// §5 shorthand属性展开 (margin → margin-top/right/bottom/left)
+
+函数 Computed样式_应用margin简写(style, 值) {
+    如果 (值 == 0) { 返回 }
+    定义 l = Computed样式_解析长度值(值)
+    style.margin_top = l
+    style.margin_right = l
+    style.margin_bottom = l
+    style.margin_left = l
+}
+
+函数 Computed样式_应用padding简写(style, 值) {
+    如果 (值 == 0) { 返回 }
+    定义 l = Computed样式_解析长度值(值)
+    style.padding_top = l
+    style.padding_right = l
+    style.padding_bottom = l
+    style.padding_left = l
+}
+
+函数 Computed样式_应用border简写(style, 值) {
+    如果 (值 == 0) { 返回 }
+    // border简写: <width> <style> <color>
+    如果 (值.类型 == CSS值_长度) {
+        style.border_top_width = 值.数值
+        style.border_right_width = 值.数值
+        style.border_bottom_width = 值.数值
+        style.border_left_width = 值.数值
+        style.border_top_style = 1    // solid
+        style.border_right_style = 1
+        style.border_bottom_style = 1
+        style.border_left_style = 1
+    }
+}
+
+// §6 CSS长度单位转换 
+// 将em/rem/vh/vw/pt/cm/mm等单位统一转换为像素值
+
+结构 CSS转换上下文 {
+ 父_font_size,    // i32 父元素font-size (px×100)
+ root_font_size,    // i32 根元素font-size (px×100)
+ viewport_width,    // i32 视口宽 (px×100)
+ viewport_height,    // i32 视口高 (px×100)
+ dpi,    // i32 屏幕DPI×100
+}
+
+函数 CSS长度_转像素(值_x100, 单位, ctx) {
+ // 将带单位的长度值转换为像素值(×100)
+ 如果 (单位 == 单位_px) { 返回 值_x100 }
+ 如果 (单位 == 单位_em) {
+ // 1em = 父元素font-size
+ 返回 值_x100 * ctx.父_font_size / 10000
+ }
+ 如果 (单位 == 单位_rem) {
+ // 1rem = 根元素font-size
+ 返回 值_x100 * ctx.root_font_size / 10000
+ }
+ 如果 (单位 == 单位_vw) {
+ // 1vw = 1%视口宽
+ 返回 值_x100 * ctx.viewport_width / 10000
+ }
+ 如果 (单位 == 单位_vh) {
+ // 1vh = 1%视口高
+ 返回 值_x100 * ctx.viewport_height / 10000
+ }
+ 如果 (单位 == 单位_vmin) {
+ 定义 min_vp = 如果(ctx.viewport_width < ctx.viewport_height, ctx.viewport_width, ctx.viewport_height)
+ 返回 值_x100 * min_vp / 10000
+ }
+ 如果 (单位 == 单位_vmax) {
+ 定义 max_vp = 如果(ctx.viewport_width > ctx.viewport_height, ctx.viewport_width, ctx.viewport_height)
+ 返回 值_x100 * max_vp / 10000
+ }
+ 如果 (单位 == 单位_pt) {
+ // 1pt = 1/72 inch = 96/72 px = 1.333px
+ 返回 值_x100 * 133 / 100
+ }
+ 如果 (单位 == 单位_cm) {
+ // 1cm = 96/2.54 px ≈ 37.795px
+ 返回 值_x100 * 3780 / 100
+ }
+ 如果 (单位 == 单位_mm) {
+ // 1mm = 96/25.4 px ≈ 3.7795px
+ 返回 值_x100 * 378 / 100
+ }
+ 如果 (单位 == 单位_in) {
+ // 1in = 96px
+ 返回 值_x100 * 9600 / 100
+ }
+ 如果 (单位 == 单位_ch) {
+ // 1ch ≈ 0.5em ("0"字符宽度的近似)
+ 返回 值_x100 * ctx.父_font_size / 20000
+ }
+ 如果 (单位 == 单位_ex) {
+ // 1ex ≈ 0.5em (x-height的近似)
+ 返回 值_x100 * ctx.父_font_size / 20000
+ }
+ 如果 (单位 == 单位_百分比) {
+ // 百分比需要外部上下文(containing block尺寸), 返回原值
+ 返回 值_x100
+ }
+ 返回 值_x100 // 默认当作px
+}
+
+函数 CSS百分比_转像素(百分比_x100, 基础值_x100) {
+ // 50% of 200px = 100px: 即 5000 * 20000 / 10000 = 10000 (100px×100)
+ 返回 百分比_x100 * 基础值_x100 / 10000
+}

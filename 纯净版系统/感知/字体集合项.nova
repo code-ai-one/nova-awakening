@@ -1,0 +1,119 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/字符串替换.nova")
+导入("./样式字体字.nova")
+
+// §2 字体FaceSet — document.fonts
+
+结构 字体FaceSet {
+    字体列表,    // u64 字体Face*数组
+    字体数量,
+    字体容量,
+    // 状态
+    状态,    // u32 "loading" / "loaded"
+    // ready 承诺
+    ready_promise,
+    // 回调
+    onloading,
+    onloadingdone,
+    onloadingerror,
+}
+
+定义 可变 全局字体FaceSet = 0
+
+
+函数 字体FaceSet_获取() {
+    如果 (全局字体FaceSet == 0) {
+        全局字体FaceSet = 堆_分配(字体FaceSet)
+        全局字体FaceSet.字体容量 = 128
+        全局字体FaceSet.字体列表 = 堆_分配_数组(128 * 8)
+        全局字体FaceSet.字体数量 = 0
+        全局字体FaceSet.状态 = 1    // loaded
+        全局字体FaceSet.ready_promise = 0
+    }
+    返回 全局字体FaceSet
+}
+
+函数 字体FaceSet_add(ffs, ff) {
+    如果 (ffs == 0 || ff == 0) { 返回 }
+    如果 (ffs.字体数量 >= ffs.字体容量) { 返回 }
+    内存_写64(ffs.字体列表 + ffs.字体数量 * 8, ff)
+    ffs.字体数量 = ffs.字体数量 + 1
+    ff.引用计数 = ff.引用计数 + 1
+}
+
+函数 字体FaceSet_delete(ffs, ff) {
+    如果 (ffs == 0 || ff == 0) { 返回 假 }
+    定义 可变 i = 0
+    当 (i < ffs.字体数量) {
+        如果 (内存_读64(ffs.字体列表 + i * 8) == ff) {
+            ffs.字体数量 = ffs.字体数量 - 1
+            内存_写64(ffs.字体列表 + i * 8, 内存_读64(ffs.字体列表 + ffs.字体数量 * 8))
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 字体FaceSet_check(ffs, 字体描述) {
+    // check("16px My字体") — 检查匹配的字体是否已加载
+    如果 (ffs == 0 || 字体描述 == 0) { 返回 假 }
+    // 解析字体描述: "16px My字体"
+    // 查找匹配的字体Face
+    定义 可变 i = 0
+    当 (i < ffs.字体数量) {
+        定义 ff = 内存_读64(ffs.字体列表 + i * 8)
+        如果 (ff != 0 && ff.状态 == FF_STATUS_LOADED) {
+            // 检查font-family名称匹配
+            如果 (字符串_包含(字体描述, ff.家族名)) { 返回 真 }
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+函数 字体FaceSet_load(ffs, 字体描述) {
+    // 加载匹配的字体,返回承诺
+    如果 (ffs == 0) { 返回 0 }
+    定义 可变 i = 0
+    当 (i < ffs.字体数量) {
+        定义 ff = 内存_读64(ffs.字体列表 + i * 8)
+        如果 (ff != 0 && ff.状态 == FF_STATUS_UNLOADED) {
+            如果 (字符串_包含(字体描述, ff.家族名)) {
+                字体Face_load(ff)
+            }
+        }
+        i = i + 1
+    }
+    返回 0    // 承诺
+}
+
+// §3 font-display策略 — 字体加载期间的渲染行为
+
+函数 字体Display_获取策略(ff, 经过时间) {
+    // 返回: 0=不可见(block) 1=用回退字体 2=用已加载字体
+    如果 (ff == 0) { 返回 1 }
+    如果 (ff.状态 == FF_STATUS_LOADED) { 返回 2 }
+
+    如果 (ff.显示策略 == FONT_DISPLAY_BLOCK) {
+        // block期(3s): 不可见 → swap: 用回退
+        如果 (经过时间 < 3000000) { 返回 0 }    // <3s: 不可见
+        返回 1    // >3s: 回退字体
+    }
+    如果 (ff.显示策略 == FONT_DISPLAY_SWAP) {
+        返回 1    // 立即用回退字体, 加载后替换
+    }
+    如果 (ff.显示策略 == FONT_DISPLAY_FALLBACK) {
+        如果 (经过时间 < 100000) { 返回 0 }     // <100ms: 不可见
+        如果 (经过时间 < 3000000) { 返回 1 }    // <3s: 回退, 加载后替换
+        返回 1    // >3s: 永久使用回退
+    }
+    如果 (ff.显示策略 == FONT_DISPLAY_OPTIONAL) {
+        如果 (经过时间 < 100000) { 返回 0 }     // <100ms: 不可见
+        返回 1    // 用回退, 不替换(即使后来加载成功)
+    }
+    // auto: 浏览器决定(通常类似block)
+    如果 (经过时间 < 3000000) { 返回 0 }
+    返回 1
+}

@@ -1,0 +1,181 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/字符串替换.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+
+函数 MQ_比较数值(实际值, expr) {
+    定义 期望 = expr.值_数字
+
+    // 范围表达式: lower op value op upper
+    如果 (expr.有下界) {
+        定义 下匹配 = 假
+        如果 (expr.下界运算符 == MQ_OP_LT) { 下匹配 = expr.下界值 < 实际值 }
+        否则 如果 (expr.下界运算符 == MQ_OP_LE) { 下匹配 = expr.下界值 <= 实际值 }
+        否则 如果 (expr.下界运算符 == MQ_OP_GT) { 下匹配 = expr.下界值 > 实际值 }
+        否则 如果 (expr.下界运算符 == MQ_OP_GE) { 下匹配 = expr.下界值 >= 实际值 }
+        如果 (!下匹配) { 返回 假 }
+    }
+
+    如果 (expr.运算符 == MQ_OP_NONE) { 返回 实际值 > 0 }
+    如果 (expr.运算符 == MQ_OP_EQ || expr.运算符 == MQ_OP_COLON) { 返回 实际值 == 期望 }
+    如果 (expr.运算符 == MQ_OP_LT) { 返回 实际值 < 期望 }
+    如果 (expr.运算符 == MQ_OP_LE) { 返回 实际值 <= 期望 }
+    如果 (expr.运算符 == MQ_OP_GT) { 返回 实际值 > 期望 }
+    如果 (expr.运算符 == MQ_OP_GE) { 返回 实际值 >= 期望 }
+    返回 假
+}
+
+// §5 Container Query — CSS容器查询
+
+定义 CONTAINER_TYPE_NORMAL      = 0
+定义 CONTAINER_TYPE_INLINE_SIZE = 1
+定义 CONTAINER_TYPE_SIZE        = 2
+
+定义 CQ_INLINE_SIZE = 1
+定义 CQ_BLOCK_SIZE  = 2
+定义 CQ_WIDTH       = 3
+定义 CQ_HEIGHT      = 4
+定义 CQ_ASPECT_RATIO = 5
+定义 CQ_ORIENTATION = 6
+
+结构 ContainerInfo {
+    名称,    // u64 container-name
+    类型,    // u32 CONTAINER_TYPE_xxx
+    元素,    // u64 关联的DOM 元素*
+    // 当前尺寸(由布局阶段填充)
+    内联尺寸,    // i32 ×100
+    块尺寸,    // i32 ×100
+}
+
+结构 ContainerQuery {
+    容器名,    // u64 @container 名称(可选)
+    条件,    // u64 媒体Condition* (复用media query条件结构)
+}
+
+结构 ContainerQueryEvaluator {
+    容器栈,    // u64 ContainerInfo*数组(从内到外)
+    容器数量,
+    容器容量,
+}
+
+定义 可变 全局容器求值器 = 0
+
+函数 ContainerQueryEvaluator_获取() {
+    如果 (全局容器求值器 == 0) {
+        全局容器求值器 = 堆_分配(ContainerQueryEvaluator)
+        全局容器求值器.容器容量 = 64
+        全局容器求值器.容器栈 = 堆_分配_数组(64 * 8)
+        全局容器求值器.容器数量 = 0
+    }
+    返回 全局容器求值器
+}
+
+函数 ContainerQuery_注册容器(元素, 名称, 类型) {
+    定义 eval = ContainerQueryEvaluator_获取()
+    如果 (eval.容器数量 >= eval.容器容量) { 返回 }
+
+    定义 info = 堆_分配(ContainerInfo)
+    info.名称 = 名称 != 0 ? 字符串_复制(名称) : 0
+    info.类型 = 类型
+    info.元素 = 元素
+    info.内联尺寸 = 0
+    info.块尺寸 = 0
+
+    内存_写64(eval.容器栈 + eval.容器数量 * 8, info)
+    eval.容器数量 = eval.容器数量 + 1
+}
+
+函数 ContainerQuery_更新尺寸(元素, 内联, 块) {
+    定义 eval = ContainerQueryEvaluator_获取()
+    定义 可变 i = 0
+    当 (i < eval.容器数量) {
+        定义 info = 内存_读64(eval.容器栈 + i * 8)
+        如果 (info != 0 && info.元素 == 元素) {
+            info.内联尺寸 = 内联
+            info.块尺寸 = 块
+            返回
+        }
+        i = i + 1
+    }
+}
+
+函数 ContainerQuery_求值(cq, 元素) {
+    如果 (cq == 0) { 返回 假 }
+
+    // 查找最近的匹配容器(从元素祖先向上)
+    定义 info = ContainerQuery_查找容器(cq.容器名, 元素)
+    如果 (info == 0) { 返回 假 }
+
+    // 检查容器类型是否支持查询的特征
+    // inline-size容器只支持内联尺寸查询
+    // size容器支持两个轴
+
+    // 用容器尺寸求值条件
+    返回 ContainerCondition_求值(cq.条件, info)
+}
+
+函数 ContainerQuery_查找容器(名称, 元素) {
+    定义 eval = ContainerQueryEvaluator_获取()
+    // 从最内层向外搜索
+    定义 可变 i = eval.容器数量 - 1
+    当 (i >= 0) {
+        定义 info = 内存_读64(eval.容器栈 + i * 8)
+        如果 (info != 0 && info.类型 != CONTAINER_TYPE_NORMAL) {
+            // 名称匹配(如果指定)
+            如果 (名称 == 0 || 字符串_长度(名称) == 0 ||
+                (info.名称 != 0 && 字符串_相等(info.名称, 名称))) {
+                // 检查是否是元素的祖先
+                // 返回最近的匹配容器祖先
+                返回 info
+            }
+        }
+        i = i - 1
+    }
+    返回 0
+}
+
+函数 ContainerCondition_求值(条件, info) {
+    如果 (条件 == 0 || info == 0) { 返回 假 }
+
+    如果 (条件.表达式 != 0 && 条件.子条件数 == 0) {
+        定义 expr = 条件.表达式
+        定义 可变 实际值 = 0
+
+        如果 (expr.特征 == CQ_WIDTH || expr.特征 == CQ_INLINE_SIZE) {
+            实际值 = info.内联尺寸
+        } 否则 如果 (expr.特征 == CQ_HEIGHT || expr.特征 == CQ_BLOCK_SIZE) {
+            如果 (info.类型 != CONTAINER_TYPE_SIZE) { 返回 假 }
+            实际值 = info.块尺寸
+        } 否则 如果 (expr.特征 == CQ_ORIENTATION) {
+            如果 (字符串_相等(expr.值_字符串, "portrait")) { 返回 info.块尺寸 > info.内联尺寸 }
+            如果 (字符串_相等(expr.值_字符串, "landscape")) { 返回 info.内联尺寸 >= info.块尺寸 }
+            返回 假
+        }
+
+        返回 MQ_比较数值(实际值, expr)
+    }
+
+    // AND/OR/NOT组合
+    如果 (条件.类型 == MQ_CONDITION_AND) {
+        定义 可变 i = 0
+        当 (i < 条件.子条件数) {
+            如果 (!ContainerCondition_求值(内存_读64(条件.子条件 + i * 8), info)) { 返回 假 }
+            i = i + 1
+        }
+        返回 真
+    }
+    如果 (条件.类型 == MQ_CONDITION_OR) {
+        定义 可变 i = 0
+        当 (i < 条件.子条件数) {
+            如果 (ContainerCondition_求值(内存_读64(条件.子条件 + i * 8), info)) { 返回 真 }
+            i = i + 1
+        }
+        返回 假
+    }
+    如果 (条件.类型 == MQ_CONDITION_NOT && 条件.子条件数 > 0) {
+        返回 !ContainerCondition_求值(内存_读64(条件.子条件), info)
+    }
+
+    返回 假
+}

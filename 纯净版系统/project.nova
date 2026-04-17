@@ -1,0 +1,53 @@
+# 纯净版系统 · 项目描述文件
+# Nova项目系统格式 v1.0
+
+项目名称: 纯净版系统
+项目类型: ai_gene_system
+入口模块: 神经中枢.nova
+入口符号: none
+默认Profile: kernel-qemu
+镜像类型: kernel-elf
+
+# ─── Profile定义 ───
+Profile: analysis-host
+Profile: linux-user
+Profile: kernel-qemu
+Profile: kernel-physical
+
+# ─── 子系统声明 ───
+子系统: 中枢 中枢/_manifest.txt
+子系统: 外联 外联/_manifest.txt
+子系统: 引导 引导/_manifest.txt
+子系统: 感知 感知/_manifest.txt
+子系统: 推理 推理/_manifest.txt
+子系统: 执行 执行/_manifest.txt
+子系统: 记忆 记忆/_manifest.txt
+子系统: 稳态 稳态/_manifest.txt
+子系统: 标准 标准/_manifest.txt
+
+# ─── AI基因模态合同 ───
+模态合同: 视觉 vision
+模态合同: 语言 language
+模态合同: 听觉 audio
+模态合同: 触觉 haptic
+模态合同: 本体 proprioception
+
+# ─── 记忆拓扑 ───
+记忆拓扑_工作: 记忆/工作记忆
+记忆拓扑_语义: 记忆/语义记忆
+记忆拓扑_长期: 记忆/长期记忆
+
+# ─── 学习合同 ───
+学习合同: hebbian
+学习合同: reinforcement
+学习合同: meta
+学习合同: contrastive
+
+# ─── 系统阶段 ───
+系统阶段: perception
+系统阶段: inference
+系统阶段: decision
+系统阶段: execution
+系统阶段: memory
+系统阶段: feedback
+系统阶段: evolution

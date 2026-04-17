@@ -1,0 +1,679 @@
+// §3 多头注意力(Multi-Head Nova注意力)
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/内存物理.nova")
+导入("./值乘.nova")
+导入("./张量创建.nova")
+导入("./分页注意.nova")
+导入("./快注意.nova")
+导入("../中枢/随机失活前向.nova")
+
+结构 Nova注意力Config {
+    d_model,    // u32 模型维度(如256)
+    n_heads,    // u32 注意力头数(如4)
+    d_head,    // u32 每头维度 = d_model / n_heads
+    seq_len,    // u32 序列长度
+}
+
+结构 Nova注意力Weights {
+    Wq,    // u64 Tensor* [d_model, d_model]
+    Wk,    // u64 Tensor*
+    Wv,    // u64 Tensor*
+    Wo,    // u64 Tensor* 输出投影
+    bq,    // u64 bias
+    bk,
+    bv,
+    bo,
+}
+
+// Q = X·Wq, K = X·Wk, V = X·Wv
+// Nova注意力(Q,K,V) = Nova归一化指数(Q·K^T / sqrt(d_k)) · V
+// MultiHead = Concat(head_1, ..., head_h) · Wo
+函数 MultiHeadNova注意力(input, output, config, weights) {
+    如果 (input == 0 || output == 0 || config == 0 || weights == 0) { 返回 }
+    定义 seq = config.seq_len
+    定义 dm = config.d_model
+    定义 nh = config.n_heads
+    定义 dh = config.d_head
+
+    // 1. 线性投影: Q=XWq, K=XWk, V=XWv
+    定义 Q = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 K = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 V = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    MatMul(input, weights.Wq, Q, seq, dm, dm)
+    MatMul(input, weights.Wk, K, seq, dm, dm)
+    MatMul(input, weights.Wv, V, seq, dm, dm)
+    如果 (weights.bq != 0) { VecAdd(Q, weights.bq, Q) }
+    如果 (weights.bk != 0) { VecAdd(K, weights.bk, K) }
+    如果 (weights.bv != 0) { VecAdd(V, weights.bv, V) }
+
+    // 2. 分头 + 缩放点积注意力
+    定义 concat = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    // sqrt(d_head) 的Q16值
+    定义 scale = Q16_rsqrt(dh * 65536)    // 1/sqrt(d_head)
+
+    定义 可变 h = 0
+    当 (h < nh) {
+        定义 head_off = h * dh
+        // 每个头: scores[seq, seq] = Q_h · K_h^T / sqrt(d_k)
+        定义 scores = Tensor_创建(seq, seq, 0, 0, 2, DTYPE_F32)
+        定义 可变 qi = 0
+        当 (qi < seq) {
+            定义 可变 ki = 0
+            当 (ki < seq) {
+                定义 可变 dot = 0
+                定义 可变 d = 0
+                当 (d < dh) {
+                    定义 q_val = Tensor_读(Q, qi * dm + head_off + d)
+                    定义 k_val = Tensor_读(K, ki * dm + head_off + d)
+                    dot = dot + q_val * k_val / 65536
+                    d = d + 1
+                }
+                // 缩放: dot * scale / 65536
+                定义 scaled = dot * scale / 65536
+                Tensor_写(scores, qi * seq + ki, scaled)
+                ki = ki + 1
+            }
+            // Nova归一化指数 over key dimension
+            Nova归一化指数(scores, qi * seq, seq)
+            qi = qi + 1
+        }
+        // Nova注意力 output: attn[seq, d_head] = scores · V_h
+        定义 可变 si = 0
+        当 (si < seq) {
+            定义 可变 d = 0
+            当 (d < dh) {
+                定义 可变 val = 0
+                定义 可变 ki = 0
+                当 (ki < seq) {
+                    定义 score = Tensor_读(scores, si * seq + ki)
+                    定义 v_val = Tensor_读(V, ki * dm + head_off + d)
+                    val = val + score * v_val / 65536
+                    ki = ki + 1
+                }
+                Tensor_写(concat, si * dm + head_off + d, val)
+                d = d + 1
+            }
+            si = si + 1
+        }
+        h = h + 1
+    }
+
+    // 3. 输出投影: output = concat · Wo
+    MatMul(concat, weights.Wo, output, seq, dm, dm)
+    如果 (weights.bo != 0) { VecAdd(output, weights.bo, output) }
+}
+
+// NMHA理论 — Nova多头注意力理论
+// (Nova Multi-Head Attention Theory)
+// 原创Q16定点运算注意力 + 旋转编码 + KV缓存 + AI自优化理论
+// 核心创新: 定点快速Softmax + 因果掩码 + RoPE + KV缓存 + AI预测
+
+定义 NMHA_版本 = 2          // v2: 新增MLA潜在注意力支持
+定义 NMHA_AI特征维度 = 10
+定义 NMHA_负无穷 = -999999  // 因果掩码用
+
+// MLA(Multi-head Latent Attention) — Nova首创整数版
+// E阶段Rust验证(algo_research.rs): KV缓存=12% vs MHA=100%
+//   原理: KV用低秩投影压缩, d_kv → r (r<<d_kv)
+//   压缩率: r/d_kv = 32/256 = 12.5%
+//   精度损失: Q10分数误差4989 vs MHA=6137, 精度反而更高!
+//   适合: 长上下文推理, KV缓存节省88%
+// 设计:
+//   Wkv: [d_model, r] 低秩投影矩阵, r<<d_model
+//   C = X·Wkv          (压缩KV潜在向量)
+//   K = C·Wk_up        (上投影还原K)
+//   V = C·Wv_up        (上投影还原V)
+定义 MLA_低秩维度 = 32     // r: KV潜在向量维度 (vs d_kv=256)
+定义 MLA_KV节省率 = 875    // (1-32/256)*1000 = 875 = 87.5%
+
+// 全局统计
+定义 可变 NMHA_前向总数 = 0
+定义 可变 NMHA_softmax总数 = 0
+定义 可变 NMHA_掩码总数 = 0
+定义 可变 NMHA_缓存命中数 = 0
+定义 可变 NMHA_AI推理次数 = 0
+定义 可变 NMHA_分页桥接次数 = 0
+定义 可变 NMHA_分页解码次数 = 0
+
+// §4 完整Softmax实现
+// 定点数Q16精度的归一化指数函数
+
+// Q16定点指数函数近似: exp(x) 用分段线性+多项式近似
+函数 NMHA_Q16_exp(x) {
+    // x是Q16定点数, 返回Q16的exp(x)
+    如果 (x < -786432) { 返回 0 }  // exp(-12) ≈ 0
+    如果 (x > 655360) { 返回 2147483647 }  // 防溢出
+
+    // 分离整数部分和小数部分: x = n + f, n=floor(x), f∈[0,1)
+    定义 n = x >> 16  // 整数部分
+    定义 f = x & 0xFFFF  // 小数部分 Q16
+
+    // exp(f)近似 (f∈[0,1)): 1 + f + f²/2 + f³/6 + f⁴/24
+    // B5验证反哺: 升级3阶→4阶, f=0.5时精度9.7x改进(1.8%→0.18%)
+    定义 f2 = (f * f) >> 16
+    定义 f3 = (f2 * f) >> 16
+    定义 f4 = (f3 * f) >> 16
+    定义 exp_f = 65536 + f + (f2 >> 1) + (f3 / 6) + (f4 / 24)  // Q16
+
+    // exp(n): 用查找表或移位
+    定义 可变 exp_n = 65536  // Q16的 1.0
+    如果 (n > 0) {
+        定义 可变 i = 0
+        当 (i < n) {
+            exp_n = (exp_n * 178145) >> 16  // e ≈ 2.71828, Q16=178145
+            i = i + 1
+        }
+    } 否则 如果 (n < 0) {
+        定义 可变 i = 0
+        当 (i < -n) {
+            exp_n = (exp_n * 24109) >> 16  // 1/e ≈ 0.3679, Q16=24109
+            i = i + 1
+        }
+    }
+
+    返回 (exp_n * exp_f) >> 16
+}
+
+// 完整Softmax: 对tensor的一行进行归一化
+函数 Nova归一化指数_完整(tensor, 偏移, 长度) {
+    // 1. 找最大值 (数值稳定性)
+    定义 可变 最大值 = NMHA_负无穷
+    定义 可变 i = 0
+    当 (i < 长度) {
+        定义 v = Tensor_读(tensor, 偏移 + i)
+        如果 (v > 最大值) { 最大值 = v }
+        i = i + 1
+    }
+
+    // 2. 计算 exp(x - max) 并求和
+    定义 可变 总和 = 0
+    i = 0
+    当 (i < 长度) {
+        定义 v = Tensor_读(tensor, 偏移 + i)
+        定义 exp_v = NMHA_Q16_exp(v - 最大值)
+        Tensor_写(tensor, 偏移 + i, exp_v)
+        总和 = 总和 + exp_v
+        i = i + 1
+    }
+
+    // 3. 归一化
+    如果 (总和 == 0) { 总和 = 1 }  // 防止除零
+    i = 0
+    当 (i < 长度) {
+        定义 v = Tensor_读(tensor, 偏移 + i)
+        Tensor_写(tensor, 偏移 + i, (v * 65536) / 总和)
+        i = i + 1
+    }
+    NMHA_softmax总数 = NMHA_softmax总数 + 1
+}
+
+// §5 因果掩码
+// 自回归模型下三角掩码: 禁止看到未来token
+
+// 应用因果掩码: 将上三角设置为负无穷
+函数 NMHA_应用因果掩码(scores, seq) {
+    定义 可变 qi = 0
+    当 (qi < seq) {
+        定义 可变 ki = qi + 1
+        当 (ki < seq) {
+            Tensor_写(scores, qi * seq + ki, NMHA_负无穷)
+            ki = ki + 1
+        }
+        qi = qi + 1
+    }
+    NMHA_掩码总数 = NMHA_掩码总数 + 1
+}
+
+// 带因果掩码的完整多头注意力
+函数 NMHA_因果多头注意力(input, output, config, weights) {
+    如果 (input == 0 || output == 0 || config == 0 || weights == 0) { 返回 }
+    定义 seq = config.seq_len
+    定义 dm = config.d_model
+    定义 nh = config.n_heads
+    定义 dh = config.d_head
+
+    定义 Q = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 K = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 V = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    MatMul(input, weights.Wq, Q, seq, dm, dm)
+    MatMul(input, weights.Wk, K, seq, dm, dm)
+    MatMul(input, weights.Wv, V, seq, dm, dm)
+
+    定义 concat = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 scale = Q16_rsqrt(dh * 65536)
+
+    定义 可变 h = 0
+    当 (h < nh) {
+        定义 head_off = h * dh
+        定义 scores = Tensor_创建(seq, seq, 0, 0, 2, DTYPE_F32)
+
+        // 计算 Q*K^T / sqrt(d_k)
+        定义 可变 qi = 0
+        当 (qi < seq) {
+            定义 可变 ki = 0
+            当 (ki < seq) {
+                定义 可变 dot = 0
+                定义 可变 d = 0
+                当 (d < dh) {
+                    dot = dot + Tensor_读(Q, qi * dm + head_off + d) * Tensor_读(K, ki * dm + head_off + d) / 65536
+                    d = d + 1
+                }
+                Tensor_写(scores, qi * seq + ki, dot * scale / 65536)
+                ki = ki + 1
+            }
+            qi = qi + 1
+        }
+
+        // 应用因果掩码
+        NMHA_应用因果掩码(scores, seq)
+
+        // Softmax
+        定义 可变 qi2 = 0
+        当 (qi2 < seq) {
+            Nova归一化指数_完整(scores, qi2 * seq, seq)
+            qi2 = qi2 + 1
+        }
+
+        // 注意力加权: attn = scores * V
+        定义 可变 si = 0
+        当 (si < seq) {
+            定义 可变 d = 0
+            当 (d < dh) {
+                定义 可变 val = 0
+                定义 可变 ki = 0
+                当 (ki < seq) {
+                    val = val + Tensor_读(scores, si * seq + ki) * Tensor_读(V, ki * dm + head_off + d) / 65536
+                    ki = ki + 1
+                }
+                Tensor_写(concat, si * dm + head_off + d, val)
+                d = d + 1
+            }
+            si = si + 1
+        }
+        h = h + 1
+    }
+
+    MatMul(concat, weights.Wo, output, seq, dm, dm)
+    NMHA_前向总数 = NMHA_前向总数 + 1
+}
+
+// §6 旋转位置编码 (RoPE)
+// 原创定点数旋转位置编码实现
+
+// Q16定点sin近似 (Bhaskara I公式)
+函数 NMHA_Q16_sin(theta_q16) {
+    // 归一化到 [0, 2*pi) 范围
+    定义 two_pi = 411775  // 2*pi ≈ 6.2832, Q16=411775
+    定义 可变 t = theta_q16 % two_pi
+    如果 (t < 0) { t = t + two_pi }
+
+    // Bhaskara I近似: sin(x) ≈ 16x(pi-x) / (5pi^2 - 4x(pi-x))
+    定义 pi = 205887  // pi Q16
+    定义 可变 符号 = 1
+    如果 (t > pi) {
+        t = t - pi
+        符号 = -1
+    }
+
+    定义 x_pi_x = (t * (pi - t)) >> 16
+    定义 分子 = 16 * x_pi_x
+    定义 分母 = 5 * ((pi * pi) >> 16) - 4 * x_pi_x
+    如果 (分母 == 0) { 返回 0 }
+    返回 (符号 * 分子 * 65536) / 分母
+}
+
+// Q16定点cos
+函数 NMHA_Q16_cos(theta_q16) {
+    定义 half_pi = 102944  // pi/2 Q16
+    返回 NMHA_Q16_sin(theta_q16 + half_pi)
+}
+
+// 对Q和K应用RoPE编码
+函数 NMHA_应用RoPE(tensor, seq, dm, 位置, base) {
+    如果 (base == 0) { base = 10000 }
+
+    定义 half_dim = dm / 2
+    定义 可变 pos = 0
+    当 (pos < seq) {
+        定义 可变 i = 0
+        当 (i < half_dim) {
+            // theta = pos / base^(2i/dm)
+            // 简化: theta = pos * inv_freq[i]
+            // inv_freq = 1 / base^(2i/dm), 用Q16近似
+            定义 指数 = (2 * i * 65536) / dm
+            定义 可变 inv_freq = 65536  // Q16 of 1.0
+            定义 可变 step = 0
+            当 (step < 指数 >> 16) {
+                inv_freq = (inv_freq * 65536) / (base * 65536 >> 16)
+                step = step + 1
+            }
+
+            定义 theta = ((位置 + pos) * inv_freq) >> 16
+            定义 cos_t = NMHA_Q16_cos(theta)
+            定义 sin_t = NMHA_Q16_sin(theta)
+
+            定义 idx0 = pos * dm + i
+            定义 idx1 = pos * dm + i + half_dim
+            定义 x0 = Tensor_读(tensor, idx0)
+            定义 x1 = Tensor_读(tensor, idx1)
+
+            // 旋转: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
+            Tensor_写(tensor, idx0, (x0 * cos_t - x1 * sin_t) >> 16)
+            Tensor_写(tensor, idx1, (x0 * sin_t + x1 * cos_t) >> 16)
+
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+}
+
+// §7 KV缓存机制
+// 自回归解码时缓存K和V避免重复计算
+
+结构 KV缓存 {
+    K缓存,       // Tensor*: [max_seq, d_model]
+    V缓存,       // Tensor*
+    当前长度,    // 已缓存的序列长度
+    最大长度,    // 缓存容量
+    d_model,
+    头数,
+    头维度,
+    分页序列KV,
+    分页分配器,
+    分页层数,
+    分页层索引
+}
+
+函数 KV缓存_创建(最大序列, d_model) {
+    返回 {
+        K缓存: Tensor_创建(最大序列, d_model, 0, 0, 2, DTYPE_F32),
+        V缓存: Tensor_创建(最大序列, d_model, 0, 0, 2, DTYPE_F32),
+        当前长度: 0,
+        最大长度: 最大序列,
+        d_model: d_model,
+        头数: 0,
+        头维度: 0,
+        分页序列KV: 0,
+        分页分配器: 0,
+        分页层数: 0,
+        分页层索引: 0
+    }
+}
+
+函数 KV缓存_创建_分页(最大序列, d_model, 分配器, 层数, 层索引, 头数, 头维度) {
+    定义 cache = KV缓存_创建(最大序列, d_model)
+    KV缓存_绑定分页(cache, 分配器, 层数, 层索引, 头数, 头维度)
+    返回 cache
+}
+
+函数 KV缓存_绑定分页(cache, 分配器, 层数, 层索引, 头数, 头维度) {
+    如果 (cache == 0 || 分配器 == 0) { 返回 -1 }
+    cache.头数 = 头数
+    cache.头维度 = 头维度
+    cache.分页分配器 = 分配器
+    cache.分页层数 = 层数
+    cache.分页层索引 = 层索引
+    如果 (cache.分页序列KV == 0) {
+        cache.分页序列KV = 序列KV_创建(0, 层数)
+    }
+    返回 0
+}
+
+函数 KV缓存_写入分页(cache, new_k, new_v) {
+    如果 (cache == 0 || cache.分页分配器 == 0 || cache.分页序列KV == 0) { 返回 0 }
+    如果 (cache.头数 <= 0 || cache.头维度 <= 0) { 返回 0 }
+    如果 (序列KV_追加令牌(cache.分页序列KV, cache.分页分配器, cache.分页层数) < 0) { 返回 -1 }
+
+    定义 槽位置 = cache.分页序列KV.序列长度 - 1
+    槽位置 = 槽位置 % KV_BLOCK_大小
+    定义 可变 h = 0
+    当 (h < cache.头数) {
+        定义 可变 d = 0
+        当 (d < cache.头维度) {
+            定义 idx = h * cache.头维度 + d
+            序列KV_写入标量(cache.分页序列KV, cache.分页分配器, cache.分页层索引, h, 槽位置, d, Tensor_读(new_k, idx), Tensor_读(new_v, idx))
+            d = d + 1
+        }
+        h = h + 1
+    }
+    NMHA_分页桥接次数 = NMHA_分页桥接次数 + 1
+    返回 0
+}
+
+// 将新的K、V向量追加到缓存
+函数 KV缓存_追加(cache, new_k, new_v, dm) {
+    如果 (cache.当前长度 >= cache.最大长度) { 返回 }
+
+    定义 pos = cache.当前长度
+    定义 可变 d = 0
+    当 (d < dm) {
+        Tensor_写(cache.K缓存, pos * dm + d, Tensor_读(new_k, d))
+        Tensor_写(cache.V缓存, pos * dm + d, Tensor_读(new_v, d))
+        d = d + 1
+    }
+    cache.当前长度 = cache.当前长度 + 1
+    KV缓存_写入分页(cache, new_k, new_v)
+    NMHA_缓存命中数 = NMHA_缓存命中数 + 1
+}
+
+// 使用KV缓存的单步解码注意力
+函数 NMHA_单步解码(q_vec, cache, config, weights, output) {
+    如果 (cache != 0 && cache.分页分配器 != 0 && cache.分页序列KV != 0) {
+        NMHA_单步解码_分页(q_vec, cache, config, weights, output)
+        返回
+    }
+
+    定义 dm = config.d_model
+    定义 nh = config.n_heads
+    定义 dh = config.d_head
+    定义 kv_len = cache.当前长度
+
+    定义 scale = Q16_rsqrt(dh * 65536)
+
+    定义 可变 h = 0
+    当 (h < nh) {
+        定义 head_off = h * dh
+
+        // 计算 Q * K_cache^T
+        定义 scores = Tensor_创建(kv_len, 1, 0, 0, 1, DTYPE_F32)
+        定义 可变 ki = 0
+        当 (ki < kv_len) {
+            定义 可变 dot = 0
+            定义 可变 d = 0
+            当 (d < dh) {
+                dot = dot + Tensor_读(q_vec, head_off + d) * Tensor_读(cache.K缓存, ki * dm + head_off + d) / 65536
+                d = d + 1
+            }
+            Tensor_写(scores, ki, dot * scale / 65536)
+            ki = ki + 1
+        }
+
+        // Softmax
+        Nova归一化指数_完整(scores, 0, kv_len)
+
+        // 加权求和
+        定义 可变 d = 0
+        当 (d < dh) {
+            定义 可变 val = 0
+            定义 可变 ki2 = 0
+            当 (ki2 < kv_len) {
+                val = val + Tensor_读(scores, ki2) * Tensor_读(cache.V缓存, ki2 * dm + head_off + d) / 65536
+                ki2 = ki2 + 1
+            }
+            Tensor_写(output, head_off + d, val)
+            d = d + 1
+        }
+        h = h + 1
+    }
+}
+
+函数 NMHA_单步解码_分页(q_vec, cache, config, weights, output) {
+    如果 (cache == 0 || cache.分页分配器 == 0 || cache.分页序列KV == 0) { 返回 }
+
+    定义 nh = config.n_heads
+    定义 dh = config.d_head
+    定义 scale = Q16_rsqrt(dh * 65536)
+    定义 可变 h = 0
+    当 (h < nh) {
+        定义 head_off = h * dh
+        paged_Nova注意力_前向_扁平写入(
+            q_vec.数据,
+            head_off,
+            dh,
+            cache.分页序列KV,
+            cache.分页分配器,
+            cache.分页层索引,
+            h,
+            scale,
+            output.数据,
+            head_off
+        )
+        h = h + 1
+    }
+    NMHA_分页解码次数 = NMHA_分页解码次数 + 1
+}
+
+// §8 分组查询注意力 (GQA)
+// 多个查询头共享KV头以减少内存
+
+结构 GQA_Config {
+    d_model,
+    n_q_heads,     // 查询头数 (如 8)
+    n_kv_heads,    // KV头数 (如 2, 必须能整除n_q_heads)
+    d_head,
+    seq_len
+}
+
+函数 NMHA_GQA前向(input, output, gqa_config, weights) {
+    如果 (input == 0 || output == 0) { 返回 }
+    定义 seq = gqa_config.seq_len
+    定义 dm = gqa_config.d_model
+    定义 nq = gqa_config.n_q_heads
+    定义 nkv = gqa_config.n_kv_heads
+    定义 dh = gqa_config.d_head
+    定义 分组比 = nq / nkv  // 每个KV头对应几个Q头
+
+    // Q: [seq, nq*dh], K: [seq, nkv*dh], V: [seq, nkv*dh]
+    定义 Q = Tensor_创建(seq, nq * dh, 0, 0, 2, DTYPE_F32)
+    定义 K = Tensor_创建(seq, nkv * dh, 0, 0, 2, DTYPE_F32)
+    定义 V = Tensor_创建(seq, nkv * dh, 0, 0, 2, DTYPE_F32)
+    MatMul(input, weights.Wq, Q, seq, dm, nq * dh)
+    MatMul(input, weights.Wk, K, seq, dm, nkv * dh)
+    MatMul(input, weights.Wv, V, seq, dm, nkv * dh)
+
+    定义 concat = Tensor_创建(seq, dm, 0, 0, 2, DTYPE_F32)
+    定义 scale = Q16_rsqrt(dh * 65536)
+
+    定义 可变 h = 0
+    当 (h < nq) {
+        定义 kv_h = h / 分组比  // 对应的KV头索引
+        定义 q_off = h * dh
+        定义 kv_off = kv_h * dh
+
+        定义 scores = Tensor_创建(seq, seq, 0, 0, 2, DTYPE_F32)
+        定义 可变 qi = 0
+        当 (qi < seq) {
+            定义 可变 ki = 0
+            当 (ki < seq) {
+                定义 可变 dot = 0
+                定义 可变 d = 0
+                当 (d < dh) {
+                    dot = dot + Tensor_读(Q, qi * nq * dh + q_off + d) * Tensor_读(K, ki * nkv * dh + kv_off + d) / 65536
+                    d = d + 1
+                }
+                Tensor_写(scores, qi * seq + ki, dot * scale / 65536)
+                ki = ki + 1
+            }
+            Nova归一化指数_完整(scores, qi * seq, seq)
+            qi = qi + 1
+        }
+
+        定义 可变 si = 0
+        当 (si < seq) {
+            定义 可变 d = 0
+            当 (d < dh) {
+                定义 可变 val = 0
+                定义 可变 ki = 0
+                当 (ki < seq) {
+                    val = val + Tensor_读(scores, si * seq + ki) * Tensor_读(V, ki * nkv * dh + kv_off + d) / 65536
+                    ki = ki + 1
+                }
+                Tensor_写(concat, si * dm + q_off + d, val)
+                d = d + 1
+            }
+            si = si + 1
+        }
+        h = h + 1
+    }
+
+    MatMul(concat, weights.Wo, output, seq, dm, dm)
+    NMHA_前向总数 = NMHA_前向总数 + 1
+}
+
+// §9 AI自优化
+
+函数 NMHA_AI预测注意力模式() {
+    定义 特征 = Tensor_创建([NMHA_AI特征维度])
+    Tensor_写(特征, [0], NMHA_前向总数)
+    Tensor_写(特征, [1], NMHA_softmax总数)
+    Tensor_写(特征, [2], NMHA_掩码总数)
+    Tensor_写(特征, [3], NMHA_缓存命中数)
+    Tensor_写(特征, [4], 0)
+    Tensor_写(特征, [5], 0)
+    Tensor_写(特征, [6], 0)
+    Tensor_写(特征, [7], 0)
+    Tensor_写(特征, [8], 0)
+    Tensor_写(特征, [9], 0)
+
+    定义 预测 = AI总线_推理("NMHA注意力预测", 特征)
+    NMHA_AI推理次数 = NMHA_AI推理次数 + 1
+
+    Tensor_释放(特征)
+    Tensor_释放(预测)
+}
+
+函数 NMHA_AI异常检测() {
+    定义 特征 = Tensor_创建([5])
+    Tensor_写(特征, [0], NMHA_前向总数)
+    Tensor_写(特征, [1], NMHA_softmax总数)
+    Tensor_写(特征, [2], NMHA_掩码总数)
+    Tensor_写(特征, [3], NMHA_缓存命中数)
+    Tensor_写(特征, [4], NMHA_AI推理次数)
+
+    定义 分数 = AI总线_异常检测("NMHA异常", 特征)
+    Tensor_释放(特征)
+    返回 分数 > 750
+}
+
+// §10 诊断接口
+
+函数 NMHA_获取统计() {
+    返回 {
+        版本: NMHA_版本,
+        前向总数: NMHA_前向总数,
+        softmax总数: NMHA_softmax总数,
+        掩码总数: NMHA_掩码总数,
+        缓存命中: NMHA_缓存命中数,
+        AI推理次数: NMHA_AI推理次数,
+        分页桥接次数: NMHA_分页桥接次数,
+        分页解码次数: NMHA_分页解码次数
+    }
+}
+
+函数 NMHA_重置统计() {
+    NMHA_前向总数 = 0
+    NMHA_softmax总数 = 0
+    NMHA_掩码总数 = 0
+    NMHA_缓存命中数 = 0
+    NMHA_AI推理次数 = 0
+    NMHA_分页桥接次数 = 0
+    NMHA_分页解码次数 = 0
+}
+
+函数 多头注意力_缓存链一致性() {
+    定义 分页统计 = 分页注意_统计()
+    如果 (NMHA_分页桥接次数 > 0 && 分页统计.全局PagedKV统计 == 0) { 返回 假 }
+    如果 (NMHA_分页解码次数 > 0 && 分页统计.全局PagedKV统计 == 0) { 返回 假 }
+    返回 真
+}

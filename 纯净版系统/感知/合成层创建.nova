@@ -1,0 +1,138 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./瓦片.nova")
+导入("./网缓画布结.nova")
+导入("./内存管理纹.nova")
+导入("../执行/底层内存操.nova")
+
+// §6 合成层创建与管理
+
+
+函数 CompositedLayer_创建(paint层, 原因) {
+    定义 lth = LayerTreeHost_获取()
+
+    定义 cl = 堆_分配(CompositedLayer)
+    cl.ID = lth.下一个层ID; lth.下一个层ID = lth.下一个层ID + 1
+    cl.paint层 = paint层
+    cl.合成原因 = 原因
+
+    // 初始化纹理参数
+    cl.纹理ID = 0
+    cl.纹理宽 = 0; cl.纹理高 = 0
+    cl.设备像素比 = lth.设备像素比
+
+    cl.偏移x = 0; cl.偏移y = 0
+    cl.变换矩阵 = 0
+    cl.不透明度 = 100
+
+    cl.瓦片列表 = 0; cl.瓦片列数 = 0; cl.瓦片行数 = 0
+    cl.脏区域 = 0; cl.需要重绘 = 真
+
+    cl.父 = 0
+    cl.子容量 = 16
+    cl.子列表 = 堆_分配_数组(16 * 8)
+    cl.子数量 = 0
+
+    cl.滚动偏移x = 0; cl.滚动偏移y = 0; cl.可滚动 = 假
+    cl.已激活 = 假; cl.需要commit = 真
+
+    // 注册到层树
+    如果 (lth.层数量 < lth.层容量) {
+        内存_写64(lth.层列表 + lth.层数量 * 8, cl)
+        lth.层数量 = lth.层数量 + 1
+    }
+
+    返回 cl
+}
+
+函数 CompositedLayer_更新尺寸(cl, 宽, 高) {
+    如果 (cl == 0) { 返回 }
+    定义 dpr = cl.设备像素比
+    如果 (dpr == 0) { dpr = 100 }
+    定义 物理宽 = 宽 * dpr / 10000    // 宽×100 × dpr÷100 / 100
+    定义 物理高 = 高 * dpr / 10000
+
+    如果 (物理宽 == cl.纹理宽 && 物理高 == cl.纹理高) { 返回 }
+
+    cl.纹理宽 = 物理宽; cl.纹理高 = 物理高
+
+    // 重新分割瓦片
+    CompositedLayer_分割瓦片(cl)
+    cl.需要重绘 = 真
+}
+
+函数 CompositedLayer_分割瓦片(cl) {
+    如果 (cl == 0 || cl.纹理宽 == 0) { 返回 }
+
+    定义 列数 = (cl.纹理宽 + TILE_SIZE - 1) / TILE_SIZE
+    定义 行数 = (cl.纹理高 + TILE_SIZE - 1) / TILE_SIZE
+    定义 总数 = 列数 * 行数
+
+    如果 (cl.瓦片列表 != 0) { 堆_释放(cl.瓦片列表) }
+    cl.瓦片列表 = 堆_分配_数组(总数 * 8)
+    cl.瓦片列数 = 列数; cl.瓦片行数 = 行数
+
+    定义 可变 r = 0
+    当 (r < 行数) {
+        定义 可变 c = 0
+        当 (c < 列数) {
+            定义 tile = 堆_分配(Tile)
+            tile.列 = c; tile.行 = r
+            tile.x = c * TILE_SIZE; tile.y = r * TILE_SIZE
+            tile.宽 = TILE_SIZE; tile.高 = TILE_SIZE
+            // 边缘瓦片可能更小
+            如果 (tile.x + tile.宽 > cl.纹理宽) { tile.宽 = cl.纹理宽 - tile.x }
+            如果 (tile.y + tile.高 > cl.纹理高) { tile.高 = cl.纹理高 - tile.y }
+            tile.状态 = TILE_STATE_IDLE
+            tile.像素数据 = 0; tile.纹理ID = 0
+            tile.优先级 = 0; tile.需要光栅化 = 真
+            内存_写64(cl.瓦片列表 + (r * 列数 + c) * 8, tile)
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+// §7 瓦片光栅化 — 在CPU上绘制瓦片内容
+
+函数 Tile_光栅化(tile, cl) {
+    如果 (tile == 0 || cl == 0) { 返回 }
+    如果 (!tile.需要光栅化) { 返回 }
+
+    // 分配像素缓冲
+    定义 大小 = tile.宽 * tile.高 * 4
+    如果 (tile.像素数据 == 0) {
+        tile.像素数据 = 堆_分配(大小)
+    }
+    内存_清零(tile.像素数据, 大小)
+
+    // 创建瓦片画布
+    定义 bitmap = Nova缓冲itmap_创建(tile.宽, tile.高)
+    bitmap.像素 = tile.像素数据
+    定义 canvas = Sk画布_创建(bitmap)
+
+    // 平移到瓦片局部坐标
+    Sk画布_translate(canvas, 0 - tile.x, 0 - tile.y)
+
+    // 重放绘制Layer的显示列表
+    如果 (cl.paint层 != 0) {
+        绘制Layer_重放显示列表(cl.paint层, canvas)
+    }
+
+    tile.状态 = TILE_STATE_RASTERIZED
+    tile.需要光栅化 = 假
+}
+
+函数 CompositedLayer_光栅化所有瓦片(cl) {
+    如果 (cl == 0) { 返回 }
+    定义 总数 = cl.瓦片列数 * cl.瓦片行数
+    定义 可变 i = 0
+    当 (i < 总数) {
+        定义 tile = 内存_读64(cl.瓦片列表 + i * 8)
+        如果 (tile != 0 && tile.需要光栅化) {
+            Tile_光栅化(tile, cl)
+        }
+        i = i + 1
+    }
+    cl.需要重绘 = 假
+}

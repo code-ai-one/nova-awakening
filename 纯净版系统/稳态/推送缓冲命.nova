@@ -1,0 +1,116 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/中断表注册处.nova")
+导入("../中枢/完成量完成.nova")
+导入("../中枢/高级中控设置.nova")
+导入("../引导/端口输入.nova")
+
+// §8 推送缓冲命令提交 — 写入图处方法(Method)
+// NVIDIA命令格式: [方法地址(13位) | 子通道(3位) | 方法数(13位) | 类型(3位)]
+// 类型: 0=递增方法, 1=非递增, 2=一次性, 3=内联
+
+定义 NV_CMD_TYPE_INCREASING  = 0x20000000
+定义 NV_CMD_TYPE_NONINC      = 0x60000000
+定义 NV_CMD_TYPE_INLINE       = 0xA0000000
+
+// 常用PGRAPH方法(Class A0B5=2D引擎, B1C0=3D引擎, B0C0=计算引擎)
+定义 NV_METHOD_SET_OBJECT     = 0x0000     // 绑定引擎类
+定义 NV_METHOD_2D_SRC_FORMAT  = 0x0200     // 2D源格式
+定义 NV_METHOD_2D_DST_FORMAT  = 0x0204     // 2D目标格式
+定义 NV_METHOD_2D_SRC_PITCH   = 0x0214     // 2D源步长
+定义 NV_METHOD_2D_DST_PITCH   = 0x0218     // 2D目标步长
+定义 NV_METHOD_2D_SRC_POS     = 0x08C0     // 2D源位置
+定义 NV_METHOD_2D_DST_POS     = 0x08C4     // 2D目标位置
+定义 NV_METHOD_2D_SIZE        = 0x08C8     // 2D大小
+定义 NV_METHOD_2D_BLIT        = 0x0300     // 2D位块传输
+定义 NV_METHOD_COMPUTE_LAUNCH = 0x02FC     // 计算核函数启动
+定义 NV_METHOD_COMPUTE_GRID   = 0x0A04     // 计算网格维度
+定义 NV_METHOD_COMPUTE_BLOCK  = 0x0A08     // 计算块维度
+定义 NV_METHOD_SEMAPHORE_ADDR = 0x0010     // 信号量地址(用于同步)
+定义 NV_METHOD_SEMAPHORE_REL  = 0x0018     // 信号量释放
+定义 NV_METHOD_FENCE_ADDR     = 0x0070     // 栅栏地址
+定义 NV_METHOD_FENCE_VAL      = 0x0074     // 栅栏值
+
+函数 NV_推送_开始(通道) {
+    // 重置写位置到缓冲开头
+    如果 (通道.写偏移 > 通道.推送缓冲大小 - 1024) {
+        通道.写偏移 = 0
+    }
+}
+
+函数 NV_推送_方法(通道, 方法, 值) {
+    // 写一条方法调用到推送缓冲
+    定义 地址 = 通道.推送缓冲地址.CPU地址 + 通道.写偏移
+    // 头: 递增方法, 1个数据词
+    内存写32(地址, NV_CMD_TYPE_INCREASING | (方法 >> 2) | (1 << 16))
+    内存写32(地址 + 4, 值)
+    通道.写偏移 = 通道.写偏移 + 8
+}
+
+函数 NV_推送_提交(通道) {
+    // 通知图处有新命令: 写入PUT指针到MMIO
+    定义 mmio = NV状态.mmio
+    内存屏障_写()
+
+    // 更新通道的PUT指针(通道控制区域)
+    定义 控制偏移 = NV_PFIFO_CHAN_BASE + 通道.ID * 0x200
+    MMIO写32(mmio + 控制偏移 + 0x40, 通道.写偏移)  // PUT
+}
+
+// §9 图处 2D加速操作
+
+函数 NV_2D_矩形填充(x, y, 宽, 高, 颜色) {
+    如果 (!NV状态.已初始化 || 计数(NV状态.通道列表) == 0) { 返回 }
+    定义 通道 = NV状态.通道列表[0]  // 图形通道
+
+    NV_推送_开始(通道)
+    NV_推送_方法(通道, NV_METHOD_2D_DST_FORMAT, 0x0E)  // A8R8G8B8
+    NV_推送_方法(通道, NV_METHOD_2D_DST_POS, (y << 16) | x)
+    NV_推送_方法(通道, NV_METHOD_2D_SIZE, (高 << 16) | 宽)
+    NV_推送_方法(通道, 0x0588, 颜色)  // SOLID_COLOR
+    NV_推送_方法(通道, NV_METHOD_2D_BLIT, 0)  // 触发
+    NV_推送_提交(通道)
+}
+
+函数 NV_2D_位块传输(源x, 源y, 目x, 目y, 宽, 高) {
+    如果 (!NV状态.已初始化 || 计数(NV状态.通道列表) == 0) { 返回 }
+    定义 通道 = NV状态.通道列表[0]
+
+    NV_推送_开始(通道)
+    NV_推送_方法(通道, NV_METHOD_2D_SRC_POS, (源y << 16) | 源x)
+    NV_推送_方法(通道, NV_METHOD_2D_DST_POS, (目y << 16) | 目x)
+    NV_推送_方法(通道, NV_METHOD_2D_SIZE, (高 << 16) | 宽)
+    NV_推送_方法(通道, NV_METHOD_2D_BLIT, 0)
+    NV_推送_提交(通道)
+}
+
+// §10 图处计算分发(CUDA核心)
+
+函数 NV_计算分发(核函数地址, 网格X, 网格Y, 网格Z, 块X, 块Y, 块Z) {
+    如果 (!NV状态.已初始化) { 返回 错误_未就绪 }
+    // 使用计算通道
+    定义 可变 通道 = 空
+    定义 可变 i = 0
+    当 (i < 计数(NV状态.通道列表)) {
+        如果 (NV状态.通道列表[i].引擎 == 2) { 通道 = NV状态.通道列表[i] }
+        i = i + 1
+    }
+    如果 (通道 == 空) { 返回 错误_不存在 }
+
+    NV_推送_开始(通道)
+    // 设置核函数地址
+    NV_推送_方法(通道, 0x02B0, 核函数地址 & 0xFFFFFFFF)  // LAUNCH_DESC_LOW
+    NV_推送_方法(通道, 0x02B4, (核函数地址 >> 32) & 0xFF) // LAUNCH_DESC_HIGH
+    // 设置网格维度
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_GRID, 网格X)
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_GRID + 4, 网格Y)
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_GRID + 8, 网格Z)
+    // 设置块维度
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_BLOCK, 块X)
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_BLOCK + 4, 块Y)
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_BLOCK + 8, 块Z)
+    // 启动计算
+    NV_推送_方法(通道, NV_METHOD_COMPUTE_LAUNCH, 1)
+    NV_推送_提交(通道)
+
+    返回 成功
+}

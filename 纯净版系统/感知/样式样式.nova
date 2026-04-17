@@ -1,0 +1,235 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式样式创.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+导入("./文档节点.nova")
+
+// §3 CSS样式Sheet
+
+结构 CSS样式Sheet_Obj {
+    标题,
+    类型,    // u64 "text/css"
+    href,    // u64 外部样式表URL
+    所有者节点,    // u64 <style>或<link>元素
+    规则列表,    // u64 CSSRule*数组
+    规则数量,
+    规则容量,
+    已禁用,
+}
+
+
+函数 CSS样式Sheet_创建() {
+    定义 ss = 堆_分配(CSS样式Sheet_Obj)
+    ss.标题 = 0
+    ss.类型 = 字符串_复制("text/css")
+    ss.href = 0; ss.所有者节点 = 0
+    ss.规则容量 = 64
+    ss.规则列表 = 堆_分配_数组(ss.规则容量 * 8)
+    ss.规则数量 = 0; ss.已禁用 = 假
+    返回 ss
+}
+
+函数 CSS样式Sheet_insertRule(ss, 规则文本, 索引) {
+    如果 (索引 > ss.规则数量) { 返回 -1 }
+    如果 (ss.规则数量 >= ss.规则容量) { 返回 -1 }
+    // 解析规则文本
+    定义 rule = CSSRule_解析(规则文本, ss)
+    如果 (rule == 0) { 返回 -1 }
+    // 插入
+    定义 可变 i = ss.规则数量
+    当 (i > 索引) {
+        内存_写64(ss.规则列表 + i * 8, 内存_读64(ss.规则列表 + (i - 1) * 8))
+        i = i - 1
+    }
+    内存_写64(ss.规则列表 + 索引 * 8, rule)
+    ss.规则数量 = ss.规则数量 + 1
+    返回 索引
+}
+
+函数 CSS样式Sheet_deleteRule(ss, 索引) {
+    如果 (索引 >= ss.规则数量) { 返回 }
+    定义 可变 i = 索引
+    当 (i < ss.规则数量 - 1) {
+        内存_写64(ss.规则列表 + i * 8, 内存_读64(ss.规则列表 + (i + 1) * 8))
+        i = i + 1
+    }
+    ss.规则数量 = ss.规则数量 - 1
+}
+
+函数 CSSRule_解析(文本, 父样式表) {
+    // 解析CSS文本并创建对应规则对象
+    定义 rule = 堆_分配(CSSRule)
+    rule.类型 = CSS规则_样式
+    rule.CSS文本 = 字符串_复制(文本)
+    rule.父规则 = 0
+    rule.父样式表 = 父样式表
+    返回 rule
+}
+
+// §4 getComputed样式() — 获取元素的最终计算样式
+// (对应 CSSComputed样式Declaration)
+// 返回只读的CSS样式Declaration,包含所有CSS属性的计算值
+
+函数 getComputed样式(元素, 伪元素) {
+    如果 (元素 == 0) { 返回 0 }
+    定义 扩展 = 元素_获取扩展(元素)
+    如果 (扩展 == 0 || 扩展.计算样式 == 0) { 返回 0 }
+
+    定义 style = 扩展.计算样式
+    定义 sd = CSS样式Declaration_创建(假, 元素)
+
+    // 将Computed样式的所有属性转换为字符串形式
+    // 这是getComputed样式最"重"的部分: 每个属性都要序列化
+
+    // display
+    定义 可变 display_str = "block"
+    如果 (style.display == 0) { display_str = "none" }
+    否则 如果 (style.display == 显示_行内) { display_str = "inline" }
+    否则 如果 (style.display == 显示_行内块) { display_str = "inline-block" }
+    否则 如果 (style.display == 显示_flex) { display_str = "flex" }
+    否则 如果 (style.display == 显示_grid) { display_str = "grid" }
+    否则 如果 (style.display == 显示_表格) { display_str = "table" }
+    CSS样式Declaration_setProperty(sd, "display", display_str, 0)
+
+    // position
+    定义 可变 pos_str = "static"
+    如果 (style.position == 1) { pos_str = "relative" }
+    否则 如果 (style.position == 2) { pos_str = "absolute" }
+    否则 如果 (style.position == 3) { pos_str = "fixed" }
+    否则 如果 (style.position == 4) { pos_str = "sticky" }
+    CSS样式Declaration_setProperty(sd, "position", pos_str, 0)
+
+    // 尺寸(像素值)
+    CSS样式Declaration_setProperty(sd, "width", CSS值转像素字符串(style.width), 0)
+    CSS样式Declaration_setProperty(sd, "height", CSS值转像素字符串(style.height), 0)
+
+    // margin
+    CSS样式Declaration_setProperty(sd, "margin-top", CSS值转像素字符串(style.margin_top), 0)
+    CSS样式Declaration_setProperty(sd, "margin-right", CSS值转像素字符串(style.margin_right), 0)
+    CSS样式Declaration_setProperty(sd, "margin-bottom", CSS值转像素字符串(style.margin_bottom), 0)
+    CSS样式Declaration_setProperty(sd, "margin-left", CSS值转像素字符串(style.margin_left), 0)
+
+    // padding
+    CSS样式Declaration_setProperty(sd, "padding-top", CSS值转像素字符串(style.padding_top), 0)
+    CSS样式Declaration_setProperty(sd, "padding-right", CSS值转像素字符串(style.padding_right), 0)
+    CSS样式Declaration_setProperty(sd, "padding-bottom", CSS值转像素字符串(style.padding_bottom), 0)
+    CSS样式Declaration_setProperty(sd, "padding-left", CSS值转像素字符串(style.padding_left), 0)
+
+    // 颜色
+    CSS样式Declaration_setProperty(sd, "color", CSS颜色转字符串(style.color), 0)
+    CSS样式Declaration_setProperty(sd, "background-color", CSS颜色转字符串(style.background_color), 0)
+
+    // 字体
+    CSS样式Declaration_setProperty(sd, "font-size", CSS值转像素字符串(style.font_size), 0)
+    CSS样式Declaration_setProperty(sd, "font-weight", 整数转字符串(style.font_weight), 0)
+
+    // opacity
+    定义 opacity_str = 堆_分配(10)
+    定义 整数部分 = style.opacity / 100
+    定义 小数部分 = style.opacity % 100
+    // 格式化opacity: "1" 或 "0.XX"
+    如果 (style.opacity >= 100) {
+        CSS样式Declaration_setProperty(sd, "opacity", "1", 0)
+    } 否则 {
+        定义 s = 字符串_连接("0.", 整数转字符串(style.opacity))
+        CSS样式Declaration_setProperty(sd, "opacity", s, 0)
+    }
+
+    // overflow
+    定义 可变 ov_str = "visible"
+    如果 (style.overflow == 1) { ov_str = "hidden" }
+    否则 如果 (style.overflow == 2) { ov_str = "scroll" }
+    否则 如果 (style.overflow == 3) { ov_str = "auto" }
+    CSS样式Declaration_setProperty(sd, "overflow", ov_str, 0)
+
+    // z-index
+    如果 (style.z_index != 0) {
+        CSS样式Declaration_setProperty(sd, "z-index", 整数转字符串(style.z_index), 0)
+    } 否则 {
+        CSS样式Declaration_setProperty(sd, "z-index", "auto", 0)
+    }
+
+    // border
+    CSS样式Declaration_setProperty(sd, "border-top-width", CSS值转像素字符串(style.border_top_width), 0)
+    CSS样式Declaration_setProperty(sd, "border-right-width", CSS值转像素字符串(style.border_right_width), 0)
+    CSS样式Declaration_setProperty(sd, "border-bottom-width", CSS值转像素字符串(style.border_bottom_width), 0)
+    CSS样式Declaration_setProperty(sd, "border-left-width", CSS值转像素字符串(style.border_left_width), 0)
+
+    // visibility
+    CSS样式Declaration_setProperty(sd, "visibility", style.visibility == 0 ? "visible" : "hidden", 0)
+
+    // cursor
+    定义 可变 cursor_str = "auto"
+    如果 (style.cursor == 30) { cursor_str = "pointer" }
+    否则 如果 (style.cursor == 31) { cursor_str = "text" }
+    否则 如果 (style.cursor == 32) { cursor_str = "wait" }
+    否则 如果 (style.cursor == 33) { cursor_str = "move" }
+    CSS样式Declaration_setProperty(sd, "cursor", cursor_str, 0)
+
+    返回 sd
+}
+
+函数 CSS值转像素字符串(值) {
+    如果 (值 == -1) { 返回 "auto" }
+    如果 (值 == 0) { 返回 "0px" }
+    定义 px = 值 / 100
+    定义 小数 = 值 % 100
+    如果 (小数 == 0) {
+        返回 字符串_连接(整数转字符串(px), "px")
+    }
+    定义 s = 整数转字符串(px)
+    s = 字符串_连接(s, ".")
+    如果 (小数 < 10) { s = 字符串_连接(s, "0") }
+    s = 字符串_连接(s, 整数转字符串(小数))
+    s = 字符串_连接(s, "px")
+    返回 s
+}
+
+函数 CSS颜色转字符串(argb) {
+    定义 a = (argb >> 24) & 0xFF
+    定义 r = (argb >> 16) & 0xFF
+    定义 g = (argb >> 8) & 0xFF
+    定义 b = argb & 0xFF
+    如果 (a == 255) {
+        // rgb(r, g, b)
+        定义 s = "rgb("
+        s = 字符串_连接(s, 整数转字符串(r))
+        s = 字符串_连接(s, ", ")
+        s = 字符串_连接(s, 整数转字符串(g))
+        s = 字符串_连接(s, ", ")
+        s = 字符串_连接(s, 整数转字符串(b))
+        s = 字符串_连接(s, ")")
+        返回 s
+    }
+    // rgba(r, g, b, a)
+    定义 s = "rgba("
+    s = 字符串_连接(s, 整数转字符串(r))
+    s = 字符串_连接(s, ", ")
+    s = 字符串_连接(s, 整数转字符串(g))
+    s = 字符串_连接(s, ", ")
+    s = 字符串_连接(s, 整数转字符串(b))
+    s = 字符串_连接(s, ", ")
+    // alpha: 0~255 → 0~1小数字符串
+    定义 alpha_pct = a * 1000 / 255    // 千分比
+    定义 alpha_int = alpha_pct / 1000
+    定义 alpha_frac = alpha_pct % 1000
+    s = 字符串_连接(s, 整数转字符串(alpha_int))
+    s = 字符串_连接(s, ".")
+    s = 字符串_连接(s, 整数转字符串_宽度3(alpha_frac))
+    s = 字符串_连接(s, ")")
+    返回 s
+}
+
+定义 可变 AI_样式样式_样式缓存命中 = 0
+
+函数 AI_样式样式_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_样式样式_布局缓存(元素哈希) {
+    AI_样式样式_样式缓存命中 = AI_样式样式_样式缓存命中 + 1
+    返回 元素哈希
+}

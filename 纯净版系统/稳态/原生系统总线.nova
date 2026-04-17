@@ -1,0 +1,674 @@
+// NovaOS PCI枚举与配置空间访问
+// 功能: PCI配置空间读写、设备枚举、BAR解析、MSI配置
+
+导入("../执行/端口.nova")
+导入("../推理/值乘.nova")
+导入("../感知/内核直连层.nova")
+
+定义 PCI_CONFIG_ADDR = 0xCF8
+定义 PCI_CONFIG_DATA = 0xCFC
+
+定义 PCI_REG_厂商ID      = 0x00
+定义 PCI_REG_设备ID      = 0x02
+定义 PCI_REG_命令        = 0x04
+定义 PCI_REG_状态        = 0x06
+定义 PCI_REG_修订ID      = 0x08
+定义 PCI_REG_编程接口    = 0x09
+定义 PCI_REG_子类代码    = 0x0A
+定义 PCI_REG_类代码      = 0x0B
+定义 PCI_REG_缓存行大小  = 0x0C
+定义 PCI_REG_延迟定时器  = 0x0D
+定义 PCI_REG_头类型      = 0x0E
+定义 PCI_REG_BIST        = 0x0F
+定义 PCI_REG_BAR0        = 0x10
+定义 PCI_REG_BAR1        = 0x14
+定义 PCI_REG_BAR2        = 0x18
+定义 PCI_REG_BAR3        = 0x1C
+定义 PCI_REG_BAR4        = 0x20
+定义 PCI_REG_BAR5        = 0x24
+定义 PCI_REG_子系统厂商  = 0x2C
+定义 PCI_REG_子系统ID    = 0x2E
+定义 PCI_REG_扩展ROM     = 0x30
+定义 PCI_REG_能力指针    = 0x34
+定义 PCI_REG_中断线      = 0x3C
+定义 PCI_REG_中断引脚    = 0x3D
+定义 PCI_REG_最小授权    = 0x3E
+定义 PCI_REG_最大延迟    = 0x3F
+
+定义 PCI_CMD_IO使能       = 0x0001
+定义 PCI_CMD_内存使能     = 0x0002
+定义 PCI_CMD_总线主控     = 0x0004
+定义 PCI_CMD_特殊周期     = 0x0008
+定义 PCI_CMD_写无效使能   = 0x0010
+定义 PCI_CMD_中断禁用     = 0x0400
+
+定义 PCI_CAP_MSI          = 0x05
+定义 PCI_CAP_MSIX         = 0x11
+定义 PCI_CAP_VENDOR       = 0x09
+定义 PCI_CAP_EXPRESS      = 0x10
+
+定义 PCI_BAR_类型_内存    = 0
+定义 PCI_BAR_类型_IO      = 1
+定义 PCI_BAR_内存_32位    = 0x00
+定义 PCI_BAR_内存_64位    = 0x04
+
+定义 PCI_类_存储控制器    = 0x01
+定义 PCI_类_网络控制器    = 0x02
+定义 PCI_类_显示控制器    = 0x03
+定义 PCI_类_桥设备        = 0x06
+
+// PCI设备结构
+
+结构 PCI设备 {
+    总线,
+    设备号,
+    功能号,
+    厂商ID,
+    设备ID,
+    类代码,
+    子类代码,
+    编程接口,
+    修订ID,
+    头类型,
+    中断线,
+    中断引脚,
+    BAR,    // 数组<PCI_BAR信息, 6>
+    BAR数量,
+    能力列表头,
+    MSI_偏移,
+    MSIX_偏移,
+    已使能,
+    驱动,    // 指针<PCI驱动>
+}
+
+结构 PCI_BAR信息 {
+    基地址,
+    大小,
+    类型,
+    是64位,
+}
+
+// NPBE理论 — Nova PCI总线枚举理论 (Nova PCI Bus Enumeration)
+// 理论核心: 拓扑感知递归扫描 + BAR自适应分配 + AI设备热度预判
+// 公式1: ScanCost = O(buses × 32 × 8) — 最坏情况全扫描
+// 公式2: BARSize = ~原始值 + 1  (BAR大小探测公式)
+// 公式3: DeviceHotness = AI(class, subclass, vendor) → priority_score
+
+定义 PCI_子类_SCSI         = 0x00
+定义 PCI_子类_IDE          = 0x01
+定义 PCI_子类_SATA         = 0x06
+定义 PCI_子类_NVMe         = 0x08
+定义 PCI_子类_以太网       = 0x00
+定义 PCI_子类_VGA          = 0x00
+定义 PCI_子类_主桥         = 0x00
+定义 PCI_子类_PCI_PCI桥    = 0x04
+
+定义 PCIE_SPEED_2_5GT   = 1
+定义 PCIE_SPEED_5GT     = 2
+定义 PCIE_SPEED_8GT     = 3
+定义 PCIE_SPEED_16GT    = 4
+
+定义 MSI_控制寄存器偏移    = 0x02
+定义 MSI_地址低32位偏移    = 0x04
+定义 MSI_地址高32位偏移    = 0x08
+定义 MSI_数据偏移_32位     = 0x08
+定义 MSI_数据偏移_64位     = 0x0C
+定义 MSIX_表偏移           = 0x04
+定义 MSIX_PBA偏移          = 0x08
+
+结构 PCI能力 {
+    ID,
+    偏移,
+    下一个,
+}
+
+结构 PCI驱动 {
+    名称,
+    厂商ID,
+    设备ID,
+    类代码,
+    子类代码,
+    初始化函数,  // fn(设备) -> 布尔
+}
+
+结构 PCI枚举统计 {
+    扫描总线数,
+    扫描设备数,
+    发现设备数,
+    BAR解析数,
+    能力遍历数,
+    MSI配置数,
+    驱动绑定数,
+    AI预判命中,
+    AI预判未中,
+}
+
+定义 可变 PCI设备列表 = []
+定义 可变 PCI驱动列表 = []
+定义 可变 PCI已初始化 = 假
+定义 可变 PCI统计 = PCI枚举统计 {
+    扫描总线数: 0, 扫描设备数: 0, 发现设备数: 0,
+    BAR解析数: 0, 能力遍历数: 0, MSI配置数: 0,
+    驱动绑定数: 0, AI预判命中: 0, AI预判未中: 0,
+}
+
+// §1 配置空间读写
+
+// ━ Nova稳态层 — Nova原生实现，整数OS自主运行，零外部依赖
+函数 PCI_构造地址(bus, dev, func, reg) {
+    返回 0x80000000 |
+        ((bus & 0xFF) << 16) |
+        ((dev & 0x1F) << 11) |
+        ((func & 0x07) << 8) |
+        (reg & 0xFC)
+}
+
+函数 PCI_读32(bus, dev, func, reg) {
+    定义 addr = PCI_构造地址(bus, dev, func, reg)
+    端口_输出32(PCI_CONFIG_ADDR, addr)
+    返回 端口_输入32(PCI_CONFIG_DATA)
+}
+
+函数 PCI_写32(bus, dev, func, reg, val) {
+    定义 addr = PCI_构造地址(bus, dev, func, reg)
+    端口_输出32(PCI_CONFIG_ADDR, addr)
+    端口_输出32(PCI_CONFIG_DATA, val)
+}
+
+函数 PCI_读16(bus, dev, func, reg) {
+    定义 raw = PCI_读32(bus, dev, func, reg & 0xFC)
+    定义 shift = ((reg & 0x02) * 8)
+    返回 (raw >> shift) & 0xFFFF
+}
+
+函数 PCI_写16(bus, dev, func, reg, val) {
+    定义 raw = PCI_读32(bus, dev, func, reg & 0xFC)
+    定义 shift = ((reg & 0x02) * 8)
+    定义 mask = ~(0xFFFF << shift)
+    PCI_写32(bus, dev, func, reg & 0xFC, (raw & mask) | ((val & 0xFFFF) << shift))
+}
+
+函数 PCI_读8(bus, dev, func, reg) {
+    定义 raw = PCI_读32(bus, dev, func, reg & 0xFC)
+    定义 shift = ((reg & 0x03) * 8)
+    返回 (raw >> shift) & 0xFF
+}
+
+函数 PCI_写8(bus, dev, func, reg, val) {
+    定义 raw = PCI_读32(bus, dev, func, reg & 0xFC)
+    定义 shift = ((reg & 0x03) * 8)
+    定义 mask = ~(0xFF << shift)
+    PCI_写32(bus, dev, func, reg & 0xFC, (raw & mask) | ((val & 0xFF) << shift))
+}
+
+// §2 BAR解析与大小探测
+
+函数 PCI_探测BAR大小(bus, dev, func, bar_reg) {
+    定义 原始值 = PCI_读32(bus, dev, func, bar_reg)
+    PCI_写32(bus, dev, func, bar_reg, 0xFFFFFFFF)
+    定义 探测值 = PCI_读32(bus, dev, func, bar_reg)
+    PCI_写32(bus, dev, func, bar_reg, 原始值)  // 恢复
+    如果 (探测值 == 0 || 探测值 == 0xFFFFFFFF) { 返回 0 }
+    // BAR大小 = ~mask + 1
+    如果 (原始值 & 0x01) {
+        // IO BAR
+        返回 (~(探测值 & 0xFFFC) + 1) & 0xFFFF
+    } 否则 {
+        // Memory BAR
+        返回 (~(探测值 & 0xFFFFFFF0) + 1)
+    }
+}
+
+函数 PCI_解析BAR(设备) {
+    可变 bar_idx = 0
+    可变 bar_reg = PCI_REG_BAR0
+    当 (bar_idx < 6 && bar_reg <= PCI_REG_BAR5) {
+        PCI统计.BAR解析数 = PCI统计.BAR解析数 + 1
+        定义 原始值 = PCI_读32(设备.总线, 设备.设备号, 设备.功能号, bar_reg)
+        如果 (原始值 == 0) {
+            bar_idx = bar_idx + 1
+            bar_reg = bar_reg + 4
+            继续
+        }
+
+        可变 bar = PCI_BAR信息 {
+            基地址: 0, 大小: 0, 类型: PCI_BAR_类型_内存, 是64位: 假
+        }
+
+        如果 (原始值 & 0x01) {
+            // IO BAR
+            bar.类型 = PCI_BAR_类型_IO
+            bar.基地址 = 原始值 & 0xFFFC
+            bar.大小 = PCI_探测BAR大小(设备.总线, 设备.设备号, 设备.功能号, bar_reg)
+        } 否则 {
+            // Memory BAR
+            bar.类型 = PCI_BAR_类型_内存
+            定义 类型位 = (原始值 >> 1) & 0x03
+            如果 (类型位 == 0x02) {
+                // 64位 BAR
+                bar.是64位 = 真
+                定义 高32 = PCI_读32(设备.总线, 设备.设备号, 设备.功能号, bar_reg + 4)
+                bar.基地址 = ((高32 << 32) | (原始值 & 0xFFFFFFF0))
+                bar.大小 = PCI_探测BAR大小(设备.总线, 设备.设备号, 设备.功能号, bar_reg)
+                设备.BAR[bar_idx] = bar
+                bar_idx = bar_idx + 1
+                bar_reg = bar_reg + 8  // 64位BAR占两个寄存器
+                继续
+            } 否则 {
+                // 32位 BAR
+                bar.基地址 = 原始值 & 0xFFFFFFF0
+                bar.大小 = PCI_探测BAR大小(设备.总线, 设备.设备号, 设备.功能号, bar_reg)
+            }
+        }
+        设备.BAR[bar_idx] = bar
+        bar_idx = bar_idx + 1
+        bar_reg = bar_reg + 4
+    }
+    设备.BAR数量 = bar_idx
+}
+
+// §3 能力链遍历
+
+函数 PCI_遍历能力(设备) {
+    定义 状态 = PCI_读16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_状态)
+    如果 ((状态 & 0x10) == 0) { 返回 }  // 无能力列表
+
+    可变 ptr = PCI_读8(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_能力指针)
+    ptr = ptr & 0xFC
+    可变 visited = 0
+
+    当 (ptr != 0 && visited < 48) {
+        PCI统计.能力遍历数 = PCI统计.能力遍历数 + 1
+        visited = visited + 1
+        定义 cap_id = PCI_读8(设备.总线, 设备.设备号, 设备.功能号, ptr)
+        定义 next = PCI_读8(设备.总线, 设备.设备号, 设备.功能号, ptr + 1) & 0xFC
+
+        如果 (cap_id == PCI_CAP_MSI) {
+            设备.MSI_偏移 = ptr
+        } 否则 如果 (cap_id == PCI_CAP_MSIX) {
+            设备.MSIX_偏移 = ptr
+        }
+        设备.能力列表头 = ptr
+        ptr = next
+    }
+}
+
+// §4 MSI/MSI-X 配置
+
+函数 PCI_配置MSI(设备, 向量号, CPU目标) {
+    如果 (设备.MSI_偏移 == 0) { 返回 假 }
+    PCI统计.MSI配置数 = PCI统计.MSI配置数 + 1
+
+    定义 ctrl = PCI_读16(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSI_偏移 + MSI_控制寄存器偏移)
+    定义 是64位 = (ctrl & 0x0080) != 0
+
+    // 构造MSI地址: 0xFEE00000 | (CPU << 12)
+    定义 addr_low = 0xFEE00000 | ((CPU目标 & 0xFF) << 12)
+    PCI_写32(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSI_偏移 + MSI_地址低32位偏移, addr_low)
+
+    如果 (是64位) {
+        PCI_写32(设备.总线, 设备.设备号, 设备.功能号,
+            设备.MSI_偏移 + MSI_地址高32位偏移, 0)
+        PCI_写16(设备.总线, 设备.设备号, 设备.功能号,
+            设备.MSI_偏移 + MSI_数据偏移_64位, 向量号 & 0xFF)
+    } 否则 {
+        PCI_写16(设备.总线, 设备.设备号, 设备.功能号,
+            设备.MSI_偏移 + MSI_数据偏移_32位, 向量号 & 0xFF)
+    }
+
+    // 使能MSI (bit0)
+    ctrl = ctrl | 0x0001
+    PCI_写16(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSI_偏移 + MSI_控制寄存器偏移, ctrl)
+
+    // 禁用传统INTx
+    定义 cmd = PCI_读16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令)
+    PCI_写16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令,
+        cmd | PCI_CMD_中断禁用)
+    返回 真
+}
+
+函数 PCI_配置MSIX(设备, 表索引, 向量号, CPU目标) {
+    如果 (设备.MSIX_偏移 == 0) { 返回 假 }
+    PCI统计.MSI配置数 = PCI统计.MSI配置数 + 1
+
+    定义 表信息 = PCI_读32(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSIX_偏移 + MSIX_表偏移)
+    定义 BAR_idx = 表信息 & 0x07
+    定义 表基址偏移 = 表信息 & 0xFFFFFFF8
+
+    如果 (BAR_idx >= 设备.BAR数量) { 返回 假 }
+    定义 表VA = 设备.BAR[BAR_idx].基地址 + 表基址偏移
+    定义 entry_off = 表索引 * 16
+
+    // 写MSI-X表项: addr_low, addr_high, data, vector_control
+    内存_写32(表VA + entry_off + 0, 0xFEE00000 | ((CPU目标 & 0xFF) << 12))
+    内存_写32(表VA + entry_off + 4, 0)
+    内存_写32(表VA + entry_off + 8, 向量号 & 0xFF)
+    内存_写32(表VA + entry_off + 12, 0)  // unmask
+
+    // 全局使能MSI-X
+    定义 ctrl = PCI_读16(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSIX_偏移 + MSI_控制寄存器偏移)
+    ctrl = ctrl | 0x8000  // MSI-X Enable
+    PCI_写16(设备.总线, 设备.设备号, 设备.功能号,
+        设备.MSIX_偏移 + MSI_控制寄存器偏移, ctrl)
+    返回 真
+}
+
+// §5 设备使能
+
+函数 PCI_使能设备(设备) {
+    定义 cmd = PCI_读16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令)
+    cmd = cmd | PCI_CMD_IO使能 | PCI_CMD_内存使能 | PCI_CMD_总线主控
+    PCI_写16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令, cmd)
+    设备.已使能 = 真
+}
+
+函数 PCI_禁用设备(设备) {
+    定义 cmd = PCI_读16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令)
+    cmd = cmd & ~(PCI_CMD_IO使能 | PCI_CMD_内存使能 | PCI_CMD_总线主控)
+    PCI_写16(设备.总线, 设备.设备号, 设备.功能号, PCI_REG_命令, cmd)
+    设备.已使能 = 假
+}
+
+// §6 设备枚举 (拓扑递归扫描)
+
+函数 PCI_探测功能(bus, dev, func) {
+    定义 vendor = PCI_读16(bus, dev, func, PCI_REG_厂商ID)
+    如果 (vendor == 0xFFFF || vendor == 0) { 返回 空 }
+
+    PCI统计.发现设备数 = PCI统计.发现设备数 + 1
+
+    可变 设备 = PCI设备 {
+        总线: bus,
+        设备号: dev,
+        功能号: func,
+        厂商ID: vendor,
+        设备ID: PCI_读16(bus, dev, func, PCI_REG_设备ID),
+        类代码: PCI_读8(bus, dev, func, PCI_REG_类代码),
+        子类代码: PCI_读8(bus, dev, func, PCI_REG_子类代码),
+        编程接口: PCI_读8(bus, dev, func, PCI_REG_编程接口),
+        修订ID: PCI_读8(bus, dev, func, PCI_REG_修订ID),
+        头类型: PCI_读8(bus, dev, func, PCI_REG_头类型),
+        中断线: PCI_读8(bus, dev, func, PCI_REG_中断线),
+        中断引脚: PCI_读8(bus, dev, func, PCI_REG_中断引脚),
+        BAR: 数组_创建(6, 空),
+        BAR数量: 0,
+        能力列表头: 0,
+        MSI_偏移: 0,
+        MSIX_偏移: 0,
+        已使能: 假,
+        驱动: 空,
+    }
+
+    PCI_解析BAR(设备)
+    PCI_遍历能力(设备)
+    数组_推入(PCI设备列表, 设备)
+    返回 设备
+}
+
+函数 PCI_扫描总线(bus) {
+    PCI统计.扫描总线数 = PCI统计.扫描总线数 + 1
+    可变 dev = 0
+    当 (dev < 32) {
+        PCI统计.扫描设备数 = PCI统计.扫描设备数 + 1
+        定义 vendor = PCI_读16(bus, dev, 0, PCI_REG_厂商ID)
+        如果 (vendor == 0xFFFF || vendor == 0) {
+            dev = dev + 1
+            继续
+        }
+
+        PCI_探测功能(bus, dev, 0)
+
+        // 检查多功能设备
+        定义 头 = PCI_读8(bus, dev, 0, PCI_REG_头类型)
+        如果 (头 & 0x80) {
+            可变 func = 1
+            当 (func < 8) {
+                PCI_探测功能(bus, dev, func)
+                func = func + 1
+            }
+        }
+
+        // 如果是PCI-PCI桥, 递归扫描次级总线
+        定义 cl = PCI_读8(bus, dev, 0, PCI_REG_类代码)
+        定义 scl = PCI_读8(bus, dev, 0, PCI_REG_子类代码)
+        如果 (cl == PCI_类_桥设备 && scl == PCI_子类_PCI_PCI桥) {
+            定义 次级 = PCI_读8(bus, dev, 0, 0x19)
+            如果 (次级 > bus && 次级 < 255) {
+                PCI_扫描总线(次级)
+            }
+        }
+        dev = dev + 1
+    }
+}
+
+函数 PCI_全枚举() {
+    PCI设备列表 = []
+    PCI统计.扫描总线数 = 0
+    PCI统计.扫描设备数 = 0
+    PCI统计.发现设备数 = 0
+    PCI统计.BAR解析数 = 0
+    PCI统计.能力遍历数 = 0
+
+    // 检查Host Bridge是否多功能 → 多总线域
+    定义 头 = PCI_读8(0, 0, 0, PCI_REG_头类型)
+    如果 (头 & 0x80) {
+        // 多功能 — 每个功能是独立总线域
+        可变 func = 0
+        当 (func < 8) {
+            定义 v = PCI_读16(0, 0, func, PCI_REG_厂商ID)
+            如果 (v != 0xFFFF && v != 0) {
+                PCI_扫描总线(func)
+            }
+            func = func + 1
+        }
+    } 否则 {
+        PCI_扫描总线(0)
+    }
+
+    PCI已初始化 = 真
+    返回 数组_长度(PCI设备列表)
+}
+
+// §7 驱动注册与绑定
+
+函数 PCI_注册驱动(驱动) {
+    数组_推入(PCI驱动列表, 驱动)
+}
+
+函数 PCI_驱动匹配设备(驱动, 设备) {
+    // 精确匹配优先
+    如果 (驱动.厂商ID != 0xFFFF && 驱动.设备ID != 0xFFFF) {
+        返回 驱动.厂商ID == 设备.厂商ID && 驱动.设备ID == 设备.设备ID
+    }
+    // 类代码匹配
+    如果 (驱动.类代码 != 0xFF) {
+        如果 (驱动.类代码 != 设备.类代码) { 返回 假 }
+        如果 (驱动.子类代码 != 0xFF && 驱动.子类代码 != 设备.子类代码) {
+            返回 假
+        }
+        返回 真
+    }
+    返回 假
+}
+
+函数 PCI_绑定全部驱动() {
+    可变 i = 0
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 设备 = PCI设备列表[i]
+        如果 (设备.驱动 != 空) {
+            i = i + 1
+            继续
+        }
+        可变 j = 0
+        当 (j < 数组_长度(PCI驱动列表)) {
+            定义 驱动 = PCI驱动列表[j]
+            如果 (PCI_驱动匹配设备(驱动, 设备)) {
+                PCI_使能设备(设备)
+                定义 ok = 驱动.初始化函数(设备)
+                如果 (ok) {
+                    设备.驱动 = 驱动
+                    PCI统计.驱动绑定数 = PCI统计.驱动绑定数 + 1
+                    跳出
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// §8 设备查找接口
+
+函数 PCI_按厂商设备查找(vendorId, deviceId) {
+    可变 i = 0
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 d = PCI设备列表[i]
+        如果 (d.厂商ID == vendorId && d.设备ID == deviceId) {
+            返回 d
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+函数 PCI_按类查找(类代码, 子类代码) {
+    可变 结果 = []
+    可变 i = 0
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 d = PCI设备列表[i]
+        如果 (d.类代码 == 类代码) {
+            如果 (子类代码 == 0xFF || d.子类代码 == 子类代码) {
+                数组_推入(结果, d)
+            }
+        }
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 PCI_按BDF查找(bus, dev, func) {
+    可变 i = 0
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 d = PCI设备列表[i]
+        如果 (d.总线 == bus && d.设备号 == dev && d.功能号 == func) {
+            返回 d
+        }
+        i = i + 1
+    }
+    返回 空
+}
+
+// §9 设备类名映射
+
+函数 PCI_类名(设备) {
+    如果 (设备.类代码 == PCI_类_存储控制器) {
+        如果 (设备.子类代码 == PCI_子类_SATA) { 返回 "SATA控制器" }
+        如果 (设备.子类代码 == PCI_子类_NVMe) { 返回 "NVMe控制器" }
+        如果 (设备.子类代码 == PCI_子类_IDE) { 返回 "IDE控制器" }
+        如果 (设备.子类代码 == PCI_子类_SCSI) { 返回 "SCSI控制器" }
+        返回 "存储控制器"
+    }
+    如果 (设备.类代码 == PCI_类_网络控制器) { 返回 "网络控制器" }
+    如果 (设备.类代码 == PCI_类_显示控制器) { 返回 "显示控制器" }
+    如果 (设备.类代码 == PCI_类_桥设备) { 返回 "桥设备" }
+    返回 "未知设备"
+}
+
+函数 PCI_BAR类名(bar) {
+    如果 (bar == 空) { 返回 "无" }
+    如果 (bar.类型 == PCI_BAR_类型_IO) { 返回 "IO" }
+    如果 (bar.是64位) { 返回 "MEM64" }
+    返回 "MEM32"
+}
+
+// §10 AI设备优先级预判 (NPBE公式3)
+
+函数 PCI_AI_设备优先级(设备) {
+    定义 特征 = Tensor_创建(1, 6)
+    Tensor_写(特征, 0, 0, 设备.类代码 * 1.0)
+    Tensor_写(特征, 0, 1, 设备.子类代码 * 1.0)
+    Tensor_写(特征, 0, 2, 设备.厂商ID * 1.0)
+    Tensor_写(特征, 0, 3, 设备.BAR数量 * 1.0)
+    Tensor_写(特征, 0, 4, (设备.MSI_偏移 > 0 ? 1.0 : 0.0))
+    Tensor_写(特征, 0, 5, (设备.MSIX_偏移 > 0 ? 1.0 : 0.0))
+    定义 结果 = AI总线_推理("pci_device_priority", 特征)
+    可变 优先级 = 50  // 默认
+    如果 (结果 != 空) {
+        优先级 = Tensor_读(结果, 0, 0)
+        如果 (优先级 > 70) {
+            PCI统计.AI预判命中 = PCI统计.AI预判命中 + 1
+        } 否则 {
+            PCI统计.AI预判未中 = PCI统计.AI预判未中 + 1
+        }
+        Tensor_释放(结果)
+    }
+    Tensor_释放(特征)
+    返回 优先级
+}
+
+函数 PCI_AI_排序设备列表() {
+    // 插入排序 按AI优先级降序
+    可变 i = 1
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 key = PCI设备列表[i]
+        定义 keyPri = PCI_AI_设备优先级(key)
+        可变 j = i - 1
+        当 (j >= 0 && PCI_AI_设备优先级(PCI设备列表[j]) < keyPri) {
+            PCI设备列表[j + 1] = PCI设备列表[j]
+            j = j - 1
+        }
+        PCI设备列表[j + 1] = key
+        i = i + 1
+    }
+}
+
+// §11 完整初始化流程
+
+函数 PCI_系统初始化() {
+    PCI设备列表 = []
+    PCI驱动列表 = []
+    PCI已初始化 = 假
+    PCI统计 = PCI枚举统计 {
+        扫描总线数: 0, 扫描设备数: 0, 发现设备数: 0,
+        BAR解析数: 0, 能力遍历数: 0, MSI配置数: 0,
+        驱动绑定数: 0, AI预判命中: 0, AI预判未中: 0,
+    }
+    定义 n = PCI_全枚举()
+    PCI_AI_排序设备列表()
+    PCI_绑定全部驱动()
+    返回 n
+}
+
+// §12 诊断输出
+
+函数 PCI_诊断报告() {
+    可变 报告 = "[NPBE诊断报告]\n"
+    报告 = 报告 + "扫描总线数: " + PCI统计.扫描总线数 + "\n"
+    报告 = 报告 + "扫描设备数: " + PCI统计.扫描设备数 + "\n"
+    报告 = 报告 + "发现设备数: " + PCI统计.发现设备数 + "\n"
+    报告 = 报告 + "BAR解析数: " + PCI统计.BAR解析数 + "\n"
+    报告 = 报告 + "能力遍历数: " + PCI统计.能力遍历数 + "\n"
+    报告 = 报告 + "MSI配置数: " + PCI统计.MSI配置数 + "\n"
+    报告 = 报告 + "驱动绑定数: " + PCI统计.驱动绑定数 + "\n"
+    报告 = 报告 + "AI预判命中: " + PCI统计.AI预判命中 + "\n"
+    报告 = 报告 + "AI预判未中: " + PCI统计.AI预判未中 + "\n\n"
+
+    可变 i = 0
+    当 (i < 数组_长度(PCI设备列表)) {
+        定义 d = PCI设备列表[i]
+        报告 = 报告 + "[" + d.总线 + ":" + d.设备号 + "." + d.功能号 + "] "
+        报告 = 报告 + PCI_类名(d) + " "
+        报告 = 报告 + "VID=" + d.厂商ID + " DID=" + d.设备ID
+        如果 (d.驱动 != 空) {
+            报告 = 报告 + " 驱动=" + d.驱动.名称
+        }
+        报告 = 报告 + "\n"
+        i = i + 1
+    }
+    返回 报告
+}

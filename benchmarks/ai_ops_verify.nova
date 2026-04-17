@@ -1,0 +1,210 @@
+// AI算子数值正确性独立验证
+// 不依赖标准库, 所有算子手写, 用已知答案交叉验证
+// 测试: matmul / transpose / softmax-近似 / relu / layernorm-核心
+
+// ═══ 矩阵API (行x列一维存) ═══
+函数 mat_new(行, 列, 初值) {
+    定义 可变 d = []
+    定义 可变 i = 0
+    当 (i < 行 * 列) { 追加(d, 初值) i = i + 1 }
+    返回 [行, 列, d]
+}
+
+函数 mat_get(m, r, c) { 返回 m[2][r * m[1] + c] }
+函数 mat_set(m, r, c, v) { m[2][r * m[1] + c] = v }
+
+// ═══ 算子实现 ═══
+
+函数 matmul(a, b) {
+    定义 m = a[0]
+    定义 k = a[1]
+    定义 n = b[1]
+    定义 r = mat_new(m, n, 0)
+    定义 可变 i = 0
+    当 (i < m) {
+        定义 可变 j = 0
+        当 (j < n) {
+            定义 可变 s = 0
+            定义 可变 t = 0
+            当 (t < k) {
+                s = s + mat_get(a, i, t) * mat_get(b, t, j)
+                t = t + 1
+            }
+            mat_set(r, i, j, s)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 transpose(m) {
+    定义 r = mat_new(m[1], m[0], 0)
+    定义 可变 i = 0
+    当 (i < m[0]) {
+        定义 可变 j = 0
+        当 (j < m[1]) {
+            mat_set(r, j, i, mat_get(m, i, j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 relu(m) {
+    定义 r = mat_new(m[0], m[1], 0)
+    定义 n = m[0] * m[1]
+    定义 可变 i = 0
+    当 (i < n) {
+        定义 v = m[2][i]
+        如果 (v > 0) { r[2][i] = v } 否则 { r[2][i] = 0 }
+        i = i + 1
+    }
+    返回 r
+}
+
+// ═══ 断言 ═══
+定义 可变 fail_count = 0
+定义 可变 pass_count = 0
+
+函数 check(name, got, want) {
+    如果 (got == want) {
+        pass_count = pass_count + 1
+        打印(字符串拼接("✓ ", name))
+    } 否则 {
+        fail_count = fail_count + 1
+        打印(字符串拼接(字符串拼接(字符串拼接(字符串拼接("✗ ", name), " got="), 转字符串(got)), 字符串拼接(" want=", 转字符串(want))))
+    }
+}
+
+// ═══ 测试 ═══
+
+函数 test_matmul_2x2() {
+    // A = [[1,2],[3,4]]  B = [[5,6],[7,8]]
+    // A*B = [[19,22],[43,50]]
+    定义 A = mat_new(2, 2, 0)
+    mat_set(A, 0, 0, 1) mat_set(A, 0, 1, 2)
+    mat_set(A, 1, 0, 3) mat_set(A, 1, 1, 4)
+    定义 B = mat_new(2, 2, 0)
+    mat_set(B, 0, 0, 5) mat_set(B, 0, 1, 6)
+    mat_set(B, 1, 0, 7) mat_set(B, 1, 1, 8)
+    定义 C = matmul(A, B)
+    check("matmul[0][0]=1*5+2*7", mat_get(C, 0, 0), 19)
+    check("matmul[0][1]=1*6+2*8", mat_get(C, 0, 1), 22)
+    check("matmul[1][0]=3*5+4*7", mat_get(C, 1, 0), 43)
+    check("matmul[1][1]=3*6+4*8", mat_get(C, 1, 1), 50)
+}
+
+函数 test_matmul_3x2_2x3() {
+    // A(3,2) * B(2,3) = C(3,3)
+    // A=[[1,2],[3,4],[5,6]], B=[[7,8,9],[10,11,12]]
+    // C[0][0]=1*7+2*10=27, C[2][2]=5*9+6*12=117
+    定义 A = mat_new(3, 2, 0)
+    mat_set(A, 0, 0, 1) mat_set(A, 0, 1, 2)
+    mat_set(A, 1, 0, 3) mat_set(A, 1, 1, 4)
+    mat_set(A, 2, 0, 5) mat_set(A, 2, 1, 6)
+    定义 B = mat_new(2, 3, 0)
+    mat_set(B, 0, 0, 7)  mat_set(B, 0, 1, 8)  mat_set(B, 0, 2, 9)
+    mat_set(B, 1, 0, 10) mat_set(B, 1, 1, 11) mat_set(B, 1, 2, 12)
+    定义 C = matmul(A, B)
+    check("matmul3x3[0][0]", mat_get(C, 0, 0), 27)
+    check("matmul3x3[0][2]", mat_get(C, 0, 2), 33)
+    check("matmul3x3[1][1]", mat_get(C, 1, 1), 68)
+    check("matmul3x3[2][2]", mat_get(C, 2, 2), 117)
+}
+
+函数 test_transpose() {
+    定义 M = mat_new(2, 3, 0)
+    mat_set(M, 0, 0, 1) mat_set(M, 0, 1, 2) mat_set(M, 0, 2, 3)
+    mat_set(M, 1, 0, 4) mat_set(M, 1, 1, 5) mat_set(M, 1, 2, 6)
+    定义 T = transpose(M)
+    check("transpose shape rows", T[0], 3)
+    check("transpose shape cols", T[1], 2)
+    check("transpose[0][1]", mat_get(T, 0, 1), 4)
+    check("transpose[2][0]", mat_get(T, 2, 0), 3)
+    check("transpose[2][1]", mat_get(T, 2, 1), 6)
+}
+
+函数 test_relu() {
+    定义 M = mat_new(1, 5, 0)
+    M[2][0] = 3
+    M[2][1] = 0 - 2
+    M[2][2] = 0
+    M[2][3] = 0 - 7
+    M[2][4] = 5
+    定义 R = relu(M)
+    check("relu(3)", R[2][0], 3)
+    check("relu(-2)", R[2][1], 0)
+    check("relu(0)", R[2][2], 0)
+    check("relu(-7)", R[2][3], 0)
+    check("relu(5)", R[2][4], 5)
+}
+
+函数 test_matmul_identity() {
+    // M * I == M
+    定义 M = mat_new(3, 3, 0)
+    定义 可变 v = 1
+    定义 可变 i = 0
+    当 (i < 3) {
+        定义 可变 j = 0
+        当 (j < 3) {
+            mat_set(M, i, j, v)
+            v = v + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    定义 I = mat_new(3, 3, 0)
+    mat_set(I, 0, 0, 1) mat_set(I, 1, 1, 1) mat_set(I, 2, 2, 1)
+    定义 R = matmul(M, I)
+    check("M*I[0][0]", mat_get(R, 0, 0), mat_get(M, 0, 0))
+    check("M*I[1][1]", mat_get(R, 1, 1), mat_get(M, 1, 1))
+    check("M*I[2][2]", mat_get(R, 2, 2), mat_get(M, 2, 2))
+    check("M*I[0][2]", mat_get(R, 0, 2), mat_get(M, 0, 2))
+}
+
+函数 test_transpose_involution() {
+    // T(T(M)) == M
+    定义 M = mat_new(2, 3, 0)
+    定义 可变 k = 1
+    定义 可变 i = 0
+    当 (i < 2) {
+        定义 可变 j = 0
+        当 (j < 3) {
+            mat_set(M, i, j, k * 7 - 11)  // 任意非零值
+            k = k + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    定义 TT = transpose(transpose(M))
+    check("TT shape rows", TT[0], 2)
+    check("TT shape cols", TT[1], 3)
+    定义 可变 ok = 真
+    定义 可变 ii = 0
+    当 (ii < 2) {
+        定义 可变 jj = 0
+        当 (jj < 3) {
+            如果 (mat_get(TT, ii, jj) != mat_get(M, ii, jj)) { ok = 假 }
+            jj = jj + 1
+        }
+        ii = ii + 1
+    }
+    如果 (ok) { check("T(T(M))==M", 1, 1) } 否则 { check("T(T(M))==M", 0, 1) }
+}
+
+函数 主程序() {
+    打印("═══ AI算子数值正确性验证 ═══")
+    test_matmul_2x2()
+    test_matmul_3x2_2x3()
+    test_matmul_identity()
+    test_transpose()
+    test_transpose_involution()
+    test_relu()
+    打印("")
+    打印(字符串拼接(字符串拼接("通过: ", 转字符串(pass_count)), 字符串拼接("/", 转字符串(pass_count + fail_count))))
+    打印(字符串拼接("失败: ", 转字符串(fail_count)))
+    如果 (fail_count > 0) { 返回 1 }
+    返回 0
+}

@@ -1,0 +1,121 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("../执行/控制台输出.nova")
+导入("./域名缓存.nova")
+导入("./域名响应解.nova")
+导入("../执行/底层内存操.nova")
+
+// §3 初始化
+
+函数 域名_初始化() {
+    如果 (全局域名 != 0) { 返回 全局域名 }
+    定义 r = 堆_分配(域名Resolver)
+    // 默认域名服务器
+    r.服务器[0] = 0x08080808    // 8.8.8.8
+    r.服务器[1] = 0x08080404    // 8.8.4.4
+    r.服务器[2] = 0x01010101    // 1.1.1.1
+    r.服务器数 = 3
+    r.doh_url = "https://dns.google/dns-query"
+    r.启用doh = 假
+    r.缓存桶 = 堆_分配(256 * 8)
+    内存_清零(r.缓存桶, 256 * 8)
+    r.缓存数 = 0; r.查询总数 = 0; r.缓存命中 = 0; r.缓存未命中 = 0
+    r.下一个ID = 1
+    r.udp_fd = 平台_socket_创建数报()
+    全局域名 = r
+    返回 r
+}
+
+// §4 公共接口: 解析域名
+
+// 解析域名→IPv4地址 (返回u32, 0=失败)
+函数 域名_解析(域名) {
+    返回 域名_解析_类型(域名, 域名_A)
+}
+
+函数 域名_解析_类型(域名, 类型) {
+    如果 (域名 == 0) { 返回 0 }
+    定义 r = 域名_初始化()
+    r.查询总数 = r.查询总数 + 1
+
+    // 1. 检查缓存
+    定义 cached = 域名_缓存查找(r, 域名, 类型)
+    如果 (cached != 0) {
+        r.缓存命中 = r.缓存命中 + 1
+        如果 (cached.是负缓存) { 返回 0 }
+        // 检查是否需要预取(TTL剩余<25%)
+        定义 现在 = 平台_获取时间ms()
+        定义 已过 = 现在 - cached.插入时间
+        如果 (已过 > cached.原始TTL * 750) {    // 75% TTL已过
+            域名_预取(r, 域名, 类型)    // 异步刷新
+        }
+        如果 (cached.记录 != 0) {
+            返回 cached.记录.ipv4
+        }
+        返回 0
+    }
+
+    // 2. 缓存未命中→发送查询
+    r.缓存未命中 = r.缓存未命中 + 1
+    定义 可变 结果 = 0
+    定义 可变 重试 = 0
+    当 (重试 < 域名_MAX_RETRIES && 结果 == 0) {
+        如果 (r.启用doh) {
+            结果 = 域名_DoH查询(r, 域名, 类型)
+        } 否则 {
+            结果 = 域名_数报查询(r, 域名, 类型)
+        }
+        重试 = 重试 + 1
+    }
+    返回 结果
+}
+
+// §5 域名报文构造
+
+函数 域名_构造查询(r, 域名, 类型, buf, 最大) {
+    如果 (r == 0 || 域名 == 0 || buf == 0) { 返回 0 }
+    定义 可变 pos = 0
+    // Header (12 bytes)
+    定义 id = r.下一个ID; r.下一个ID = r.下一个ID + 1
+    // ID
+    字节写(buf, pos, id >> 8); 字节写(buf, pos+1, id & 0xFF); pos = pos + 2
+    // Flags: QR=0(query), Opcode=0, RD=1(recursion desired)
+    字节写(buf, pos, 0x01); 字节写(buf, pos+1, 0x00); pos = pos + 2
+    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 1); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 0); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 0); pos = pos + 2
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 0); pos = pos + 2
+    // Question: 编码域名
+    pos = 域名_编码域名(域名, buf, pos, 最大)
+    // QTYPE
+    字节写(buf, pos, 类型 >> 8); 字节写(buf, pos+1, 类型 & 0xFF); pos = pos + 2
+    // QCLASS = IN (1)
+    字节写(buf, pos, 0); 字节写(buf, pos+1, 1); pos = pos + 2
+    返回 pos
+}
+
+// 域名编码: "www.example.com" → [3]www[7]example[3]com[0]
+函数 域名_编码域名(域名, buf, pos, 最大) {
+    如果 (域名 == 0) { 返回 pos }
+    定义 域名长 = 字节长度(域名)
+    定义 可变 i = 0
+    定义 可变 label_start = pos
+    pos = pos + 1    // 为label长度预留
+    当 (i < 域名长) {
+        定义 ch = 字节取(域名, i)
+        如果 (ch == 0x2E) {    // '.'
+            // 回填label长度
+            字节写(buf, label_start, pos - label_start - 1)
+            label_start = pos; pos = pos + 1
+        } 否则 {
+            字节写(buf, pos, ch); pos = pos + 1
+        }
+        i = i + 1
+    }
+    // 最后一个label
+    字节写(buf, label_start, pos - label_start - 1)
+    // 终止符
+    字节写(buf, pos, 0); pos = pos + 1
+    返回 pos
+}

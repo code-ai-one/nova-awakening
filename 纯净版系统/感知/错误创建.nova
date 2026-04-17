@@ -1,0 +1,116 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("../执行/控制台输出.nova")
+
+//       nova/Nova渲染核心/frame/reporting_observer.cc 
+//        (~1000行)
+// 错误传播层次:
+// 1. try/catch (JS层面)
+// 2. 承诺.catch / .then(null, onrejected)
+// 3. window.onerror (全局未捕获错误)
+// 4. window.onunhandledrejection (未处理的承诺拒绝)
+// 5. Reporting 接口 (发送到服务器)
+// 错误事件:
+// message: 错误消息
+// filename: 源文件URL
+// lineno: 行号
+// colno: 列号
+// error: 错误对象
+// 承诺Rejection事件:
+// promise: 被拒绝的承诺
+// reason: 拒绝原因
+// type: "unhandledrejection" / "rejectionhandled"
+// 错误类型:
+// 错误 / Type错误 / Reference错误 / Syntax错误 /
+// Range错误 / URI错误 / Eval错误 /
+// DOMException / Security错误 / Network错误
+// Reporting 接口:
+// ReportingObserver: 收集CSP违规/弃用警告/干预/崩溃报告
+// Report-To HTTP头: 自动发送到服务器端点
+// 【Nova特色】AI错误分析:
+// ① AI分析错误模式, 预测根因
+// ② AI建议修复方案
+// ③ AI错误聚合(相同错误去重+计数)
+
+// §1 错误对象
+
+定义 ERR_GENERIC = 0
+定义 ERR_TYPE = 1
+定义 ERR_REFERENCE = 2
+定义 ERR_SYNTAX = 3
+定义 ERR_RANGE = 4
+定义 ERR_URI = 5
+定义 ERR_EVAL = 6
+定义 ERR_DOM_EXCEPTION = 10
+定义 ERR_SECURITY = 11
+定义 ERR_NETWORK = 12
+定义 ERR_ABORT = 13
+定义 ERR_QUOTA_EXCEEDED = 14
+定义 ERR_NOT_SUPPORTED = 15
+定义 ERR_INVALID_STATE = 16
+
+结构 JS错误 {
+ 类型,    // u8 ERR_xxx
+ message,    // u64 错误消息字符串
+ name,    // u64 "Type错误"/"Reference错误"/...
+ // 源位置
+ fileName,    // u64 源文件URL
+ lineNumber,
+ columnNumber,
+ // 调用栈
+ stack,    // u64 栈追踪字符串
+ // DOMException特有
+ code,    // u16 DOMException error code
+ // 原因链
+ cause,    // u64 错误* (ES2022 error cause)
+}
+
+函数 错误_创建(类型, message) {
+ 定义 err = 堆_分配(JS错误)
+ err.类型 = 类型; err.message = message
+ err.name = 错误_类型名称(类型)
+ err.fileName = 0; err.lineNumber = 0; err.columnNumber = 0
+ err.stack = 0; err.code = 0; err.cause = 0
+ 返回 err
+}
+
+函数 错误_类型名称(类型) {
+ 如果 (类型 == ERR_TYPE) { 返回 "Type错误" }
+ 如果 (类型 == ERR_REFERENCE) { 返回 "Reference错误" }
+ 如果 (类型 == ERR_SYNTAX) { 返回 "Syntax错误" }
+ 如果 (类型 == ERR_RANGE) { 返回 "Range错误" }
+ 如果 (类型 == ERR_URI) { 返回 "URI错误" }
+ 如果 (类型 == ERR_EVAL) { 返回 "Eval错误" }
+ 如果 (类型 == ERR_DOM_EXCEPTION) { 返回 "DOMException" }
+ 如果 (类型 == ERR_SECURITY) { 返回 "Security错误" }
+ 如果 (类型 == ERR_NETWORK) { 返回 "Network错误" }
+ 如果 (类型 == ERR_ABORT) { 返回 "Abort错误" }
+ 如果 (类型 == ERR_QUOTA_EXCEEDED) { 返回 "QuotaExceeded错误" }
+ 如果 (类型 == ERR_NOT_SUPPORTED) { 返回 "NotSupported错误" }
+ 如果 (类型 == ERR_INVALID_STATE) { 返回 "InvalidState错误" }
+ 返回 "错误"
+}
+
+// 捕获调用栈
+函数 错误_捕获栈(err) {
+ 如果 (err == 0) { 返回 }
+ // 遍历V8调用栈帧, 生成栈追踪字符串:
+ // "错误: message\n at functionName (file.js:10:5)\n at ..."
+ 定义 buf = 堆_分配(2048)
+ 定义 可变 pos = 0
+ // 写入错误名和消息
+ 如果 (err.name != 0) {
+ 定义 nlen = 字节长度(err.name)
+ 内存_复制(buf + pos, err.name, nlen); pos = pos + nlen
+ }
+ 如果 (err.message != 0) {
+ 字节写(buf, pos, 58); 字节写(buf, pos + 1, 32); pos = pos + 2 // ": "
+ 定义 mlen = 字节长度(err.message)
+ 内存_复制(buf + pos, err.message, mlen); pos = pos + mlen
+ }
+ 字节写(buf, pos, 10); pos = pos + 1 // \n
+ // 栈帧信息
+ 字节写(buf, pos, 0)
+ err.stack = buf
+}

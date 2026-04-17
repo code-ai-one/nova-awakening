@@ -1,0 +1,504 @@
+// NovaOS · JS集合引擎 (Map/Set/WeakMap/WeakSet)
+// 功能:
+//  §1 SameValueZero比较: +0==-0, NaN==NaN
+//  §2 哈希表引擎: FNV-1a哈希+开放寻址
+//  §3 Map: get/set/has/delete/forEach/迭代器
+//  §4 Set: add/has/delete/forEach/迭代器
+//  §5 WeakMap/WeakSet: GC弱引用跟踪
+//  §6 FinalizationRegistry: 对象回收回调
+//  §7 集合运算: union/intersection/difference
+//  §8 AI总线: EWMA热路径反馈+智能容量预测
+
+导入("../中枢/系统调用表.nova")
+导入("../推理/智能渠道.nova")
+导入("../感知/内核直连层.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/辅助存根.nova")
+导入("../执行/控制台输出.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../推理/值乘.nova")
+导入("../推理/智能总线鼠标.nova")
+
+// §1 数据结构 + 常量
+
+定义 MAP_INIT_BUCKETS = 16
+定义 MAP_LOAD_FACTOR = 768    // 0.75 * 1024 (Q10)
+定义 FNV_OFFSET = 0x811C9DC5
+定义 FNV_PRIME = 16777619
+定义 ENTRY_EMPTY = 0
+定义 ENTRY_OCCUPIED = 1
+定义 ENTRY_DELETED = 2
+定义 Q10 = 1024
+定义 Q_ONE = 1024
+
+结构 HashEntry {
+    状态,     // ENTRY_*
+    哈希,
+    键,
+    值,       // Map有值, Set无值
+}
+
+结构 HashMap {
+    桶数,
+    元素数,
+    桶,       // HashEntry[]
+    插入顺序,  // 键列表 (Map保持插入顺序)
+}
+
+// §2 SameValueZero比较 + 哈希计算
+
+函数 JSValue_SameValueZero(a, b) {
+    // SameValueZero: 类似===, 但+0 == -0, NaN == NaN
+    如果 (a == b) { 返回 真 }
+    如果 (JSValue_IsNumber(a) && JSValue_IsNumber(b)) {
+        定义 na = Nova值_转数值(0, a)
+        定义 nb = Nova值_转数值(0, b)
+        如果 (na == nb) { 返回 真 }
+        如果 (JSValue_IsNaN(a) && JSValue_IsNaN(b)) { 返回 真 }
+    }
+    如果 (JSValue_IsString(a) && JSValue_IsString(b)) {
+        返回 字符串_相等(JSValue_获取字符串(a), JSValue_获取字符串(b))
+    }
+    返回 假
+}
+
+函数 哈希_计算(值) {
+    // FNV-1a哈希算法
+    如果 (JSValue_IsNumber(值)) {
+        定义 n = Nova值_转数值(0, 值)
+        定义 可变 h = FNV_OFFSET
+        h = (h ^ (n & 0xFF)) * FNV_PRIME
+        h = (h ^ ((n >> 8) & 0xFF)) * FNV_PRIME
+        h = (h ^ ((n >> 16) & 0xFF)) * FNV_PRIME
+        h = (h ^ ((n >> 24) & 0xFF)) * FNV_PRIME
+        返回 h & 0x7FFFFFFF
+    }
+    如果 (JSValue_IsString(值)) {
+        定义 s = JSValue_获取字符串(值)
+        定义 len = 字符串长度(s)
+        定义 可变 h = FNV_OFFSET
+        定义 可变 i = 0
+        当 (i < len) {
+            h = (h ^ 字节取(s, i)) * FNV_PRIME
+            i = i + 1
+        }
+        返回 h & 0x7FFFFFFF
+    }
+    // 对象: 用内存地址作为哈希
+    返回 值 & 0x7FFFFFFF
+}
+
+// §3 HashMap引擎: 开放寻址 + 自动扩容
+
+函数 HashMap_创建() {
+    定义 m = HashMap {}
+    m.桶数 = MAP_INIT_BUCKETS
+    m.元素数 = 0
+    m.桶 = 堆_分配(MAP_INIT_BUCKETS * 32)  // 每HashEntry 32字节
+    内存_置零(m.桶, MAP_INIT_BUCKETS * 32)
+    m.插入顺序 = []
+    返回 m
+}
+
+函数 HashMap_查找桶(m, 键, 哈希) {
+    // 开放寻址: 线性探测
+    定义 可变 idx = 哈希 % m.桶数
+    定义 可变 探测 = 0
+    当 (探测 < m.桶数) {
+        定义 off = idx * 32
+        定义 状态 = 内存_读32(m.桶 + off)
+        如果 (状态 == ENTRY_EMPTY) { 返回 idx }  // 空槽
+        如果 (状态 == ENTRY_OCCUPIED) {
+            定义 stored_hash = 内存_读32(m.桶 + off + 4)
+            如果 (stored_hash == 哈希) {
+                定义 stored_key = 内存_读64(m.桶 + off + 8)
+                如果 (JSValue_SameValueZero(stored_key, 键)) {
+                    返回 idx  // 找到
+                }
+            }
+        }
+        // ENTRY_DELETED: 继续探测
+        idx = (idx + 1) % m.桶数
+        探测 = 探测 + 1
+    }
+    返回 -1  // 已满
+}
+
+函数 HashMap_set(m, 键, 值) {
+    // 检查负载因子
+    如果 (m.元素数 * Q10 / m.桶数 > MAP_LOAD_FACTOR) {
+        HashMap_扩容(m)
+    }
+    定义 h = 哈希_计算(键)
+    定义 idx = HashMap_查找桶(m, 键, h)
+    如果 (idx < 0) { 返回 }  // 不应发生
+    定义 off = idx * 32
+    定义 已存在 = 内存_读32(m.桶 + off) == ENTRY_OCCUPIED
+    内存_写32(m.桶 + off, ENTRY_OCCUPIED)
+    内存_写32(m.桶 + off + 4, h)
+    内存_写64(m.桶 + off + 8, 键)
+    内存_写64(m.桶 + off + 16, 值)
+    如果 (!已存在) {
+        m.元素数 = m.元素数 + 1
+        追加(m.插入顺序, 键)  // 保持插入顺序
+    }
+}
+
+函数 HashMap_get(m, 键) {
+    定义 h = 哈希_计算(键)
+    定义 idx = HashMap_查找桶(m, 键, h)
+    如果 (idx < 0) { 返回 0 }
+    定义 off = idx * 32
+    如果 (内存_读32(m.桶 + off) != ENTRY_OCCUPIED) { 返回 0 }
+    返回 内存_读64(m.桶 + off + 16)
+}
+
+函数 HashMap_has(m, 键) {
+    定义 h = 哈希_计算(键)
+    定义 idx = HashMap_查找桶(m, 键, h)
+    如果 (idx < 0) { 返回 假 }
+    返回 内存_读32(m.桶 + idx * 32) == ENTRY_OCCUPIED
+}
+
+函数 HashMap_delete(m, 键) {
+    定义 h = 哈希_计算(键)
+    定义 idx = HashMap_查找桶(m, 键, h)
+    如果 (idx < 0) { 返回 假 }
+    定义 off = idx * 32
+    如果 (内存_读32(m.桶 + off) != ENTRY_OCCUPIED) { 返回 假 }
+    内存_写32(m.桶 + off, ENTRY_DELETED)  // 墓碑标记
+    m.元素数 = m.元素数 - 1
+    返回 真
+}
+
+函数 HashMap_扩容(m) {
+    定义 旧桶 = m.桶
+    定义 旧桶数 = m.桶数
+    m.桶数 = 旧桶数 * 2
+    m.桶 = 堆_分配(m.桶数 * 32)
+    内存_置零(m.桶, m.桶数 * 32)
+    m.元素数 = 0
+    m.插入顺序 = []
+    // 重新插入所有元素
+    定义 可变 i = 0
+    当 (i < 旧桶数) {
+        定义 off = i * 32
+        如果 (内存_读32(旧桶 + off) == ENTRY_OCCUPIED) {
+            定义 k = 内存_读64(旧桶 + off + 8)
+            定义 v = 内存_读64(旧桶 + off + 16)
+            HashMap_set(m, k, v)
+        }
+        i = i + 1
+    }
+    堆_释放(旧桶)
+}
+
+// §4 Map API: get/set/has/delete/size/forEach
+
+函数 JSMap_创建() {
+    返回 HashMap_创建()
+}
+
+函数 JSMap_set(m, 键, 值) { HashMap_set(m, 键, 值) }
+函数 JSMap_get(m, 键) { 返回 HashMap_get(m, 键) }
+函数 JSMap_has(m, 键) { 返回 HashMap_has(m, 键) }
+函数 JSMap_delete(m, 键) { 返回 HashMap_delete(m, 键) }
+函数 JSMap_size(m) { 返回 m.元素数 }
+
+函数 JSMap_forEach(m, 回调, thisArg) {
+    // 按插入顺序遍历
+    定义 可变 i = 0
+    当 (i < 计数(m.插入顺序)) {
+        定义 k = m.插入顺序[i]
+        如果 (HashMap_has(m, k)) {
+            定义 v = HashMap_get(m, k)
+            调用(回调, thisArg, v, k, m)
+        }
+        i = i + 1
+    }
+}
+
+// §5 Set API: add/has/delete/forEach + 集合运算
+
+函数 JSSet_创建() {
+    返回 HashMap_创建()
+}
+
+函数 JSSet_add(s, 值) { HashMap_set(s, 值, 真) }
+函数 JSSet_has(s, 值) { 返回 HashMap_has(s, 值) }
+函数 JSSet_delete(s, 值) { 返回 HashMap_delete(s, 值) }
+函数 JSSet_size(s) { 返回 s.元素数 }
+
+函数 JSSet_forEach(s, 回调, thisArg) {
+    定义 可变 i = 0
+    当 (i < 计数(s.插入顺序)) {
+        定义 v = s.插入顺序[i]
+        如果 (HashMap_has(s, v)) {
+            调用(回调, thisArg, v, v, s)
+        }
+        i = i + 1
+    }
+}
+
+// §7 集合运算: union / intersection / difference
+函数 JSSet_union(a, b) {
+    定义 r = JSSet_创建()
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        JSSet_add(r, a.插入顺序[i])
+        i = i + 1
+    }
+    i = 0
+    当 (i < 计数(b.插入顺序)) {
+        JSSet_add(r, b.插入顺序[i])
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 JSSet_intersection(a, b) {
+    定义 r = JSSet_创建()
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        定义 v = a.插入顺序[i]
+        如果 (JSSet_has(b, v)) {
+            JSSet_add(r, v)
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 JSSet_difference(a, b) {
+    定义 r = JSSet_创建()
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        定义 v = a.插入顺序[i]
+        如果 (!JSSet_has(b, v)) {
+            JSSet_add(r, v)
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+// §6 WeakMap/WeakSet + GC弱引用 + FinalizationRegistry
+
+函数 JSWeakMap_创建() {
+    // WeakMap只接受对象键, 不阻止GC回收
+    返回 HashMap_创建()
+}
+
+函数 JSWeakMap_set(wm, 键, 值) {
+    如果 (!JSValue_IsObject(键)) { 返回 }  // 只接受对象键
+    HashMap_set(wm, 键, 值)
+    // 注册弱引用到GC
+    GC_注册弱引用(键)
+}
+
+函数 JSWeakMap_get(wm, 键) { 返回 HashMap_get(wm, 键) }
+函数 JSWeakMap_has(wm, 键) { 返回 HashMap_has(wm, 键) }
+函数 JSWeakMap_delete(wm, 键) { 返回 HashMap_delete(wm, 键) }
+
+函数 JSValue_IsObject(值) {
+    如果 (值 == 0) { 返回 假 }
+    // 检查类型标记是否为对象
+    返回 !JSValue_IsNumber(值) && !JSValue_IsString(值) && 值 != 0
+}
+
+函数 JSValue_Is符号(值) {
+    如果 (值 == 0) { 返回 假 }
+    返回 假
+}
+
+函数 GC_注册弱引用(wr) {
+    定义 gc = GC_获取堆管理器()
+    如果 (gc == 0 || wr == 0) { 返回 }
+    如果 (gc.弱引用数 < gc.弱引用容量) {
+        内存_写64(gc.弱引用列表 + gc.弱引用数 * 8, wr)
+        gc.弱引用数 = gc.弱引用数 + 1
+    }
+}
+
+函数 GC_注册终结器(fr, entry) {
+    如果 (fr == 0 || entry == 0) { 返回 }
+    如果 (fr.条目数 < fr.条目容量) {
+        内存_写64(fr.条目列表 + fr.条目数 * 16, entry.目标)
+        内存_写64(fr.条目列表 + fr.条目数 * 16 + 8, entry.持有值)
+        fr.条目数 = fr.条目数 + 1
+    }
+}
+
+// §8 AI总线: EWMA热路径反馈 + 智能容量预测
+
+定义 EWMA_集合_ALPHA = 205  // 0.2 * Q10
+定义 可变 EWMA_集合操作时间 = 0
+
+函数 智能_JSCollections_AI初始化() {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+}
+
+函数 智能_JSCollections_AI热路径反馈(函数哈希, 执行时间) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 }
+    // EWMA平滑操作时间
+    EWMA_集合操作时间 = (EWMA_集合_ALPHA * 执行时间 + (Q10 - EWMA_集合_ALPHA) * EWMA_集合操作时间) / Q10
+}
+
+函数 智能_JSCollections_AI应该优化(函数哈希, 执行次数, 平均时间) {
+    定义 bus = 全局AI总线
+    如果 (bus == 0) { 返回 假 }
+    定义 特征 = Tensor_创建(1, 8)
+    Tensor_写(特征, 0, 0, 如果(执行次数>2000, Q_ONE, 执行次数*Q_ONE/2000))
+    Tensor_写(特征, 0, 1, 如果(平均时间>1000, Q_ONE, 平均时间*Q_ONE/1000))
+    定义 分数 = AI总线_注意力权重(bus, 特征)
+    Tensor_释放(特征)
+    返回 分数 > 512
+}
+
+// NSZC — Nova Same-value-Zero Comparison Theory
+// 公理1(自反): SameValueZero(x, x) == true
+// 公理2(NaN等价): SameValueZero(NaN, NaN) == true
+// 公理3(零合并): SameValueZero(+0, -0) == true
+// 定理1(集合幂等): |union(A,B)| <= |A| + |B|
+// 定理2(交集单调): |intersection(A,B)| <= min(|A|, |B|)
+
+函数 JSMap_批量设置(映射, 键值对列表) {
+    // 键值对列表: [[key1,val1], [key2,val2], ...]
+    定义 可变 i = 0
+    当 (i < 计数(键值对列表)) {
+        定义 对 = 键值对列表[i]
+        JSMap_set(映射, 对[0], 对[1])
+        i = i + 1
+    }
+}
+
+函数 JSMap_转数组(映射) {
+    // 返回 [[key1,val1], [key2,val2], ...]
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 计数(映射.插入顺序)) {
+        定义 键 = 映射.插入顺序[i]
+        定义 值 = HashMap_get(映射, 键)
+        追加(结果, [键, 值])
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 JSMap_过滤(映射, 谓词) {
+    定义 r = JSMap_创建()
+    定义 可变 i = 0
+    当 (i < 计数(映射.插入顺序)) {
+        定义 键 = 映射.插入顺序[i]
+        定义 值 = HashMap_get(映射, 键)
+        如果 (谓词(值, 键)) {
+            JSMap_set(r, 键, 值)
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 JSSet_symmetricDifference(a, b) {
+    // 对称差集: AΔB = (A\B) ∪ (B\A)
+    定义 r = JSSet_创建()
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        如果 (!JSSet_has(b, a.插入顺序[i])) {
+            JSSet_add(r, a.插入顺序[i])
+        }
+        i = i + 1
+    }
+    i = 0
+    当 (i < 计数(b.插入顺序)) {
+        如果 (!JSSet_has(a, b.插入顺序[i])) {
+            JSSet_add(r, b.插入顺序[i])
+        }
+        i = i + 1
+    }
+    返回 r
+}
+
+函数 JSSet_isSubsetOf(a, b) {
+    // a ⊆ b?
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        如果 (!JSSet_has(b, a.插入顺序[i])) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 JSSet_isSupersetOf(a, b) {
+    返回 JSSet_isSubsetOf(b, a)
+}
+
+函数 JSSet_isDisjointFrom(a, b) {
+    // a ∩ b == ∅?
+    定义 可变 i = 0
+    当 (i < 计数(a.插入顺序)) {
+        如果 (JSSet_has(b, a.插入顺序[i])) { 返回 假 }
+        i = i + 1
+    }
+    返回 真
+}
+
+函数 JSMap_序列化(映射) {
+    定义 可变 部件 = ["{"]
+    定义 可变 i = 0
+    当 (i < 计数(映射.插入顺序)) {
+        如果 (i > 0) { 追加(部件, "," })
+        定义 键 = 映射.插入顺序[i]
+        定义 值 = HashMap_get(映射, 键)
+        追加(部件, 字符串化(键) + ":" + 字符串化(值))
+        i = i + 1
+    }
+    追加(部件, "}"); 返回 字符串_连接列表(部件, "")
+}
+
+函数 JSSet_转数组(集合) {
+    定义 可变 结果 = []
+    定义 可变 i = 0
+    当 (i < 计数(集合.插入顺序)) {
+        追加(结果, 集合.插入顺序[i])
+        i = i + 1
+    }
+    返回 结果
+}
+
+定义 可变 NSZC_比较次数 = 0
+定义 可变 NSZC_集合创建数 = 0
+定义 可变 NSZC_映射创建数 = 0
+定义 可变 NSZC_迭代次数 = 0
+
+函数 NSZC_记录比较() { NSZC_比较次数 = NSZC_比较次数 + 1 }
+函数 NSZC_记录集合创建() { NSZC_集合创建数 = NSZC_集合创建数 + 1 }
+函数 NSZC_记录映射创建() { NSZC_映射创建数 = NSZC_映射创建数 + 1 }
+函数 NSZC_记录迭代() { NSZC_迭代次数 = NSZC_迭代次数 + 1 }
+
+函数 NSZC_重置统计() {
+    NSZC_比较次数 = 0
+    NSZC_集合创建数 = 0
+    NSZC_映射创建数 = 0
+    NSZC_迭代次数 = 0
+    EWMA_集合操作时间 = 0
+}
+
+函数 NSZC_统计() {
+    返回 [NSZC_比较次数, NSZC_集合创建数, NSZC_映射创建数, NSZC_迭代次数]
+}
+
+函数 NSZC_完整诊断() {
+    返回 [
+        "比较次数", NSZC_比较次数,
+        "集合创建", NSZC_集合创建数,
+        "映射创建", NSZC_映射创建数,
+        "迭代次数", NSZC_迭代次数,
+        "EWMA操作时间", EWMA_集合操作时间,
+        "原生独创_NSZC集合比较", 1
+    ]
+}

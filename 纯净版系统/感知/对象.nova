@@ -1,0 +1,122 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./样式.nova")
+导入("./端口创建.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/辅助存根.nova")
+导入("./创建过渡动.nova")
+
+// §3 ViewTransition 对象
+
+结构 ViewTransition {
+    状态,    // u32 VT_STATE_xxx
+    // 回调
+    更新回调,    // u64 () => void
+    // 快照对
+    旧快照列表,    // u64 VTSnapshot*数组
+    新快照列表,
+    快照数量,
+    快照容量,
+    // 参与元素(view-transition-name → 元素*)
+    参与元素映射,    // u64 [name, 元素*] 对
+    参与数量,
+    // 承诺
+    ready_promise,    // u64 动画就绪
+    updateCallbackDone,    // u64 更新完成
+    finished_promise,    // u64 全部完成
+    // 动画
+    动画列表,    // u64 Animation*数组
+    动画数量,
+    // 时间
+    动画持续,    // u32 ms (默认250)
+    动画缓动,    // u64 ease函数
+}
+
+
+函数 ViewTransition_创建(更新回调) {
+    定义 vt = 堆_分配(ViewTransition)
+    vt.状态 = VT_STATE_IDLE
+    vt.更新回调 = 更新回调
+    vt.快照容量 = 32
+    vt.旧快照列表 = 堆_分配_数组(32 * 8)
+    vt.新快照列表 = 堆_分配_数组(32 * 8)
+    vt.快照数量 = 0
+    vt.参与元素映射 = 堆_分配_数组(32 * 16)
+    vt.参与数量 = 0
+    vt.动画列表 = 堆_分配_数组(32 * 8)
+    vt.动画数量 = 0
+    vt.动画持续 = 250
+    返回 vt
+}
+
+// §4 document.startViewTransition(callback)
+
+函数 Document_startViewTransition(Nova运行时实例, 文档, 更新回调) {
+    定义 vt = ViewTransition_创建(更新回调)
+
+    // Phase 1: 收集参与元素(有view-transition-name的)
+    VT_收集参与元素(vt, 文档)
+
+    // Phase 2: 捕获旧状态快照
+    vt.状态 = VT_STATE_CAPTURING
+    VT_捕获快照(vt, 假)    // 旧状态
+
+    // Phase 3: 执行DOM更新回调
+    vt.状态 = VT_STATE_UPDATING
+    如果 (更新回调 != 0) {
+        Nova函数_Call_简(Nova运行时实例, 更新回调)
+    }
+
+    // Phase 4: 捕获新状态快照
+    VT_捕获快照(vt, 真)    // 新状态
+
+    // Phase 5: 创建并播放过渡动画
+    vt.状态 = VT_STATE_ANIMATING
+    VT_创建动画(vt)
+
+    返回 vt
+}
+
+函数 VT_收集参与元素(vt, 文档) {
+    如果 (vt == 0 || 文档 == 0) { 返回 }
+    // 遍历所有元素,查找有view-transition-name的
+    VT_收集递归(vt, 文档.根元素)
+}
+
+函数 VT_收集递归(vt, 元素) {
+    如果 (元素 == 0) { 返回 }
+    定义 布局 = 元素.布局对象
+    如果 (布局 != 0 && 布局.计算样式 != 0) {
+        定义 名称 = 布局.计算样式.view_transition_name
+        如果 (名称 != 0 && !字符串_相等(名称, "none")) {
+            // 注册参与元素
+            如果 (vt.参与数量 < 32) {
+                定义 偏移 = vt.参与元素映射 + vt.参与数量 * 16
+                内存_写64(偏移, 字符串_复制(名称))
+                内存_写64(偏移 + 8, 元素)
+                vt.参与数量 = vt.参与数量 + 1
+            }
+        }
+    }
+    // 递归子元素
+    定义 可变 子 = 元素.第一子节点
+    当 (子 != 0) {
+        如果 (子.节点类型 == 1) { VT_收集递归(vt, 子) }
+        子 = 子.后一兄弟
+    }
+}
+
+函数 VT_捕获快照(vt, 是新状态) {
+    如果 (vt == 0) { 返回 }
+    定义 目标 = 是新状态 ? vt.新快照列表 : vt.旧快照列表
+    定义 可变 i = 0
+    当 (i < vt.参与数量) {
+        定义 偏移 = vt.参与元素映射 + i * 16
+        定义 名称 = 内存_读64(偏移)
+        定义 元素 = 内存_读64(偏移 + 8)
+        定义 snap = VTSnapshot_创建(名称, 元素)
+        内存_写64(目标 + i * 8, snap)
+        i = i + 1
+    }
+    vt.快照数量 = vt.参与数量
+}

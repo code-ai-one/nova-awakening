@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../标准/类型判断.nova")
+导入("./内核直连层.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../推理/小整数快速判.nova")
+导入("../中枢/字符串替换.nova")
+
+// §7 结构化克隆(Structured Clone Algorithm)
+// postMessage需要深拷贝数据(不共享引用)
+
+定义 SC_TYPE_UNDEFINED  = 0
+定义 SC_TYPE_NULL       = 1
+定义 SC_TYPE_BOOLEAN    = 2
+定义 SC_TYPE_NUMBER     = 3
+定义 SC_TYPE_STRING     = 4
+定义 SC_TYPE_OBJECT     = 5
+定义 SC_TYPE_ARRAY      = 6
+定义 SC_TYPE_DATE       = 7
+定义 SC_TYPE_REGEXP     = 8
+定义 SC_TYPE_MAP        = 9
+定义 SC_TYPE_SET        = 10
+定义 SC_TYPE_ARRAYBUFFER = 11
+定义 SC_TYPE_ERROR      = 12
+定义 SC_TYPE_BLOB       = 13
+
+结构 StructuredCloneData {
+    数据,
+    大小,
+}
+
+函数 StructuredClone_序列化(值) {
+    // 将JSValue递归序列化为字节流
+    定义 结果 = StructuredCloneData {}
+    结果.数据 = 堆_分配(4096)    // 初始缓冲
+    结果.大小 = 0
+
+    StructuredClone_写值(结果, 值)
+    返回 结果
+}
+
+函数 StructuredClone_写值(结果, 值) {
+    如果 (值 == 0) {
+        StructuredClone_写字节(结果, SC_TYPE_UNDEFINED)
+        返回
+    }
+
+    如果 (JSValue_IsNumber(值)) {
+        StructuredClone_写字节(结果, SC_TYPE_NUMBER)
+        StructuredClone_写64(结果, Nova值_转数值(0, 值))
+        返回
+    }
+
+    如果 (JSValue_IsString(值)) {
+        定义 str = JSValue_获取字符串(值)
+        定义 len = 字符串_长度(str)
+        StructuredClone_写字节(结果, SC_TYPE_STRING)
+        StructuredClone_写32(结果, len)
+        StructuredClone_写数据(结果, str, len)
+        返回
+    }
+
+    如果 (JSValue_IsBoolean(值)) {
+        StructuredClone_写字节(结果, SC_TYPE_BOOLEAN)
+        StructuredClone_写字节(结果, JSValue_ToBoolean(0, 值) ? 1 : 0)
+        返回
+    }
+
+    // 对象/数组: 递归序列化
+    StructuredClone_写字节(结果, SC_TYPE_OBJECT)
+    // 递归序列化属性
+    定义 keys = Nova对象_获取所有键(0, 值)
+    定义 key_count = Nova数组_长度(keys)
+    StructuredClone_写变32(结果, key_count)
+    定义 可变 ki = 0
+    当 (ki < key_count) {
+        定义 key = Nova数组_获取(keys, ki)
+        定义 val = Nova对象_获取属性(0, 值, key)
+        StructuredClone_序列化_字符串(结果, key)
+        StructuredClone_序列化(结果, val)
+        ki = ki + 1
+    }
+}
+
+函数 StructuredClone_反序列化(数据, 大小) {
+    // 从字节流还原JSValue
+    如果 (数据 == 0 || 大小 == 0) { 返回 0 }
+    // 从字节流还原JSValue
+    定义 可变 pos = 0
+    返回 StructuredClone_反序列化_值(数据, 大小, pos)
+}
+
+函数 StructuredClone_转移(对象) {
+    如果 (对象 == 0) { 返回 0 }
+    // 数组Buffer转移: 将数据所有权移交, 源buffer置为neutered
+    定义 新对象 = 堆_分配(16)
+    内存_写64(新对象, 对象.数据指针)
+    内存_写64(新对象 + 8, 对象.字节长度)
+    对象.数据指针 = 0
+    对象.字节长度 = 0
+    对象.已分离 = 真
+    返回 新对象
+}
+
+函数 StructuredClone_写字节(结果, 字节) {
+    内存_写8(结果.数据 + 结果.大小, 字节)
+    结果.大小 = 结果.大小 + 1
+}
+
+函数 StructuredClone_写32(结果, 值) {
+    内存_写32(结果.数据 + 结果.大小, 值)
+    结果.大小 = 结果.大小 + 4
+}
+
+函数 StructuredClone_写64(结果, 值) {
+    内存_写64(结果.数据 + 结果.大小, 值)
+    结果.大小 = 结果.大小 + 8
+}
+
+函数 StructuredClone_写数据(结果, 数据, 长度) {
+    内存_复制(结果.数据 + 结果.大小, 数据, 长度)
+    结果.大小 = 结果.大小 + 长度
+}

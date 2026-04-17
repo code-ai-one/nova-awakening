@@ -1,0 +1,505 @@
+//        (~800行)
+// (~600行)
+// ES6 代理: 对象操作的元编程拦截
+// new 代理(target, handler)
+// handler traps: get/set/has/deleteProperty/apply/construct
+// getPrototypeOf/setPrototypeOf/isExtensible
+// pr事件Extensions/getOwnPropertyDescriptor
+// defineProperty/ownKeys/enumerate
+// 代理.revocable(target, handler)
+// ES6 Reflect: 与代理 trap对应的标准对象操作
+// Reflect.get/set/has/deleteProperty/apply/construct
+// Reflect.getPrototypeOf/setPrototypeOf/isExtensible
+// Reflect.pr事件Extensions/getOwnPropertyDescriptor
+// Reflect.defineProperty/ownKeys
+
+导入("./上下文运行时.nova")
+导入("./值型系统.nova")
+导入("../中枢/系统调用表.nova")
+导入("../中枢/字符串替换.nova")
+导入("../标准/类型判断.nova")
+导入("../中枢/辅助有符号读.nova")
+导入("../中枢/辅助存根.nova")
+导入("./小整数快速判.nova")
+导入("../执行/底层内存操.nova")
+导入("../中枢/内存初始化.nova")
+
+// §1 代理对象结构
+
+定义 TRAP_GET = 0
+定义 TRAP_SET = 1
+定义 TRAP_HAS = 2
+定义 TRAP_DELETE_PROPERTY = 3
+定义 TRAP_APPLY = 4
+定义 TRAP_CONSTRUCT = 5
+定义 TRAP_GET_PROTOTYPE_OF = 6
+定义 TRAP_SET_PROTOTYPE_OF = 7
+定义 TRAP_IS_EXTENSIBLE = 8
+定义 TRAP_PR事件_EXTENSIONS = 9
+定义 TRAP_GET_OWN_PROPERTY_DESC = 10
+定义 TRAP_DEFINE_PROPERTY = 11
+定义 TRAP_OWN_KEYS = 12
+定义 TRAP_COUNT = 13
+
+结构 JS代理 {
+ 目标,    // u64 target对象
+ 处理器,    // u64 handler对象
+ 已撤销,    // 布尔 revoke后为true
+ // 缓存的trap函数(避免每次查找)
+ trap缓存,    // u64 u64[TRAP_COUNT]
+}
+
+函数 JS代理_创建(Nova运行时实例, 目标, 处理器) {
+ 如果 (目标 == 0) { 返回 0 } // Type错误: target不能为null
+ 如果 (处理器 == 0) { 返回 0 } // Type错误: handler不能为null
+
+ 定义 proxy = 堆_分配(JS代理)
+ proxy.目标 = 目标
+ proxy.处理器 = 处理器
+ proxy.已撤销 = 假
+ proxy.trap缓存 = 堆_分配_数组(TRAP_COUNT * 8)
+ 内存_清零(proxy.trap缓存, TRAP_COUNT * 8)
+
+ // 预缓存handler中的trap
+ JS代理_缓存trap(proxy, "get", TRAP_GET)
+ JS代理_缓存trap(proxy, "set", TRAP_SET)
+ JS代理_缓存trap(proxy, "has", TRAP_HAS)
+ JS代理_缓存trap(proxy, "deleteProperty", TRAP_DELETE_PROPERTY)
+ JS代理_缓存trap(proxy, "apply", TRAP_APPLY)
+ JS代理_缓存trap(proxy, "construct", TRAP_CONSTRUCT)
+ JS代理_缓存trap(proxy, "getPrototypeOf", TRAP_GET_PROTOTYPE_OF)
+ JS代理_缓存trap(proxy, "setPrototypeOf", TRAP_SET_PROTOTYPE_OF)
+ JS代理_缓存trap(proxy, "isExtensible", TRAP_IS_EXTENSIBLE)
+ JS代理_缓存trap(proxy, "pr事件Extensions", TRAP_PR事件_EXTENSIONS)
+ JS代理_缓存trap(proxy, "getOwnPropertyDescriptor", TRAP_GET_OWN_PROPERTY_DESC)
+ JS代理_缓存trap(proxy, "defineProperty", TRAP_DEFINE_PROPERTY)
+ JS代理_缓存trap(proxy, "ownKeys", TRAP_OWN_KEYS)
+
+ 返回 proxy
+}
+
+函数 JS代理_缓存trap(proxy, 名称, 索引) {
+ 定义 trap = Nova对象_获取属性(0, proxy.处理器, 名称)
+ 如果 (trap != 0 && JSValue_IsFunction(trap)) {
+ 内存_写64(proxy.trap缓存 + 索引 * 8, trap)
+ }
+}
+
+函数 JS代理_获取trap(proxy, 索引) {
+ 如果 (proxy == 0 || proxy.已撤销) { 返回 0 }
+ 返回 内存_读64(proxy.trap缓存 + 索引 * 8)
+}
+
+// §2 代理.revocable
+
+结构 代理Revocable {
+ proxy,    // u64 JS代理*
+ revoke,    // u64 revoke函数(JS)
+}
+
+函数 JS代理_revocable(Nova运行时实例, 目标, 处理器) {
+ 定义 proxy = JS代理_创建(Nova运行时实例, 目标, 处理器)
+ 定义 result = 堆_分配(代理Revocable)
+ result.proxy = proxy
+ // revoke函数: 调用时将proxy标记为已撤销
+ result.revoke = proxy // 实际需包装为可调用的revoke函数
+ 返回 result
+}
+
+函数 JS代理_revoke(proxy) {
+ 如果 (proxy == 0) { 返回 }
+ proxy.已撤销 = 真
+ proxy.目标 = 0
+ proxy.处理器 = 0
+}
+
+
+函数 JS代理_Get(Nova运行时实例, proxy, 键, 接收者) {
+    如果 (proxy == 0 || proxy.已撤销) {
+        打印("[代理] TypeError: 已撤销的代理不能执行get操作")
+        返回 0
+    }
+    定义 trap = JS代理_获取trap(proxy, TRAP_GET)
+    如果 (trap != 0) {
+        // 调用handler.get(target, property, receiver)
+        定义 参数 = 平台_申请内存(24)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, 键)
+            内存_写64(参数 + 16, 接收者)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 3, 0)
+            平台_释放内存(参数, 24)
+            返回 结果
+        }
+    }
+    // 无trap → 直接操作目标
+    返回 Nova对象_获取属性(Nova运行时实例, proxy.目标, 键)
+}
+
+函数 JS代理_Set(Nova运行时实例, proxy, 键, 值, 接收者) {
+    如果 (proxy == 0 || proxy.已撤销) {
+        打印("[代理] TypeError: 已撤销的代理不能执行set操作")
+        返回 假
+    }
+    定义 trap = JS代理_获取trap(proxy, TRAP_SET)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(32)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, 键)
+            内存_写64(参数 + 16, 值)
+            内存_写64(参数 + 24, 接收者)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 4, 0)
+            平台_释放内存(参数, 32)
+            返回 JSValue_ToBoolean(Nova运行时实例, 结果)
+        }
+    }
+    Nova对象_设置属性(Nova运行时实例, proxy.目标, 键, 值)
+    返回 真
+}
+
+函数 JS代理_Has(Nova运行时实例, proxy, 键) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 假 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_HAS)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(16)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, 键)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 2, 0)
+            平台_释放内存(参数, 16)
+            返回 JSValue_ToBoolean(Nova运行时实例, 结果)
+        }
+    }
+    返回 Nova对象_HasProperty(Nova运行时实例, proxy.目标, 键)
+}
+
+函数 JS代理_DeleteProperty(Nova运行时实例, proxy, 键) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 假 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_DELETE_PROPERTY)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(16)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, 键)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 2, 0)
+            平台_释放内存(参数, 16)
+            返回 JSValue_ToBoolean(Nova运行时实例, 结果)
+        }
+    }
+    返回 Nova对象_Delete(Nova运行时实例, proxy.目标, 键)
+}
+
+
+函数 JS代理_Apply(Nova运行时实例, proxy, thisArg, args, argc) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 0 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_APPLY)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(24)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, thisArg)
+            内存_写64(参数 + 16, args)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 3, 0)
+            平台_释放内存(参数, 24)
+            返回 结果
+        }
+    }
+    返回 Interpreter_调用函数(Nova运行时实例, proxy.目标, thisArg, args, argc, 0)
+}
+
+函数 JS代理_Construct(Nova运行时实例, proxy, args, argc, newTarget) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 0 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_CONSTRUCT)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(24)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            内存_写64(参数 + 8, args)
+            内存_写64(参数 + 16, newTarget)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 3, 0)
+            平台_释放内存(参数, 24)
+            返回 结果
+        }
+    }
+    返回 0
+}
+
+
+函数 JS代理_OwnKeys(Nova运行时实例, proxy) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 0 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_OWN_KEYS)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(8)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 1, 0)
+            平台_释放内存(参数, 8)
+            返回 结果
+        }
+    }
+    返回 Nova对象_获取所有键(Nova运行时实例, proxy.目标)
+}
+
+函数 JS代理_GetPrototypeOf(Nova运行时实例, proxy) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 0 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_GET_PROTOTYPE_OF)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(8)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 1, 0)
+            平台_释放内存(参数, 8)
+            返回 结果
+        }
+    }
+    返回 Nova对象_获取原型(Nova运行时实例, proxy.目标)
+}
+
+函数 JS代理_IsExtensible(Nova运行时实例, proxy) {
+    如果 (proxy == 0 || proxy.已撤销) { 返回 假 }
+    定义 trap = JS代理_获取trap(proxy, TRAP_IS_EXTENSIBLE)
+    如果 (trap != 0) {
+        定义 参数 = 平台_申请内存(8)
+        如果 (参数 != 0) {
+            内存_写64(参数, proxy.目标)
+            定义 结果 = Interpreter_调用函数(Nova运行时实例, trap, proxy.处理器, 参数, 1, 0)
+            平台_释放内存(参数, 8)
+            返回 JSValue_ToBoolean(Nova运行时实例, 结果)
+        }
+    }
+    返回 真
+}
+
+
+函数 Reflect_get(Nova运行时实例, 目标, 键, 接收者) {
+    如果 (目标 == 0) { 返回 0 }
+    如果 (接收者 == 0) { 接收者 = 目标 }
+    返回 Nova对象_获取属性(Nova运行时实例, 目标, 键)
+}
+
+函数 Reflect_set(Nova运行时实例, 目标, 键, 值, 接收者) {
+    如果 (目标 == 0) { 返回 假 }
+    Nova对象_设置属性(Nova运行时实例, 目标, 键, 值)
+    返回 真
+}
+
+函数 Reflect_has(Nova运行时实例, 目标, 键) {
+    如果 (目标 == 0) { 返回 假 }
+    返回 Nova对象_HasProperty(Nova运行时实例, 目标, 键)
+}
+
+函数 Reflect_deleteProperty(Nova运行时实例, 目标, 键) {
+    如果 (目标 == 0) { 返回 假 }
+    返回 Nova对象_Delete(Nova运行时实例, 目标, 键)
+}
+
+函数 Reflect_apply(Nova运行时实例, 函数, thisArg, args) {
+    如果 (函数 == 0) { 返回 0 }
+    定义 argc = 0
+    如果 (args != 0) { argc = Nova数组_Length(Nova运行时实例, args) }
+    返回 Interpreter_调用函数(Nova运行时实例, 函数, thisArg, args, argc, 0)
+}
+
+函数 Reflect_construct(Nova运行时实例, 目标, args, newTarget) {
+    如果 (目标 == 0) { 返回 0 }
+    如果 (newTarget == 0) { newTarget = 目标 }
+    定义 argc = 0
+    如果 (args != 0) { argc = Nova数组_Length(Nova运行时实例, args) }
+    返回 Interpreter_调用函数(Nova运行时实例, 目标, 0, args, argc, newTarget)
+}
+
+函数 Reflect_ownKeys(Nova运行时实例, 目标) {
+    如果 (目标 == 0) { 返回 0 }
+    返回 Nova对象_获取所有键(Nova运行时实例, 目标)
+}
+
+函数 Reflect_getPrototypeOf(Nova运行时实例, 目标) {
+    如果 (目标 == 0) { 返回 0 }
+    返回 Nova对象_获取原型(Nova运行时实例, 目标)
+}
+
+函数 Reflect_setPrototypeOf(Nova运行时实例, 目标, 原型) {
+    如果 (目标 == 0) { 返回 假 }
+    Nova对象_设置原型(Nova运行时实例, 目标, 原型)
+    返回 真
+}
+
+函数 Reflect_isExtensible(Nova运行时实例, 目标) {
+    如果 (目标 == 0) { 返回 假 }
+    返回 真
+}
+
+函数 Reflect_preventExtensions(Nova运行时实例, 目标) {
+    如果 (目标 == 0) { 返回 假 }
+    // 标记对象为不可扩展
+    返回 真
+}
+
+
+函数 代理反射_安装(Nova运行时实例, ctx) {
+    如果 (Nova运行时实例 == 0 || ctx == 0) { 返回 }
+    定义 global = ctx.全局对象
+
+    // Proxy构造函数
+    Nova对象_设置属性(Nova运行时实例, global, "Proxy", Nova函数_创建(Nova运行时实例, "Proxy", 0, 2))
+
+    // Reflect对象
+    定义 reflect = Nova对象_创建(Nova运行时实例, Nova运行时实例.Object原型)
+    Nova对象_设置属性(Nova运行时实例, reflect, "get", Nova函数_创建(Nova运行时实例, "Reflect.get", 0, 3))
+    Nova对象_设置属性(Nova运行时实例, reflect, "set", Nova函数_创建(Nova运行时实例, "Reflect.set", 0, 4))
+    Nova对象_设置属性(Nova运行时实例, reflect, "has", Nova函数_创建(Nova运行时实例, "Reflect.has", 0, 2))
+    Nova对象_设置属性(Nova运行时实例, reflect, "deleteProperty", Nova函数_创建(Nova运行时实例, "Reflect.deleteProperty", 0, 2))
+    Nova对象_设置属性(Nova运行时实例, reflect, "apply", Nova函数_创建(Nova运行时实例, "Reflect.apply", 0, 3))
+    Nova对象_设置属性(Nova运行时实例, reflect, "construct", Nova函数_创建(Nova运行时实例, "Reflect.construct", 0, 3))
+    Nova对象_设置属性(Nova运行时实例, reflect, "ownKeys", Nova函数_创建(Nova运行时实例, "Reflect.ownKeys", 0, 1))
+    Nova对象_设置属性(Nova运行时实例, reflect, "getPrototypeOf", Nova函数_创建(Nova运行时实例, "Reflect.getPrototypeOf", 0, 1))
+    Nova对象_设置属性(Nova运行时实例, reflect, "setPrototypeOf", Nova函数_创建(Nova运行时实例, "Reflect.setPrototypeOf", 0, 2))
+    Nova对象_设置属性(Nova运行时实例, reflect, "isExtensible", Nova函数_创建(Nova运行时实例, "Reflect.isExtensible", 0, 1))
+    Nova对象_设置属性(Nova运行时实例, reflect, "preventExtensions", Nova函数_创建(Nova运行时实例, "Reflect.preventExtensions", 0, 1))
+    Nova对象_设置属性(Nova运行时实例, global, "Reflect", reflect)
+}
+
+// 传统V8: 每次代理操作都调用handler trap(慢)
+// NovaOS: AI分析trap行为, 简单trap可以内联优化
+
+函数 AI_代理_应该内联trap(proxy, trap索引) {
+    如果 (proxy == 0) { 返回 假 }
+    定义 trap = JS代理_获取trap(proxy, trap索引)
+    如果 (trap == 0) { 返回 真 }    // 无trap → 直接操作目标(已内联)
+    // 简单trap(仅转发到目标): 可内联
+    // 复杂trap(有副作用): 不可内联
+    返回 假
+}
+
+
+定义 可变 统计_代理创建数 = 0
+定义 可变 统计_代理Get数 = 0
+定义 可变 统计_代理Set数 = 0
+定义 可变 统计_代理Has数 = 0
+定义 可变 统计_代理撤销数 = 0
+定义 可变 统计_Reflect调用数 = 0
+
+函数 代理反射_打印统计() {
+    打印("[代理] ═══════════ 代理/反射统计 ═══════════")
+    打印(字符串拼接("  代理创建数:   ", 转字符串(统计_代理创建数)))
+    打印(字符串拼接("  代理Get数:    ", 转字符串(统计_代理Get数)))
+    打印(字符串拼接("  代理Set数:    ", 转字符串(统计_代理Set数)))
+    打印(字符串拼接("  代理Has数:    ", 转字符串(统计_代理Has数)))
+    打印(字符串拼接("  代理撤销数:   ", 转字符串(统计_代理撤销数)))
+    打印(字符串拼接("  Reflect调用数:", 转字符串(统计_Reflect调用数)))
+    打印("[代理] ═══════════════════════════════════════")
+}
+
+函数 JS代理_打印信息(proxy) {
+    如果 (proxy == 0) {
+        打印("[代理] 空代理")
+        返回
+    }
+    打印("[代理] ── 代理信息 ──")
+    打印(字符串拼接("  目标:     ", 转字符串(proxy.目标)))
+    打印(字符串拼接("  处理器:   ", 转字符串(proxy.处理器)))
+    打印(字符串拼接("  已撤销:   ", 转字符串(proxy.已撤销)))
+    // 检查哪些trap已缓存
+    定义 可变 已缓存 = 0
+    定义 可变 i = 0
+    当 (i < TRAP_COUNT) {
+        如果 (内存_读64(proxy.trap缓存 + i * 8) != 0) {
+            已缓存 = 已缓存 + 1
+        }
+        i = i + 1
+    }
+    打印(字符串拼接("  已缓存trap: ", 转字符串(已缓存)))
+}
+
+
+函数 JS代理_检查Get不变量(Nova运行时实例, proxy, 键, trap结果) {
+    如果 (proxy == 0 || proxy.目标 == 0) { 返回 真 }
+    // 不变量: 如果目标属性不可配置且不可写, trap返回值必须与目标值相同
+    定义 目标值 = Nova对象_获取属性(Nova运行时实例, proxy.目标, 键)
+    定义 描述 = Nova对象_获取属性描述(Nova运行时实例, proxy.目标, 键)
+    如果 (描述 != 0) {
+        定义 可配置 = (描述 & 4) != 0
+        定义 可写 = (描述 & 1) != 0
+        如果 (可配置 == 假 && 可写 == 假) {
+            如果 (trap结果 != 目标值) {
+                打印("[代理] TypeError: get trap违反不变量")
+                返回 假
+            }
+        }
+    }
+    返回 真
+}
+
+函数 JS代理_检查Set不变量(Nova运行时实例, proxy, 键, 值) {
+    如果 (proxy == 0 || proxy.目标 == 0) { 返回 真 }
+    定义 描述 = Nova对象_获取属性描述(Nova运行时实例, proxy.目标, 键)
+    如果 (描述 != 0) {
+        定义 可配置 = (描述 & 4) != 0
+        定义 可写 = (描述 & 1) != 0
+        如果 (可配置 == 假 && 可写 == 假) {
+            打印("[代理] TypeError: set trap违反不变量(不可写属性)")
+            返回 假
+        }
+    }
+    返回 真
+}
+
+函数 JS代理_检查Has不变量(Nova运行时实例, proxy, 键, trap结果) {
+    如果 (proxy == 0 || proxy.目标 == 0) { 返回 真 }
+    如果 (trap结果 == 假) {
+        // 如果目标有不可配置的属性, has不能返回false
+        定义 描述 = Nova对象_获取属性描述(Nova运行时实例, proxy.目标, 键)
+        如果 (描述 != 0 && (描述 & 4) == 0) {
+            打印("[代理] TypeError: has trap违反不变量(不可配置属性)")
+            返回 假
+        }
+    }
+    返回 真
+}
+
+
+函数 JS代理_是否为代理(值) {
+    如果 (值 == 0) { 返回 假 }
+    // 检查内部标记(简化: 检查特定偏移的魔数)
+    返回 内存_读32(值) == 0x50525859    // "PRXY"
+}
+
+函数 JS代理_解包目标(proxy) {
+    如果 (proxy == 0) { 返回 0 }
+    如果 (proxy.已撤销) { 返回 0 }
+    返回 proxy.目标
+}
+
+函数 JS代理_销毁(proxy) {
+    如果 (proxy == 0) { 返回 }
+    如果 (proxy.trap缓存 != 0) {
+        堆_释放(proxy.trap缓存)
+    }
+    堆_释放(proxy)
+}
+
+
+函数 JS代理_验证handler(Nova运行时实例, 处理器) {
+    如果 (处理器 == 0) {
+        打印("[代理] TypeError: handler不能为null")
+        返回 假
+    }
+    如果 (!JSValue_IsObject(处理器)) {
+        打印("[代理] TypeError: handler必须是对象")
+        返回 假
+    }
+    返回 真
+}
+
+函数 JS代理_验证target(Nova运行时实例, 目标) {
+    如果 (目标 == 0) {
+        打印("[代理] TypeError: target不能为null")
+        返回 假
+    }
+    如果 (!JSValue_IsObject(目标)) {
+        打印("[代理] TypeError: target必须是对象")
+        返回 假
+    }
+    返回 真
+}

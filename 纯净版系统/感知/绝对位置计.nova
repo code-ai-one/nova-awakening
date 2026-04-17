@@ -1,0 +1,115 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./创建销毁.nova")
+导入("./智能布局设.nova")
+导入("../中枢/字符串替换.nova")
+导入("./文档节点.nova")
+导入("./文档接口属.nova")
+导入("./计算长度零.nova")
+导入("./样式继承.nova")
+导入("./应用样式声明.nova")
+导入("./计算样式创.nova")
+
+// §7 绝对位置计算 + 客户端矩形
+
+
+函数 布局Object_计算绝对位置(lo) {
+    如果 (lo.父 != 0) {
+        lo.绝对x = lo.父.绝对x + lo.x
+        lo.绝对y = lo.父.绝对y + lo.y
+    } 否则 {
+        lo.绝对x = lo.x
+        lo.绝对y = lo.y
+    }
+
+    // 递归更新子
+    定义 可变 子 = lo.第一子
+    当 (子 != 0) {
+        布局Object_计算绝对位置(子)
+        子 = 子.后兄
+    }
+}
+
+函数 布局Object_获取客户端矩形(lo) {
+    // 返回 [x, y, width, height] (绝对位置,像素×100)
+    返回 [lo.绝对x, lo.绝对y, 布局Object_边框盒宽(lo), 布局Object_边框盒高(lo)]
+}
+
+// §8 从DOM树构建布局树
+// (对应 布局TreeBuilder)
+
+函数 布局Tree_构建(文档, 视口宽, 视口高) {
+ // 创建根布局View
+ 定义 根样式 = Computed样式_创建()
+ 根样式.display = Display_block
+ 根样式.width = 计算长度_px(视口宽)
+ 根样式.height = 计算长度_px(视口高)
+ 定义 根 = 布局Object_创建(布局类型_视图, 文档, 根样式)
+ 根.内容宽 = 视口宽
+ 根.内容高 = 视口高
+
+ // 递归遍历DOM树,为每个可见节点创建布局Object
+ 定义 html = Document_document元素(文档)
+ 如果 (html != 0) {
+ 布局Tree_构建递归(根, html)
+ }
+
+ 返回 根
+}
+
+函数 布局Tree_构建递归(父lo, dom节点) {
+ 如果 (dom节点 == 0) { 返回 }
+
+ // 文本节点
+ 如果 (dom节点.节点类型 == TEXT_节点) {
+ 定义 文本 = CharacterData_data(dom节点)
+ 如果 (文本 != 0 && 字符串_长度(文本) > 0) {
+ 定义 文本样式 = Computed样式_创建()
+ 如果 (父lo.样式 != 0) {
+ Computed样式_继承(文本样式, 父lo.样式)
+ }
+ 定义 文本lo = 布局Object_创建(布局类型_文本, dom节点, 文本样式)
+ 布局Object_添加子(父lo, 文本lo)
+ }
+ 返回
+ }
+
+ // 元素节点
+ 如果 (dom节点.节点类型 == 元素_节点) {
+ 定义 扩展 = 元素_获取扩展(dom节点)
+ 如果 (扩展 == 0) { 返回 }
+
+ 定义 样式 = 扩展.计算样式
+ 如果 (样式 == 0) {
+ 样式 = Computed样式_创建()
+ Computed样式_应用UA默认(样式, 扩展.标签名原子)
+ 如果 (父lo.样式 != 0) {
+ Computed样式_继承(样式, 父lo.样式)
+ }
+ 扩展.计算样式 = 样式
+ }
+
+ 如果 (样式.display == Display_none) { 返回 }
+
+ 定义 可变 类型 = 布局类型_块
+ 如果 (样式.display == Display_inline) { 类型 = 布局类型_内联 }
+ 否则 如果 (样式.display == Display_inline_block) { 类型 = 布局类型_块 }
+ 否则 如果 (样式.display == Display_flex || 样式.display == Display_inline_flex) { 类型 = 布局类型_弹性 }
+ 否则 如果 (样式.display == Display_grid || 样式.display == Display_inline_grid) { 类型 = 布局类型_网格 }
+ 否则 如果 (样式.display == Display_table) { 类型 = 布局类型_表格 }
+ 否则 如果 (样式.display == Display_table_row) { 类型 = 布局类型_表格行 }
+ 否则 如果 (样式.display == Display_table_cell) { 类型 = 布局类型_表格单元 }
+
+ 定义 lo = 布局Object_创建(类型, dom节点, 样式)
+ 布局Object_添加子(父lo, lo)
+
+ AI布局_设置语义优先级(lo, dom节点)
+
+ // 递归子节点
+ 定义 可变 子 = dom节点.第一子节点
+ 当 (子 != 0) {
+ 布局Tree_构建递归(lo, 子)
+ 子 = 子.后一兄弟
+ }
+ }
+}

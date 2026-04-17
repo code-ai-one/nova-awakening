@@ -1,0 +1,250 @@
+导入("../中枢/类型定义.nova")
+导入("../中枢/系统调用表.nova")
+导入("./认证递增计数.nova")
+导入("../感知/内核直连层.nova")
+导入("./密钥.nova")
+导入("../中枢/加密框架.nova")
+
+// §5 AES-GCM (NIST SP 800-38D) — 认证加密
+
+// GCM的GHASH — GF(2^128)乘法
+
+// 本模块遵循行业标准协议规范，全部代码由Nova团队原创编写
+
+函数 GCM_GHASH_block(H, X, Y) {
+    // Y = (Y XOR X) * H  在GF(2^128)中
+    // 先XOR
+    定义 可变 i = 0
+    当 (i < 16) {
+        内存_写8(Y + i, 内存_读8(Y + i) ^ 内存_读8(X + i))
+        i = i + 1
+    }
+    // GF(2^128)乘法 (bit-by-bit, 约化多项式 x^128 + x^7 + x^2 + x + 1)
+    定义 V = 堆_分配(16)
+    内存_复制(V, H, 16)
+    定义 Z = 堆_分配(16)
+    内存_置零(Z, 16)
+
+    定义 可变 byte_idx = 0
+    当 (byte_idx < 16) {
+        定义 y_byte = 内存_读8(Y + byte_idx)
+        定义 可变 bit = 7
+        当 (bit >= 0) {
+            如果 (y_byte & (1 << bit)) {
+                // Z = Z XOR V
+                定义 可变 k = 0
+                当 (k < 16) {
+                    内存_写8(Z + k, 内存_读8(Z + k) ^ 内存_读8(V + k))
+                    k = k + 1
+                }
+            }
+            // V = V >> 1 (在GF中右移)
+            定义 carry = 内存_读8(V + 15) & 1
+            定义 可变 k = 15
+            当 (k > 0) {
+                内存_写8(V + k, (内存_读8(V + k) >> 1) | ((内存_读8(V + k - 1) & 1) << 7))
+                k = k - 1
+            }
+            内存_写8(V, 内存_读8(V) >> 1)
+            // 如果carry, XOR约化多项式 0xE1000000...
+            如果 (carry) {
+                内存_写8(V, 内存_读8(V) ^ 0xE1)
+            }
+            bit = bit - 1
+        }
+        byte_idx = byte_idx + 1
+    }
+
+    内存_复制(Y, Z, 16)
+    堆_释放(V); 堆_释放(Z)
+}
+
+// AES-GCM加密
+函数 AES_GCM_加密(密钥, 密钥长度, IV, IV长度, 明文, 明文长度, AAD, AAD长度, 密文, 标签) {
+    // 1. 密钥扩展
+    定义 扩展密钥 = 堆_分配(240)  // 最多15*16字节
+    定义 Nr = AES_密钥扩展(密钥, 密钥长度, 扩展密钥)
+
+    // 2. 计算H = AES_K(0^128)
+    定义 H = 堆_分配(16)
+    内存_置零(H, 16)
+    AES_加密块(H, 扩展密钥, Nr)
+
+    // 3. 构造J0 (初始计数器)
+    定义 J0 = 堆_分配(16)
+    如果 (IV长度 == 12) {
+        内存_复制(J0, IV, 12)
+        内存_写8(J0 + 12, 0); 内存_写8(J0 + 13, 0)
+        内存_写8(J0 + 14, 0); 内存_写8(J0 + 15, 1)
+    } 否则 {
+        // GHASH(IV || padding || len64)
+        内存_置零(J0, 16)
+        // 对IV做GHASH处理
+        定义 可变 off = 0
+        当 (off + 16 <= IV长度) {
+            GCM_GHASH_block(H, IV + off, J0)
+            off = off + 16
+        }
+        如果 (off < IV长度) {
+            定义 pad = 堆_分配(16)
+            内存_置零(pad, 16)
+            内存_复制(pad, IV + off, IV长度 - off)
+            GCM_GHASH_block(H, pad, J0)
+            堆_释放(pad)
+        }
+        // 追加长度块
+        定义 len_block = 堆_分配(16)
+        内存_置零(len_block, 16)
+        定义 iv_bits = IV长度 * 8
+        内存_写8(len_block + 8, (iv_bits >> 56) & 0xFF)
+        内存_写8(len_block + 9, (iv_bits >> 48) & 0xFF)
+        内存_写8(len_block + 10, (iv_bits >> 40) & 0xFF)
+        内存_写8(len_block + 11, (iv_bits >> 32) & 0xFF)
+        内存_写8(len_block + 12, (iv_bits >> 24) & 0xFF)
+        内存_写8(len_block + 13, (iv_bits >> 16) & 0xFF)
+        内存_写8(len_block + 14, (iv_bits >> 8) & 0xFF)
+        内存_写8(len_block + 15, iv_bits & 0xFF)
+        GCM_GHASH_block(H, len_block, J0)
+        堆_释放(len_block)
+    }
+
+    // 4. CTR模式加密
+    定义 计数器 = 堆_分配(16)
+    内存_复制(计数器, J0, 16)
+    GCM_递增计数器(计数器)  // J0+1开始加密
+
+    定义 可变 off = 0
+    当 (off + 16 <= 明文长度) {
+        定义 keystream = 堆_分配(16)
+        内存_复制(keystream, 计数器, 16)
+        AES_加密块(keystream, 扩展密钥, Nr)
+        定义 可变 j = 0
+        当 (j < 16) {
+            内存_写8(密文 + off + j, 内存_读8(明文 + off + j) ^ 内存_读8(keystream + j))
+            j = j + 1
+        }
+        内存_清零(keystream, 64); 堆_释放(keystream)
+        GCM_递增计数器(计数器)
+        off = off + 16
+    }
+    // 处理最后不完整的块
+    如果 (off < 明文长度) {
+        定义 keystream = 堆_分配(16)
+        内存_复制(keystream, 计数器, 16)
+        AES_加密块(keystream, 扩展密钥, Nr)
+        定义 可变 j = 0
+        当 (off + j < 明文长度) {
+            内存_写8(密文 + off + j, 内存_读8(明文 + off + j) ^ 内存_读8(keystream + j))
+            j = j + 1
+        }
+        内存_清零(keystream, 64); 堆_释放(keystream)
+    }
+
+    // 5. 计算认证标签 GHASH(AAD || C || len(AAD) || len(C))
+    定义 S = 堆_分配(16)
+    内存_置零(S, 16)
+
+    // GHASH AAD
+    off = 0
+    当 (off + 16 <= AAD长度) {
+        GCM_GHASH_block(H, AAD + off, S)
+        off = off + 16
+    }
+    如果 (off < AAD长度) {
+        定义 pad = 堆_分配(16)
+        内存_置零(pad, 16)
+        内存_复制(pad, AAD + off, AAD长度 - off)
+        GCM_GHASH_block(H, pad, S)
+        堆_释放(pad)
+    }
+
+    // GHASH 密文
+    off = 0
+    当 (off + 16 <= 明文长度) {
+        GCM_GHASH_block(H, 密文 + off, S)
+        off = off + 16
+    }
+    如果 (off < 明文长度) {
+        定义 pad = 堆_分配(16)
+        内存_置零(pad, 16)
+        内存_复制(pad, 密文 + off, 明文长度 - off)
+        GCM_GHASH_block(H, pad, S)
+        堆_释放(pad)
+    }
+
+    // 长度块: AAD_bits(64) || C_bits(64)
+    定义 len_block = 堆_分配(16)
+    定义 aad_bits = AAD长度 * 8
+    定义 c_bits = 明文长度 * 8
+    内存_写8(len_block, (aad_bits >> 56) & 0xFF)
+    内存_写8(len_block + 1, (aad_bits >> 48) & 0xFF)
+    内存_写8(len_block + 2, (aad_bits >> 40) & 0xFF)
+    内存_写8(len_block + 3, (aad_bits >> 32) & 0xFF)
+    内存_写8(len_block + 4, (aad_bits >> 24) & 0xFF)
+    内存_写8(len_block + 5, (aad_bits >> 16) & 0xFF)
+    内存_写8(len_block + 6, (aad_bits >> 8) & 0xFF)
+    内存_写8(len_block + 7, aad_bits & 0xFF)
+    内存_写8(len_block + 8, (c_bits >> 56) & 0xFF)
+    内存_写8(len_block + 9, (c_bits >> 48) & 0xFF)
+    内存_写8(len_block + 10, (c_bits >> 40) & 0xFF)
+    内存_写8(len_block + 11, (c_bits >> 32) & 0xFF)
+    内存_写8(len_block + 12, (c_bits >> 24) & 0xFF)
+    内存_写8(len_block + 13, (c_bits >> 16) & 0xFF)
+    内存_写8(len_block + 14, (c_bits >> 8) & 0xFF)
+    内存_写8(len_block + 15, c_bits & 0xFF)
+    GCM_GHASH_block(H, len_block, S)
+
+    // 标签 = AES_K(J0) XOR S
+    定义 E_J0 = 堆_分配(16)
+    内存_复制(E_J0, J0, 16)
+    AES_加密块(E_J0, 扩展密钥, Nr)
+    定义 可变 j = 0
+    当 (j < 16) {
+        内存_写8(标签 + j, 内存_读8(S + j) ^ 内存_读8(E_J0 + j))
+        j = j + 1
+    }
+
+    堆_释放(H); 堆_释放(J0); 堆_释放(计数器)
+    堆_释放(S); 堆_释放(E_J0); 堆_释放(len_block); 堆_释放(扩展密钥)
+}
+
+// AES-GCM解密 (验证标签后解密)
+函数 AES_GCM_解密(密钥, 密钥长度, IV, IV长度, 密文, 密文长度, AAD, AAD长度, 明文, 标签) {
+    // 1. 先计算预期标签
+    定义 期望标签 = 堆_分配(16)
+    定义 临时密文 = 堆_分配(密文长度)
+    // 解密就是再加密一次(CTR模式是对称的)
+    AES_GCM_加密(密钥, 密钥长度, IV, IV长度, 密文, 密文长度, AAD, AAD长度, 明文, 期望标签)
+
+    // 2. 验证标签(常量时间比较)
+    定义 可变 diff = 0
+    定义 可变 i = 0
+    当 (i < 16) {
+        diff = diff | (内存_读8(标签 + i) ^ 内存_读8(期望标签 + i))
+        i = i + 1
+    }
+
+    堆_释放(期望标签); 堆_释放(临时密文)
+
+    如果 (diff != 0) {
+        // 标签验证失败: 清除输出
+        内存_置零(明文, 密文长度)
+        返回 -1
+    }
+    返回 0
+}
+
+定义 可变 AI_密钥认证_威胁计数 = 0
+
+函数 AI_密钥认证_风险评分(操作类型, 权限级别, 来源可信度) {
+    定义 可变 风险 = 0
+    如果 (权限级别 > 500) { 风险 = 风险 + 300 }
+    如果 (来源可信度 < 200) { 风险 = 风险 + 400 }
+    如果 (风险 > 500) { AI_密钥认证_威胁计数 = AI_密钥认证_威胁计数 + 1 }
+    返回 风险
+}
+
+函数 AI_密钥认证_异常行为检测(操作频率, 基线频率) {
+    如果 (基线频率 > 0 && 操作频率 > 基线频率 * 5) { 返回 真 }
+    返回 假
+}

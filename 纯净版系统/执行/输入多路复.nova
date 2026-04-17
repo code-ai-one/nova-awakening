@@ -1,0 +1,113 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./底层系统调.nova")
+导入("../感知/内核直连层.nova")
+
+// §7 IO多路复用封装
+
+函数 系统调用_Nova事件轮询_创建(flags) {
+    返回 系统调用1(SYS_Nova事件轮询_创建1, flags)
+}
+
+函数 系统调用_Nova事件轮询_ctl(epfd, op, fd, 事件) {
+    返回 系统调用4(SYS_Nova事件轮询_ctl, epfd, op, fd, 事件)
+}
+
+函数 系统调用_Nova事件轮询_wait(epfd, 事件s, max事件s, timeout) {
+    返回 系统调用5(SYS_Nova事件轮询_pwait, epfd, 事件s, max事件s, timeout, 0)
+}
+
+函数 系统调用_ppoll(fds, nfds, timeout_ms) {
+    // 构建timespec
+    定义 ts = 堆_分配(16)
+    内存_写64(ts, timeout_ms / 1000)          // tv_sec
+    内存_写64(ts + 8, (timeout_ms % 1000) * 1000000)  // tv_nsec
+    定义 ret = 系统调用5(SYS_ppoll, fds, nfds, ts, 0, 0)
+    堆_释放(ts)
+    返回 ret
+}
+
+// 便捷: 创建Nova事件轮询实例
+函数 平台_创建Nova事件轮询() {
+    返回 系统调用_Nova事件轮询_创建(O_CLOEXEC)
+}
+
+// 便捷: 添加fd到Nova事件轮询
+函数 平台_Nova事件轮询_添加(epfd, fd, 事件s) {
+    定义 ev = 堆_分配(12)
+    内存_写32(ev, 事件s)
+    内存_写32(ev + 4, fd)
+    定义 ret = 系统调用_Nova事件轮询_ctl(epfd, Nova事件轮询_CTL_ADD, fd, ev)
+    堆_释放(ev)
+    返回 ret
+}
+
+// §8 时间封装
+
+函数 系统调用_clock_gettime(clk_id, tp) {
+    返回 系统调用2(SYS_clock_gettime, clk_id, tp)
+}
+
+函数 系统调用_nanosleep(req, rem) {
+    返回 系统调用2(SYS_nanosleep, req, rem)
+}
+
+// 便捷: 获取单调时间(纳秒)
+函数 平台_获取单调时间_ns() {
+    定义 ts = 堆_分配(16)
+    系统调用_clock_gettime(CLOCK_MONOTONIC, ts)
+    定义 sec = 内存_读64(ts)
+    定义 nsec = 内存_读64(ts + 8)
+    堆_释放(ts)
+    返回 sec * 1000000000 + nsec
+}
+
+// 便捷: 获取实时时间(毫秒)
+函数 平台_获取时间_ms() {
+    定义 ts = 堆_分配(16)
+    系统调用_clock_gettime(CLOCK_REALTIME, ts)
+    定义 sec = 内存_读64(ts)
+    定义 nsec = 内存_读64(ts + 8)
+    堆_释放(ts)
+    返回 sec * 1000 + nsec / 1000000
+}
+
+// 便捷: 睡眠(毫秒)
+函数 平台_sleep_ms(ms) {
+    定义 req = 堆_分配(16)
+    内存_写64(req, ms / 1000)
+    内存_写64(req + 8, (ms % 1000) * 1000000)
+    系统调用_nanosleep(req, 0)
+    堆_释放(req)
+}
+
+// §9 信号封装
+
+函数 系统调用_sigaction(signum, act, oldact) {
+    返回 系统调用4(SYS_rt_sigaction, signum, act, oldact, 8)
+}
+
+函数 系统调用_sigprocmask(how, set, oldset) {
+    返回 系统调用4(SYS_rt_sigprocmask, how, set, oldset, 8)
+}
+
+// §10 随机数/安全
+
+函数 系统调用_getrandom(buf, buflen, flags) {
+    返回 系统调用3(SYS_getrandom, buf, buflen, flags)
+}
+
+// 便捷: 获取安全随机字节
+函数 平台_安全随机(buf, len) {
+    定义 可变 已读 = 0
+    当 (已读 < len) {
+        定义 n = 系统调用_getrandom(buf + 已读, len - 已读, 0)
+        如果 (n <= 0) { 跳出 }
+        已读 = 已读 + n
+    }
+    返回 已读
+}
+
+函数 系统调用_seccomp(op, flags, args) {
+    返回 系统调用3(SYS_seccomp, op, flags, args)
+}

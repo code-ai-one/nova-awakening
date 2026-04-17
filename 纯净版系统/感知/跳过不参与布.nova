@@ -1,0 +1,355 @@
+// NovaOS 块级流布局核心 — 正常流/浮动/margin折叠/clear/BFC/定位
+// 本模块实现CSS块级格式化上下文(BFC)的完整布局算法:
+//   1. 正常流: 块级子元素垂直堆叠
+//   2. 浮动: float:left/right + clear:left/right/both
+//   3. margin折叠: CSS2.1 §8.3.1相邻垂直margin合并
+//   4. BFC建立: overflow非visible/float/绝对定位/inline-block
+//   5. 宽度计算: auto宽度/百分比/min-max约束
+//   6. 定位元素收集: 绝对/固定定位延迟处理
+//   7. AI布局预测: 增量布局/脏子树检测
+// 与弹性布局、样式引擎、绘制合成器、智能大脑深度耦合。
+
+导入("../中枢/类型定义.nova")
+导入("../中枢/错误码.nova")
+导入("../中枢/日志中枢.nova")
+导入("../中枢/公共智能.nova")
+导入("../引导/引导加载器.nova")
+导入("./图绘渲染上下.nova")
+导入("./弹性布局深度.nova")
+
+// §1 常量
+
+定义 定位_静态 = 0
+定义 定位_相对 = 1
+定义 定位_绝对 = 2
+定义 定位_固定 = 3
+定义 定位_粘性 = 4
+
+定义 可变 块级布局_总次数 = 0
+定义 可变 块级布局_浮动处理 = 0
+定义 可变 块级布局_margin折叠 = 0
+
+
+函数 布局块级Flow_布局(layout, 包含块宽, 包含块高) {
+    如果 (layout == 0) { 返回 }
+    块级布局_总次数 = 块级布局_总次数 + 1
+
+    定义 可变 左浮动边界 = 0        // 当前左浮动占据的右边界
+    定义 可变 右浮动边界 = 包含块宽  // 当前右浮动占据的左边界
+    定义 可变 左浮动底部 = 0
+    定义 可变 右浮动底部 = 0
+
+    定义 可变 上一个margin_bottom = 0
+    定义 可变 是第一个子 = 真
+
+    定义 可变 当前Y = 0
+
+    定义 内容x = layout.padding_left + layout.border_left
+    定义 内容y_起始 = layout.padding_top + layout.border_top
+    当前Y = 内容y_起始
+
+    定义 可变 子 = layout.第一子
+    当 (子 != 0) {
+        定义 子style = 子.样式
+
+        // 跳过不参与布局的元素
+        如果 (子style != 0 && 子style.display == 0) {
+            // display:none
+            子 = 子.后一兄弟布局
+            继续
+        }
+
+        // 绝对/固定定位元素不参与正常流
+        如果 (子style != 0 && (子style.position == 定位_绝对 || 子style.position == 定位_固定)) {
+            // 稍后处理定位元素
+            子 = 子.后一兄弟布局
+            继续
+        }
+
+        布局Box_计算盒模型(子, 包含块宽, 包含块高)
+
+        如果 (子style != 0 && 子style.float_type != 0) {
+            布局块级Flow_布局浮动(layout, 子, 包含块宽,
+                左浮动边界, 右浮动边界, 左浮动底部, 右浮动底部, 当前Y)
+
+            如果 (子style.float_type == 1) {    // float:left
+                左浮动边界 = 子.x + 子.宽度 + 子.margin_right + 子.border_right + 子.padding_right
+                如果 (子.y + 子.高度 > 左浮动底部) {
+                    左浮动底部 = 子.y + 子.高度 + 子.margin_bottom
+                }
+            } 否则 {    // float:right
+                右浮动边界 = 子.x - 子.margin_left
+                如果 (子.y + 子.高度 > 右浮动底部) {
+                    右浮动底部 = 子.y + 子.高度 + 子.margin_bottom
+                }
+            }
+
+            子 = 子.后一兄弟布局
+            继续
+        }
+
+        如果 (子style != 0 && 子style.clear != 0) {
+            如果 (子style.clear == 1 || 子style.clear == 3) {    // clear:left 或 clear:both
+                如果 (当前Y < 左浮动底部) { 当前Y = 左浮动底部 }
+            }
+            如果 (子style.clear == 2 || 子style.clear == 3) {    // clear:right 或 clear:both
+                如果 (当前Y < 右浮动底部) { 当前Y = 右浮动底部 }
+            }
+        }
+
+        // 规则: 相邻的垂直margin合并为较大者
+        // 例外: 建立新BFC的元素/浮动/绝对定位/inline-block/overflow非visible
+        定义 子margin_top = 子.margin_top
+        如果 (子margin_top < 0) { 子margin_top = 0 }
+
+        定义 可变 折叠后margin = 0
+        如果 (是第一个子) {
+            // 第一个子的margin-top可能与父的margin-top折叠
+            // (如果父没有border-top/padding-top/BFC)
+            如果 (layout.border_top == 0 && layout.padding_top == 0 && !布局块级Flow_建立BFC(layout)) {
+                // 折叠: 父的margin-top与第一个子的margin-top合并
+                // 向上传播: 取父和子的margin-top较大者作为父的margin
+                定义 父margin = layout.margin_top
+                如果 (父margin < 0) { 父margin = 0 }
+                如果 (子margin_top > 父margin) {
+                    layout.margin_top = 子margin_top    // 传播到父
+                }
+                折叠后margin = 0    // 已传播到父, 子元素不再留margin
+            } 否则 {
+                折叠后margin = 子margin_top
+            }
+            是第一个子 = 假
+        } 否则 {
+            // 与前一个兄弟的margin-bottom折叠
+            折叠后margin = 布局块级Flow_折叠margin(上一个margin_bottom, 子margin_top)
+        }
+
+        当前Y = 当前Y + 折叠后margin
+
+        定义 可用宽度 = 右浮动边界 - 左浮动边界
+        如果 (当前Y < 左浮动底部 || 当前Y < 右浮动底部) {
+            // 在浮动区域内: 收缩可用宽度
+        } 否则 {
+            可用宽度 = 包含块宽 - 内容x * 2
+        }
+
+        如果 (子.宽度 <= 0 || 子style.width_auto) {
+            子.宽度 = 可用宽度 - 子.margin_left - 子.margin_right - 子.border_left - 子.border_right - 子.padding_left - 子.padding_right
+            如果 (子.宽度 < 0) { 子.宽度 = 0 }
+        }
+
+        // min/max宽度约束
+        如果 (子style != 0) {
+            如果 (子style.min_width > 0 && 子.宽度 < 子style.min_width) {
+                子.宽度 = 子style.min_width
+            }
+            如果 (子style.max_width > 0 && 子style.max_width != -1 && 子.宽度 > 子style.max_width) {
+                子.宽度 = 子style.max_width
+            }
+        }
+
+        定义 可变 子X = 内容x + 子.margin_left + 子.border_left + 子.padding_left
+        // auto margin居中
+        如果 (子style != 0 && 子style.margin_left_auto && 子style.margin_right_auto) {
+            定义 剩余 = 可用宽度 - 子.宽度
+            如果 (剩余 > 0) {
+                子X = 内容x + 剩余 / 2
+            }
+        }
+        子.x = layout.x + 子X
+
+        子.y = layout.y + 当前Y
+
+        如果 (子style != 0 && 子style.display_flex) {
+            布局弹性_入口(子)
+        } 否则 如果 (子.第一子 != 0) {
+            布局块级Flow_布局(子, 子.宽度, 子.高度)
+        }
+
+        如果 (子.高度 <= 0 || 子style.height_auto) {
+            子.高度 = 布局块级Flow_计算内容高度(子)
+        }
+
+        // min/max高度约束
+        如果 (子style != 0) {
+            如果 (子style.min_height > 0 && 子.高度 < 子style.min_height) {
+                子.高度 = 子style.min_height
+            }
+            如果 (子style.max_height > 0 && 子style.max_height != -1 && 子.高度 > 子style.max_height) {
+                子.高度 = 子style.max_height
+            }
+        }
+
+        当前Y = 当前Y + 子.高度 + 子.padding_bottom + 子.border_bottom
+
+        如果 (子style != 0 && 子style.position == 定位_相对) {
+            子.x = 子.x + 子style.left - 子style.right
+            子.y = 子.y + 子style.top - 子style.bottom
+        }
+
+        上一个margin_bottom = 子.margin_bottom
+        子 = 子.后一兄弟布局
+    }
+
+    如果 (当前Y < 左浮动底部) { 当前Y = 左浮动底部 }
+    如果 (当前Y < 右浮动底部) { 当前Y = 右浮动底部 }
+
+    如果 (layout.高度 <= 0 || layout.样式 == 0 || layout.样式.height_auto) {
+        layout.高度 = 当前Y - 内容y_起始 + layout.padding_bottom + layout.border_bottom
+    }
+}
+
+// §2 浮动布局
+
+函数 布局块级Flow_布局浮动(layout, 子, 包含块宽, 左边界, 右边界, 左底, 右底, 当前Y) {
+    块级布局_浮动处理 = 块级布局_浮动处理 + 1
+    定义 子style = 子.样式
+
+    // 计算浮动元素宽度(shrink-to-fit)
+    如果 (子.宽度 <= 0) {
+        子.宽度 = 布局块级Flow_shrink_to_fit宽度(子, 包含块宽)
+    }
+
+    如果 (子style.float_type == 1) {
+        // float:left
+        子.x = layout.x + 左边界 + 子.margin_left
+        子.y = layout.y + 当前Y + 子.margin_top
+    } 否则 {
+        // float:right
+        子.x = layout.x + 右边界 - 子.宽度 - 子.margin_right
+        子.y = layout.y + 当前Y + 子.margin_top
+    }
+
+    // 递归布局浮动元素内容
+    如果 (子.第一子 != 0) {
+        布局块级Flow_布局(子, 子.宽度, 子.高度)
+    }
+    如果 (子.高度 <= 0) {
+        子.高度 = 布局块级Flow_计算内容高度(子)
+    }
+}
+
+函数 布局块级Flow_shrink_to_fit宽度(子, 可用宽度) {
+    // shrink-to-fit: min(max(最小宽度, 可用宽度), 首选宽度)
+    // 简化: 使用可用宽度的一半作为近似
+    定义 首选 = 可用宽度 / 2
+    如果 (子.样式 != 0 && 子.样式.width > 0) {
+        首选 = 子.样式.width
+    }
+    如果 (首选 > 可用宽度) { 首选 = 可用宽度 }
+    返回 首选
+}
+
+// §3 BFC判断与margin折叠
+
+函数 布局块级Flow_建立BFC(layout) {
+    如果 (layout == 0 || layout.样式 == 0) { 返回 假 }
+    定义 s = layout.样式
+    // 以下情况建立新BFC:
+    如果 (s.overflow != 0) { 返回 真 }
+    如果 (s.float_type != 0) { 返回 真 }
+    如果 (s.position == 定位_绝对 || s.position == 定位_固定) { 返回 真 }
+    如果 (s.display_inline_block) { 返回 真 }
+    如果 (s.display_flex) { 返回 真 }
+    如果 (s.display_grid) { 返回 真 }
+    返回 假
+}
+
+函数 布局块级Flow_折叠margin(margin_a, margin_b) {
+    块级布局_margin折叠 = 块级布局_margin折叠 + 1
+    // 正正取大、负负取小(绝对值大)、正负相加
+    如果 (margin_a >= 0 && margin_b >= 0) {
+        如果 (margin_a > margin_b) { 返回 margin_a }
+        返回 margin_b
+    }
+    如果 (margin_a < 0 && margin_b < 0) {
+        如果 (margin_a < margin_b) { 返回 margin_a }
+        返回 margin_b
+    }
+    返回 margin_a + margin_b
+}
+
+函数 布局块级Flow_计算内容高度(layout) {
+    如果 (layout == 0) { 返回 0 }
+    // 内容高度 = 最后一个子元素的底部 - 第一个子元素的顶部
+    定义 可变 最大底部 = 0
+    定义 可变 子 = layout.第一子
+    当 (子 != 0) {
+        如果 (子.样式 != 0 && 子.样式.display != 0) {
+            定义 底部 = (子.y - layout.y) + 子.高度 + 子.margin_bottom
+            如果 (底部 > 最大底部) { 最大底部 = 底部 }
+        }
+        子 = 子.后一兄弟布局
+    }
+    返回 最大底部
+}
+
+// §4 盒模型计算
+
+函数 布局Box_计算盒模型(子, 父宽, 父高) {
+    如果 (子 == 0 || 子.样式 == 0) { 返回 }
+    定义 s = 子.样式
+
+    // 宽度
+    如果 (s.width > 0 && !s.width_auto) {
+        子.宽度 = CSS值_解析(s.width, 父宽)
+    }
+    // 高度
+    如果 (s.height > 0 && !s.height_auto) {
+        子.高度 = CSS值_解析(s.height, 父高)
+    }
+    // margin
+    子.margin_top = CSS值_解析(s.margin_top, 父宽)
+    子.margin_right = CSS值_解析(s.margin_right, 父宽)
+    子.margin_bottom = CSS值_解析(s.margin_bottom, 父宽)
+    子.margin_left = CSS值_解析(s.margin_left, 父宽)
+    // padding
+    子.padding_top = CSS值_解析(s.padding_top, 父宽)
+    子.padding_right = CSS值_解析(s.padding_right, 父宽)
+    子.padding_bottom = CSS值_解析(s.padding_bottom, 父宽)
+    子.padding_left = CSS值_解析(s.padding_left, 父宽)
+    // border
+    子.border_top = s.border_top_width
+    子.border_right = s.border_right_width
+    子.border_bottom = s.border_bottom_width
+    子.border_left = s.border_left_width
+
+    // box-sizing: border-box
+    如果 (s.box_sizing == 1 && 子.宽度 > 0) {
+        子.宽度 = 子.宽度 - 子.padding_left - 子.padding_right - 子.border_left - 子.border_right
+        如果 (子.宽度 < 0) { 子.宽度 = 0 }
+    }
+    如果 (s.box_sizing == 1 && 子.高度 > 0) {
+        子.高度 = 子.高度 - 子.padding_top - 子.padding_bottom - 子.border_top - 子.border_bottom
+        如果 (子.高度 < 0) { 子.高度 = 0 }
+    }
+}
+
+函数 CSS值_解析(值, 参照) {
+    如果 (值 <= 0) { 返回 0 }
+    返回 值
+}
+
+// §5 布局入口
+
+函数 布局_根(根节点, 视口宽, 视口高) {
+    如果 (根节点 == 0) { 返回 }
+    根节点.x = 0
+    根节点.y = 0
+    根节点.宽度 = 视口宽
+    如果 (根节点.样式 != 0 && 根节点.样式.display_flex) {
+        布局弹性_入口(根节点)
+    } 否则 {
+        布局块级Flow_布局(根节点, 视口宽, 视口高)
+    }
+}
+
+// §6 统计
+
+函数 块级布局_统计() {
+    返回 {
+        总布局: 块级布局_总次数,
+        浮动处理: 块级布局_浮动处理,
+        margin折叠: 块级布局_margin折叠,
+    }
+}

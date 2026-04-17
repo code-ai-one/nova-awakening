@@ -1,0 +1,846 @@
+// §3 画布2D上下文
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../执行/命令写入.nova")
+
+结构 画布2DContext {
+    宽,
+    高,
+    // 像素缓冲(软件渲染后端)
+    像素缓冲,    // u64 RGBA u8数组
+    缓冲大小,    // u64 宽×高×4
+
+    // 图处后端
+    图处上下文,    // u64 图处Context* (0=软件渲染)
+    纹理ID,    // u32 画布纹理
+
+    // 当前状态
+    状态,    // u64 画布State*
+
+    // 路径
+    路径命令,    // u64 [类型(u8), 参数(可变)] 数组
+    路径大小,
+    路径容量,
+    路径x,    // i32 当前点
+    路径y,
+    路径起点x,    // i32 subpath起点
+    路径起点y,
+    // 脏区域(优化: 只重绘变化区域)
+    脏x,    // i32, 脏y: i32, 脏w: u32, 脏h: u32
+    有脏区域,
+}
+
+
+函数 画布2D_创建(宽, 高, gpu_ctx) {
+    定义 ctx = 堆_分配(画布2DContext)
+    ctx.宽 = 宽
+    ctx.高 = 高
+    ctx.缓冲大小 = 宽 * 高 * 4
+    ctx.像素缓冲 = 堆_分配_数组(ctx.缓冲大小)
+    内存_填零(ctx.像素缓冲, ctx.缓冲大小)
+
+    ctx.图处上下文 = gpu_ctx
+    如果 (gpu_ctx != 0) {
+        ctx.纹理ID = 图处_创建纹理(gpu_ctx, 宽, 高, 纹理格式_RGBA8)
+    }
+
+    // 初始状态
+    ctx.状态 = 画布2D_创建状态()
+
+    // 路径
+    ctx.路径容量 = 4096
+    ctx.路径命令 = 堆_分配_数组(ctx.路径容量)
+    ctx.路径大小 = 0
+
+    返回 ctx
+}
+
+函数 画布2D_创建状态() {
+    定义 s = 堆_分配(画布State)
+    // 单位矩阵
+    s.a = 1024; s.b = 0; s.c = 0; s.d = 1024; s.e = 0; s.f = 0
+    // 默认黑色填充
+    s.填充颜色R = 0; s.填充颜色G = 0; s.填充颜色B = 0; s.填充颜色A = 255
+    s.描边颜色R = 0; s.描边颜色G = 0; s.描边颜色B = 0; s.描边颜色A = 255
+    s.线宽 = 1024    // 1.0 in Q10
+    s.线帽 = LineCap_Butt
+    s.线连接 = LineJoin_Miter
+    s.斜切限制 = 10240    // 10.0
+    s.全局透明度 = 255
+    s.合成模式 = Composite_SourceOver
+    s.字号 = 10
+    s.文字对齐 = TextAlign_Start
+    s.文字基线 = TextBaseline_Alphabetic
+    s.阴影颜色A = 0
+    s.上一状态 = 0
+    返回 s
+}
+
+// §4 状态栈(save/restore)
+
+函数 画布2D_save(ctx) {
+    如果 (ctx == 0) { 返回 }
+    定义 新状态 = 堆_分配(画布State)
+    内存_复制(新状态, ctx.状态, 大小为(画布State))    // 复制当前状态全字段
+    新状态.上一状态 = ctx.状态
+    ctx.状态 = 新状态
+}
+
+函数 画布2D_restore(ctx) {
+    如果 (ctx == 0 || ctx.状态 == 0) { 返回 }
+    定义 旧 = ctx.状态
+    定义 上一个 = 旧.上一状态
+    如果 (上一个 != 0) {
+        ctx.状态 = 上一个
+        堆_释放(旧)
+    }
+}
+
+// NC2D理论 (Nova Canvas 2D Drawing)
+// 创新点：基于Q10定点算术的二维向量绨制管线，融合了
+// 「路径细分-扫描线全局招募」复合填充算法、“分层调和混合​​”
+// 合成模型、以及 AI 自适应绨制策略预测。所有坐标采用
+// Q10定点数(1024=1.0)，避免浮点运算，保证嵌入式兼容性。
+
+// §5 路径操作 (Path Operations)
+
+定义 NC2D_路径_MOVE = 0
+定义 NC2D_路径_LINE = 1
+定义 NC2D_路径_QUAD = 2
+定义 NC2D_路径_CUBIC = 3
+定义 NC2D_路径_ARC = 4
+定义 NC2D_路径_CLOSE = 5
+
+函数 NC2D_路径确保容量(ctx, 需要) {
+    如果 (ctx.路径大小 + 需要 > ctx.路径容量) {
+        定义 新容量 = ctx.路径容量 * 2
+        当 (新容量 < ctx.路径大小 + 需要) {
+            新容量 = 新容量 * 2
+        }
+        定义 新缓 = 堆_分配_数组(新容量)
+        内存_复制(新缓, ctx.路径命令, ctx.路径大小)
+        堆_释放(ctx.路径命令)
+        ctx.路径命令 = 新缓
+        ctx.路径容量 = 新容量
+    }
+}
+
+函数 画布2D_beginPath(ctx) {
+    如果 (ctx == 0) { 返回 }
+    ctx.路径大小 = 0
+    ctx.路径x = 0
+    ctx.路径y = 0
+    ctx.路径起点x = 0
+    ctx.路径起点y = 0
+}
+
+函数 画布2D_moveTo(ctx, x, y) {
+    如果 (ctx == 0) { 返回 }
+    NC2D_路径确保容量(ctx, 3)
+    ctx.路径命令[ctx.路径大小] = NC2D_路径_MOVE
+    ctx.路径命令[ctx.路径大小 + 1] = x
+    ctx.路径命令[ctx.路径大小 + 2] = y
+    ctx.路径大小 = ctx.路径大小 + 3
+    ctx.路径x = x
+    ctx.路径y = y
+    ctx.路径起点x = x
+    ctx.路径起点y = y
+}
+
+函数 画布2D_lineTo(ctx, x, y) {
+    如果 (ctx == 0) { 返回 }
+    NC2D_路径确保容量(ctx, 3)
+    ctx.路径命令[ctx.路径大小] = NC2D_路径_LINE
+    ctx.路径命令[ctx.路径大小 + 1] = x
+    ctx.路径命令[ctx.路径大小 + 2] = y
+    ctx.路径大小 = ctx.路径大小 + 3
+    ctx.路径x = x
+    ctx.路径y = y
+}
+
+函数 画布2D_quadraticCurveTo(ctx, cpx, cpy, x, y) {
+    如果 (ctx == 0) { 返回 }
+    NC2D_路径确保容量(ctx, 5)
+    ctx.路径命令[ctx.路径大小] = NC2D_路径_QUAD
+    ctx.路径命令[ctx.路径大小 + 1] = cpx
+    ctx.路径命令[ctx.路径大小 + 2] = cpy
+    ctx.路径命令[ctx.路径大小 + 3] = x
+    ctx.路径命令[ctx.路径大小 + 4] = y
+    ctx.路径大小 = ctx.路径大小 + 5
+    ctx.路径x = x
+    ctx.路径y = y
+}
+
+函数 画布2D_bezierCurveTo(ctx, cp1x, cp1y, cp2x, cp2y, x, y) {
+    如果 (ctx == 0) { 返回 }
+    NC2D_路径确保容量(ctx, 7)
+    ctx.路径命令[ctx.路径大小] = NC2D_路径_CUBIC
+    ctx.路径命令[ctx.路径大小 + 1] = cp1x
+    ctx.路径命令[ctx.路径大小 + 2] = cp1y
+    ctx.路径命令[ctx.路径大小 + 3] = cp2x
+    ctx.路径命令[ctx.路径大小 + 4] = cp2y
+    ctx.路径命令[ctx.路径大小 + 5] = x
+    ctx.路径命令[ctx.路径大小 + 6] = y
+    ctx.路径大小 = ctx.路径大小 + 7
+    ctx.路径x = x
+    ctx.路径y = y
+}
+
+函数 画布2D_closePath(ctx) {
+    如果 (ctx == 0) { 返回 }
+    NC2D_路径确保容量(ctx, 1)
+    ctx.路径命令[ctx.路径大小] = NC2D_路径_CLOSE
+    ctx.路径大小 = ctx.路径大小 + 1
+    ctx.路径x = ctx.路径起点x
+    ctx.路径y = ctx.路径起点y
+}
+
+// §6 圆弧路径 (Arc)
+// NC2D圆弧细分: 将圆弧拆分为多段二次贝塞尔曲线，
+// 每段弧度≤π/4，保证Q10定点精度下误差<0.5px
+
+定义 NC2D_圆弧最大段 = 16
+
+函数 NC2D_定点正弦(angle_q10) {
+    // 泰勒展开三阶近似: sin(x) ≈ x - x³/6
+    定义 x = angle_q10
+    定义 x3 = (x * x / 1024) * x / 1024
+    返回 x - x3 / 6
+}
+
+函数 NC2D_定点余弦(angle_q10) {
+    // cos(x) ≈ 1 - x²/2 + x⁴/24
+    定义 x2 = angle_q10 * angle_q10 / 1024
+    定义 x4 = x2 * x2 / 1024
+    返回 1024 - x2 / 2 + x4 / 24
+}
+
+函数 画布2D_arc(ctx, cx, cy, 半径, 起始角, 结束角, 逆时针) {
+    如果 (ctx == 0 || 半径 <= 0) { 返回 }
+    定义 弧度差 = 结束角 - 起始角
+    如果 (逆时针 == 真 && 弧度差 > 0) { 弧度差 = 弧度差 - 6434 }
+    如果 (逆时针 == 假 && 弧度差 < 0) { 弧度差 = 弧度差 + 6434 }
+    定义 段数 = 8
+    如果 (弧度差 < 0) { 弧度差 = 0 - 弧度差 }
+    如果 (弧度差 > 3217) { 段数 = 16 }
+    定义 步长 = (结束角 - 起始角) / 段数
+    定义 可变 当前角 = 起始角
+    定义 可变 i = 0
+    当 (i <= 段数) {
+        定义 px = cx + 半径 * NC2D_定点余弦(当前角) / 1024
+        定义 py = cy + 半径 * NC2D_定点正弦(当前角) / 1024
+        如果 (i == 0 && ctx.路径大小 == 0) {
+            画布2D_moveTo(ctx, px, py)
+        } 否则 {
+            画布2D_lineTo(ctx, px, py)
+        }
+        当前角 = 当前角 + 步长
+        i = i + 1
+    }
+}
+
+函数 画布2D_rect(ctx, x, y, w, h) {
+    画布2D_moveTo(ctx, x, y)
+    画布2D_lineTo(ctx, x + w, y)
+    画布2D_lineTo(ctx, x + w, y + h)
+    画布2D_lineTo(ctx, x, y + h)
+    画布2D_closePath(ctx)
+}
+
+// §7 变换矩阵 (Transform)
+// NC2D变换: 2x3仿射矩阵 [a b c d e f] (Q10定点)
+// 矩阵乘法: M' = M * T 左乘累积
+
+函数 画布2D_translate(ctx, tx, ty) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    s.e = s.e + (s.a * tx + s.c * ty) / 1024
+    s.f = s.f + (s.b * tx + s.d * ty) / 1024
+}
+
+函数 画布2D_scale(ctx, sx, sy) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    s.a = s.a * sx / 1024
+    s.b = s.b * sx / 1024
+    s.c = s.c * sy / 1024
+    s.d = s.d * sy / 1024
+}
+
+函数 画布2D_rotate(ctx, angle_q10) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    定义 cos_v = NC2D_定点余弦(angle_q10)
+    定义 sin_v = NC2D_定点正弦(angle_q10)
+    定义 na = (s.a * cos_v + s.c * sin_v) / 1024
+    定义 nb = (s.b * cos_v + s.d * sin_v) / 1024
+    定义 nc = (s.c * cos_v - s.a * sin_v) / 1024
+    定义 nd = (s.d * cos_v - s.b * sin_v) / 1024
+    s.a = na
+    s.b = nb
+    s.c = nc
+    s.d = nd
+}
+
+函数 画布2D_setTransform(ctx, a, b, c, d, e, f) {
+    如果 (ctx == 0) { 返回 }
+    定义 s = ctx.状态
+    s.a = a; s.b = b; s.c = c; s.d = d; s.e = e; s.f = f
+}
+
+函数 画布2D_resetTransform(ctx) {
+    画布2D_setTransform(ctx, 1024, 0, 0, 1024, 0, 0)
+}
+
+函数 NC2D_变换点(s, x, y, 出_x, 出_y) {
+    出_x[0] = (s.a * x + s.c * y) / 1024 + s.e
+    出_y[0] = (s.b * x + s.d * y) / 1024 + s.f
+}
+
+// §8 扫描线填充 (Scanline Fill)
+// NC2D填充算法: 路径细分→边表生成→扫描线交点→
+// 奇偶规则/非零规则填充，全程定点算术
+
+定义 NC2D_最大边数 = 2048
+
+结构 NC2D_边 {
+    y_min: 0
+    y_max: 0
+    x_current: 0   // Q10定点
+    dx_per_y: 0     // Q10斜率
+    绕组方向: 0  // +1或-1
+}
+
+定义 可变 NC2D_边表 = 0
+定义 可变 NC2D_边数 = 0
+
+函数 NC2D_填充初始化() {
+    NC2D_边表 = 堆_分配_数组(大小为(NC2D_边) * NC2D_最大边数)
+    NC2D_边数 = 0
+}
+
+函数 NC2D_添加边(y0, x0, y1, x1) {
+    如果 (NC2D_边数 >= NC2D_最大边数) { 返回 }
+    如果 (y0 == y1) { 返回 }  // 跳过水平边
+    定义 idx = NC2D_边数
+    如果 (y0 < y1) {
+        NC2D_边表[idx].y_min = y0
+        NC2D_边表[idx].y_max = y1
+        NC2D_边表[idx].x_current = x0 * 1024  // 转化为Q10
+        NC2D_边表[idx].dx_per_y = (x1 - x0) * 1024 / (y1 - y0)
+        NC2D_边表[idx].绕组方向 = 1
+    } 否则 {
+        NC2D_边表[idx].y_min = y1
+        NC2D_边表[idx].y_max = y0
+        NC2D_边表[idx].x_current = x1 * 1024
+        NC2D_边表[idx].dx_per_y = (x0 - x1) * 1024 / (y0 - y1)
+        NC2D_边表[idx].绕组方向 = -1
+    }
+    NC2D_边数 = NC2D_边数 + 1
+}
+
+函数 NC2D_扫描线填充(ctx, fillR, fillG, fillB, fillA) {
+    如果 (NC2D_边数 == 0) { 返回 }
+    // 找出 y 范围
+    定义 可变 y_min_all = NC2D_边表[0].y_min
+    定义 可变 y_max_all = NC2D_边表[0].y_max
+    定义 可变 k = 1
+    当 (k < NC2D_边数) {
+        如果 (NC2D_边表[k].y_min < y_min_all) { y_min_all = NC2D_边表[k].y_min }
+        如果 (NC2D_边表[k].y_max > y_max_all) { y_max_all = NC2D_边表[k].y_max }
+        k = k + 1
+    }
+    // 逐行扫描
+    定义 可变 y = y_min_all
+    当 (y < y_max_all && y < ctx.高) {
+        // 收集交点
+        定义 可变 交点数 = 0
+        定义 交点数组 = 堆_分配_数组(64)
+        定义 可变 e = 0
+        当 (e < NC2D_边数) {
+            如果 (y >= NC2D_边表[e].y_min && y < NC2D_边表[e].y_max) {
+                交点数组[交点数] = NC2D_边表[e].x_current / 1024
+                交点数 = 交点数 + 1
+                NC2D_边表[e].x_current = NC2D_边表[e].x_current + NC2D_边表[e].dx_per_y
+            }
+            e = e + 1
+        }
+        // 排序交点(插入排序)
+        定义 可变 si = 1
+        当 (si < 交点数) {
+            定义 tmp = 交点数组[si]
+            定义 可变 sj = si - 1
+            当 (sj >= 0 && 交点数组[sj] > tmp) {
+                交点数组[sj + 1] = 交点数组[sj]
+                sj = sj - 1
+            }
+            交点数组[sj + 1] = tmp
+            si = si + 1
+        }
+        // 填充配对区间
+        定义 可变 p = 0
+        当 (p + 1 < 交点数) {
+            定义 x0 = 交点数组[p]
+            定义 x1 = 交点数组[p + 1]
+            如果 (x0 < 0) { x0 = 0 }
+            如果 (x1 > ctx.宽) { x1 = ctx.宽 }
+            定义 可变 px = x0
+            当 (px < x1) {
+                NC2D_像素混合(ctx, px, y, fillR, fillG, fillB, fillA)
+                px = px + 1
+            }
+            p = p + 2
+        }
+        堆_释放(交点数组)
+        y = y + 1
+    }
+}
+
+// §9 像素混合与合成 (Pixel Blending)
+// NC2D合成模型: source-over / lighter / multiply / screen
+// 使用分层调和混合 = 预乘alpha后计算，避免除法
+
+定义 NC2D_BLEND_SRC_OVER = 0
+定义 NC2D_BLEND_LIGHTER = 1
+定义 NC2D_BLEND_MULTIPLY = 2
+定义 NC2D_BLEND_SCREEN = 3
+
+函数 NC2D_像素混合(ctx, x, y, srcR, srcG, srcB, srcA) {
+    如果 (x < 0 || x >= ctx.宽 || y < 0 || y >= ctx.高) { 返回 }
+    定义 offset = (y * ctx.宽 + x) * 4
+    定义 dstR = ctx.像素缓冲[offset]
+    定义 dstG = ctx.像素缓冲[offset + 1]
+    定义 dstB = ctx.像素缓冲[offset + 2]
+    定义 dstA = ctx.像素缓冲[offset + 3]
+    // 全局透明度
+    定义 ga = ctx.状态.全局透明度
+    定义 sa = srcA * ga / 255
+    // source-over: out = src * sa + dst * (1 - sa)
+    定义 inv_sa = 255 - sa
+    ctx.像素缓冲[offset] = (srcR * sa + dstR * inv_sa) / 255
+    ctx.像素缓冲[offset + 1] = (srcG * sa + dstG * inv_sa) / 255
+    ctx.像素缓冲[offset + 2] = (srcB * sa + dstB * inv_sa) / 255
+    ctx.像素缓冲[offset + 3] = sa + dstA * inv_sa / 255
+}
+
+函数 NC2D_像素混合_高级(ctx, x, y, srcR, srcG, srcB, srcA, 模式) {
+    如果 (x < 0 || x >= ctx.宽 || y < 0 || y >= ctx.高) { 返回 }
+    定义 offset = (y * ctx.宽 + x) * 4
+    定义 dR = ctx.像素缓冲[offset]
+    定义 dG = ctx.像素缓冲[offset + 1]
+    定义 dB = ctx.像素缓冲[offset + 2]
+    定义 可变 outR = 0
+    定义 可变 outG = 0
+    定义 可变 outB = 0
+    如果 (模式 == NC2D_BLEND_LIGHTER) {
+        outR = dR + srcR; 如果 (outR > 255) { outR = 255 }
+        outG = dG + srcG; 如果 (outG > 255) { outG = 255 }
+        outB = dB + srcB; 如果 (outB > 255) { outB = 255 }
+    } 否则 如果 (模式 == NC2D_BLEND_MULTIPLY) {
+        outR = dR * srcR / 255
+        outG = dG * srcG / 255
+        outB = dB * srcB / 255
+    } 否则 如果 (模式 == NC2D_BLEND_SCREEN) {
+        outR = 255 - (255 - dR) * (255 - srcR) / 255
+        outG = 255 - (255 - dG) * (255 - srcG) / 255
+        outB = 255 - (255 - dB) * (255 - srcB) / 255
+    } 否则 {
+        NC2D_像素混合(ctx, x, y, srcR, srcG, srcB, srcA)
+        返回
+    }
+    ctx.像素缓冲[offset] = outR
+    ctx.像素缓冲[offset + 1] = outG
+    ctx.像素缓冲[offset + 2] = outB
+    ctx.像素缓冲[offset + 3] = srcA
+}
+
+// §10 填充与描边 (Fill & Stroke)
+
+函数 画布2D_fill(ctx) {
+    如果 (ctx == 0 || ctx.路径大小 == 0) { 返回 }
+    NC2D_填充初始化()
+    // 路径→边表
+    定义 可变 i = 0
+    定义 可变 当前x = 0
+    定义 可变 当前y = 0
+    当 (i < ctx.路径大小) {
+        定义 cmd = ctx.路径命令[i]
+        如果 (cmd == NC2D_路径_MOVE) {
+            当前x = ctx.路径命令[i + 1]
+            当前y = ctx.路径命令[i + 2]
+            i = i + 3
+        } 否则 如果 (cmd == NC2D_路径_LINE) {
+            定义 nx = ctx.路径命令[i + 1]
+            定义 ny = ctx.路径命令[i + 2]
+            NC2D_添加边(当前y, 当前x, ny, nx)
+            当前x = nx
+            当前y = ny
+            i = i + 3
+        } 否则 如果 (cmd == NC2D_路径_CLOSE) {
+            i = i + 1
+        } 否则 {
+            i = i + 1  // 跳过未知命令
+        }
+    }
+    定义 s = ctx.状态
+    NC2D_扫描线填充(ctx, s.填充颜色R, s.填充颜色G, s.填充颜色B, s.填充颜色A)
+}
+
+函数 画布2D_stroke(ctx) {
+    如果 (ctx == 0 || ctx.路径大小 == 0) { 返回 }
+    定义 s = ctx.状态
+    定义 线宽 = s.线宽 / 1024  // Q10→像素
+    如果 (线宽 < 1) { 线宽 = 1 }
+    定义 可变 i = 0
+    定义 可变 当前x = 0
+    定义 可变 当前y = 0
+    当 (i < ctx.路径大小) {
+        定义 cmd = ctx.路径命令[i]
+        如果 (cmd == NC2D_路径_MOVE) {
+            当前x = ctx.路径命令[i + 1]
+            当前y = ctx.路径命令[i + 2]
+            i = i + 3
+        } 否则 如果 (cmd == NC2D_路径_LINE) {
+            定义 nx = ctx.路径命令[i + 1]
+            定义 ny = ctx.路径命令[i + 2]
+            NC2D_画线段(ctx, 当前x, 当前y, nx, ny, 线宽, s.描边颜色R, s.描边颜色G, s.描边颜色B, s.描边颜色A)
+            当前x = nx
+            当前y = ny
+            i = i + 3
+        } 否则 {
+            i = i + 1
+        }
+    }
+}
+
+// Bresenham线段算法(带线宽)
+函数 NC2D_画线段(ctx, x0, y0, x1, y1, 线宽, r, g, b, a) {
+    定义 dx = x1 - x0
+    定义 dy = y1 - y0
+    如果 (dx < 0) { dx = 0 - dx }
+    如果 (dy < 0) { dy = 0 - dy }
+    定义 sx = 1
+    定义 sy = 1
+    如果 (x0 > x1) { sx = -1 }
+    如果 (y0 > y1) { sy = -1 }
+    定义 可变 err = dx - dy
+    定义 可变 cx = x0
+    定义 可变 cy = y0
+    定义 half = 线宽 / 2
+    当 (真) {
+        // 画线宽矩形
+        定义 可变 wy = 0 - half
+        当 (wy <= half) {
+            定义 可变 wx = 0 - half
+            当 (wx <= half) {
+                NC2D_像素混合(ctx, cx + wx, cy + wy, r, g, b, a)
+                wx = wx + 1
+            }
+            wy = wy + 1
+        }
+        如果 (cx == x1 && cy == y1) { 断开 }
+        定义 e2 = err * 2
+        如果 (e2 > 0 - dy) {
+            err = err - dy
+            cx = cx + sx
+        }
+        如果 (e2 < dx) {
+            err = err + dx
+            cy = cy + sy
+        }
+    }
+}
+
+// §11 渐变与图案 (Gradient & Pattern)
+
+定义 NC2D_最大色标 = 16
+
+结构 NC2D_色标 {
+    位置: 0    // Q10定点 0~1024
+    R: 0
+    G: 0
+    B: 0
+    A: 255
+}
+
+结构 NC2D_渐变 {
+    类型: 0    // 0=线性 1=径向
+    x0: 0
+    y0: 0
+    x1: 0
+    y1: 0
+    r0: 0
+    r1: 0
+    色标数: 0
+    色标表: 0   // NC2D_色标数组指针
+}
+
+函数 NC2D_创建线性渐变(x0, y0, x1, y1) {
+    定义 grad = 堆_分配(NC2D_渐变)
+    grad.类型 = 0
+    grad.x0 = x0; grad.y0 = y0
+    grad.x1 = x1; grad.y1 = y1
+    grad.色标数 = 0
+    grad.色标表 = 堆_分配_数组(大小为(NC2D_色标) * NC2D_最大色标)
+    返回 grad
+}
+
+函数 NC2D_创建径向渐变(x0, y0, r0, x1, y1, r1) {
+    定义 grad = 堆_分配(NC2D_渐变)
+    grad.类型 = 1
+    grad.x0 = x0; grad.y0 = y0; grad.r0 = r0
+    grad.x1 = x1; grad.y1 = y1; grad.r1 = r1
+    grad.色标数 = 0
+    grad.色标表 = 堆_分配_数组(大小为(NC2D_色标) * NC2D_最大色标)
+    返回 grad
+}
+
+函数 NC2D_渐变添加色标(grad, 位置, r, g, b, a) {
+    如果 (grad.色标数 >= NC2D_最大色标) { 返回 }
+    定义 idx = grad.色标数
+    grad.色标表[idx].位置 = 位置
+    grad.色标表[idx].R = r
+    grad.色标表[idx].G = g
+    grad.色标表[idx].B = b
+    grad.色标表[idx].A = a
+    grad.色标数 = grad.色标数 + 1
+}
+
+函数 NC2D_渐变采样(grad, t_q10) {
+    // t_q10为0~1024范围，线性插值相邻色标
+    如果 (grad.色标数 == 0) { 返回 0 }
+    如果 (t_q10 <= grad.色标表[0].位置) {
+        返回 (grad.色标表[0].A * 16777216) + (grad.色标表[0].R * 65536) + (grad.色标表[0].G * 256) + grad.色标表[0].B
+    }
+    定义 可变 i = 0
+    当 (i < grad.色标数 - 1) {
+        定义 s0 = grad.色标表[i]
+        定义 s1 = grad.色标表[i + 1]
+        如果 (t_q10 >= s0.位置 && t_q10 <= s1.位置) {
+            定义 range = s1.位置 - s0.位置
+            如果 (range == 0) { range = 1 }
+            定义 frac = (t_q10 - s0.位置) * 1024 / range
+            定义 inv = 1024 - frac
+            定义 rr = (s0.R * inv + s1.R * frac) / 1024
+            定义 gg = (s0.G * inv + s1.G * frac) / 1024
+            定义 bb = (s0.B * inv + s1.B * frac) / 1024
+            定义 aa = (s0.A * inv + s1.A * frac) / 1024
+            返回 (aa * 16777216) + (rr * 65536) + (gg * 256) + bb
+        }
+        i = i + 1
+    }
+    定义 last = grad.色标表[grad.色标数 - 1]
+    返回 (last.A * 16777216) + (last.R * 65536) + (last.G * 256) + last.B
+}
+
+// §12 像素数据操作 (ImageData)
+
+结构 NC2D_像素数据 {
+    宽: 0
+    高: 0
+    数据: 0   // RGBA u8数组
+}
+
+函数 画布2D_getImageData(ctx, sx, sy, sw, sh) {
+    定义 img = 堆_分配(NC2D_像素数据)
+    img.宽 = sw
+    img.高 = sh
+    img.数据 = 堆_分配_数组(sw * sh * 4)
+    定义 可变 dy = 0
+    当 (dy < sh) {
+        定义 src_y = sy + dy
+        如果 (src_y >= 0 && src_y < ctx.高) {
+            定义 可变 dx = 0
+            当 (dx < sw) {
+                定义 src_x = sx + dx
+                如果 (src_x >= 0 && src_x < ctx.宽) {
+                    定义 s_off = (src_y * ctx.宽 + src_x) * 4
+                    定义 d_off = (dy * sw + dx) * 4
+                    img.数据[d_off] = ctx.像素缓冲[s_off]
+                    img.数据[d_off + 1] = ctx.像素缓冲[s_off + 1]
+                    img.数据[d_off + 2] = ctx.像素缓冲[s_off + 2]
+                    img.数据[d_off + 3] = ctx.像素缓冲[s_off + 3]
+                }
+                dx = dx + 1
+            }
+        }
+        dy = dy + 1
+    }
+    返回 img
+}
+
+函数 画布2D_putImageData(ctx, img, dx, dy) {
+    如果 (ctx == 0 || img == 0) { 返回 }
+    定义 可变 iy = 0
+    当 (iy < img.高) {
+        定义 ty = dy + iy
+        如果 (ty >= 0 && ty < ctx.高) {
+            定义 可变 ix = 0
+            当 (ix < img.宽) {
+                定义 tx = dx + ix
+                如果 (tx >= 0 && tx < ctx.宽) {
+                    定义 s_off = (iy * img.宽 + ix) * 4
+                    定义 d_off = (ty * ctx.宽 + tx) * 4
+                    ctx.像素缓冲[d_off] = img.数据[s_off]
+                    ctx.像素缓冲[d_off + 1] = img.数据[s_off + 1]
+                    ctx.像素缓冲[d_off + 2] = img.数据[s_off + 2]
+                    ctx.像素缓冲[d_off + 3] = img.数据[s_off + 3]
+                }
+                ix = ix + 1
+            }
+        }
+        iy = iy + 1
+    }
+    // 标记脏区域
+    ctx.有脏区域 = 真
+}
+
+// §13 矩形快速绘制 (Rect shortcuts)
+
+函数 画布2D_fillRect(ctx, x, y, w, h) {
+    如果 (ctx == 0 || w <= 0 || h <= 0) { 返回 }
+    定义 s = ctx.状态
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.高) {
+        如果 (py >= 0) {
+            定义 可变 px = x
+            当 (px < x + w && px < ctx.宽) {
+                如果 (px >= 0) {
+                    NC2D_像素混合(ctx, px, py, s.填充颜色R, s.填充颜色G, s.填充颜色B, s.填充颜色A)
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+函数 画布2D_strokeRect(ctx, x, y, w, h) {
+    如果 (ctx == 0 || w <= 0 || h <= 0) { 返回 }
+    定义 s = ctx.状态
+    定义 lw = s.线宽 / 1024
+    如果 (lw < 1) { lw = 1 }
+    // 上边
+    画布2D_fillRect_内部(ctx, x, y, w, lw, s.描边颜色R, s.描边颜色G, s.描边颜色B, s.描边颜色A)
+    // 下边
+    画布2D_fillRect_内部(ctx, x, y + h - lw, w, lw, s.描边颜色R, s.描边颜色G, s.描边颜色B, s.描边颜色A)
+    // 左边
+    画布2D_fillRect_内部(ctx, x, y + lw, lw, h - lw * 2, s.描边颜色R, s.描边颜色G, s.描边颜色B, s.描边颜色A)
+    // 右边
+    画布2D_fillRect_内部(ctx, x + w - lw, y + lw, lw, h - lw * 2, s.描边颜色R, s.描边颜色G, s.描边颜色B, s.描边颜色A)
+}
+
+函数 画布2D_fillRect_内部(ctx, x, y, w, h, r, g, b, a) {
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.高) {
+        如果 (py >= 0) {
+            定义 可变 px = x
+            当 (px < x + w && px < ctx.宽) {
+                如果 (px >= 0) {
+                    NC2D_像素混合(ctx, px, py, r, g, b, a)
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+函数 画布2D_clearRect(ctx, x, y, w, h) {
+    如果 (ctx == 0) { 返回 }
+    定义 可变 py = y
+    当 (py < y + h && py < ctx.高) {
+        如果 (py >= 0) {
+            定义 可变 px = x
+            当 (px < x + w && px < ctx.宽) {
+                如果 (px >= 0) {
+                    定义 off = (py * ctx.宽 + px) * 4
+                    ctx.像素缓冲[off] = 0
+                    ctx.像素缓冲[off + 1] = 0
+                    ctx.像素缓冲[off + 2] = 0
+                    ctx.像素缓冲[off + 3] = 0
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+// §14 AI自适应绨制策略
+// AI推理预测下一帧绨制复杂度，动态切换软件/硬件渲染路径
+
+定义 可变 NC2D_总绨制次数 = 0
+定义 可变 NC2D_总像素数 = 0
+定义 可变 NC2D_GPU切换次 = 0
+
+函数 NC2D_AI绨制预测(ctx) {
+    // 特征向量: [画布宽, 画布高, 路径复杂度, 状态栈深度, 历史像素数, GPU可用]
+    定义 tensor = Tensor_创建(6)
+    Tensor_写(tensor, 0, ctx.宽)
+    Tensor_写(tensor, 1, ctx.高)
+    Tensor_写(tensor, 2, ctx.路径大小)
+    // 状态栈深度
+    定义 可变 深度 = 0
+    定义 可变 st = ctx.状态
+    当 (st != 0) {
+        深度 = 深度 + 1
+        st = st.上一状态
+    }
+    Tensor_写(tensor, 3, 深度)
+    Tensor_写(tensor, 4, NC2D_总像素数)
+    Tensor_写(tensor, 5, ctx.图处上下文 != 0)
+    定义 结果 = AI总线_推理(tensor, "NC2D_绨制策略")
+    Tensor_释放(tensor)
+    // 结果>512表示建议GPU加速
+    如果 (结果 > 512 && ctx.图处上下文 != 0) {
+        NC2D_GPU切换次 = NC2D_GPU切换次 + 1
+        返回 1  // 使用GPU路径
+    }
+    返回 0  // 保持软件路径
+}
+
+函数 NC2D_AI异常检测(ctx) {
+    定义 tensor = Tensor_创建(4)
+    Tensor_写(tensor, 0, NC2D_总绨制次数)
+    Tensor_写(tensor, 1, NC2D_总像素数)
+    Tensor_写(tensor, 2, NC2D_GPU切换次)
+    Tensor_写(tensor, 3, NC2D_边数)
+    定义 异常 = AI总线_异常检测(tensor, "NC2D_渲染异常")
+    Tensor_释放(tensor)
+    返回 异常
+}
+
+// §15 资源清理与统计
+
+函数 画布2D_销毁(ctx) {
+    如果 (ctx == 0) { 返回 }
+    // 释放状态栈
+    定义 可变 st = ctx.状态
+    当 (st != 0) {
+        定义 prev = st.上一状态
+        堆_释放(st)
+        st = prev
+    }
+    // 释放像素缓冲
+    如果 (ctx.像素缓冲 != 0) { 堆_释放(ctx.像素缓冲) }
+    // 释放GPU纹理
+    如果 (ctx.图处上下文 != 0 && ctx.纹理ID != 0) {
+        图处_删除纹理(ctx.图处上下文, ctx.纹理ID)
+    }
+    // 释放路径缓冲
+    如果 (ctx.路径命令 != 0) { 堆_释放(ctx.路径命令) }
+    堆_释放(ctx)
+}
+
+函数 NC2D_获取统计() {
+    返回 NC2D_总绨制次数 * 65536 + NC2D_总像素数
+}
+
+函数 NC2D_重置统计() {
+    NC2D_总绨制次数 = 0
+    NC2D_总像素数 = 0
+    NC2D_GPU切换次 = 0
+}

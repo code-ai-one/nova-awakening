@@ -1,0 +1,277 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./协议处理.nova")
+导入("./窗口管理每.nova")
+导入("../中枢/硬链接.nova")
+导入("../外联/地址解析辅.nova")
+导入("../中枢/整数转字符串.nova")
+
+定义 资源_图标根 = "../资源/图标/"
+定义 资源_系统图标根 = "../资源/系统图标/"
+定义 资源_壁纸根 = "../资源/壁纸/"
+
+函数 Nova原生桌面_标识到图片(标识) {
+    如果 (标识 == "终端") { 返回 资源_图标根 + "图标_终端.png" }
+    如果 (标识 == "ai") { 返回 资源_图标根 + "图标_AI.png" }
+    如果 (标识 == "system") { 返回 资源_系统图标根 + "系统_CPU.png" }
+    如果 (标识 == "multimodal") { 返回 资源_系统图标根 + "系统_视觉.png" }
+    如果 (标识 == "automation") { 返回 资源_图标根 + "图标_代码.png" }
+    如果 (标识 == "recovery") { 返回 资源_图标根 + "图标_设置.png" }
+    如果 (标识 == "settings") { 返回 资源_图标根 + "图标_设置.png" }
+    如果 (标识 == "voice") { 返回 资源_系统图标根 + "系统_语音.png" }
+    如果 (标识 == "avatar") { 返回 资源_系统图标根 + "系统_形象.png" }
+    如果 (标识 == "setup") { 返回 资源_图标根 + "图标_设置.png" }
+    返回 资源_图标根 + "图标_文件.png"
+}
+
+定义 壁纸_默认_冥想 = 资源_壁纸根 + "壁纸_默认_冥想.png"
+定义 壁纸_觉醒     = 资源_壁纸根 + "壁纸_觉醒.png"
+定义 壁纸_拔剑     = 资源_壁纸根 + "壁纸_拔剑.png"
+定义 壁纸_星空     = 资源_壁纸根 + "壁纸_星空.png"
+定义 壁纸_花海     = 资源_壁纸根 + "壁纸_花海.png"
+定义 壁纸_水面     = 资源_壁纸根 + "壁纸_水面.png"
+定义 壁纸_科技     = 资源_壁纸根 + "壁纸_科技.png"
+定义 壁纸_飘浮     = 资源_壁纸根 + "壁纸_飘浮.png"
+定义 可变 当前壁纸 = 资源_壁纸根 + "壁纸_默认_冥想.png"
+
+函数 Nova原生桌面_切换壁纸(索引) {
+    如果 (索引 == 0) { 当前壁纸 = 壁纸_默认_冥想 }
+    如果 (索引 == 1) { 当前壁纸 = 壁纸_觉醒 }
+    如果 (索引 == 2) { 当前壁纸 = 壁纸_拔剑 }
+    如果 (索引 == 3) { 当前壁纸 = 壁纸_星空 }
+    如果 (索引 == 4) { 当前壁纸 = 壁纸_花海 }
+    如果 (索引 == 5) { 当前壁纸 = 壁纸_水面 }
+    如果 (索引 == 6) { 当前壁纸 = 壁纸_科技 }
+    如果 (索引 == 7) { 当前壁纸 = 壁纸_飘浮 }
+}
+
+// §5 生成窗口NML — 每个窗口包含标题栏+内容区
+
+函数 Nova原生桌面_解析图标标识(url, 标识) {
+    如果 (字符串长度(标识) > 0) { 返回 标识 }
+    如果 (字符串查找(url, "nova://终端") == 0 || 字符串查找(url, "nova://newtab") == 0) { 返回 "终端" }
+    如果 (字符串查找(url, "nova://ai") == 0) { 返回 "ai" }
+    如果 (字符串查找(url, "nova://system") == 0) { 返回 "system" }
+    如果 (字符串查找(url, "nova://multimodal") == 0) { 返回 "multimodal" }
+    如果 (字符串查找(url, "nova://automation") == 0) { 返回 "automation" }
+    如果 (字符串查找(url, "nova://recovery") == 0) { 返回 "recovery" }
+    如果 (字符串查找(url, "nova://settings") == 0) { 返回 "settings" }
+    如果 (字符串查找(url, "nova://voice") == 0) { 返回 "voice" }
+    如果 (字符串查找(url, "nova://avatar") == 0) { 返回 "avatar" }
+    如果 (字符串查找(url, "nova://setup") == 0) { 返回 "setup" }
+    返回 "app"
+}
+
+函数 Nova原生桌面_图标短码(标识) {
+    如果 (标识 == "终端") { 返回 "NX" }
+    如果 (标识 == "ai") { 返回 "AI" }
+    如果 (标识 == "system") { 返回 "IO" }
+    如果 (标识 == "multimodal") { 返回 "MM" }
+    如果 (标识 == "automation") { 返回 "AT" }
+    如果 (标识 == "recovery") { 返回 "RC" }
+    如果 (标识 == "settings") { 返回 "ST" }
+    如果 (标识 == "voice") { 返回 "VC" }
+    如果 (标识 == "avatar") { 返回 "AV" }
+    如果 (标识 == "setup") { 返回 "SU" }
+    返回 "AP"
+}
+
+函数 Nova原生桌面_图标标签(标识) {
+    如果 (标识 == "终端") { 返回 "CORE" }
+    如果 (标识 == "ai") { 返回 "智能体" }
+    如果 (标识 == "system") { 返回 "BUS" }
+    如果 (标识 == "multimodal") { 返回 "SENSE" }
+    如果 (标识 == "automation") { 返回 "FLOW" }
+    如果 (标识 == "recovery") { 返回 "SAFE" }
+    如果 (标识 == "settings") { 返回 "CTRL" }
+    如果 (标识 == "voice") { 返回 "VOICE" }
+    如果 (标识 == "avatar") { 返回 "AVATAR" }
+    如果 (标识 == "setup") { 返回 "BOOT" }
+    返回 "APP"
+}
+
+函数 Nova原生桌面_图标渐变(标识) {
+    如果 (标识 == "终端") { 返回 "linear-gradient(135deg,#ffffff,#dbeafe 48%,#bfdbfe 100%)" }
+    如果 (标识 == "ai") { 返回 "linear-gradient(135deg,#f5f3ff,#ddd6fe 48%,#c4b5fd 100%)" }
+    如果 (标识 == "system") { 返回 "linear-gradient(135deg,#eff6ff,#bfdbfe 48%,#93c5fd 100%)" }
+    如果 (标识 == "multimodal") { 返回 "linear-gradient(135deg,#ecfeff,#a5f3fc 44%,#7dd3fc 100%)" }
+    如果 (标识 == "automation") { 返回 "linear-gradient(135deg,#f0fdf4,#bbf7d0 44%,#86efac 100%)" }
+    如果 (标识 == "recovery") { 返回 "linear-gradient(135deg,#fff7ed,#fed7aa 44%,#fdba74 100%)" }
+    如果 (标识 == "settings") { 返回 "linear-gradient(135deg,#f8fafc,#e2e8f0 44%,#cbd5e1 100%)" }
+    如果 (标识 == "voice") { 返回 "linear-gradient(135deg,#fdf2f8,#fbcfe8 46%,#f9a8d4 100%)" }
+    如果 (标识 == "avatar") { 返回 "linear-gradient(135deg,#ecfeff,#bfdbfe 44%,#99f6e4 100%)" }
+    如果 (标识 == "setup") { 返回 "linear-gradient(135deg,#eef2ff,#c7d2fe 46%,#a5b4fc 100%)" }
+    返回 "linear-gradient(135deg,#ffffff,#e2e8f0 48%,#cbd5e1 100%)"
+}
+
+函数 Nova原生桌面_图标符号HTML(标识) {
+    定义 图片 = Nova原生桌面_标识到图片(标识)
+    返回 "<img class='icon-pic' src='" + 图片 + "' alt='" + 标识 + "'/>"
+}
+
+函数 Nova原生桌面_工作区高度() {
+    返回 桌面.屏幕高 - 桌面.任务栏高 - 桌面.系统栏高
+}
+
+函数 Nova原生桌面_建议窗口几何(序号) {
+    定义 左 = 228 + (序号 % 4) * 18
+    定义 顶 = 18 + (序号 % 4) * 16
+    定义 宽 = 桌面.屏幕宽 - 左 - 28
+    定义 高 = Nova原生桌面_工作区高度() - 顶 - 24
+    如果 (宽 < 860) {
+        左 = 36
+        宽 = 桌面.屏幕宽 - 72
+    }
+    如果 (高 < 560) {
+        顶 = 12
+        高 = Nova原生桌面_工作区高度() - 24
+    }
+    返回 [左, 顶, 宽, 高]
+}
+
+函数 Nova原生桌面_生成窗口NML(窗口) {
+    定义 focused = ""
+    如果 (窗口.ID == 桌面.焦点窗口) { focused = " focused" }
+
+    定义 可变 html = "<div class='nova-window" + focused + "'"
+    html = html + " style='left:" + 整数转字符串(窗口.x) + "px;"
+    html = html + "top:" + 整数转字符串(窗口.y) + "px;"
+    html = html + "width:" + 整数转字符串(窗口.宽) + "px;"
+    html = html + "height:" + 整数转字符串(窗口.高) + "px;"
+    html = html + "z-index:" + 整数转字符串(窗口.Z序) + ";'>"
+
+    // 标题栏
+    html = html + "<div class='window-titlebar'>"
+    html = html + "  <div class='window-controls'>"
+    html = html + "    <div class='window-btn close'></div>"
+    html = html + "    <div class='window-btn minimize'></div>"
+    html = html + "    <div class='window-btn maximize'></div>"
+    html = html + "  </div>"
+    html = html + "  <span class='title'>" + 窗口.标题 + "</span>"
+    html = html + "</div>"
+
+    // 内容区(加载的网页/应用)
+    html = html + "<div class='window-content' id='wc-" + 整数转字符串(窗口.ID) + "'>"
+    html = html + Nova原生桌面_生成窗口内容HTML(窗口)
+    html = html + "</div>"
+    html = html + "</div>"
+
+    返回 html
+}
+
+// §6 桌面图标渲染
+
+函数 Nova原生桌面_生成图标NML() {
+    定义 可变 html = ""
+    定义 可变 i = 0
+
+    当 (i < 计数(桌面.桌面图标)) {
+        定义 图标 = 桌面.桌面图标[i]
+        定义 标识 = Nova原生桌面_解析图标标识(图标[1], 图标[2])
+        定义 标签 = Nova原生桌面_图标标签(标识)
+        定义 背景 = Nova原生桌面_图标渐变(标识)
+        定义 符号 = Nova原生桌面_图标符号HTML(标识)
+        html = html + "<div class='desktop-icon' style='left:" + 整数转字符串(图标[3]) + "px;top:" + 整数转字符串(图标[4]) + "px;'"
+        html = html + " data-url='" + 图标[1] + "'>"
+        html = html + "  <div class='icon-img'>" + 符号 + "</div>"
+        html = html + "  <div class='icon-name'>" + 图标[0] + "</div>"
+        html = html + "  <div class='icon-caption'>" + 标签 + "</div>"
+        html = html + "</div>"
+        i = i + 1
+    }
+    返回 html
+}
+
+// §7 任务栏渲染
+
+函数 Nova原生桌面_生成任务栏NML() {
+    定义 可变 html = ""
+    定义 可变 i = 0
+    当 (i < 计数(桌面.窗口列表)) {
+        定义 窗口 = 桌面.窗口列表[i]
+        定义 active = ""
+        定义 标识 = Nova原生桌面_解析图标标识(窗口.URL, "")
+        定义 符号 = Nova原生桌面_图标符号HTML(标识)
+        如果 (窗口.ID == 桌面.焦点窗口) { active = " active" }
+        html = html + "<div class='taNova缓冲ar-app" + active + "' data-wid='" + 整数转字符串(窗口.ID) + "'>"
+        html = html + "<span class='taNova缓冲ar-app-symbol'>" + 符号 + "</span>"
+        html = html + "</div>"
+        i = i + 1
+    }
+    返回 html
+}
+
+// §8 桌面事件处理
+
+函数 Nova原生桌面_图标双击(图标索引) {
+    如果 (图标索引 < 计数(桌面.桌面图标)) {
+        定义 图标 = 桌面.桌面图标[图标索引]
+        定义 几何 = Nova原生桌面_建议窗口几何(图标索引)
+        Nova原生桌面_打开窗口(图标[0], 图标[1],
+            几何[0], 几何[1], 几何[2], 几何[3])
+    }
+}
+
+函数 Nova原生桌面_任务栏点击(窗口ID) {
+    Nova原生桌面_聚焦窗口(窗口ID)
+}
+
+// §9 加载任意平台界面
+
+函数 Nova原生桌面_加载外部平台(url, 标题) {
+    // 核心: 任何Web平台都可以作为NovaOS的"窗口应用"加载
+    // 实现: 每个窗口就是一个完整的浏览器实例
+    // 效果: 微信网页版/行业 Docs/GitHub 都是NovaOS原生窗口
+    定义 几何 = Nova原生桌面_建议窗口几何(计数(桌面.窗口列表) + 1)
+    返回 Nova原生桌面_打开窗口(标题, url,
+        几何[0], 几何[1], 几何[2], 几何[3])
+}
+
+函数 Nova原生桌面_生成窗口内容HTML(窗口) {
+    定义 可变 内容 = ""
+    如果 (字符串查找(窗口.URL, "nova://ai") == 0) {
+        内容 = 浏览器网络_生成AI工作台内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://system") == 0) {
+        内容 = 浏览器网络_生成系统面内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://settings") == 0) {
+        内容 = 浏览器网络_生成设置内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://multimodal") == 0) {
+        内容 = 浏览器网络_生成多模态内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://voice") == 0) {
+        内容 = 浏览器网络_生成语音内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://avatar") == 0) {
+        内容 = 浏览器网络_生成形象内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://automation") == 0) {
+        内容 = 浏览器网络_生成自动化内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://recovery") == 0) {
+        内容 = 浏览器网络_生成恢复内容HTML()
+    } 否则 如果 (字符串查找(窗口.URL, "nova://newtab") == 0 || 字符串查找(窗口.URL, "nova://终端") == 0) {
+        内容 = 浏览器网络_生成主壳内容HTML()
+    } 否则 {
+        内容 = "<section class='nova-grid'><div class='nova-panel'><h2>browser-终端 窗口上下文已连接</h2><p>当前窗口已经具备独立文档状态，后续可继续接入真实页面、任务流和多模态工作区。</p></div><div class='nova-panel'><h2>当前目标</h2><p>把浏览器窗口变成系统模块、AI工作台和自动化执行台的统一承载面。</p></div></section>"
+    }
+
+    定义 可变 html = "<div class='window-page-终端'>"
+    html = html + "<div class='window-page-title'>" + 窗口.标题 + "</div>"
+    html = html + "<div class='window-page-url'>" + 窗口.URL + "</div>"
+    html = html + "<div class='window-page-status'>browser-终端 窗口上下文已连接 · kernel+AI 页面已注入</div>"
+    html = html + "<div class='window-终端-actions'><a href='nova://终端'>主壳</a><a href='nova://ai'>AI</a><a href='nova://system'>系统</a><a href='nova://multimodal'>多模态</a><a href='nova://voice'>语音</a><a href='nova://avatar'>形象</a><a href='nova://recovery'>恢复</a></div>"
+    html = html + 内容
+    html = html + "</div>"
+    返回 html
+}
+
+函数 Nova原生桌面_构建窗口文档(窗口) {
+    定义 可变 html = "<!DOCTYPE html><html><head>"
+    html = html + "<meta charset='UTF-8'>"
+    html = html + "<title>" + 窗口.标题 + "</title>"
+    html = html + "<style>" + 桌面.主题CSS + "</style>"
+    html = html + "</head><body>"
+    html = html + Nova原生桌面_生成窗口NML(窗口)
+    html = html + "</body></html>"
+    返回 DOM_解析NML(html, 窗口.URL)
+}
+
+函数 Nova原生桌面_统计() {
+    返回 [计数(桌面.窗口列表), 桌面.焦点窗口, 计数(桌面.桌面图标)]
+}

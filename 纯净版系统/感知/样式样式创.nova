@@ -1,0 +1,209 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./原子驻留.nova")
+导入("./超传头部创.nova")
+导入("../中枢/内存初始化.nova")
+导入("../中枢/辅助存根.nova")
+导入("../中枢/整数转字符串.nova")
+
+//       css_style_sheet.cc (~1000行)
+//       css_rule.cc (~300行) + css_style_rule.cc (~400行)
+//       css_media_rule.cc (~300行) + media_query_evaluator.cc (~800行)
+//       computed_style.cc (getComputed样式) 
+//       css_style_declaration.cc (~600行)
+// CSSOM允许JS操作样式表:
+//   document.styleSheets[0].cssRules[0].style.color = "red"
+//   getComputed样式(el).width
+//   match媒体("(max-width: 768px)")
+// 本文件实现:
+//   1. CSS样式Sheet (样式表对象)
+//   2. CSSRule / CSS样式Rule / CSS媒体Rule / CSSKeyframesRule
+//   3. CSS样式Declaration (style属性对象)
+//   4. getComputed样式() 完整实现
+//   5. match媒体() / 媒体QueryList
+//   6. 样式Sheet集合管理
+
+// §1 CSSRule类型
+
+定义 CSS规则_样式     = 1     // CSS样式Rule: .foo { color: red }
+定义 CSS规则_媒体     = 4     // CSS媒体Rule: @media (...)
+定义 CSS规则_字体     = 5     // CSS字体FaceRule: @font-face
+定义 CSS规则_关键帧组 = 7     // CSSKeyframesRule: @keyframes
+定义 CSS规则_关键帧   = 8     // CSSKeyframeRule
+定义 CSS规则_支持     = 12    // CSSSupportsRule: @supports
+定义 CSS规则_导入     = 3     // CSSImportRule: @import
+定义 CSS规则_命名空间 = 10    // CSSNamespaceRule
+定义 CSS规则_层       = 16    // CSSLayerRule: @layer
+
+结构 CSSRule {
+    类型,    // u32 CSS规则_xxx
+    CSS文本,    // u64 完整规则文本
+    父规则,    // u64 CSSRule* (嵌套在@media等中时)
+    父样式表,    // u64 CSS样式Sheet*
+    // 子类数据
+    数据,    // u64 指向具体规则数据
+}
+
+结构 CSS样式Rule {
+    选择器文本,    // u64 ".foo, .bar"
+    样式声明,    // u64 CSS样式Declaration*
+}
+
+结构 CSS媒体Rule {
+    媒体文本,    // u64 "(max-width: 768px)"
+    媒体查询,    // u64 媒体Query* (解析后)
+    子规则,    // u64 CSSRule*数组
+    子规则数量,
+    子规则容量,
+}
+
+结构 CSSKeyframesRule_Data {
+    名称,    // u64 动画名称
+    关键帧,    // u64 CSSKeyframeRule*数组
+    关键帧数量,
+}
+
+// §2 CSS样式Declaration — style属性的JS接口
+// 元素.style.color = "red"  →  CSS样式Declaration.setProperty("color", "red")
+
+结构 CSS样式Declaration {
+    声明,    // u64 [属性名, 属性值, 优先级] 数组
+    声明数量,
+    声明容量,
+    所属规则,    // u64 CSSRule* (内联样式时为null)
+    所属元素,    // u64 元素* (内联样式时)
+    是内联,
+}
+
+函数 CSS样式Declaration_创建(是内联, 元素) {
+    定义 sd = 堆_分配(CSS样式Declaration)
+    sd.声明容量 = 64
+    sd.声明 = 堆_分配_数组(sd.声明容量 * 24)
+    sd.声明数量 = 0
+    sd.所属规则 = 0
+    sd.所属元素 = 元素
+    sd.是内联 = 是内联
+    返回 sd
+}
+
+函数 CSS样式Declaration_getPropertyValue(sd, 属性名) {
+    定义 可变 i = 0
+    当 (i < sd.声明数量) {
+        定义 偏移 = sd.声明 + i * 24
+        定义 名 = 内存_读64(偏移)
+        如果 (字符串_相等_不区分大小写(名, 属性名)) {
+            返回 内存_读64(偏移 + 8)
+        }
+        i = i + 1
+    }
+    返回 ""
+}
+
+函数 CSS样式Declaration_setProperty(sd, 属性名, 值, 优先级) {
+    // 查找已有
+    定义 可变 i = 0
+    当 (i < sd.声明数量) {
+        定义 偏移 = sd.声明 + i * 24
+        定义 名 = 内存_读64(偏移)
+        如果 (字符串_相等_不区分大小写(名, 属性名)) {
+            // 更新值
+            内存_写64(偏移 + 8, 字符串_复制(值))
+            内存_写32(偏移 + 16, 优先级)    // 0=normal 1=important
+            CSS样式Declaration_通知变更(sd)
+            返回
+        }
+        i = i + 1
+    }
+    // 新增
+    如果 (sd.声明数量 >= sd.声明容量) { 返回 }
+    定义 偏移 = sd.声明 + sd.声明数量 * 24
+    内存_写64(偏移, 字符串_复制(属性名))
+    内存_写64(偏移 + 8, 字符串_复制(值))
+    内存_写32(偏移 + 16, 优先级)
+    sd.声明数量 = sd.声明数量 + 1
+    CSS样式Declaration_通知变更(sd)
+}
+
+函数 CSS样式Declaration_removeProperty(sd, 属性名) {
+    定义 可变 i = 0
+    当 (i < sd.声明数量) {
+        定义 偏移 = sd.声明 + i * 24
+        定义 名 = 内存_读64(偏移)
+        如果 (字符串_相等_不区分大小写(名, 属性名)) {
+            定义 旧值 = 内存_读64(偏移 + 8)
+            // 移除: 后面前移
+            定义 可变 j = i
+            当 (j < sd.声明数量 - 1) {
+                内存_复制(sd.声明 + j * 24, sd.声明 + (j + 1) * 24, 24)
+                j = j + 1
+            }
+            sd.声明数量 = sd.声明数量 - 1
+            CSS样式Declaration_通知变更(sd)
+            返回 旧值
+        }
+        i = i + 1
+    }
+    返回 ""
+}
+
+函数 CSS样式Declaration_getPropertyPriority(sd, 属性名) {
+    定义 可变 i = 0
+    当 (i < sd.声明数量) {
+        定义 偏移 = sd.声明 + i * 24
+        如果 (字符串_相等_不区分大小写(内存_读64(偏移), 属性名)) {
+            如果 (内存_读32(偏移 + 16) == 1) { 返回 "important" }
+            返回 ""
+        }
+        i = i + 1
+    }
+    返回 ""
+}
+
+函数 CSS样式Declaration_item(sd, 索引) {
+    如果 (索引 >= sd.声明数量) { 返回 "" }
+    返回 内存_读64(sd.声明 + 索引 * 24)
+}
+
+函数 CSS样式Declaration_length(sd) { 返回 sd.声明数量 }
+
+函数 CSS样式Declaration_cssText(sd) {
+    定义 可变 结果 = ""
+    定义 可变 i = 0
+    当 (i < sd.声明数量) {
+        定义 偏移 = sd.声明 + i * 24
+        如果 (i > 0) { 结果 = 字符串_连接(结果, " ") }
+        结果 = 字符串_连接(结果, 内存_读64(偏移))
+        结果 = 字符串_连接(结果, ": ")
+        结果 = 字符串_连接(结果, 内存_读64(偏移 + 8))
+        如果 (内存_读32(偏移 + 16) == 1) {
+            结果 = 字符串_连接(结果, " !important")
+        }
+        结果 = 字符串_连接(结果, ";")
+        i = i + 1
+    }
+    返回 结果
+}
+
+函数 CSS样式Declaration_通知变更(sd) {
+    如果 (sd.是内联 && sd.所属元素 != 0) {
+        // 更新元素的style属性字符串
+        定义 css = CSS样式Declaration_cssText(sd)
+        元素_setAttribute(sd.所属元素, "style", css)
+        // 标记样式脏
+        sd.所属元素.节点标志 = sd.所属元素.节点标志 | 节点标志_样式脏
+    }
+}
+
+定义 可变 AI_样式样式创_样式缓存命中 = 0
+
+函数 AI_样式样式创_选择器复杂度(选择器长度, 组合子数) {
+    如果 (组合子数 > 5) { 返回 "高复杂度" }
+    如果 (组合子数 > 2) { 返回 "中复杂度" }
+    返回 "低复杂度"
+}
+
+函数 AI_样式样式创_布局缓存(元素哈希) {
+    AI_样式样式创_样式缓存命中 = AI_样式样式创_样式缓存命中 + 1
+    返回 元素哈希
+}

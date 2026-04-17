@@ -1,0 +1,176 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./感知戊.nova")
+导入("./感知甲丙.nova")
+
+// §5 R传控eerConnection
+
+结构 R传控eerConnection {
+    // 状态
+    signalingState,    // u8 RTC_SIGNALING_xxx
+    iceConnectionState,    // u8 ICE_xxx
+    iceGatheringState,    // u8 ICE_GATHER_xxx
+    connectionState,    // u8 CONN_xxx
+    // SDP
+    localDescription,    // u64 RTCSessionDescription*
+    remoteDescription,
+    pendingLocalDescription,
+    pendingRemoteDescription,
+    // ICE配置
+    iceServers,    // [8]u64 ICE服务器URL
+    iceServers数,
+    // ICE候选
+    本地候选,    // [32]u64 RTCIceCandidate*
+    本地候选数,
+    远端候选,    // [32]u64
+    远端候选数,
+    // 收发器(transceiver)
+    收发器,    // [8]u64 RTCRtpTransceiver*
+    收发器数,
+    // 数据通道
+    数据通道,    // [16]u64 RTCDataChannel*
+    数据通道数,
+    // 本地流
+    本地流,    // [4]u64 媒体Stream*
+    本地流数,
+    远端流,    // [4]u64
+    远端流数,
+    // 回调
+    onicecandidate,
+    ontrack,
+    ondatachannel,
+    oniceconnectionstatechange,
+    onnegotiationneeded,
+    onsignalingstatechange,
+    onconnectionstatechange,
+}
+
+函数 R传控eerConnection_创建(iceServers, iceServers数) {
+    定义 pc = 堆_分配(R传控eerConnection)
+    pc.signalingState = RTC_SIGNALING_STABLE
+    pc.iceConnectionState = ICE_NEW
+    pc.iceGatheringState = ICE_GATHER_NEW
+    pc.connectionState = CONN_NEW
+    pc.localDescription = 0; pc.remoteDescription = 0
+    pc.pendingLocalDescription = 0; pc.pendingRemoteDescription = 0
+    定义 可变 i = 0
+    当 (i < iceServers数 && i < 8) {
+        pc.iceServers[i] = 内存_读64(iceServers + i * 8)
+        i = i + 1
+    }
+    pc.iceServers数 = 如果(iceServers数 > 8, 8, iceServers数)
+    pc.本地候选数 = 0; pc.远端候选数 = 0
+    pc.收发器数 = 0; pc.数据通道数 = 0
+    pc.本地流数 = 0; pc.远端流数 = 0
+    返回 pc
+}
+
+// createOffer()
+函数 RTC_createOffer(pc) {
+    如果 (pc == 0) { 返回 0 }
+    返回 SDP_生成Offer(pc)
+}
+
+// createAnswer()
+函数 RTC_createAnswer(pc) {
+    如果 (pc == 0 || pc.remoteDescription == 0) { 返回 0 }
+    返回 SDP_生成Answer(pc)
+}
+
+// setLocalDescription(desc)
+函数 RTC_setLocalDescription(pc, desc) {
+    如果 (pc == 0 || desc == 0) { 返回 }
+    pc.localDescription = desc
+    如果 (desc.类型 == SDP_OFFER) {
+        pc.signalingState = RTC_SIGNALING_HAVE_LOCAL_OFFER
+    } 否则 如果 (desc.类型 == SDP_ANSWER) {
+        pc.signalingState = RTC_SIGNALING_STABLE
+    }
+    // 开始ICE收集
+    pc.iceGatheringState = ICE_GATHER_GATHERING
+    RTC_开始ICE收集(pc)
+}
+
+// setRemoteDescription(desc)
+函数 RTC_setRemoteDescription(pc, desc) {
+    如果 (pc == 0 || desc == 0) { 返回 }
+    pc.remoteDescription = desc
+    如果 (desc.类型 == SDP_OFFER) {
+        pc.signalingState = RTC_SIGNALING_HAVE_REMOTE_OFFER
+    } 否则 如果 (desc.类型 == SDP_ANSWER) {
+        pc.signalingState = RTC_SIGNALING_STABLE
+    }
+    // 处理远端媒体
+    // 触发ontrack事件(如果有新轨道)
+}
+
+// addIceCandidate(candidate)
+函数 RTC_addIceCandidate(pc, candidate) {
+    如果 (pc == 0 || candidate == 0) { 返回 }
+    如果 (pc.远端候选数 >= 32) { 返回 }
+    pc.远端候选[pc.远端候选数] = candidate
+    pc.远端候选数 = pc.远端候选数 + 1
+    // 尝试与远端候选建立连接
+    RTC_ICE检查(pc)
+}
+
+// addTrack(track, ...streams)
+函数 RTC_addTrack(pc, track, stream) {
+    如果 (pc == 0 || track == 0) { 返回 0 }
+    // 创建RTCRtpTransceiver
+    定义 tc = 堆_分配(RTCRtpTransceiver)
+    tc.sender_track = track
+    如果 (pc.收发器数 < 8) {
+        pc.收发器[pc.收发器数] = tc; pc.收发器数 = pc.收发器数 + 1
+    }
+    // 触发negotiationneeded
+    如果 (pc.onnegotiationneeded != 0) {
+        // 调用回调
+    }
+    返回 tc
+}
+
+// removeTrack(sender)
+函数 RTC_removeTrack(pc, sender) {
+    如果 (pc == 0 || sender == 0) { 返回 }
+    // 将sender的track设为null
+    // 触发negotiationneeded
+}
+
+// close()
+函数 RTC_close(pc) {
+    如果 (pc == 0) { 返回 }
+    pc.signalingState = RTC_SIGNALING_CLOSED
+    pc.iceConnectionState = ICE_CLOSED
+    pc.connectionState = CONN_CLOSED
+    // 关闭所有数据通道
+    定义 可变 i = 0
+    当 (i < pc.数据通道数) {
+        定义 dc = pc.数据通道[i]
+        如果 (dc != 0) { DataChannel_close(dc) }
+        i = i + 1
+    }
+}
+
+// getStats()
+函数 RTC_getStats(pc) {
+    如果 (pc == 0) { 返回 0 }
+    // 返回RTCStatsReport
+    // 包含: inbound-rtp/outbound-rtp/candidate-pair/transport/...
+    返回 0
+}
+
+定义 可变 AI_传控连接_调用数 = 0
+定义 可变 AI_传控连接_异常数 = 0
+
+函数 AI_传控连接_监控() {
+    AI_传控连接_调用数 = AI_传控连接_调用数 + 1
+    返回 AI_传控连接_异常数 == 0
+}
+
+函数 AI_传控连接_健康检查() {
+    如果 (AI_传控连接_调用数 > 0 && AI_传控连接_异常数 * 100 / AI_传控连接_调用数 > 10) {
+        返回 假
+    }
+    返回 真
+}

@@ -1,0 +1,237 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+
+// Worker线程与Structured Clone序列化
+
+// §1 常量
+
+// 工线类型
+定义 WORKER_DEDICATED = 0
+定义 WORKER_SHARED = 1
+定义 WORKER_SERVICE = 2 // 见Service工线.nova
+
+// 工线状态
+定义 WORKER_STATE_CREATED = 0
+定义 WORKER_STATE_RUNNING = 1
+定义 WORKER_STATE_CLOSING = 2
+定义 WORKER_STATE_TERMINATED = 3
+
+// 脚本类型
+定义 SCRIPT_CLASSIC = 0
+定义 SCRIPT_MODULE = 1
+
+// 消息类型
+定义 MSG_TYPE_DATA = 0
+定义 MSG_TYPE_ERROR = 1
+定义 MSG_TYPE_TERMINATE = 2
+
+// §2 Structured Clone
+
+结构 CloneBuffer {
+ 数据,
+ 大小,
+ 容量,
+ // Transferable列表
+ 转移,    // [16]u64
+ 转移数,
+}
+
+// 序列化类型标签
+定义 SC_TAG_NULL      = 0
+定义 SC_TAG_UNDEF     = 1
+定义 SC_TAG_BOOL_T    = 2
+定义 SC_TAG_BOOL_F    = 3
+定义 SC_TAG_INT32     = 4
+定义 SC_TAG_FLOAT64   = 5
+定义 SC_TAG_STRING    = 6
+定义 SC_TAG_ARRAY     = 7
+定义 SC_TAG_OBJECT    = 8
+定义 SC_TAG_DATE      = 9
+定义 SC_TAG_ARRAYBUF  = 10
+定义 SC_TAG_MAP       = 11
+定义 SC_TAG_SET       = 12
+定义 SC_TAG_REF       = 13  // 循环引用
+定义 SC_TAG_TRANSFER  = 14  // Transferable
+
+函数 SC_写字节(buf, val) {
+ 如果 (buf.大小 >= buf.容量) {
+  定义 new_cap = buf.容量 * 2
+  定义 new_data = 堆_分配(new_cap)
+  内存_复制(new_data, buf.数据, buf.大小)
+  堆_释放(buf.数据)
+  buf.数据 = new_data
+  buf.容量 = new_cap
+ }
+ 内存_写8(buf.数据 + buf.大小, val)
+ buf.大小 = buf.大小 + 1
+}
+函数 SC_写32位(buf, val) {
+ SC_写字节(buf, val & 0xFF)
+ SC_写字节(buf, (val >> 8) & 0xFF)
+ SC_写字节(buf, (val >> 16) & 0xFF)
+ SC_写字节(buf, (val >> 24) & 0xFF)
+}
+函数 SC_读字节(buf, pos) { 返回 内存_读8(buf.数据 + pos) }
+函数 SC_读32位(buf, pos) {
+ 返回 SC_读字节(buf, pos) | (SC_读字节(buf, pos+1) << 8) | (SC_读字节(buf, pos+2) << 16) | (SC_读字节(buf, pos+3) << 24)
+}
+
+函数 StructuredClone_序列化(值, transferList, transferCount) {
+ 定义 buf = 堆_分配(CloneBuffer)
+ buf.容量 = 4096
+ buf.数据 = 堆_分配(buf.容量)
+ buf.大小 = 0; buf.转移数 = 0
+ // 处理Transferable: 转移所有权
+ 如果 (transferList != 0) {
+  定义 可变 i = 0
+  当 (i < transferCount && i < 16) {
+   buf.转移[i] = 内存_读64(transferList + i * 8)
+   buf.转移数 = buf.转移数 + 1
+   i = i + 1
+  }
+ }
+ 定义 visited = []
+ SC_序列化值(buf, 值, visited)
+ 返回 buf
+}
+
+定义 可变 _SC_序列化深度 = 0
+
+函数 SC_序列化值(buf, 值, visited) {
+ _SC_序列化深度 = _SC_序列化深度 + 1
+ 如果 (_SC_序列化深度 > 1000) { _SC_序列化深度 = _SC_序列化深度 - 1; SC_写字节(buf, SC_TAG_NULL); 返回 }
+ 如果 (值 == 空) { SC_写字节(buf, SC_TAG_NULL); _SC_序列化深度 = _SC_序列化深度 - 1; 返回 }
+ 如果 (值 == 未定义) { SC_写字节(buf, SC_TAG_UNDEF); 返回 }
+ 如果 (值 == 真) { SC_写字节(buf, SC_TAG_BOOL_T); 返回 }
+ 如果 (值 == 假) { SC_写字节(buf, SC_TAG_BOOL_F); 返回 }
+ // 循环引用检测
+ 定义 可变 vi = 0
+ 当 (vi < 计数(visited)) {
+  如果 (visited[vi] == 值) {
+   SC_写字节(buf, SC_TAG_REF)
+   SC_写32位(buf, vi)
+   返回
+  }
+  vi = vi + 1
+ }
+ 如果 (是数字(值)) {
+  SC_写字节(buf, SC_TAG_INT32)
+  SC_写32位(buf, 值)
+  返回
+ }
+ 如果 (是字符串(值)) {
+  SC_写字节(buf, SC_TAG_STRING)
+  定义 len = 字符串长度(值)
+  SC_写32位(buf, len)
+  定义 可变 si = 0
+  当 (si < len) { SC_写字节(buf, 字符码(值, si)); si = si + 1 }
+  返回
+ }
+ 如果 (是列表(值)) {
+  追加(visited, 值)
+  SC_写字节(buf, SC_TAG_ARRAY)
+  定义 arr_len = 计数(值)
+  SC_写32位(buf, arr_len)
+  定义 可变 ai = 0
+  当 (ai < arr_len) { SC_序列化值(buf, 值[ai], visited); ai = ai + 1 }
+  返回
+ }
+ 如果 (是字典(值)) {
+  追加(visited, 值)
+  SC_写字节(buf, SC_TAG_OBJECT)
+  定义 keys = 获取键(值)
+  SC_写32位(buf, 计数(keys))
+  定义 可变 ki = 0
+  当 (ki < 计数(keys)) {
+   定义 k = keys[ki]
+   定义 klen = 字符串长度(k)
+   SC_写32位(buf, klen)
+   定义 可变 ci = 0
+   当 (ci < klen) { SC_写字节(buf, 字符码(k, ci)); ci = ci + 1 }
+   SC_序列化值(buf, 值[k], visited)
+   ki = ki + 1
+  }
+  返回
+ }
+ SC_写字节(buf, SC_TAG_NULL)
+}
+
+函数 StructuredClone_反序列化(buf) {
+ 如果 (buf == 0 || buf.大小 == 0) { 返回 0 }
+ 定义 可变 pos = [0]  // 用列表包装以便递归中修改
+ 定义 refs = []
+ 定义 result = SC_反序列化值(buf, pos, refs)
+ // 处理Transferable对象: 直接转移所有权
+ 定义 可变 ti = 0
+ 当 (ti < buf.转移数) {
+  // Transferable对象已在序列化时转移, 此处无需额外操作
+  ti = ti + 1
+ }
+ 返回 result
+}
+
+定义 可变 _SC_反序列化深度 = 0
+
+函数 SC_反序列化值(buf, pos, refs) {
+ _SC_反序列化深度 = _SC_反序列化深度 + 1
+ 如果 (_SC_反序列化深度 > 1000) { _SC_反序列化深度 = _SC_反序列化深度 - 1; 返回 空 }
+ 如果 (pos[0] >= buf.大小) { _SC_反序列化深度 = _SC_反序列化深度 - 1; 返回 空 }
+ 定义 tag = SC_读字节(buf, pos[0])
+ pos[0] = pos[0] + 1
+ 如果 (tag == SC_TAG_NULL) { 返回 空 }
+ 如果 (tag == SC_TAG_UNDEF) { 返回 未定义 }
+ 如果 (tag == SC_TAG_BOOL_T) { 返回 真 }
+ 如果 (tag == SC_TAG_BOOL_F) { 返回 假 }
+ 如果 (tag == SC_TAG_REF) {
+  定义 ref_idx = SC_读32位(buf, pos[0])
+  pos[0] = pos[0] + 4
+  如果 (ref_idx < 计数(refs)) { 返回 refs[ref_idx] }
+  返回 空
+ }
+ 如果 (tag == SC_TAG_INT32) {
+  定义 val = SC_读32位(buf, pos[0])
+  pos[0] = pos[0] + 4
+  返回 val
+ }
+ 如果 (tag == SC_TAG_STRING) {
+  定义 len = SC_读32位(buf, pos[0])
+  pos[0] = pos[0] + 4
+  定义 可变 s = ""
+  定义 可变 si = 0
+  当 (si < len) { s = s + 字符(SC_读字节(buf, pos[0])); pos[0] = pos[0] + 1; si = si + 1 }
+  返回 s
+ }
+ 如果 (tag == SC_TAG_ARRAY) {
+  定义 arr_len = SC_读32位(buf, pos[0])
+  pos[0] = pos[0] + 4
+  定义 arr = []
+  追加(refs, arr)
+  定义 可变 ai = 0
+  当 (ai < arr_len) { 追加(arr, SC_反序列化值(buf, pos, refs)); ai = ai + 1 }
+  返回 arr
+ }
+ 如果 (tag == SC_TAG_OBJECT) {
+  定义 num_keys = SC_读32位(buf, pos[0])
+  pos[0] = pos[0] + 4
+  定义 obj = {}
+  追加(refs, obj)
+  定义 可变 ki = 0
+  当 (ki < num_keys) {
+   定义 klen = SC_读32位(buf, pos[0])
+   pos[0] = pos[0] + 4
+   定义 可变 k = ""
+   定义 可变 ci = 0
+   当 (ci < klen) { k = k + 字符(SC_读字节(buf, pos[0])); pos[0] = pos[0] + 1; ci = ci + 1 }
+   obj[k] = SC_反序列化值(buf, pos, refs)
+   ki = ki + 1
+  }
+  返回 obj
+ }
+ 返回 空
+}
+
+// structuredClone(value, {transfer})
+函数 全局_structuredClone(值, transferList, transferCount) {
+ 定义 buf = StructuredClone_序列化(值, transferList, transferCount)
+ 返回 StructuredClone_反序列化(buf)
+}

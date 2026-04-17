@@ -1,0 +1,1627 @@
+// Nova · x86-64 AVX-512 + AMX + VNNI 指令发射器
+// 依赖: 发射器.nova (发射/发射组/发射32)
+// 覆盖: AVX-512F/BW/DQ/VL/VNNI/BF16 + AMX-INT8/BF16/FP16
+
+导入("发射器.nova")
+
+// EVEX前缀编码辅助 (4字节前缀: 0x62 + P0 + P1 + P2)
+函数 发射_evex(R, X, B, R2, mm, W, vvvv, pp, z, L2, L, b位, V2, aaa) {
+    发射(0x62)
+    定义 p0 = ((R & 1) << 7) | ((X & 1) << 6) | ((B & 1) << 5) | ((R2 & 1) << 4) | (mm & 0x03)
+    发射(p0)
+    定义 p1 = ((W & 1) << 7) | (((~vvvv) & 0xF) << 3) | 0x04 | (pp & 0x03)
+    发射(p1)
+    定义 p2 = ((z & 1) << 7) | ((L2 & 1) << 6) | ((L & 1) << 5) | ((b位 & 1) << 4) | (((~V2) & 1) << 3) | (aaa & 0x07)
+    发射(p2)
+}
+
+// EVEX简化: 512位(L2=1,L=0), 无掩码(aaa=0), 无零化(z=0)
+函数 EVEX512编码(W, vvvv, pp, 操作码, modrm) {
+    发射_evex(1,  1,  1,  1,  1,  W,  vvvv,  pp,  0,  1, 0 ,  1, 0, 0)
+    发射(操作码) 发射(modrm)
+}
+
+// AVX-512F 浮点运算 (ZMM 512位 = 16×float / 8×double)
+
+// vaddps zmm, zmm, zmm — 16路单精度加法
+函数 发射_avx512_加ps(d, s1, s2) { EVEX512编码(0,  s1, x58,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vsubps zmm, zmm, zmm
+函数 发射_avx512_减ps(d, s1, s2) { EVEX512编码(0,  s1, x5C,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vmulps zmm, zmm, zmm
+函数 发射_avx512_乘ps(d, s1, s2) { EVEX512编码(0,  s1, x59,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vdivps zmm, zmm, zmm
+函数 发射_avx512_除ps(d, s1, s2) { EVEX512编码(0,  s1, x5E,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vsqrtps zmm, zmm
+函数 发射_avx512_根ps(d, s) { EVEX512编码(0, 0 ,  0x51,  0xC0 + (d & 7) * 8 + (s & 7), 0) }
+// vmaxps zmm, zmm, zmm
+函数 发射_avx512_最大ps(d, s1, s2) { EVEX512编码(0,  s1, x5F,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vminps zmm, zmm, zmm
+函数 发射_avx512_最小ps(d, s1, s2) { EVEX512编码(0,  s1, x5D,  0xC0 + (d & 7) * 8 + (s2 & 7), 0) }
+// vaddpd zmm, zmm, zmm — 8路双精度加法
+函数 发射_avx512_加pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x58, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vsubpd zmm, zmm, zmm
+函数 发射_avx512_减pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x5C, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vmulpd zmm, zmm, zmm
+函数 发射_avx512_乘pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x59, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vdivpd zmm, zmm, zmm
+函数 发射_avx512_除pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x5E, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vsqrtpd zmm, zmm
+函数 发射_avx512_根pd(d, s) { EVEX512编码(1, 0, 1, 0x51, 0xC0 + (d & 7) * 8 + (s & 7)) }
+// vmaxpd/vminpd
+函数 发射_avx512_最大pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x5F, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_最小pd(d, s1, s2) { EVEX512编码(1, s1, 1, 0x5D, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+
+// AVX-512F FMA (融合乘加 — 智能推理/训练核心)
+
+// vfmadd132ps zmm, zmm, zmm — d = d*s2 + s1
+函数 发射_avx512_fma132ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x98) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfmadd213ps zmm, zmm, zmm — d = s1*d + s2
+函数 发射_avx512_fma213ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xA8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfmadd231ps zmm, zmm, zmm — d = s1*s2 + d
+函数 发射_avx512_fma231ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xB8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfmadd213pd zmm — 双精度FMA
+函数 发射_avx512_fma213pd(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  1,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xA8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfmsub213ps — d = s1*d - s2
+函数 发射_avx512_fms213ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xAA) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfnmadd213ps — d = -(s1*d) + s2
+函数 发射_avx512_fnma213ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xAC) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfnmsub213ps — d = -(s1*d) - s2
+函数 发射_avx512_fnms213ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xAE) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512F 数据移动
+
+// vmovaps zmm, zmm — 对齐移动
+函数 发射_avx512_movaps(d, s) { EVEX512编码(0, 0 ,  0x28,  0xC0 + (d & 7) * 8 + (s & 7), 0) }
+// vmovups zmm, zmm — 非对齐移动
+函数 发射_avx512_movups(d, s) { EVEX512编码(0, 0 ,  0x10,  0xC0 + (d & 7) * 8 + (s & 7), 0) }
+// vmovapd zmm, zmm
+函数 发射_avx512_movapd(d, s) { EVEX512编码(1, 0, 1, 0x28, 0xC0 + (d & 7) * 8 + (s & 7)) }
+// vmovdqa32 zmm, zmm
+函数 发射_avx512_movdqa32(d, s) { EVEX512编码(0, 0, 1, 0x6F, 0xC0 + (d & 7) * 8 + (s & 7)) }
+// vmovdqa64 zmm, zmm
+函数 发射_avx512_movdqa64(d, s) { EVEX512编码(1, 0, 1, 0x6F, 0xC0 + (d & 7) * 8 + (s & 7)) }
+// vmovaps zmm, [mem]
+函数 发射_avx512_读对齐ps(zmm, reg) { EVEX512编码(0, 0 ,  0x28,  0x00 + (zmm & 7) * 8 + (reg & 7), 0) }
+// vmovaps [mem], zmm
+函数 发射_avx512_写对齐ps(zmm, reg) { EVEX512编码(0, 0 ,  0x29,  0x00 + (zmm & 7) * 8 + (reg & 7), 0) }
+// vmovups zmm, [mem]
+函数 发射_avx512_读非齐ps(zmm, reg) { EVEX512编码(0, 0 ,  0x10,  0x00 + (zmm & 7) * 8 + (reg & 7), 0) }
+// vmovups [mem], zmm
+函数 发射_avx512_写非齐ps(zmm, reg) { EVEX512编码(0, 0 ,  0x11,  0x00 + (zmm & 7) * 8 + (reg & 7), 0) }
+
+// AVX-512F 广播/排列/混合
+
+// vbroadcastss zmm, xmm
+函数 发射_avx512_广播ss(zmm, xmm) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x18) 发射(0xC0 + (zmm & 7) * 8 + (xmm & 7))
+}
+// vbroadcastsd zmm, xmm
+函数 发射_avx512_广播sd(zmm, xmm) {
+    发射_evex(1,  1,  1,  1,  2,  1,  0,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x19) 发射(0xC0 + (zmm & 7) * 8 + (xmm & 7))
+}
+// vpbroadcastd zmm, xmm — 广播32位整数
+函数 发射_avx512_广播d(zmm, xmm) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x58) 发射(0xC0 + (zmm & 7) * 8 + (xmm & 7))
+}
+// vpbroadcastq zmm, xmm
+函数 发射_avx512_广播q(zmm, xmm) {
+    发射_evex(1,  1,  1,  1,  2,  1,  0,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x59) 发射(0xC0 + (zmm & 7) * 8 + (xmm & 7))
+}
+// vpermps zmm, zmm, zmm
+函数 发射_avx512_排列ps(d, ctl, s) {
+    发射_evex(1,  1,  1,  1,  2,  0,  ctl,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x16) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpermd zmm, zmm, zmm
+函数 发射_avx512_排列d(d, ctl, s) {
+    发射_evex(1,  1,  1,  1,  2,  0,  ctl,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x36) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpermq zmm, zmm, imm8
+函数 发射_avx512_排列q(d, s, 控制) {
+    发射_evex(1,  1,  1,  1,  3,  1,  0,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x00) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(控制)
+}
+// vblendmps zmm{k}, zmm, zmm
+函数 发射_avx512_掩码混合ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x65) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512F 整数运算
+
+// vpaddd zmm, zmm, zmm
+函数 发射_avx512_加d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xFE, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsubd zmm, zmm, zmm
+函数 发射_avx512_减d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xFA, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpaddq zmm, zmm, zmm
+函数 发射_avx512_加q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xD4, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsubq zmm, zmm, zmm
+函数 发射_avx512_减q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xFB, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpmulld zmm, zmm, zmm
+函数 发射_avx512_乘d(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x40) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpmullq zmm, zmm, zmm — 64位乘法(AVX-512DQ)
+函数 发射_avx512_乘q(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  1,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x40) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpxord zmm, zmm, zmm
+函数 发射_avx512_异或d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xEF, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpxorq zmm, zmm, zmm
+函数 发射_avx512_异或q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xEF, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpandd zmm, zmm, zmm
+函数 发射_avx512_与d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xDB, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpandq zmm, zmm, zmm
+函数 发射_avx512_与q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xDB, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpord zmm, zmm, zmm
+函数 发射_avx512_或d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xEB, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vporq zmm, zmm, zmm
+函数 发射_avx512_或q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xEB, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpandnd/vpandnq
+函数 发射_avx512_与非d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xDF, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_与非q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xDF, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+
+// AVX-512F 比较/转换
+
+// vcmpps k, zmm, zmm, imm8
+函数 发射_avx512_比较ps(k, s1, s2, 模式) {
+    发射_evex(1,  1,  1,  1,  1,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0xC2) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(模式)
+}
+// vcmppd k, zmm, zmm, imm8
+函数 发射_avx512_比较pd(k, s1, s2, 模式) {
+    发射_evex(1,  1,  1,  1,  1,  1,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xC2) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(模式)
+}
+// vpcmpeqd k, zmm, zmm
+函数 发射_avx512_比较等d(k, s1, s2) {
+    发射_evex(1,  1,  1,  1,  1,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x76) 发射(0xC0 + (k & 7) * 8 + (s2 & 7))
+}
+// vpcmpgtd k, zmm, zmm
+函数 发射_avx512_比较大d(k, s1, s2) {
+    发射_evex(1,  1,  1,  1,  1,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x66) 发射(0xC0 + (k & 7) * 8 + (s2 & 7))
+}
+// vcvtps2dq zmm, zmm — float→int32
+函数 发射_avx512_浮转整(d, s) { EVEX512编码(0, 0, 1, 0x5B, 0xC0 + (d & 7) * 8 + (s & 7)) }
+// vcvtdq2ps zmm, zmm — int32→float
+函数 发射_avx512_整转浮(d, s) { EVEX512编码(0, 0 ,  0x5B,  0xC0 + (d & 7) * 8 + (s & 7), 0) }
+// vcvtps2pd zmm, ymm — float→double
+函数 发射_avx512_单转双(d, s) { EVEX512编码(0, 0 ,  0x5A,  0xC0 + (d & 7) * 8 + (s & 7), 0) }
+// vcvtpd2ps ymm, zmm — double→float
+函数 发射_avx512_双转单(d, s) { EVEX512编码(1, 0, 1, 0x5A, 0xC0 + (d & 7) * 8 + (s & 7)) }
+
+// AVX-512F 移位
+函数 发射_avx512_左移d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xF2, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_左移q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xF3, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_右移d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xD2, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_右移q(d, s1, s2) { EVEX512编码(1, s1, 1, 0xD3, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_算右移d(d, s1, s2) { EVEX512编码(0, s1, 1, 0xE2, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsravq — 64位变量算术右移(AVX-512唯一新增)
+函数 发射_avx512_算右移q(d, s1, s2) { EVEX512编码(1, s1, 1, 0x46, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vprolvd — 变量左旋转
+函数 发射_avx512_左旋d(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x15) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vprorvd — 变量右旋转
+函数 发射_avx512_右旋d(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x14) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512F 杂项
+
+// vgetexpps zmm, zmm — 提取浮点指数
+函数 发射_avx512_取指数ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x42) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vgetmantps zmm, zmm, imm8 — 提取尾数
+函数 发射_avx512_取尾数ps(d, s, 控制) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x26) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(控制)
+}
+// vscalefps zmm, zmm, zmm — 缩放(乘以2^n)
+函数 发射_avx512_缩放ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x2C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vrcp14ps zmm, zmm — 近似倒数
+函数 发射_avx512_倒数ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x4C) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vrsqrt14ps zmm, zmm — 近似倒数平方根
+函数 发射_avx512_倒数根ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x4E) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vrndscaleps zmm, zmm, imm8 — 精确舍入
+函数 发射_avx512_舍入ps(d, s, 模式) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x08) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(模式)
+}
+// vfixupimmps zmm, zmm, zmm, imm8 — 特殊值修复
+函数 发射_avx512_修复ps(d, s1, s2, 控制) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x54) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(控制)
+}
+
+// AVX-512 掩码寄存器操作
+
+// kmovw k, k
+函数 发射_avx512_kmov(kd, ks) { 发射组([0xC5, 0xF8, 0x90]) 发射(0xC0 + (kd & 7) * 8 + (ks & 7)) }
+// kandw k, k, k
+函数 发射_avx512_kand(kd, ks1, ks2) { 发射组([0xC5]) 发射(0xFC - ks1 * 8) 发射(0x41) 发射(0xC0 + (kd & 7) * 8 + (ks2 & 7)) }
+// korw k, k, k
+函数 发射_avx512_kor(kd, ks1, ks2) { 发射组([0xC5]) 发射(0xFC - ks1 * 8) 发射(0x45) 发射(0xC0 + (kd & 7) * 8 + (ks2 & 7)) }
+// kxorw k, k, k
+函数 发射_avx512_kxor(kd, ks1, ks2) { 发射组([0xC5]) 发射(0xFC - ks1 * 8) 发射(0x47) 发射(0xC0 + (kd & 7) * 8 + (ks2 & 7)) }
+// knotw k, k
+函数 发射_avx512_knot(kd, ks) { 发射组([0xC5, 0xF8, 0x44]) 发射(0xC0 + (kd & 7) * 8 + (ks & 7)) }
+// kmovw k, reg
+函数 发射_avx512_kmov_从reg(k, reg) { 发射组([0xC5, 0xF8, 0x92]) 发射(0xC0 + (k & 7) * 8 + (reg & 7)) }
+// kmovw reg, k
+函数 发射_avx512_kmov_到reg(reg, k) { 发射组([0xC5, 0xF8, 0x93]) 发射(0xC0 + (reg & 7) * 8 + (k & 7)) }
+
+// AVX-512BW (字节/字操作)
+
+// vpaddb zmm, zmm, zmm
+函数 发射_avx512_加b(d, s1, s2) { EVEX512编码(0, s1, 1, 0xFC, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpaddw zmm, zmm, zmm
+函数 发射_avx512_加w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xFD, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsubb zmm, zmm, zmm
+函数 发射_avx512_减b(d, s1, s2) { EVEX512编码(0, s1, 1, 0xF8, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsubw zmm, zmm, zmm
+函数 发射_avx512_减w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xF9, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpmullw zmm, zmm, zmm
+函数 发射_avx512_乘w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xD5, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpaddsb/sw — 饱和加
+函数 发射_avx512_饱和加b(d, s1, s2) { EVEX512编码(0, s1, 1, 0xEC, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_饱和加w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xED, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsubsb/sw — 饱和减
+函数 发射_avx512_饱和减b(d, s1, s2) { EVEX512编码(0, s1, 1, 0xE8, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_饱和减w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xE9, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpaddusb/uw — 无符号饱和加
+函数 发射_avx512_饱和加ub(d, s1, s2) { EVEX512编码(0, s1, 1, 0xDC, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_饱和加uw(d, s1, s2) { EVEX512编码(0, s1, 1, 0xDD, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpmaxsb/sw/sd zmm
+函数 发射_avx512_最大b(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x3C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_最大w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xEE, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpminsb/sw
+函数 发射_avx512_最小b(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x38) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_最小w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xEA, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpshufb zmm — 字节洗牌
+函数 发射_avx512_字节洗牌(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x00) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpmaddubsw zmm — 字节乘加
+函数 发射_avx512_字节乘加(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x04) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpmaddwd zmm — 字乘加
+函数 发射_avx512_字乘加(d, s1, s2) { EVEX512编码(0, s1, 1, 0xF5, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpavgb/w — 平均
+函数 发射_avx512_平均b(d, s1, s2) { EVEX512编码(0, s1, 1, 0xE0, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+函数 发射_avx512_平均w(d, s1, s2) { EVEX512编码(0, s1, 1, 0xE3, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+// vpsadbw zmm — 绝对差和
+函数 发射_avx512_绝对差和(d, s1, s2) { EVEX512编码(0, s1, 1, 0xF6, 0xC0 + (d & 7) * 8 + (s2 & 7)) }
+
+// AVX-512 VNNI (向量神经网络指令 — AI量化推理核心)
+
+// vpdpbusd zmm, zmm, zmm — 无符号/有符号字节→int32点积累加(INT8量化!)
+函数 发射_avx512_字节点积(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x50) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpbusds zmm — 饱和字节点积累加
+函数 发射_avx512_饱和字节点积(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x51) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpwssd zmm — INT16点积累加
+函数 发射_avx512_字点积(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x52) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpwssds zmm — 饱和INT16点积累加
+函数 发射_avx512_饱和字点积(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x53) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 BF16 (BFloat16 — AI混合精度训练)
+
+// vcvtne2ps2bf16 zmm — float→BF16
+函数 发射_avx512_转bf16(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  3,  0,  1, 0 ,  1, 0, 0)
+    发射(0x72) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vdpbf16ps zmm — BF16点积累加到FP32
+函数 发射_avx512_bf16点积(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  3,  0,  1, 0 ,  1, 0, 0)
+    发射(0x52) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vcvtneps2bf16 ymm, zmm — float32→bf16(截断)
+函数 发射_avx512_单转bf16(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x72) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// AVX-512 FP16 (半精度浮点)
+
+// vaddph zmm, zmm, zmm — 32路半精度加法
+函数 发射_avx512_加ph(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  5,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0x58) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vsubph zmm
+函数 发射_avx512_减ph(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  5,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vmulph zmm
+函数 发射_avx512_乘ph(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  5,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0x59) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vdivph zmm
+函数 发射_avx512_除ph(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  5,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfmadd213ph zmm — FP16 FMA
+函数 发射_avx512_fma213ph(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  6,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0xA8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vcvtph2ps zmm, ymm — FP16→FP32
+函数 发射_avx512_半转单(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x13) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2ph ymm, zmm, imm8 — FP32→FP16
+函数 发射_avx512_单转半(d, s, 控制) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x1D) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(控制)
+}
+
+// AMX (高级矩阵扩展 — AI大模型训练核心)
+
+// ldtilecfg [mem] — 加载瓦片配置
+函数 发射_amx_加载配置(reg) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0)
+    发射(0x49) 发射(0x00 + reg)
+}
+// sttilecfg [mem] — 存储瓦片配置
+函数 发射_amx_存储配置(reg) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1, 0 , 0 ,  1, 0, 0, 0, 0)
+    发射(0x49) 发射(0x00 + reg)
+}
+// tileloadd tmm, [base+stride*idx]
+函数 发射_amx_加载瓦片(tmm, base, stride) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  3, 0 , 0 ,  1, 0, 0, 0, 0)
+    发射(0x4B) 发射(0x04 + (tmm & 7) * 8) 发射(base + stride * 8)
+}
+// tilestored [base+stride*idx], tmm
+函数 发射_amx_存储瓦片(tmm, base, stride) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2, 0 , 0 ,  1, 0, 0, 0, 0)
+    发射(0x4B) 发射(0x04 + (tmm & 7) * 8) 发射(base + stride * 8)
+}
+// tdpbssd tmm, tmm, tmm — INT8矩阵乘(有符号*有符号→INT32)
+函数 发射_amx_矩阵乘ss(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  3, 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tdpbsud tmm — INT8(有符号*无符号)
+函数 发射_amx_矩阵乘su(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  2, 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tdpbusd tmm — INT8(无符号*有符号)
+函数 发射_amx_矩阵乘us(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1, 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tdpbuud tmm — INT8(无符号*无符号)
+函数 发射_amx_矩阵乘uu(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1, 0 , 0 ,  0,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tdpbf16ps tmm — BF16矩阵乘累加到FP32(AI大模型训练核心!)
+函数 发射_amx_bf16矩阵乘(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  3, 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tdpfp16ps tmm — FP16矩阵乘
+函数 发射_amx_fp16矩阵乘(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  2, 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// tilerelease — 释放瓦片
+函数 发射_amx_释放() {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0)
+    发射(0x49) 发射(0xC0)
+}
+// tilezero tmm — 瓦片清零
+函数 发射_amx_清零(tmm) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  3, 0 , 0 ,  1, 0, 0, 0, 0)
+    发射(0x49) 发射(0xC0 + (tmm & 7) * 8)
+}
+
+// VT-x 虚拟化指令
+函数 发射_vmxon(reg) { 发射(0xF3) 发射(0x0F) 发射(0xC7) 发射(0x30 + reg) }
+函数 发射_vmxoff() { 发射组([0x0F, 0x01, 0xC4]) }
+函数 发射_vmlaunch() { 发射组([0x0F, 0x01, 0xC2]) }
+函数 发射_vmresume() { 发射组([0x0F, 0x01, 0xC3]) }
+函数 发射_vmread() { 发射组([0x0F, 0x78, 0xC8]) }
+函数 发射_vmwrite() { 发射组([0x0F, 0x79, 0xC1]) }
+函数 发射_vmptrld(reg) { 发射(0x0F) 发射(0xC7) 发射(0x30 + reg) }
+函数 发射_vmclear(reg) { 发射(0x66) 发射(0x0F) 发射(0xC7) 发射(0x30 + reg) }
+函数 发射_vmptrst(reg) { 发射(0x0F) 发射(0xC7) 发射(0x38 + reg) }
+函数 发射_vmcall() { 发射组([0x0F, 0x01, 0xC1]) }
+函数 发射_invept(reg) { 发射(0x66) 发射(0x0F) 发射(0x38) 发射(0x80) 发射(0x00 + reg) }
+函数 发射_invvpid(reg) { 发射(0x66) 发射(0x0F) 发射(0x38) 发射(0x81) 发射(0x00 + reg) }
+
+// SGX / CET / 杂项系统指令
+函数 发射_encls() { 发射组([0x0F, 0x01, 0xCF]) }
+函数 发射_enclu() { 发射组([0x0F, 0x01, 0xD7]) }
+函数 发射_wrss64() { 发射组([0x66, 0x48, 0x0F, 0x38, 0xF6]) }
+函数 avx512_发射_incsspq() { 发射组([0xF3, 0x48, 0x0F, 0xAE, 0xE8]) }
+函数 avx512_发射_rdsspq() { 发射组([0xF3, 0x48, 0x0F, 0x1E, 0xC8]) }
+函数 发射_saveprevssp() { 发射组([0xF3, 0x0F, 0x01, 0xEA]) }
+函数 发射_rstorssp(reg) { 发射(0xF3) 发射(0x0F) 发射(0x01) 发射(0x28 + reg) }
+函数 发射_serialize() { 发射组([0x0F, 0x01, 0xE8]) }
+函数 avx512_发射_xsavec(reg) { 发射(0x0F) 发射(0xC7) 发射(0x20 + reg) }
+函数 avx512_发射_xsaves(reg) { 发射(0x0F) 发射(0xC7) 发射(0x28 + reg) }
+函数 发射_xrstors(reg) { 发射(0x0F) 发射(0xC7) 发射(0x18 + reg) }
+函数 发射_wbnoinvd() { 发射组([0xF3, 0x0F, 0x09]) }
+函数 avx512_发射_wbinvd() { 发射组([0x0F, 0x09]) }
+函数 avx512_发射_invd() { 发射组([0x0F, 0x08]) }
+
+// 字符串操作指令补全
+函数 avx512_发射_movsw() { 发射组([0x66, 0xA5]) }
+函数 avx512_发射_movsd_str() { 发射(0xA5) }
+函数 avx512_发射_movsq() { 发射组([0x48, 0xA5]) }
+函数 发射_rep_movsw() { 发射组([0xF3, 0x66, 0xA5]) }
+函数 发射_rep_movsd() { 发射组([0xF3, 0xA5]) }
+函数 avx512_发射_rep_movsq() { 发射组([0xF3, 0x48, 0xA5]) }
+函数 avx512_发射_stosw() { 发射组([0x66, 0xAB]) }
+函数 avx512_发射_stosd() { 发射(0xAB) }
+函数 avx512_发射_stosq() { 发射组([0x48, 0xAB]) }
+函数 发射_rep_stosw() { 发射组([0xF3, 0x66, 0xAB]) }
+函数 发射_rep_stosd() { 发射组([0xF3, 0xAB]) }
+函数 avx512_发射_rep_stosq() { 发射组([0xF3, 0x48, 0xAB]) }
+函数 avx512_发射_lodsb() { 发射(0xAC) }
+函数 avx512_发射_lodsw() { 发射组([0x66, 0xAD]) }
+函数 avx512_发射_lodsd() { 发射(0xAD) }
+函数 avx512_发射_lodsq() { 发射组([0x48, 0xAD]) }
+函数 avx512_发射_scasb() { 发射(0xAE) }
+函数 avx512_发射_scasw() { 发射组([0x66, 0xAF]) }
+函数 avx512_发射_scasd() { 发射(0xAF) }
+函数 avx512_发射_scasq() { 发射组([0x48, 0xAF]) }
+函数 avx512_发射_repne_scasb() { 发射组([0xF2, 0xAE]) }
+函数 发射_repe_scasb() { 发射组([0xF3, 0xAE]) }
+函数 avx512_发射_cmpsw() { 发射组([0x66, 0xA7]) }
+函数 avx512_发射_cmpsd_str() { 发射(0xA7) }
+函数 avx512_发射_cmpsq() { 发射组([0x48, 0xA7]) }
+函数 avx512_发射_repe_cmpsb() { 发射组([0xF3, 0xA6]) }
+函数 发射_repne_cmpsb() { 发射组([0xF2, 0xA6]) }
+函数 avx512_发射_repe_cmpsq() { 发射组([0xF3, 0x48, 0xA7]) }
+函数 avx512_发射_std() { 发射(0xFD) }
+函数 发射_insb() { 发射(0x6C) }
+函数 发射_insw() { 发射组([0x66, 0x6D]) }
+函数 发射_insd() { 发射(0x6D) }
+函数 发射_outsb() { 发射(0x6E) }
+函数 发射_outsw() { 发射组([0x66, 0x6F]) }
+函数 发射_outsd() { 发射(0x6F) }
+函数 发射_rep_insb() { 发射组([0xF3, 0x6C]) }
+函数 发射_rep_outsb() { 发射组([0xF3, 0x6E]) }
+
+// 原子操作补全
+// lock add [rcx], rax
+函数 发射_锁加64() { 发射组([0xF0, 0x48, 0x01, 0x01]) }
+// lock sub [rcx], rax
+函数 发射_锁减64() { 发射组([0xF0, 0x48, 0x29, 0x01]) }
+// lock and [rcx], rax
+函数 发射_锁与64() { 发射组([0xF0, 0x48, 0x21, 0x01]) }
+// lock or [rcx], rax
+函数 发射_锁或64() { 发射组([0xF0, 0x48, 0x09, 0x01]) }
+// lock xor [rcx], rax
+函数 发射_锁异或64() { 发射组([0xF0, 0x48, 0x31, 0x01]) }
+// lock inc qword [rcx]
+函数 发射_锁增64() { 发射组([0xF0, 0x48, 0xFF, 0x01]) }
+// lock dec qword [rcx]
+函数 发射_锁减1_64() { 发射组([0xF0, 0x48, 0xFF, 0x09]) }
+// lock bts [rcx], rax
+函数 发射_锁位设置() { 发射组([0xF0, 0x48, 0x0F, 0xAB, 0x01]) }
+// lock btr [rcx], rax
+函数 发射_锁位清除() { 发射组([0xF0, 0x48, 0x0F, 0xB3, 0x01]) }
+
+// AVX-512 Foundation 补全 — 转换/比较/置换
+// vcvtdq2ps zmm, zmm
+函数 发射_avx512_cvtdq2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 ,  1, 0 ,  1, 0, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2dq zmm, zmm
+函数 发射_avx512_cvtps2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvttps2dq zmm, zmm
+函数 发射_avx512_cvttps2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2pd zmm, ymm
+函数 发射_avx512_cvtps2pd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 ,  1, 0 ,  1, 0, 0, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtpd2ps ymm, zmm
+函数 发射_avx512_cvtpd2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtdq2pd zmm, ymm
+函数 发射_avx512_cvtdq2pd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtpd2dq ymm, zmm
+函数 发射_avx512_cvtpd2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  3,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvttpd2dq ymm, zmm
+函数 发射_avx512_cvttpd2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtudq2ps zmm, zmm — 无符号整数→单精度
+函数 发射_avx512_cvtudq2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x7A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2udq zmm, zmm — 单精度→无符号整数
+函数 发射_avx512_cvtps2udq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 ,  1, 0 ,  1, 0, 0, 0, 0)
+    发射(0x79) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvttps2udq zmm, zmm
+函数 发射_avx512_cvttps2udq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 ,  1, 0 ,  1, 0, 0, 0, 0)
+    发射(0x78) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtqq2ps ymm, zmm — 64位整数→单精度
+函数 发射_avx512_cvtqq2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 , 0 ,  1, 0 ,  1,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtqq2pd zmm, zmm — 64位整数→双精度
+函数 发射_avx512_cvtqq2pd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// AVX-512 比较/掩码操作
+// vpcmpd k, zmm, zmm, imm8 — 打包双字比较
+函数 发射_avx512_vpcmpd(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x1F) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// vpcmpq k, zmm, zmm, imm8 — 打包四字比较
+函数 发射_avx512_vpcmpq(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x1F) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// vpcmpud k, zmm, zmm, imm8 — 无符号双字比较
+函数 发射_avx512_vpcmpud(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x1E) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// vpcmpuq k, zmm, zmm, imm8 — 无符号四字比较
+函数 发射_avx512_vpcmpuq(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x1E) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// vcmpps k, zmm, zmm, imm8 — 单精度浮点比较
+函数 发射_avx512_vcmpps(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1, 0 ,  1, 0 ,  1, 0, 0, 0)
+    发射(0xC2) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// vcmppd k, zmm, zmm, imm8 — 双精度浮点比较
+函数 发射_avx512_vcmppd(k, s1, s2, 谓词) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0xC2) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(谓词)
+}
+// kmovw k, k — 掩码寄存器移动
+函数 发射_avx512_kmovw(kd, ks) { 发射组([0xC5, 0xF8, 0x90, 0xC0 + kd * 8 + ks]) }
+// kandw k, k, k
+函数 发射_avx512_kandw(kd, k1, k2) { 发射组([0xC5, 0xFC - k1 * 8, 0x41, 0xC0 + kd * 8 + k2]) }
+// korw k, k, k
+函数 发射_avx512_korw(kd, k1, k2) { 发射组([0xC5, 0xFC - k1 * 8, 0x45, 0xC0 + kd * 8 + k2]) }
+// kxorw k, k, k
+函数 发射_avx512_kxorw(kd, k1, k2) { 发射组([0xC5, 0xFC - k1 * 8, 0x47, 0xC0 + kd * 8 + k2]) }
+// knotw k, k
+函数 发射_avx512_knotw(kd, ks) { 发射组([0xC5, 0xF8, 0x44, 0xC0 + kd * 8 + ks]) }
+// ktestw k, k
+函数 发射_avx512_ktestw(k1, k2) { 发射组([0xC5, 0xF8, 0x99, 0xC0 + k1 * 8 + k2]) }
+// kortestw k, k
+函数 发射_avx512_kortestw(k1, k2) { 发射组([0xC5, 0xF8, 0x98, 0xC0 + k1 * 8 + k2]) }
+
+// AVX-512 高级运算
+// vpternlogd zmm, zmm, zmm, imm8 — 三元逻辑
+函数 发射_avx512_vpternlogd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x25) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vpternlogq zmm, zmm, zmm, imm8
+函数 发射_avx512_vpternlogq(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x25) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vgetexpps zmm, zmm — 提取指数
+函数 发射_avx512_vgetexpps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x42) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vgetexppd zmm, zmm
+函数 发射_avx512_vgetexppd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x42) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vgetmantps zmm, zmm, imm8 — 提取尾数
+函数 发射_avx512_vgetmantps(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x26) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vgetmantpd zmm, zmm, imm8
+函数 发射_avx512_vgetmantpd(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x26) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vrndscaleps zmm, zmm, imm8 — 舍入控制
+函数 发射_avx512_vrndscaleps(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x08) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vrndscalepd zmm, zmm, imm8
+函数 发射_avx512_vrndscalepd(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x09) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vreduceps zmm, zmm, imm8 — 区间缩减
+函数 发射_avx512_vreduceps(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x56) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vreducepd zmm, zmm, imm8
+函数 发射_avx512_vreducepd(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x56) 发射(0xC0 + (d & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vscalefps zmm, zmm, zmm — 浮点缩放
+函数 发射_avx512_vscalefps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x2C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vscalefpd zmm, zmm, zmm
+函数 发射_avx512_vscalefpd(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x2C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vrangeps zmm, zmm, zmm, imm8 — 范围选择
+函数 发射_avx512_vrangeps(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x50) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vrangepd zmm, zmm, zmm, imm8
+函数 发射_avx512_vrangepd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x50) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vfixupimmps zmm, zmm, zmm, imm8 — 浮点修正
+函数 发射_avx512_vfixupimmps(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x54) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vfixupimmpd zmm, zmm, zmm, imm8
+函数 发射_avx512_vfixupimmpd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x54) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vfpclassps k, zmm, imm8 — 浮点分类
+函数 发射_avx512_vfpclassps(k, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x66) 发射(0xC0 + (k & 7) * 8 + (s & 7)) 发射(imm)
+}
+// vfpclasspd k, zmm, imm8
+函数 发射_avx512_vfpclasspd(k, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x66) 发射(0xC0 + (k & 7) * 8 + (s & 7)) 发射(imm)
+}
+
+// AVX-512 置换/压缩/展开
+// vpermb zmm, zmm, zmm — 字节级置换
+函数 发射_avx512_vpermb(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x8D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermw zmm, zmm, zmm — 字级置换
+函数 发射_avx512_vpermw(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x8D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermd zmm, zmm, zmm — 双字级置换
+函数 发射_avx512_vpermd(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x36) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermq zmm, zmm, zmm — 四字级置换
+函数 发射_avx512_vpermq(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x36) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermi2d zmm, zmm, zmm — 双索引置换
+函数 发射_avx512_vpermi2d(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x76) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermi2q zmm, zmm, zmm
+函数 发射_avx512_vpermi2q(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x76) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermt2d zmm, zmm, zmm
+函数 发射_avx512_vpermt2d(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x7E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpermt2q zmm, zmm, zmm
+函数 发射_avx512_vpermt2q(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x7E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpcompressd zmm, zmm — 打包压缩双字
+函数 发射_avx512_vpcompressd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x8B) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vpcompressq zmm, zmm
+函数 发射_avx512_vpcompressq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x8B) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vpexpandd zmm, zmm — 打包展开双字
+函数 发射_avx512_vpexpandd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x89) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpexpandq zmm, zmm
+函数 发射_avx512_vpexpandq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x89) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcompressps zmm, zmm — 浮点压缩存储
+函数 发射_avx512_vcompressps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x8A) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vcompresspd zmm, zmm
+函数 发射_avx512_vcompresspd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x8A) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vexpandps zmm, zmm — 浮点展开加载
+函数 发射_avx512_vexpandps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x88) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vexpandpd zmm, zmm
+函数 发射_avx512_vexpandpd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x88) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// AVX-512CD (冲突检测)
+// vpconflictd zmm, zmm — 双字冲突检测
+函数 发射_avx512_vpconflictd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xC4) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpconflictq zmm, zmm
+函数 发射_avx512_vpconflictq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xC4) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vplzcntd zmm, zmm — 双字前导零计数
+函数 发射_avx512_vplzcntd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x44) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vplzcntq zmm, zmm
+函数 发射_avx512_vplzcntq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x44) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vbroadcastmb2q zmm, k — 掩码→四字广播
+函数 发射_avx512_vbroadcastmb2q(d, k) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x2A) 发射(0xC0 + (d & 7) * 8 + (k & 7))
+}
+// vbroadcastmw2d zmm, k — 掩码→双字广播
+函数 发射_avx512_vbroadcastmw2d(d, k) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x3A) 发射(0xC0 + (d & 7) * 8 + (k & 7))
+}
+
+// AVX-512 数据移动/广播补全
+// vmovdqa32 zmm, zmm — 对齐32位移动
+函数 发射_avx512_vmovdqa32(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x6F) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vmovdqa64 zmm, zmm — 对齐64位移动
+函数 发射_avx512_vmovdqa64(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x6F) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vmovdqu8 zmm, zmm — 非对齐8位移动
+函数 发射_avx512_vmovdqu8(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x6F) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vmovdqu16 zmm, zmm — 非对齐16位移动
+函数 发射_avx512_vmovdqu16(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x6F) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vmovdqu32 zmm, zmm — 非对齐32位移动
+函数 发射_avx512_vmovdqu32(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x7F) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vmovdqu64 zmm, zmm
+函数 发射_avx512_vmovdqu64(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  2,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x7F) 发射(0xC0 + (s & 7) * 8 + (d & 7))
+}
+// vpbroadcastb zmm, r32 — 字节广播
+函数 发射_avx512_vpbroadcastb(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x7A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpbroadcastw zmm, r32 — 字广播
+函数 发射_avx512_vpbroadcastw(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x7B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vbroadcasti32x4 zmm, xmm
+函数 发射_avx512_vbroadcasti32x4(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vbroadcasti64x4 zmm, ymm
+函数 发射_avx512_vbroadcasti64x4(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// AVX-512 杂项整数运算补全
+// vpopcntd zmm, zmm — 双字popcount (VPOPCNTDQ)
+函数 发射_avx512_vpopcntd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x55) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpopcntq zmm, zmm
+函数 发射_avx512_vpopcntq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x55) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpshufbitqmb k, zmm, zmm — 位混洗到掩码 (BITALG)
+函数 发射_avx512_vpshufbitqmb(k, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x8F) 发射(0xC0 + (k & 7) * 8 + (s2 & 7))
+}
+// vpmultishiftqb zmm, zmm, zmm — 多重移位(VBMI)
+函数 发射_avx512_vpmultishiftqb(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x83) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpshldw zmm, zmm, zmm, imm8 — 打包双移位左(VBMI2)
+函数 发射_avx512_vpshldw(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x70) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vpshldd zmm, zmm, zmm, imm8
+函数 发射_avx512_vpshldd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x71) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vpshldq zmm, zmm, zmm, imm8
+函数 发射_avx512_vpshldq(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x71) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vpshrdw/vpshrdd/vpshrdq — 打包双移位右
+函数 发射_avx512_vpshrdw(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x72) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+函数 发射_avx512_vpshrdd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x73) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+函数 发射_avx512_vpshrdq(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x73) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// valignd zmm, zmm, zmm, imm8 — 双字对齐
+函数 发射_avx512_valignd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x03) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// valignq zmm, zmm, zmm, imm8
+函数 发射_avx512_valignq(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x03) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vdbpsadbw zmm, zmm, zmm, imm8 — 双块字节SAD
+函数 发射_avx512_vdbpsadbw(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x42) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vpmullq zmm, zmm, zmm — 64位乘低 (IFMA补全)
+函数 发射_avx512_vpmullq(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x40) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 BF16 (Brain Floating Point 16)
+// vcvtne2ps2bf16 zmm, zmm, zmm
+函数 发射_avx512_vcvtne2ps2bf16(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x72) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vcvtneps2bf16 ymm, zmm
+函数 发射_avx512_vcvtneps2bf16(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x72) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vdpbf16ps zmm, zmm, zmm
+函数 发射_avx512_vdpbf16ps(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x52) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 FP16 (半精度浮点)
+// vaddph zmm, zmm, zmm
+函数 发射_avx512_vaddph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x58) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vsubph zmm, zmm, zmm
+函数 发射_avx512_vsubph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5C) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vmulph zmm, zmm, zmm
+函数 发射_avx512_vmulph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x59) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vdivph zmm, zmm, zmm
+函数 发射_avx512_vdivph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vsqrtph zmm, zmm
+函数 发射_avx512_vsqrtph(d, s) {
+    发射_evex(1,  1,  0,  1, 0 ,  0,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x51) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vfmadd132ph / vfmadd213ph / vfmadd231ph
+函数 发射_avx512_vfmadd132ph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x98) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vfmadd213ph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xA8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vfmadd231ph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xB8) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vmaxph / vminph
+函数 发射_avx512_vmaxph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5F) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vminph(d, s1, s2) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vcmpph k, zmm, zmm, imm8
+函数 发射_avx512_vcmpph(k, s1, s2, imm) {
+    发射_evex(1,  1,  0,  1, 0 ,  s1,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xC2) 发射(0xC0 + (k & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vcvtph2ps zmm, ymm — FP16到FP32
+函数 发射_avx512_vcvtph2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x13) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2ph ymm, zmm, imm8 — FP32到FP16
+函数 发射_avx512_vcvtps2ph(d, s, imm) {
+    发射_evex(1,  1,  1,  1,  3, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x1D) 发射(0xC0 + (s & 7) * 8 + (d & 7)) 发射(imm)
+}
+// vcvtph2pd zmm, xmm — FP16到FP64
+函数 发射_avx512_vcvtph2pd(d, s) {
+    发射_evex(1,  1,  0,  1, 0 ,  0,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// AVX-512 VNNI (Vector Neural Network)
+// vpdpbusd zmm, zmm, zmm — 无符号x有符号字节点积累加
+函数 发射_avx512_vpdpbusd(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x50) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpbusds zmm, zmm, zmm — 饱和版
+函数 发射_avx512_vpdpbusds(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x51) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpwssd zmm, zmm, zmm — 有符号字点积累加
+函数 发射_avx512_vpdpwssd(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x52) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpdpwssds zmm, zmm, zmm — 饱和版
+函数 发射_avx512_vpdpwssds(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x53) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 GFNI (Galois Field)
+// vgf2p8affineinvqb zmm, zmm, zmm, imm8
+函数 发射_avx512_vgf2p8affineinvqb(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0xCF) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vgf2p8affineqb zmm, zmm, zmm, imm8
+函数 发射_avx512_vgf2p8affineqb(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0xCE) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vgf2p8mulb zmm, zmm, zmm
+函数 发射_avx512_vgf2p8mulb(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xCF) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 VAES / VPCLMULQDQ
+// vaesenc zmm, zmm, zmm
+函数 发射_avx512_vaesenc(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xDC) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vaesenclast zmm, zmm, zmm
+函数 发射_avx512_vaesenclast(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xDD) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vaesdec zmm, zmm, zmm
+函数 发射_avx512_vaesdec(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xDE) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vaesdeclast zmm, zmm, zmm
+函数 发射_avx512_vaesdeclast(d, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0xDF) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vpclmulqdq zmm, zmm, zmm, imm8
+函数 发射_avx512_vpclmulqdq(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  1,  3,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x44) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+
+// AVX-512 更多掩码操作
+// kaddb k, k, k / kaddw / kaddd / kaddq
+函数 发射_avx512_kaddb(k1, k2, k3) {
+    发射_evex(1,  1, 0 , 0 ,  k2, 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x4A) 发射(0xC0 + (k1 & 7) * 8 + (k3 & 7))
+}
+函数 发射_avx512_kaddw(k1, k2, k3) {
+    发射_evex(1,  1, 0 , 0 ,  k2, 0 , 0 , 0 , 0, 0, 0, 0, 0, 0)
+    发射(0x4A) 发射(0xC0 + (k1 & 7) * 8 + (k3 & 7))
+}
+函数 发射_avx512_kaddd(k1, k2, k3) {
+    发射_evex(1,  1, 0 ,  1,  0,  k2, 0 , 0 ,  0,  1, 0, 0, 0, 0)
+    发射(0x4A) 发射(0xC0 + (k1 & 7) * 8 + (k3 & 7))
+}
+函数 发射_avx512_kaddq(k1, k2, k3) {
+    发射_evex(1,  1, 0 ,  1,  0,  k2, 0 , 0 , 0 , 0, 0, 0, 0, 0)
+    发射(0x4A) 发射(0xC0 + (k1 & 7) * 8 + (k3 & 7))
+}
+// ktestb / ktestw / ktestd / ktestq
+函数 发射_avx512_ktestb(k1, k2) {
+    发射_evex(1,  1, 0 , 0 , 0 , 0 , 0 ,  1, 0, 0, 0, 0, 0, 0)
+    发射(0x99) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7))
+}
+函数 发射_avx512_ktestd(k1, k2) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x99) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7))
+}
+函数 发射_avx512_ktestq(k1, k2) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 , 0 , 0, 0, 0, 0, 0, 0)
+    发射(0x99) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7))
+}
+// kshiftlb / kshiftlw / kshiftld / kshiftlq
+函数 发射_avx512_kshiftlb(k1, k2, imm) {
+    发射_evex(1,  1, 0 , 0 , 0 , 0 , 0 ,  1, 0, 0, 0, 0, 0, 0)
+    发射(0x32) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftlw(k1, k2, imm) {
+    发射_evex(1,  1, 0 , 0 , 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x32) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftld(k1, k2, imm) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x33) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftlq(k1, k2, imm) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 , 0 ,  1, 0, 0, 0, 0, 0)
+    发射(0x33) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+// kshiftrb / kshiftrw / kshiftrd / kshiftrq
+函数 发射_avx512_kshiftrb(k1, k2, imm) {
+    发射_evex(1,  1, 0 , 0 , 0 , 0 , 0 ,  1, 0, 0, 0, 0, 0, 0)
+    发射(0x30) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftrw(k1, k2, imm) {
+    发射_evex(1,  1, 0 , 0 , 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x30) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftrd(k1, k2, imm) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 ,  0,  1, 0, 0, 0, 0, 0)
+    发射(0x31) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+函数 发射_avx512_kshiftrq(k1, k2, imm) {
+    发射_evex(1,  1, 0 ,  1, 0 , 0 , 0 , 0 ,  1, 0, 0, 0, 0, 0)
+    发射(0x31) 发射(0xC0 + (k1 & 7) * 8 + (k2 & 7)) 发射(imm)
+}
+
+// AVX-512 散射/聚集
+// vgatherdps zmm, [base+zmm*scale]
+函数 发射_avx512_vgatherdps(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x92) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vgatherdpd zmm, [base+ymm*scale]
+函数 发射_avx512_vgatherdpd(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x92) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vgatherqps ymm, [base+zmm*scale]
+函数 发射_avx512_vgatherqps(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x93) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vgatherqpd zmm, [base+zmm*scale]
+函数 发射_avx512_vgatherqpd(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x93) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vpgatherdd zmm, [base+zmm*scale]
+函数 发射_avx512_vpgatherdd(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x90) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vpgatherdq zmm, [base+ymm*scale]
+函数 发射_avx512_vpgatherdq(d, base, idx) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x90) 发射(0x04 + (d & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vscatterdps [base+zmm*scale], zmm
+函数 发射_avx512_vscatterdps(base, idx, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xA2) 发射(0x04 + (s & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vscatterdpd [base+ymm*scale], zmm
+函数 发射_avx512_vscatterdpd(base, idx, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xA2) 发射(0x04 + (s & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vpscatterdd [base+zmm*scale], zmm
+函数 发射_avx512_vpscatterdd(base, idx, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0xA0) 发射(0x04 + (s & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+// vpscatterdq [base+ymm*scale], zmm
+函数 发射_avx512_vpscatterdq(base, idx, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xA0) 发射(0x04 + (s & 7) * 8) 发射((idx & 7) * 8 + (base & 7))
+}
+
+// AVX-512 更多浮点转换
+// vcvtdq2ps zmm, zmm
+函数 发射_avx512_vcvtdq2ps(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtdq2pd zmm, ymm
+函数 发射_avx512_vcvtdq2pd(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2dq zmm, zmm
+函数 发射_avx512_vcvtps2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  1, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2pd zmm, ymm
+函数 发射_avx512_vcvtps2pd(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtpd2ps ymm, zmm
+函数 发射_avx512_vcvtpd2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  1, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x5A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtpd2dq ymm, zmm
+函数 发射_avx512_vcvtpd2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvttpd2dq ymm, zmm — 截断
+函数 发射_avx512_vcvttpd2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  1, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0xE6) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvttps2dq zmm, zmm — 截断
+函数 发射_avx512_vcvttps2dq(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtudq2ps zmm, zmm — 无符号到浮点
+函数 发射_avx512_vcvtudq2ps(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x7A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtudq2pd zmm, ymm
+函数 发射_avx512_vcvtudq2pd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x7A) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtps2udq zmm, zmm
+函数 发射_avx512_vcvtps2udq(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x79) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtpd2udq ymm, zmm
+函数 发射_avx512_vcvtpd2udq(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x79) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtqq2ps ymm, zmm — 64位整数到浮点
+函数 发射_avx512_vcvtqq2ps(d, s) {
+    发射_evex(1,  1,  1,  1, 0 ,  0,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vcvtqq2pd zmm, zmm
+函数 发射_avx512_vcvtqq2pd(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x5B) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+
+// vpopcntb zmm, zmm — 字节popcount (BITALG)
+函数 发射_avx512_vpopcntb(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1, 0, 0, 0)
+    发射(0x54) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vpopcntw zmm, zmm — 字popcount
+函数 发射_avx512_vpopcntw(d, s) {
+    发射_evex(1,  1,  1,  1,  2, 0 ,  1,  0,  1, 0 ,  1,  1, 0, 0)
+    发射(0x54) 发射(0xC0 + (d & 7) * 8 + (s & 7))
+}
+// vp2intersectd k, zmm, zmm (VP2INTERSECT)
+函数 发射_avx512_vp2intersectd(k, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1, 0, 0)
+    发射(0x68) 发射(0xC0 + (k & 7) * 8 + (s2 & 7))
+}
+// vp2intersectq k, zmm, zmm
+函数 发射_avx512_vp2intersectq(k, s1, s2) {
+    发射_evex(1,  1,  1,  1,  2,  0,  s1,  1,  0,  1, 0 ,  1,  1, 0)
+    发射(0x68) 发射(0xC0 + (k & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 标量浮点操作
+// vaddss xmm, xmm, xmm
+函数 发射_avx512_vaddss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x58) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vaddsd xmm, xmm, xmm
+函数 发射_avx512_vaddsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x58) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vmulss / vmulsd
+函数 发射_avx512_vmulss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x59) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vmulsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x59) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vdivss / vdivsd
+函数 发射_avx512_vdivss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vdivsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x5E) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vsqrtss / vsqrtsd
+函数 发射_avx512_vsqrtss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x51) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vsqrtsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x51) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vrcp14ss / vrcp14sd
+函数 发射_avx512_vrcp14ss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x4D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vrcp14sd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x4D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vrsqrt14ss / vrsqrt14sd
+函数 发射_avx512_vrsqrt14ss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x4F) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vrsqrt14sd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x4F) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vfixupimmss / vfixupimmsd
+函数 发射_avx512_vfixupimmss(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x55) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+函数 发射_avx512_vfixupimmsd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x55) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vgetexpss / vgetexpsd
+函数 发射_avx512_vgetexpss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x43) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vgetexpsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x43) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+// vgetmantss / vgetmantsd
+函数 发射_avx512_vgetmantss(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x27) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+函数 发射_avx512_vgetmantsd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x27) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vrndscaless / vrndscalesd
+函数 发射_avx512_vrndscaless(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x0B) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+函数 发射_avx512_vrndscalesd(d, s1, s2, imm) {
+    发射_evex(1,  1,  1,  0,  3,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x0B) 发射(0xC0 + (d & 7) * 8 + (s2 & 7)) 发射(imm)
+}
+// vscalefss / vscalefsd
+函数 发射_avx512_vscalefss(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 , 0, 0, 0, 0)
+    发射(0x2D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+函数 发射_avx512_vscalefsd(d, s1, s2) {
+    发射_evex(1,  1,  1,  0,  2,  0,  s1, 0 , 0 , 0 ,  1, 0, 0, 0)
+    发射(0x2D) 发射(0xC0 + (d & 7) * 8 + (s2 & 7))
+}
+
+// AVX-512 FP16 标量补全 (MAP6)
+// vaddsh / vsubsh / vmulsh / vdivsh
+函数 发射_avx512_vaddsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x58) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vsubsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x5C) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vmulsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x59) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vdivsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x5E) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vminsh / vmaxsh
+函数 发射_avx512_vminsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x5D) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vmaxsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x5F) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vsqrtsh
+函数 发射_avx512_vsqrtsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x51) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vfmadd132sh / vfmadd213sh / vfmadd231sh
+函数 发射_avx512_vfmadd132sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x99) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfmadd213sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xA9) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfmadd231sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xB9) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vfmsub132sh / vfmsub213sh / vfmsub231sh
+函数 发射_avx512_vfmsub132sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x9B) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfmsub213sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xAB) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfmsub231sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xBB) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vfnmadd132sh / vfnmadd213sh / vfnmadd231sh
+函数 发射_avx512_vfnmadd132sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x9D) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfnmadd213sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xAD) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfnmadd231sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xBD) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vfnmsub132sh / vfnmsub213sh / vfnmsub231sh
+函数 发射_avx512_vfnmsub132sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x9F) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfnmsub213sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xAF) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfnmsub231sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xBF) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vcvtsh2ss / vcvtss2sh / vcvtsh2sd / vcvtsd2sh
+函数 发射_avx512_vcvtsh2ss(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x13) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vcvtss2sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x1D) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vcvtsh2sd(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x5A) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vcvtsd2sh(d, s1, s2) { 发射_evex(1,1,1,0,5,0,s1,0,0,0,0,0,0,1) 发射(0x5A) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vcvtsh2si / vcvtsh2usi / vcvttsh2si / vcvttsh2usi
+函数 发射_avx512_vcvtsh2si(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x2D) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtsh2usi(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x79) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvttsh2si(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x2C) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvttsh2usi(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x78) 发射(0xC0+(d&7)*8+(s&7)) }
+// vcvtsi2sh / vcvtusi2sh
+函数 发射_avx512_vcvtsi2sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x2A) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vcvtusi2sh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x7B) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vcomish / vucomish
+函数 发射_avx512_vcomish(s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x2F) 发射(0xC0+(s1&7)*8+(s2&7)) }
+函数 发射_avx512_vucomish(s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x2E) 发射(0xC0+(s1&7)*8+(s2&7)) }
+// vgetexpsh / vgetmantsh / vrndscalesh / vreducesh
+函数 发射_avx512_vgetexpsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x43) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vgetmantsh(d, s1, s2, imm) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x27) 发射(0xC0+(d&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vrndscalesh(d, s1, s2, imm) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x0A) 发射(0xC0+(d&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vreducesh(d, s1, s2, imm) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x57) 发射(0xC0+(d&7)*8+(s2&7)) 发射(imm) }
+// vscalefsh / vfpclasssh
+函数 发射_avx512_vscalefsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x2D) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vfpclasssh(k, s, imm) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0) 发射(0x67) 发射(0xC0+(k&7)*8+(s&7)) 发射(imm) }
+
+// AVX-512 IFMA (vpmadd52luq/vpmadd52huq)
+函数 发射_avx512_vpmadd52luq(d, s1, s2) { 发射_evex(1,1,1,1,2,0,s1,1,0,0,0,0,0,1) 发射(0xB4) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpmadd52huq(d, s1, s2) { 发射_evex(1,1,1,1,2,0,s1,1,0,0,0,0,0,1) 发射(0xB5) 发射(0xC0+(d&7)*8+(s2&7)) }
+
+函数 发射_avx512_vpermi2b(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x75) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpermt2b(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x7D) 发射(0xC0+(d&7)*8+(s2&7)) }
+
+// AVX-512 VBMI2 (vpcompressb/vpcompressw/vpexpandb/vpexpandw/vpshldvw/vpshldvd/vpshldvq/vpshrdvw/vpshrdvd/vpshrdvq/vpshldw/vpshldd/vpshldq/vpshrdw/vpshrdd/vpshrdq)
+函数 发射_avx512_vpcompressb(d, s) { 发射_evex(1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x63) 发射(0xC0+(s&7)*8+(d&7)) }
+函数 发射_avx512_vpcompressw(d, s) { 发射_evex(1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x63) 发射(0xC0+(s&7)*8+(d&7)) }
+函数 发射_avx512_vpexpandb(d, s) { 发射_evex(1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x62) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vpexpandw(d, s) { 发射_evex(1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x62) 发射(0xC0+(d&7)*8+(s&7)) }
+// vpshldvw/vpshldvd/vpshldvq
+函数 发射_avx512_vpshldvw(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x70) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpshldvd(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x71) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpshldvq(d, s1, s2) { 发射_evex(1,1,1,1,2,0,s1,1,0,0,0,0,0,1) 发射(0x71) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vpshrdvw/vpshrdvd/vpshrdvq
+函数 发射_avx512_vpshrdvw(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x72) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpshrdvd(d, s1, s2) { 发射_evex(1, 1, 1, 1, 2, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x73) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vpshrdvq(d, s1, s2) { 发射_evex(1,1,1,1,2,0,s1,1,0,0,0,0,0,1) 发射(0x73) 发射(0xC0+(d&7)*8+(s2&7)) }
+
+// AVX-512 更多比较/逻辑/转换
+// vpcmpb/vpcmpub/vpcmpw/vpcmpuw (带掩码比较)
+函数 发射_avx512_vpcmpb(k, s1, s2, imm) { 发射_evex(1, 1, 1, 1, 3, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x3F) 发射(0xC0+(k&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vpcmpub(k, s1, s2, imm) { 发射_evex(1, 1, 1, 1, 3, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x3E) 发射(0xC0+(k&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vpcmpw(k, s1, s2, imm) { 发射_evex(1, 1, 1, 1, 3, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x3F) 发射(0xC0+(k&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vpcmpuw(k, s1, s2, imm) { 发射_evex(1, 1, 1, 1, 3, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x3E) 发射(0xC0+(k&7)*8+(s2&7)) 发射(imm) }
+函数 发射_avx512_vcvtpd2ph(d, s) { 发射_evex(1,1,1,0,5,0,0,1,0,0,0,0,0,1) 发射(0x5A) 发射(0xC0+(d&7)*8+(s&7)) }
+// vcvtph2qq / vcvtqq2ph / vcvtph2uqq / vcvtuqq2ph
+函数 发射_avx512_vcvtph2qq(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7B) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtqq2ph(d, s) { 发射_evex(1,1,1,0,5,0,0,1,0,0,0,0,0,1) 发射(0x5B) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtph2uqq(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x79) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtuqq2ph(d, s) { 发射_evex(1,1,1,0,5,0,0,1,0,0,0,0,0,1) 发射(0x7A) 发射(0xC0+(d&7)*8+(s&7)) }
+// vcvtph2dq / vcvtdq2ph / vcvtph2udq / vcvtudq2ph
+函数 发射_avx512_vcvtph2dq(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x5B) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtdq2ph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x5B) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtph2udq(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x79) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtudq2ph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7A) 发射(0xC0+(d&7)*8+(s&7)) }
+// vcvtph2w / vcvtw2ph / vcvtph2uw / vcvtuw2ph
+函数 发射_avx512_vcvtph2w(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7D) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtw2ph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7D) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtph2uw(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7C) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vcvtuw2ph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x7C) 发射(0xC0+(d&7)*8+(s&7)) }
+
+// AVX-512 FP16 向量运算补全
+// vrcpph / vrsqrtph
+函数 发射_avx512_vrcpph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x4C) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vrsqrtph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x4E) 发射(0xC0+(d&7)*8+(s&7)) }
+// vrcpsh / vrsqrtsh
+函数 发射_avx512_vrcpsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x4D) 发射(0xC0+(d&7)*8+(s2&7)) }
+函数 发射_avx512_vrsqrtsh(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0x4F) 发射(0xC0+(d&7)*8+(s2&7)) }
+// vfpclassph / vcmpph
+函数 发射_avx512_vfpclassph(k, s, imm) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x66) 发射(0xC0+(k&7)*8+(s&7)) 发射(imm) }
+函数 发射_avx512_vcmpsh(k, s1, s2, imm) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 0, 0, 0, 0, 0, 0, 0) 发射(0xC2) 发射(0xC0+(k&7)*8+(s2&7)) 发射(imm) }
+// vgetexpph / vgetmantph / vrndscaleph / vreduceph
+函数 发射_avx512_vgetexpph(d, s) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x42) 发射(0xC0+(d&7)*8+(s&7)) }
+函数 发射_avx512_vgetmantph(d, s, imm) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x26) 发射(0xC0+(d&7)*8+(s&7)) 发射(imm) }
+函数 发射_avx512_vrndscaleph(d, s, imm) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x08) 发射(0xC0+(d&7)*8+(s&7)) 发射(imm) }
+函数 发射_avx512_vreduceph(d, s, imm) { 发射_evex(1, 1, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0) 发射(0x56) 发射(0xC0+(d&7)*8+(s&7)) 发射(imm) }
+// vscalefph
+函数 发射_avx512_vscalefph(d, s1, s2) { 发射_evex(1, 1, 1, 0, 5, 0, s1, 1, 0, 0, 0, 0, 0, 0) 发射(0x2C) 发射(0xC0+(d&7)*8+(s2&7)) }
+
+函数 发射_avx512_kandd(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x41) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kandq(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x41) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kord(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x45) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_korq(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x45) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kxord(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x47) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kxorq(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x47) 发射(0xC0+(k1&7)*8+(k3&7)) }
+// kxnorw/kxnord/kxnorq
+函数 发射_avx512_kxnorw(k1, k2, k3) { 发射(0xC5) 发射(0xEC-(k2&7)*8) 发射(0x46) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kxnord(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x46) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kxnorq(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x46) 发射(0xC0+(k1&7)*8+(k3&7)) }
+// kandnw/kandnd/kandnq
+函数 发射_avx512_kandnw(k1, k2, k3) { 发射(0xC5) 发射(0xEC-(k2&7)*8) 发射(0x42) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kandnd(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x42) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kandnq(k1, k2, k3) { 发射(0xC4) 发射(0xE1) 发射(0xEC-(k2&7)*8) 发射(0x42) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_knotd(k1, k2) { 发射(0xC4) 发射(0xE1) 发射(0xF8) 发射(0x44) 发射(0xC0+(k1&7)*8+(k2&7)) }
+函数 发射_avx512_knotq(k1, k2) { 发射(0xC4) 发射(0xE1) 发射(0xF8) 发射(0x44) 发射(0xC0+(k1&7)*8+(k2&7)) }
+函数 发射_avx512_kortestd(k1, k2) { 发射(0xC4) 发射(0xE1) 发射(0xF8) 发射(0x98) 发射(0xC0+(k1&7)*8+(k2&7)) }
+函数 发射_avx512_kortestq(k1, k2) { 发射(0xC4) 发射(0xE1) 发射(0xF8) 发射(0x98) 发射(0xC0+(k1&7)*8+(k2&7)) }
+// kunpckbw/kunpckwd/kunpckdq
+函数 发射_avx512_kunpckbw(k1, k2, k3) { 发射(0xC5) 发射(0xEC-(k2&7)*8) 发射(0x4B) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kunpckwd(k1, k2, k3) { 发射(0xC5) 发射(0xEC-(k2&7)*8) 发射(0x4B) 发射(0xC0+(k1&7)*8+(k3&7)) }
+函数 发射_avx512_kunpckdq(k1, k2, k3) { 发射(0xC5) 发射(0xEC-(k2&7)*8) 发射(0x4B) 发射(0xC0+(k1&7)*8+(k3&7)) }
+// kmovw r,k / k,r
+函数 发射_avx512_kmovw_r_k(r, k) { 发射(0xC5) 发射(0xF8) 发射(0x93) 发射(0xC0+(r&7)*8+(k&7)) }
+函数 发射_avx512_kmovw_k_r(k, r) { 发射(0xC5) 发射(0xF8) 发射(0x92) 发射(0xC0+(k&7)*8+(r&7)) }
+函数 发射_avx512_kmovd_r_k(r, k) { 发射(0xC5) 发射(0xFB) 发射(0x93) 发射(0xC0+(r&7)*8+(k&7)) }
+函数 发射_avx512_kmovd_k_r(k, r) { 发射(0xC5) 发射(0xFB) 发射(0x92) 发射(0xC0+(k&7)*8+(r&7)) }
+函数 发射_avx512_kmovq_r_k(r, k) { 发射(0xC4) 发射(0xE1) 发射(0xFB) 发射(0x93) 发射(0xC0+(r&7)*8+(k&7)) }
+函数 发射_avx512_kmovq_k_r(k, r) { 发射(0xC4) 发射(0xE1) 发射(0xFB) 发射(0x92) 发射(0xC0+(k&7)*8+(r&7)) }

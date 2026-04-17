@@ -1,0 +1,126 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../标准/原生字符串.nova")
+导入("./内核直连层.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/创建甲.nova")
+导入("../标准/加法运算符.nova")
+
+// §4 Console 接口
+
+定义 日志级别_LOG   = 0
+定义 日志级别_WARN  = 1
+定义 日志级别_ERROR = 2
+定义 日志级别_INFO  = 3
+定义 日志级别_DEBUG = 4
+
+结构 ConsoleTimer {
+    标签,
+    开始时间,
+}
+
+定义 控制台计时器 = [16]ConsoleTimer
+定义 控制台计时器数 = 0
+
+函数 Console_log(args, 参数数) { Console_输出(日志级别_LOG, args, 参数数) }
+函数 Console_warn(args, 参数数) { Console_输出(日志级别_WARN, args, 参数数) }
+函数 Console_error(args, 参数数) { Console_输出(日志级别_ERROR, args, 参数数) }
+
+函数 Console_输出(级别, args, 参数数) {
+    // 序列化参数为字符串, 输出到DevTools控制台
+    定义 buf = 堆_分配(4096)
+    定义 可变 pos = 0
+    // 前缀
+    如果 (级别 == 日志级别_WARN) { pos = 字符串_追加(buf, pos, "[WARN] ") }
+    否则 如果 (级别 == 日志级别_ERROR) { pos = 字符串_追加(buf, pos, "[ERROR] ") }
+    // 序列化每个参数
+    定义 可变 i = 0
+    当 (i < 参数数 && pos < 3900) {
+        如果 (i > 0) { pos = 字符串_追加(buf, pos, " ") }
+        定义 arg = 内存_读64(args + i * 8)
+        定义 str = JSValue_ToString(0, arg)
+        如果 (str != 0) { pos = 字符串_追加(buf, pos, str) }
+        i = i + 1
+    }
+    内存_写8(buf + pos, 0)
+    // 输出到系统控制台
+    内核信息(buf)
+    // 通过IPC发送到DevTools
+    DevTools_Console消息(级别, buf)
+    堆_释放(buf)
+}
+
+函数 Console_time(标签) {
+    如果 (控制台计时器数 < 16) {
+        控制台计时器[控制台计时器数].标签 = 标签
+        控制台计时器[控制台计时器数].开始时间 = 平台_获取高精度时间()
+        控制台计时器数 = 控制台计时器数 + 1
+    }
+}
+
+函数 Console_timeEnd(标签) {
+    定义 可变 i = 0
+    当 (i < 控制台计时器数) {
+        如果 (字符串_相等(控制台计时器[i].标签, 标签)) {
+            定义 耗时 = 平台_获取高精度时间() - 控制台计时器[i].开始时间
+            // 输出: "标签: X.XXXms"
+            控制台计时器数 = 控制台计时器数 - 1
+            控制台计时器[i] = 控制台计时器[控制台计时器数]
+            返回
+        }
+        i = i + 1
+    }
+}
+
+// §5 Performance 接口
+
+结构 PerformanceEntry {
+    名称,
+    类型,    // u64 "mark"/"measure"/"resource"/"navigation"
+    开始时间,    // u64 微秒(相对于navigationStart)
+    持续时间,
+}
+
+结构 PerformanceTimeline {
+    导航开始,    // u64 navigationStart时间戳
+    条目,    // [256]PerformanceEntry
+    条目数,
+}
+
+函数 Performance_now(timeline) {
+    如果 (timeline == 0) { 返回 0 }
+    返回 (平台_获取高精度时间() - timeline.导航开始) / 1000    // 毫秒(带微秒精度)
+}
+
+函数 Performance_mark(timeline, 名称) {
+    如果 (timeline == 0 || timeline.条目数 >= 256) { 返回 }
+    定义 idx = timeline.条目数
+    timeline.条目[idx].名称 = 名称
+    timeline.条目[idx].类型 = "mark"
+    timeline.条目[idx].开始时间 = Performance_now(timeline)
+    timeline.条目[idx].持续时间 = 0
+    timeline.条目数 = timeline.条目数 + 1
+}
+
+函数 Performance_measure(timeline, 名称, 开始标记, 结束标记) {
+    如果 (timeline == 0) { 返回 }
+    定义 开始 = Performance_查找标记(timeline, 开始标记)
+    定义 结束 = Performance_查找标记(timeline, 结束标记)
+    如果 (开始 >= 0 && 结束 >= 0 && timeline.条目数 < 256) {
+        定义 idx = timeline.条目数
+        timeline.条目[idx].名称 = 名称
+        timeline.条目[idx].类型 = "measure"
+        timeline.条目[idx].开始时间 = timeline.条目[开始].开始时间
+        timeline.条目[idx].持续时间 = timeline.条目[结束].开始时间 - timeline.条目[开始].开始时间
+        timeline.条目数 = timeline.条目数 + 1
+    }
+}
+
+函数 Performance_查找标记(timeline, 名称) {
+    定义 可变 i = timeline.条目数 - 1
+    当 (i >= 0) {
+        如果 (字符串_相等(timeline.条目[i].名称, 名称)) { 返回 i }
+        i = i - 1
+    }
+    返回 -1
+}

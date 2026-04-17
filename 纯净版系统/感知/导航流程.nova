@@ -1,0 +1,500 @@
+// NovaOS NNAV 导航流程引擎 (Nova Navigation Flow)
+// NNAV理论: 基于状态机的多阶段导航流程算法
+//   1. beforeunload检查 → unload旧文档
+//   2. BF缓存命中检测 → 网络请求
+//   3. 响应解析 → 文档构建 → 提交导航
+//   4. 会话历史管理: pushState/replaceState/popstate
+//   5. 预渲染/预连接优化
+//   AI增强: Tensor特征预测导航延迟/BF缓存命中率/预取优先级
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../推理/值乘.nova")
+导入("../中枢/硬链接.nova")
+导入("../中枢/字符串替换.nova")
+导入("../外联/地址解析辅.nova")
+导入("./文档事件.nova")
+
+函数 历史_触发popstate(h, 状态) {
+    定义 evt = 事件_创建2("popstate", 假, 假)
+    evt.是可信的 = 真
+    // evt.state = 状态 (需要作为Custom事件或特殊事件子类)
+    // dispatch到window
+}
+
+// §7 BF缓存 (Back-Forward 缓存)
+
+定义 NNAV_BF缓存容量 = 8
+
+结构 NNAV_BF缓存项 {
+    url: ""            // 页面URL
+    文档快照: 0     // 冻结的文档状态
+    滚动位置: 0     // 滚动位置
+    时间戳: 0        // 缓存时间
+    可缓存: 真       // 是否可以缓存
+}
+
+定义 可变 NNAV_BF缓存列表 = []
+
+函数 NNAV_BF缓存_存入(url, 文档) {
+    // 检查页面是否可以进入BF缓存
+    如果 (!NNAV_BF缓存_可缓存检查(文档)) { 返回 假 }
+    // 检查容量
+    如果 (计数(NNAV_BF缓存列表) >= NNAV_BF缓存容量) {
+        // 驱逐最旧的
+        NNAV_BF缓存列表 = NNAV_BF缓存列表[1:]
+    }
+    定义 entry = NNAV_BF缓存项 {
+        url: url,
+        文档快照: 文档,
+        滚动位置: 0,
+        时间戳: 系统调用_时间戳(),
+        可缓存: 真
+    }
+    追加(NNAV_BF缓存列表, entry)
+    NNAV_BF缓存存入次数 = NNAV_BF缓存存入次数 + 1
+    返回 真
+}
+
+函数 NNAV_BF缓存_查找(url) {
+    定义 可变 i = 0
+    当 (i < 计数(NNAV_BF缓存列表)) {
+        如果 (NNAV_BF缓存列表[i].url == url && NNAV_BF缓存列表[i].可缓存) {
+            NNAV_BF缓存命中次数 = NNAV_BF缓存命中次数 + 1
+            返回 NNAV_BF缓存列表[i]
+        }
+        i = i + 1
+    }
+    返回 0
+}
+
+函数 NNAV_BF缓存_可缓存检查(文档) {
+    // 检查是否有阻止BF缓存的因素
+    如果 (文档 == 0) { 返回 假 }
+    // unload事件处理器会阻止BF缓存
+    // Cache-Control: no-store 也会阻止
+    // 活跃的WebSocket/WebRTC连接也会阻止
+    返回 真
+}
+
+函数 NNAV_BF缓存_恢复(entry, 浏览上下文) {
+    如果 (entry == 0) { 返回 假 }
+    // 恢复文档快照
+    // 触发 pageshow 事件 (persisted=true)
+    定义 evt = 事件_创建2("pageshow", 假, 假)
+    evt.是可信的 = 真
+    // 恢复滚动位置
+    NNAV_BF缓存恢复次数 = NNAV_BF缓存恢复次数 + 1
+    返回 真
+}
+
+// §8 会话历史管理
+
+定义 NNAV_历史最大条目 = 50
+
+结构 NNAV_历史条目 {
+    url: ""
+    标题: ""
+    状态: 0        // pushState/replaceState 的状态对象
+    滚动X: 0
+    滚动Y: 0
+    时间戳: 0
+}
+
+定义 可变 NNAV_历史列表 = []
+定义 可变 NNAV_当前索引 = -1
+
+函数 NNAV_pushState(状态, 标题, url) {
+    NNAV_pushState次数 = NNAV_pushState次数 + 1
+    // 截断前进历史
+    如果 (NNAV_当前索引 < 计数(NNAV_历史列表) - 1) {
+        NNAV_历史列表 = NNAV_历史列表[:NNAV_当前索引 + 1]
+    }
+    // 限制历史长度
+    如果 (计数(NNAV_历史列表) >= NNAV_历史最大条目) {
+        NNAV_历史列表 = NNAV_历史列表[1:]
+    }
+    定义 entry = NNAV_历史条目 {
+        url: url, 标题: 标题, 状态: 状态,
+        滚动X: 0, 滚动Y: 0,
+        时间戳: 系统调用_时间戳()
+    }
+    追加(NNAV_历史列表, entry)
+    NNAV_当前索引 = 计数(NNAV_历史列表) - 1
+}
+
+函数 NNAV_replaceState(状态, 标题, url) {
+    NNAV_replaceState次数 = NNAV_replaceState次数 + 1
+    如果 (NNAV_当前索引 >= 0 && NNAV_当前索引 < 计数(NNAV_历史列表)) {
+        NNAV_历史列表[NNAV_当前索引].url = url
+        NNAV_历史列表[NNAV_当前索引].标题 = 标题
+        NNAV_历史列表[NNAV_当前索引].状态 = 状态
+    }
+}
+
+函数 NNAV_go(偏移) {
+    定义 目标 = NNAV_当前索引 + 偏移
+    如果 (目标 < 0 || 目标 >= 计数(NNAV_历史列表)) { 返回 }
+    NNAV_当前索引 = 目标
+    定义 entry = NNAV_历史列表[目标]
+    // 触发 popstate 事件
+    历史_触发popstate(0, entry.状态)
+    NNAV_导航次数 = NNAV_导航次数 + 1
+}
+
+函数 NNAV_back() { NNAV_go(-1) }
+函数 NNAV_forward() { NNAV_go(1) }
+
+函数 NNAV_获取当前条目() {
+    如果 (NNAV_当前索引 < 0) { 返回 0 }
+    返回 NNAV_历史列表[NNAV_当前索引]
+}
+
+函数 NNAV_获取历史长度() { 返回 计数(NNAV_历史列表) }
+
+// §9 预渲染与预连接
+
+定义 NNAV_预连接_dns = 1
+定义 NNAV_预连接_tcp = 2
+定义 NNAV_预连接_prerender = 3
+定义 NNAV_预连接_prefetch = 4
+
+结构 NNAV_预取任务 {
+    url: ""
+    类型: 0         // NNAV_预连接_*
+    优先级: 0       // 0-100
+    状态: 0         // 0=等待 1=进行中 2=完成 3=失败
+    开始时间: 0
+}
+
+定义 可变 NNAV_预取队列 = []
+
+函数 NNAV_预取(url, 类型) {
+    NNAV_预取次数 = NNAV_预取次数 + 1
+    定义 task = NNAV_预取任务 {
+        url: url, 类型: 类型, 优先级: 50,
+        状态: 0, 开始时间: 系统调用_时间戳()
+    }
+    追加(NNAV_预取队列, task)
+}
+
+函数 NNAV_预取_dns(url) { NNAV_预取(url, NNAV_预连接_dns) }
+函数 NNAV_预取_预连接(url) { NNAV_预取(url, NNAV_预连接_tcp) }
+函数 NNAV_预取_预渲染(url) { NNAV_预取(url, NNAV_预连接_prerender) }
+函数 NNAV_预取_prefetch(url) { NNAV_预取(url, NNAV_预连接_prefetch) }
+
+// §10 NNAV 全局统计与计数器
+
+定义 可变 NNAV_导航次数 = 0
+定义 可变 NNAV_pushState次数 = 0
+定义 可变 NNAV_replaceState次数 = 0
+定义 可变 NNAV_hashchange次数 = 0
+定义 可变 NNAV_BF缓存存入次数 = 0
+定义 可变 NNAV_BF缓存命中次数 = 0
+定义 可变 NNAV_BF缓存恢复次数 = 0
+定义 可变 NNAV_预取次数 = 0
+定义 可变 NNAV_AI预测次数 = 0
+
+// AI总线引用
+定义 可变 NNAV_AI总线 = 0
+
+// §11 增强导航主流程
+
+函数 NNAV_增强导航(浏览上下文, url, 添加历史) {
+    NNAV_导航次数 = NNAV_导航次数 + 1
+    如果 (url == 0) { 返回 }
+    // 1. beforeunload检查
+    定义 可以离开 = Navigation_beforeunload检查()
+    如果 (!可以离开) { 返回 }
+    // 2. 检查是否仅hash变化
+    定义 当前 = NNAV_获取当前条目()
+    如果 (当前 != 0 && NNAV_仅hash变化(当前.url, url)) {
+        NNAV_hashchange次数 = NNAV_hashchange次数 + 1
+        Navigation_hashchange(当前.url, url)
+        如果 (添加历史) { NNAV_pushState(0, "", url) }
+        否则 { NNAV_replaceState(0, "", url) }
+        返回
+    }
+    // 3. BF缓存存入旧页面
+    如果 (当前 != 0) {
+        NNAV_BF缓存_存入(当前.url, 0)
+    }
+    // 4. 检查BF缓存命中
+    定义 cached = NNAV_BF缓存_查找(url)
+    如果 (cached != 0) {
+        NNAV_BF缓存_恢复(cached, 浏览上下文)
+        如果 (添加历史) { NNAV_pushState(0, "", url) }
+        返回
+    }
+    // 5. 卸载旧文档
+    Navigation_unload()
+    // 6. 执行普通导航
+    Navigation_导航(浏览上下文, url, 添加历史)
+}
+
+函数 NNAV_仅hash变化(旧url, 新url) {
+    // 检查两个URL是否仅hash不同
+    定义 hashPos1 = 字符串查找(旧url, "#")
+    定义 hashPos2 = 字符串查找(新url, "#")
+    定义 base1 = 旧url
+    定义 base2 = 新url
+    如果 (hashPos1 >= 0) { base1 = 字符串子串(旧url, 0, hashPos1) }
+    如果 (hashPos2 >= 0) { base2 = 字符串子串(新url, 0, hashPos2) }
+    返回 base1 == base2
+}
+
+// §12 AI导航预测引擎
+
+函数 NNAV_AI特征提取(url) {
+    定义 tensor = Tensor_创建(8)
+    // 特征[0]: URL长度归一化
+    Tensor_写(tensor, 0, 字符串长度(url) / 2048.0)
+    // 特征[1]: 历史深度归一化
+    Tensor_写(tensor, 1, NNAV_当前索引 / 50.0)
+    // 特征[2]: BF缓存命中率
+    如果 (NNAV_导航次数 > 0) {
+        Tensor_写(tensor, 2, NNAV_BF缓存命中次数 / NNAV_导航次数)
+    }
+    // 特征[3]: 是否同域
+    定义 当前 = NNAV_获取当前条目()
+    如果 (当前 != 0 && NNAV_同域检查(当前.url, url)) {
+        Tensor_写(tensor, 3, 1.0)
+    }
+    // 特征[4]: 预取队列长度
+    Tensor_写(tensor, 4, 计数(NNAV_预取队列) / 16.0)
+    返回 tensor
+}
+
+函数 NNAV_同域检查(url1, url2) {
+    // 简化的同域检查: 比较协议+主机
+    定义 slash1 = 字符串查找(url1, "//")
+    定义 slash2 = 字符串查找(url2, "//")
+    如果 (slash1 < 0 || slash2 < 0) { 返回 假 }
+    定义 end1 = 字符串查找(字符串子串(url1, slash1 + 2, 字符串长度(url1) - slash1 - 2), "/")
+    定义 end2 = 字符串查找(字符串子串(url2, slash2 + 2, 字符串长度(url2) - slash2 - 2), "/")
+    定义 host1 = 字符串子串(url1, 0, slash1 + 2 + end1)
+    定义 host2 = 字符串子串(url2, 0, slash2 + 2 + end2)
+    返回 host1 == host2
+}
+
+函数 NNAV_AI预测导航延迟(url) {
+    NNAV_AI预测次数 = NNAV_AI预测次数 + 1
+    如果 (NNAV_AI总线 == 0) { 返回 0 }
+    定义 tensor = NNAV_AI特征提取(url)
+    定义 结果 = AI总线_推理(NNAV_AI总线, "nav_latency", tensor)
+    定义 延迟 = Tensor_读(结果, 0)
+    Tensor_释放(tensor)
+    Tensor_释放(结果)
+    返回 延迟
+}
+
+// §13 初始化与诊断
+
+函数 NNAV_初始化() {
+    NNAV_BF缓存列表 = []
+    NNAV_历史列表 = []
+    NNAV_当前索引 = -1
+    NNAV_预取队列 = []
+    NNAV_导航次数 = 0
+    NNAV_pushState次数 = 0
+    NNAV_replaceState次数 = 0
+    NNAV_hashchange次数 = 0
+    NNAV_BF缓存存入次数 = 0
+    NNAV_BF缓存命中次数 = 0
+    NNAV_BF缓存恢复次数 = 0
+    NNAV_预取次数 = 0
+    NNAV_AI预测次数 = 0
+    NNAV_AI总线 = 全局AI总线
+    打印("[NNAV] 导航流程引擎初始化完成")
+}
+
+函数 NNAV_诊断报告() {
+    打印("[NNAV] === 导航诊断 ===")
+    打印("  导航=" + 整数转字符串(NNAV_导航次数) + " push=" + 整数转字符串(NNAV_pushState次数) + " replace=" + 整数转字符串(NNAV_replaceState次数))
+    打印("  hash=" + 整数转字符串(NNAV_hashchange次数) + " 历史条目=" + 整数转字符串(计数(NNAV_历史列表)))
+    打印("  BF存=" + 整数转字符串(NNAV_BF缓存存入次数) + " BF命中=" + 整数转字符串(NNAV_BF缓存命中次数) + " BF恢复=" + 整数转字符串(NNAV_BF缓存恢复次数))
+    打印("  预取=" + 整数转字符串(NNAV_预取次数) + " AI预测=" + 整数转字符串(NNAV_AI预测次数))
+}
+
+// §14 Navigation API (Level 2)
+
+结构 NNAV_NavigationEntry {
+    id: 0
+    url: ""
+    key: ""
+    index: 0
+    sameDocument: 假
+}
+
+定义 可变 NNAV_下一个EntryID = 1
+
+函数 NNAV_创建NavigationEntry(url) {
+    定义 entry = NNAV_NavigationEntry {
+        id: NNAV_下一个EntryID,
+        url: url,
+        key: "",
+        index: NNAV_当前索引,
+        sameDocument: 假
+    }
+    NNAV_下一个EntryID = NNAV_下一个EntryID + 1
+    返回 entry
+}
+
+函数 NNAV_navigate(url, 状态, 历史处理) {
+    // navigation.navigate(url, {state, history})
+    如果 (历史处理 == "push") {
+        NNAV_pushState(状态, "", url)
+    } 否则 如果 (历史处理 == "replace") {
+        NNAV_replaceState(状态, "", url)
+    }
+    返回 NNAV_创建NavigationEntry(url)
+}
+
+函数 NNAV_traverseTo(key) {
+    // 通过key导航到特定历史条目
+    定义 可变 i = 0
+    当 (i < 计数(NNAV_历史列表)) {
+        如果 (NNAV_历史列表[i].url == key) {
+            NNAV_go(i - NNAV_当前索引)
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}
+
+// §15 导航性能计时
+
+结构 NNAV_导航计时 {
+    导航开始: 0
+    unload完成: 0
+    网络请求开始: 0
+    响应到达: 0
+    DOM解析完成: 0
+    页面加载完成: 0
+}
+
+定义 可变 NNAV_当前计时 = 0
+
+函数 NNAV_开始计时() {
+    NNAV_当前计时 = NNAV_导航计时 {
+        导航开始: 系统调用_时间戳(),
+        unload完成: 0, 网络请求开始: 0,
+        响应到达: 0, DOM解析完成: 0, 页面加载完成: 0
+    }
+}
+
+函数 NNAV_记录时间点(阶段) {
+    如果 (NNAV_当前计时 == 0) { 返回 }
+    定义 now = 系统调用_时间戳()
+    如果 (阶段 == "unload") { NNAV_当前计时.unload完成 = now }
+    否则 如果 (阶段 == "request") { NNAV_当前计时.网络请求开始 = now }
+    否则 如果 (阶段 == "response") { NNAV_当前计时.响应到达 = now }
+    否则 如果 (阶段 == "dom") { NNAV_当前计时.DOM解析完成 = now }
+    否则 如果 (阶段 == "load") { NNAV_当前计时.页面加载完成 = now }
+}
+
+函数 NNAV_获取总延迟() {
+    如果 (NNAV_当前计时 == 0) { 返回 0 }
+    如果 (NNAV_当前计时.页面加载完成 == 0) { 返回 0 }
+    返回 NNAV_当前计时.页面加载完成 - NNAV_当前计时.导航开始
+}
+
+函数 NNAV_获取TTFB() {
+    // Time To First Byte
+    如果 (NNAV_当前计时 == 0) { 返回 0 }
+    如果 (NNAV_当前计时.响应到达 == 0) { 返回 0 }
+    返回 NNAV_当前计时.响应到达 - NNAV_当前计时.导航开始
+}
+
+定义 NAV_TYPE_NAVIGATE    = 0    // 新导航
+定义 NAV_TYPE_RELOAD      = 1
+定义 NAV_TYPE_BACK_FORWARD = 2
+定义 NAV_TYPE_PRERENDER   = 3
+
+结构 NavigationRequest {
+    url,    // u64 目标URL
+    类型,    // u8 NAV_TYPE_xxx
+    添加历史,    // 布尔 true=pushState, false=replaceState
+    // HTTP相关
+    method,    // u64 "GET" / "POST"
+    headers,
+    body,
+    // referrer
+    referrer,
+    // 状态
+    已提交,
+    已完成,
+    已取消,
+}
+
+函数 Navigation_导航(浏览上下文, url, 添加历史) {
+    如果 (url == 0) { 返回 }
+
+    定义 req = 堆_分配(NavigationRequest)
+    req.url = url; req.类型 = NAV_TYPE_NAVIGATE
+    req.添加历史 = 添加历史; req.method = "GET"
+    req.已提交 = 假; req.已完成 = 假; req.已取消 = 假
+
+    // 1. 检查beforeunload
+    定义 可以离开 = Navigation_beforeunload检查()
+    如果 (!可以离开) {
+        req.已取消 = 真
+        返回
+    }
+
+    // 2. 仅hash变化? (同一页面内跳转)
+    如果 (浏览上下文 != 0) {
+        // 比较新URL和当前URL, 如果仅hash不同 → 不需要网络请求
+        // 直接更新hash, 触发hashchange事件
+    }
+
+    // 3. 卸载旧文档
+    Navigation_unload()
+
+    // 4. 检查bfcache (Back-Forward 缓存)
+    // 如果目标页面在bfcache中, 直接恢复, 跳过网络请求
+
+    // 5. 网络请求(异步)
+    // fetch(url) → 响应
+
+    // 6. 解析响应, 创建新文档
+
+    // 7. 提交导航
+    req.已提交 = 真
+    req.已完成 = 真
+}
+
+函数 Navigation_beforeunload检查() {
+    定义 evt = 事件_创建2("beforeunload", 真, 真)
+    evt.是可信的 = 真
+    evt.returnValue = ""
+    事件Target_dispatch事件(全局_window, evt)
+    // 如果处理器设置了returnValue或调用了preventDefault → 需要用户确认
+    如果 (evt.returnValue != "" || evt.默认已阻止) {
+        返回 平台_显示确认对话框("此页面询问您是否要离开 — 您输入的信息可能不会被保存。")
+    }
+    返回 真
+}
+
+函数 Navigation_unload() {
+    // 触发window.onunload事件
+    定义 evt = 事件_创建2("unload", 假, 假)
+    evt.是可信的 = 真
+    事件Target_dispatch事件(全局_window, evt)
+    // 清理定时器
+    Timer_清除所有()
+    // 终止正在进行的fetch请求
+    取数_中止所有待处理()
+}
+
+// §6 hashchange事件
+
+函数 Navigation_hashchange(旧URL, 新URL) {
+    定义 evt = 事件_创建2("hashchange", 假, 假)
+    evt.是可信的 = 真
+    // 哈希Change事件有oldURL和newURL属性
+    // dispatch到window
+}
+
+// §7 BF缓存 (Back-Forward 缓存)

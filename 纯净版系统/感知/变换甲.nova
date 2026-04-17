@@ -1,0 +1,124 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../稳态/原生系统双.nova")
+导入("./内核直连层.nova")
+
+// §7 Transform Feedback
+
+结构 TransformFeedback {
+    ID,
+    缓冲,    // [4]u32 绑定的缓冲ID
+    缓冲数,
+    活跃,
+    暂停,
+}
+
+定义 可变 TF_池 = 0
+定义 可变 TF_池大小 = 0
+定义 可变 TF_下一个ID = 1
+
+函数 图绘2_createTransformFeedback() {
+    如果 (TF_池 == 0) {
+        TF_池 = 堆_分配_数组(16 * 大小of(TransformFeedback))
+        TF_池大小 = 0
+    }
+    如果 (TF_池大小 >= 16) { 返回 0 }
+    定义 tf = TF_池 + TF_池大小 * 大小of(TransformFeedback)
+    tf.ID = TF_下一个ID; TF_下一个ID = TF_下一个ID + 1
+    tf.缓冲数 = 0; tf.活跃 = 假; tf.暂停 = 假
+    TF_池大小 = TF_池大小 + 1
+    返回 tf.ID
+}
+
+函数 图绘2_beginTransformFeedback(primitiveMode) {
+    // 开始记录顶点着色器输出到缓冲
+    定义 cmd = 图处命令_分配(图处_CMD_BEGIN_TF, 4)
+    内存_写32(cmd + 8, primitiveMode)
+    图处命令_提交(cmd)
+    GL_状态设置(GL_TRANSFORM_FEEDBACK_ACTIVE, 1)
+}
+
+函数 图绘2_endTransformFeedback() {
+    // 结束Transform Feedback
+    定义 cmd = 图处命令_分配(图处_CMD_END_TF, 0)
+    图处命令_提交(cmd)
+    GL_状态设置(GL_TRANSFORM_FEEDBACK_ACTIVE, 0)
+}
+
+函数 图绘2_pauseTransformFeedback() { GL_状态设置(GL_TRANSFORM_FEEDBACK_PAUSED, 1) }
+函数 图绘2_resumeTransformFeedback() { GL_状态设置(GL_TRANSFORM_FEEDBACK_PAUSED, 0) }
+
+函数 图绘2_transformFeedbackVaryings(program, varyings, count, bufferMode) {
+    // 指定哪些varying要捕获
+    如果 (program == 0 || varyings == 0 || count <= 0) { 返回 }
+    定义 cmd = 图处命令_分配(图处_CMD_TF_VARYINGS, 12 + count * 8)
+    内存_写32(cmd + 8, program)
+    内存_写32(cmd + 12, count)
+    内存_写32(cmd + 16, bufferMode)
+    定义 可变 i = 0
+    当 (i < count) {
+        内存_写64(cmd + 20 + i * 8, 内存_读64(varyings + i * 8))
+        i = i + 1
+    }
+    图处命令_提交(cmd)
+}
+
+// §8 同步对象 (Fence Sync)
+
+结构 GLSync {
+    ID,
+    已发出,
+    状态,    // u8 0=未发出 1=已发出 2=已完成
+}
+
+定义 可变 Sync_下一个ID = 1
+
+函数 图绘2_fenceSync(condition, flags) {
+    如果 (condition != GL_SYNC_图处_COMMANDS_COMPLETE) { 返回 0 }
+    定义 s = 堆_分配(GLSync)
+    s.ID = Sync_下一个ID; Sync_下一个ID = Sync_下一个ID + 1
+    s.已发出 = 真; s.状态 = 1
+    返回 s
+}
+
+函数 图绘2_clientWaitSync(sync, flags, timeout) {
+    如果 (sync == 0) { 返回 GL_WAIT_FAILED }
+    如果 (sync.状态 == 2) { 返回 GL_ALREADY_SIGNALED }
+    // 等待图处完成
+    // 如果timeout到期: GL_TIMEOUT_EXPIRED
+    // 如果完成: GL_CONDITION_SATISFIED
+    sync.状态 = 2
+    返回 GL_CONDITION_SATISFIED
+}
+
+函数 图绘2_deleteSync(sync) {
+    如果 (sync == 0) { 返回 }
+    // 释放
+}
+
+// §9 查询对象 (Occlusion Query)
+
+结构 GLQuery {
+    ID,
+    类型,    // u32 GL_ANY_SAMPLES_PASSED / ...
+    结果,
+    已完成,
+}
+
+函数 图绘2_createQuery() {
+    定义 q = 堆_分配(GLQuery)
+    q.ID = 1; q.类型 = 0; q.结果 = 0; q.已完成 = 假
+    返回 q
+}
+
+函数 图绘2_beginQuery(target, query) {
+    如果 (query == 0) { 返回 }
+    query.类型 = target; query.已完成 = 假; query.结果 = 0
+}
+
+函数 图绘2_endQuery(target) { GL_状态设置(GL_QUERY_ACTIVE, 0) }
+
+函数 图绘2_getQueryParameter(query, pname) {
+    如果 (query == 0) { 返回 0 }
+    返回 query.结果
+}

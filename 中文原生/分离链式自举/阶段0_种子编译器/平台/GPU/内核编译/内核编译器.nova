@@ -1,0 +1,230 @@
+// [循环导入已解耦] 导入("../核心/FFI桥接.nova") — 函数由链接器全局解析
+导入("../核心/设备管理.nova")
+导入("../../../标准库/基础.nova")
+
+// Nova · 平台层 · GPU内核编译器
+// 运行时编译GPU计算内核 — PTX(NVIDIA)/GCN IL(AMD)
+// 真实调用nvrtc/hiprtc运行时编译API
+// 支持: 源码编译/PTX加载/缓存/编译选项
+
+// 内核状态
+定义 内核_未编译 = 0
+定义 内核_编译中 = 1
+定义 内核_就绪 = 2
+定义 内核_错误 = 3
+
+// 内核描述符
+// [名称, 源码, 编译后模块句柄, 函数句柄, 状态, 错误信息,
+// 参数列表, 共享内存大小, 寄存器数, 编译选项, 厂商]
+函数 GPU内核_创建(名称, 源码) { 返回 [名称, 源码, 0, 内核_未编译, "",
+ [], 0, [], GPU_厂商_未知]
+}
+
+函数 GPU内核_名称(k) { 返回 k[0] }
+函数 GPU内核_状态(k) { 返回 k[4] }
+函数 GPU内核_错误(k) { 返回 k[5] }
+函数 GPU内核_就绪(k) { 返回 k[4] == 内核_就绪 }
+
+// NVIDIA PTX/CUDA 编译
+函数 GPU内核_编译_NVIDIA(内核, 编译选项) { 定义 nvrtc_lib = GPU_加载CUDA候选([
+ "nvrtc64_120_0.dll",
+ "nvrtc64_121_0.dll",
+ "nvrtc64_122_0.dll",
+ "libnvrtc.so.12",
+ "libnvrtc.so.11",
+ "libnvrtc.so"
+ ])
+ 如果 (nvrtc_lib == 0) {
+ 内核[4] = 内核_错误
+ 内核[5] = "无法加载nvrtc库"
+ 返回 假
+ }
+
+ 内核[4] = 内核_编译中
+ 内核[10] = GPU_厂商_NVIDIA
+
+ // nvrtcCreateProgram(&prog, src, name, 0, NULL, NULL)
+ 定义 prog = 外部调用(nvrtc_lib,  "nvrtcCreateProgram",  内核[1],  内核[0], 0, 0, 0)
+ 如果 (prog == 0) {
+ 内核[4] = 内核_错误
+ 内核[5] = "创建程序失败"
+ 返回 假
+ }
+
+ // 编译选项: 计算能力, 优化等级等
+ 定义 可变 选项列 = []
+ 追加(选项列, "--gpu-architecture=compute_70") // 默认Volta+
+ 追加(选项列, "-default-device")
+ 定义 可变 i = 0
+ 当 (i < 计数(编译选项)) {
+ 追加(选项列, 编译选项[i])
+ i = i + 1
+ }
+
+ // nvrtcCompileProgram(prog, numOpts, opts)
+ 定义 编译结果 = 外部调用(nvrtc_lib,  "nvrtcCompileProgram",  prog,  计数(选项列),  选项列, 0, 0)
+ 如果 (编译结果 != 0) {
+ // 获取编译错误日志
+ 内核[5] = 外部调用字符串(nvrtc_lib,  "nvrtcGetProgramLog",  prog, 0)
+ 内核[4] = 内核_错误
+ 返回 假
+ }
+
+ // 获取PTX
+ 定义 ptx = 外部调用字符串(nvrtc_lib,  "nvrtcGetPTX",  prog, 0)
+
+ // 加载到CUDA驱动
+ // cuModuleLoadDataEx(&module, ptx, 0, NULL, NULL)
+ 内核[2] = 外部调用(cuda_lib,  "cuModuleLoadDataEx",  ptx, 0, 0, 0, 0)
+ // cuModuleGetFunction(&func, module, name)
+ 内核[3] = 外部调用(cuda_lib,  "cuModuleGetFunction",  内核[2],  内核[0], 0, 0, 0)
+
+ // 获取内核属性
+ // CU_FUNC_ATTRIBUTE_NUM_REGS = 4
+ 内核[8] = 外部调用(cuda_lib,  "cuFuncGetAttribute",  4,  内核[3], 0, 0, 0)
+ // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1
+ 内核[7] = 外部调用(cuda_lib,  "cuFuncGetAttribute",  1,  内核[3], 0, 0, 0)
+
+ 内核[4] = 内核_就绪
+ // 清理nvrtc程序
+ 外部调用(nvrtc_lib,  "nvrtcDestroyProgram",  prog, 0, 0, 0, 0)
+ 返回 真
+}
+
+// AMD HIP 编译
+函数 GPU内核_编译_AMD(内核, 编译选项) { 定义 hiprtc_lib = GPU_加载ROCm候选([
+ "hiprtc.dll",
+ "libhiprtc.so"
+ ])
+ 如果 (hiprtc_lib == 0) {
+ 内核[4] = 内核_错误
+ 内核[5] = "无法加载hiprtc库"
+ 返回 假
+ }
+
+ 内核[4] = 内核_编译中
+ 内核[10] = GPU_厂商_AMD
+
+ // hiprtcCreateProgram(&prog, src, name, 0, NULL, NULL)
+ 定义 prog = 外部调用(hiprtc_lib,  "hiprtcCreateProgram",  内核[1],  内核[0], 0, 0, 0)
+
+ // 编译选项
+ 定义 可变 选项列 = []
+ 追加(选项列, "--gpu-architecture=gfx908") // 默认MI100+
+ 定义 可变 i = 0
+ 当 (i < 计数(编译选项)) {
+ 追加(选项列, 编译选项[i])
+ i = i + 1
+ }
+
+ 定义 编译结果 = 外部调用(hiprtc_lib,  "hiprtcCompileProgram",  prog,  计数(选项列),  选项列, 0, 0)
+ 如果 (编译结果 != 0) {
+ 内核[5] = 外部调用字符串(hiprtc_lib,  "hiprtcGetProgramLog",  prog, 0)
+ 内核[4] = 内核_错误
+ 返回 假
+ }
+
+ // 获取编译后代码
+ 定义 代码 = 外部调用字符串(hiprtc_lib,  "hiprtcGetCode",  prog, 0)
+
+ // 加载到HIP运行时
+ 内核[2] = 外部调用(hip_lib,  "hipModuleLoadData",  代码, 0, 0, 0, 0)
+ 内核[3] = 外部调用(hip_lib,  "hipModuleGetFunction",  内核[2],  内核[0], 0, 0, 0)
+
+ 内核[4] = 内核_就绪
+ 外部调用(hiprtc_lib,  "hiprtcDestroyProgram",  prog, 0, 0, 0, 0)
+ 返回 真
+}
+
+// 统一编译入口
+函数 GPU内核_编译(内核, gpu管理器, 编译选项) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+ 如果 (dev == 空) {
+ 内核[4] = 内核_错误
+ 内核[5] = "无可用GPU设备"
+ 返回 假
+ }
+
+ 如果 (厂商 == GPU_厂商_NVIDIA) { 返回 GPU内核_编译_NVIDIA(内核, 编译选项)
+ }
+ 如果 (厂商 == GPU_厂商_AMD) { 返回 GPU内核_编译_AMD(内核, 编译选项)
+ }
+
+ 内核[4] = 内核_错误
+ 内核[5] = "不支持的GPU厂商"
+ 返回 假
+}
+
+// 内核启动
+// grid: [gridX, gridY, gridZ] block: [blockX, blockY, blockZ]
+函数 GPU内核_启动(内核, grid, block, 参数列, 共享内存, 流) { 如果 (!GPU内核_就绪(内核)) {
+ 打印(字符串拼接("错误: 内核未就绪 - ", GPU内核_名称(内核)))
+ 返回 假
+ }
+
+如果 (内核[10] == GPU_厂商_NVIDIA) {
+ // cuLaunchKernel(func, gridX,gridY,gridZ, blockX,blockY,blockZ, sharedMem, stream, params, extra)
+ 返回 外部调用(cuda_lib, "cuLaunchKernel",
+ 内核[3],
+ grid[0], grid[1], grid[2],
+ block[0], block[1], block[2],
+ 共享内存, 流,
+ 参数列) == 0
+ }
+
+如果 (内核[10] == GPU_厂商_AMD) {
+ // hipModuleLaunchKernel(func, gridX,gridY,gridZ, blockX,blockY,blockZ, sharedMem, stream, params, extra)
+ 返回 外部调用(hip_lib, "hipModuleLaunchKernel",
+ 内核[3],
+ grid[0], grid[1], grid[2],
+ block[0], block[1], block[2],
+ 共享内存, 流,
+ 参数列) == 0
+ }
+
+ 返回 假
+}
+
+// 同步等待
+函数 GPU同步(gpu管理器) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+
+如果 (厂商 == GPU_厂商_NVIDIA) {
+ 返回 外部调用(cuda_lib,  "cuCtxSynchronize", 0, 0, 0, 0, 0) == 0
+ }
+如果 (厂商 == GPU_厂商_AMD) {
+ 返回 外部调用(hip_lib,  "hipDeviceSynchronize", 0, 0, 0, 0, 0) == 0
+ }
+ 返回 假
+}
+
+// 流管理
+函数 GPU流_创建(gpu管理器) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+
+如果 (厂商 == GPU_厂商_NVIDIA) {
+ 返回 外部调用(cuda_lib,  "cuStreamCreate", 0, 0, 0, 0, 0)
+ }
+如果 (厂商 == GPU_厂商_AMD) {
+ 返回 外部调用(hip_lib,  "hipStreamCreate", 0, 0, 0, 0, 0)
+ }
+ 返回 0
+}
+
+函数 GPU流_同步(gpu管理器, 流) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+
+如果 (厂商 == GPU_厂商_NVIDIA) {
+ 返回 外部调用(cuda_lib,  "cuStreamSynchronize",  流, 0, 0, 0, 0) == 0
+ }
+如果 (厂商 == GPU_厂商_AMD) {
+ 返回 外部调用(hip_lib,  "hipStreamSynchronize",  流, 0, 0, 0, 0) == 0
+ }
+ 返回 假
+}
+
+函数 GPU流_销毁(gpu管理器, 流) { 定义 dev = GPU管理器_当前设备(gpu管理器)
+
+如果 (厂商 == GPU_厂商_NVIDIA) {
+ 外部调用(cuda_lib,  "cuStreamDestroy_v2",  流, 0, 0, 0, 0)
+ }
+如果 (厂商 == GPU_厂商_AMD) {
+ 外部调用(hip_lib,  "hipStreamDestroy",  流, 0, 0, 0, 0)
+ }
+}

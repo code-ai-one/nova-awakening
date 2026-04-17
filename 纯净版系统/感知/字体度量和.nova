@@ -1,0 +1,123 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./真字体字体.nova")
+导入("./内核直连层.nova")
+导入("./统一码解码.nova")
+导入("./文字绘制最.nova")
+导入("./头部查水平.nova")
+导入("../中枢/内存初始化.nova")
+导入("./字形光栅化.nova")
+导入("./码点统一码.nova")
+
+// §6 字体度量和文本塑形
+
+// 获取字形水平前进宽度 (FUnit)
+
+
+函数 TrueType_获取前进宽度(font, glyphID) {
+    如果 (font.hmtx_偏移 == 0) { 返回 font.upem / 2 }
+    定义 d = font.数据 + font.hmtx_偏移
+    // hmtx: [advanceWidth(u16) + lsb(i16)] × numberOfHMetrics
+    //       + [lsb(i16)] × (numGlyphs - numberOfHMetrics)
+    如果 (glyphID < font.水平度量数) {
+        返回 读16(d, glyphID * 4)
+    }
+    // 超出范围: 使用最后一个度量
+    返回 读16(d, (font.水平度量数 - 1) * 4)
+}
+
+// 获取字形左侧偏移 (FUnit)
+函数 TrueType_获取左侧偏移(font, glyphID) {
+    如果 (font.hmtx_偏移 == 0) { 返回 0 }
+    定义 d = font.数据 + font.hmtx_偏移
+    如果 (glyphID < font.水平度量数) {
+        返回 读i16(d, glyphID * 4 + 2)
+    }
+    // 超出longHorMetric范围: 在leftSideBearing数组中
+    定义 lsbStart = font.水平度量数 * 4
+    返回 读i16(d, lsbStart + (glyphID - font.水平度量数) * 2)
+}
+
+// 文本塑形结果
+结构 ShapedGlyph {
+    glyphID,
+    x偏移,    // i32 像素×64 (26.6定点)
+    y偏移,
+    前进宽度,    // i32 像素×64
+}
+
+// 简易文本塑形: UTF-8文本→定位字形序列
+函数 TrueType_塑形(font, 文本, 文本长度, 像素大小, 结果, 最大字形) {
+    如果 (font == 0 || 文本 == 0) { 返回 0 }
+
+    定义 scale_64 = 像素大小 * 64 / font.upem  // FUnit→像素×64
+    定义 可变 i = 0
+    定义 可变 count = 0
+    定义 可变 pen_x = 0  // 当前笔位置 (像素×64)
+
+    当 (i < 文本长度 && count < 最大字形) {
+        // 解码UTF-8
+        定义 码点 = UTF8_解码(文本, i, 文本长度)
+        定义 字节数 = UTF8_字节数(文本, i)
+        i = i + 字节数
+
+        // 查找字形ID
+        定义 gid = TrueType_查找字形(font, 码点)
+
+        // 获取度量
+        定义 advance = TrueType_获取前进宽度(font, gid)
+
+        // 填充结果
+        定义 sg = 结果 + count * 16  // ShapedGlyph大小
+        内存_写16(sg, gid)
+        内存_写32(sg + 4, pen_x)
+        内存_写32(sg + 8, 0)  // y偏移
+        定义 adv_px = advance * scale_64
+        内存_写32(sg + 12, adv_px)
+
+        pen_x = pen_x + adv_px
+        count = count + 1
+    }
+
+    返回 count
+}
+
+// §7 字形缓存 — LRU缓存已光栅化的位图
+
+结构 Glyph缓存Entry {
+    glyphID,
+    像素大小,
+    位图,    // u64 GlyphBitmap*
+    使用计数,
+}
+
+函数 TrueType_获取缓存位图(font, glyphID, 像素大小) {
+    // 在缓存中查找
+    定义 key = (glyphID << 16) | (像素大小 & 0xFFFF)
+    定义 slot = key % font.缓存容量
+    定义 entry = 内存_读64(font.字形缓存 + slot * 8)
+
+    如果 (entry != 0) {
+        定义 cached_id = 内存_读16(entry)
+        定义 cached_size = 内存_读16(entry + 2)
+        如果 (cached_id == glyphID && cached_size == 像素大小) {
+            内存_写32(entry + 8, 内存_读32(entry + 8) + 1)  // 增加使用计数
+            返回 内存_读64(entry + 12)  // 返回缓存的位图
+        }
+    }
+
+    // 缓存未命中: 光栅化
+    定义 bmp = TrueType_光栅化字形(font, glyphID, 像素大小)
+
+    // 存入缓存
+    如果 (entry == 0) {
+        entry = 堆_分配(24)
+        内存_写64(font.字形缓存 + slot * 8, entry)
+    }
+    内存_写16(entry, glyphID)
+    内存_写16(entry + 2, 像素大小)
+    内存_写32(entry + 8, 1)
+    内存_写64(entry + 12, bmp)
+
+    返回 bmp
+}

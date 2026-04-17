@@ -1,0 +1,106 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./原子驻留.nova")
+导入("./资源加载资源.nova")
+导入("../中枢/内存初始化.nova")
+
+// §5 Resource取数er — 资源获取器
+// (对应 Resource取数er)
+// 管理同一文档的所有资源加载,处理缓存/去重/优先级
+
+结构 Resource取数er {
+ 活跃请求列表,    // u64 ResourceLoader*数组
+ 活跃请求数量,
+ 活跃请求容量,
+ // 资源缓存
+ 缓存,    // u64 简单哈希表: URL哈希 → 缓存数据
+ 缓存数量,
+ 缓存容量,
+ // 并发限制(同一主机)
+ 每主机最大连接,    // u32 Nova浏览器默认6
+
+ // 统计
+ 总请求数,
+ 缓存命中数,
+ 网络请求数,
+ 总接收字节,
+}
+
+函数 Resource取数er_创建() {
+ 定义 fetcher = 堆_分配(Resource取数er)
+ fetcher.活跃请求容量 = 32
+ fetcher.活跃请求列表 = 堆_分配_数组(fetcher.活跃请求容量 * 8)
+ fetcher.活跃请求数量 = 0
+ fetcher.缓存容量 = 256
+ fetcher.缓存 = 堆_分配_数组(fetcher.缓存容量 * 24)
+ fetcher.缓存数量 = 0
+ fetcher.每主机最大连接 = 6
+ fetcher.总请求数 = 0
+ fetcher.缓存命中数 = 0
+ fetcher.网络请求数 = 0
+ fetcher.总接收字节 = 0
+ 返回 fetcher
+}
+
+函数 Resource取数er_获取资源(fetcher, url字符串, 资源类型, 完成回调, 用户数据) {
+ fetcher.总请求数 = fetcher.总请求数 + 1
+
+ // 检查缓存
+ 定义 缓存数据 = Resource取数er_查缓存(fetcher, url字符串)
+ 如果 (缓存数据 != 0) {
+ fetcher.缓存命中数 = fetcher.缓存命中数 + 1
+ 如果 (完成回调 != 0) {
+ 定义 长度 = 内存_读32(缓存数据 + 8)
+ 定义 数据 = 内存_读64(缓存数据)
+ 调用(完成回调, 0, 数据, 长度)
+ }
+ 返回
+ }
+
+ // 创建加载器
+ fetcher.网络请求数 = fetcher.网络请求数 + 1
+ 定义 loader = ResourceLoader_创建(url字符串, 资源类型)
+ loader.完成回调 = 完成回调
+ loader.用户数据 = 用户数据
+
+ // 添加到活跃列表
+ 如果 (fetcher.活跃请求数量 < fetcher.活跃请求容量) {
+ 内存_写64(fetcher.活跃请求列表 + fetcher.活跃请求数量 * 8, loader)
+ fetcher.活跃请求数量 = fetcher.活跃请求数量 + 1
+ }
+
+ // 启动加载
+ ResourceLoader_开始加载(loader)
+
+ // 缓存响应
+ 如果 (loader.状态 == 请求状态_完成 && loader.已接收字节 > 0) {
+ Resource取数er_存缓存(fetcher, url字符串, loader.接收缓冲, loader.已接收字节)
+ fetcher.总接收字节 = fetcher.总接收字节 + loader.已接收字节
+ }
+}
+
+函数 Resource取数er_查缓存(fetcher, url字符串) {
+ 定义 哈希 = 字符串_哈希(url字符串)
+ 定义 可变 i = 0
+ 当 (i < fetcher.缓存数量) {
+ 定义 偏移 = fetcher.缓存 + i * 24
+ 如果 (内存_读32(偏移 + 16) == 哈希) {
+ 返回 偏移
+ }
+ i = i + 1
+ }
+ 返回 0
+}
+
+函数 Resource取数er_存缓存(fetcher, url字符串, 数据, 长度) {
+ 如果 (fetcher.缓存数量 >= fetcher.缓存容量) { 返回 }
+ 定义 副本 = 堆_分配(长度 + 1)
+ 内存_复制(副本, 数据, 长度)
+ 内存_写8(副本 + 长度, 0)
+ 定义 偏移 = fetcher.缓存 + fetcher.缓存数量 * 24
+ 内存_写64(偏移, 副本)
+ 内存_写32(偏移 + 8, 长度)
+ 内存_写32(偏移 + 16, 字符串_哈希(url字符串))
+ fetcher.缓存数量 = fetcher.缓存数量 + 1
+}

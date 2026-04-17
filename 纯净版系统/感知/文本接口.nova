@@ -1,0 +1,121 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./内核直连层.nova")
+导入("./像素混合.nova")
+导入("./图像数据像.nova")
+
+// §10 文本接口
+
+结构 TextMetrics {
+    width,    // i32 Q10
+    actualBoundingBoxLeft,
+    actualBoundingBoxRight,
+    fontBoundingBoxAscent,
+    fontBoundingBoxDescent,
+    actualBoundingBoxAscent,
+    actualBoundingBoxDescent,
+    emHeightAscent,
+    emHeightDescent,
+    alphabeticBaseline,
+    hangingBaseline,
+    ideographicBaseline,
+}
+
+
+函数 Ctx2D_fillText(ctx, 文本, x, y, maxWidth) {
+    如果 (ctx == 0 || 文本 == 0) { 返回 }
+    // 1. 解析font属性获取字体信息
+    // 2. 对齐计算(textAlign + textBaseline)
+    // 3. 逐字符光栅化
+    // 4. 如果maxWidth>0且文本宽度超出, 水平缩放
+}
+
+函数 Ctx2D_strokeText(ctx, 文本, x, y, maxWidth) {
+    如果 (ctx == 0 || 文本 == 0) { 返回 }
+    // 与fillText类似, 但用描边而非填充
+}
+
+函数 Ctx2D_measureText(ctx, 文本) {
+    如果 (ctx == 0 || 文本 == 0) { 返回 0 }
+    定义 m = 堆_分配(TextMetrics)
+    // 根据当前font计算文本宽度和边界
+    m.width = 0
+    返回 m
+}
+
+// §11 图像绘制
+
+函数 Ctx2D_draw图像_3(ctx, image, dx, dy) {
+    如果 (ctx == 0 || image == 0) { 返回 }
+    // draw图像(image, dx, dy)
+    Ctx2D_draw图像_9(ctx, image, 0, 0, image.宽度, image.高度, dx, dy, image.宽度, image.高度)
+}
+
+函数 Ctx2D_draw图像_5(ctx, image, dx, dy, dw, dh) {
+    如果 (ctx == 0 || image == 0) { 返回 }
+    Ctx2D_draw图像_9(ctx, image, 0, 0, image.宽度, image.高度, dx, dy, dw, dh)
+}
+
+函数 Ctx2D_draw图像_9(ctx, image, sx, sy, sw, sh, dx, dy, dw, dh) {
+    如果 (ctx == 0 || image == 0 || sw == 0 || sh == 0 || dw == 0 || dh == 0) { 返回 }
+    // 双线性插值缩放源区域到目标区域
+    定义 可变 py = 0
+    当 (py < dh) {
+        定义 sry = sy + py * sh / dh
+        如果 (dy + py >= 0 && dy + py < ctx.画布高) {
+            定义 可变 px = 0
+            当 (px < dw) {
+                定义 srx = sx + px * sw / dw
+                如果 (dx + px >= 0 && dx + px < ctx.画布宽) {
+                    // 从image读取像素
+                    // 写入ctx缓冲
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+    Ctx2D_标记脏区(ctx, dx, dy, dw, dh)
+}
+
+// §12 像素操作
+
+函数 Ctx2D_get图像Data(ctx, sx, sy, sw, sh) {
+    如果 (ctx == 0 || sw <= 0 || sh <= 0) { 返回 0 }
+    定义 id = 图像Data_创建(sw, sh)
+    定义 可变 y = 0
+    当 (y < sh) {
+        定义 可变 x = 0
+        当 (x < sw) {
+            定义 srcX = sx + x; 定义 srcY = sy + y
+            如果 (srcX >= 0 && srcX < ctx.画布宽 && srcY >= 0 && srcY < ctx.画布高) {
+                定义 偏移 = (srcY * ctx.画布宽 + srcX) * 4
+                定义 dst偏移 = (y * sw + x) * 4
+                内存_复制(id.数据 + dst偏移, ctx.像素缓冲 + 偏移, 4)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    返回 id
+}
+
+函数 Ctx2D_put图像Data(ctx, imageData, dx, dy) {
+    如果 (ctx == 0 || imageData == 0) { 返回 }
+    定义 可变 y = 0
+    当 (y < imageData.高度) {
+        定义 可变 x = 0
+        当 (x < imageData.宽度) {
+            定义 dstX = dx + x; 定义 dstY = dy + y
+            如果 (dstX >= 0 && dstX < ctx.画布宽 && dstY >= 0 && dstY < ctx.画布高) {
+                定义 src偏移 = (y * imageData.宽度 + x) * 4
+                定义 dst偏移 = (dstY * ctx.画布宽 + dstX) * 4
+                // put图像Data直接覆盖, 不受globalAlpha/composite影响
+                内存_复制(ctx.像素缓冲 + dst偏移, imageData.数据 + src偏移, 4)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    Ctx2D_标记脏区(ctx, dx, dy, imageData.宽度, imageData.高度)
+}

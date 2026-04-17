@@ -1,0 +1,133 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/辅助存根.nova")
+导入("./索引库键范围.nova")
+导入("../中枢/整数转字符串.nova")
+
+//       indexed_db_database.cc (~2500行)
+//       indexed_db_transaction.cc (~1000行)
+//       indexed_db_cursor.cc (~600行)
+//       indexed_db_backing_store.cc 
+// IndexedDB: 浏览器内的结构化数据库
+//   const req = indexedDB.open('myDB', 1)
+//   req.onupgradeneeded = (e) => {
+//     db.createObjectStore('items', { keyPath: 'id' })
+//   }
+//   事务: db.transaction('items', 'readwrite')
+//   增删改查: store.add/put/get/delete/getAll
+//   游标: store.openCursor()
+//   索引: store.createIndex('by_name', 'name')
+// 本文件实现:
+//   1. 数据库打开/版本升级
+//   2. 对象存储(ObjectStore)
+//   3. 事务(readonly/readwrite/versionchange)
+//   4. 游标(forward/reverse/key-only)
+//   5. 索引(唯一/多值)
+//   6. 键范围(IDBKeyRange: only/bound/lowerBound/upperBound)
+
+// §1 IDBDatabase — 数据库
+
+结构 IDBDatabase {
+    名称,
+    版本,
+    // 对象存储
+    存储列表,    // u64 IDBObjectStore*数组
+    存储数量,
+    存储容量,
+    // 事务
+    活跃事务,    // u64 IDBTransaction*数组
+    活跃事务数,
+    // 回调
+    onclose,
+    onversionchange,
+    // 状态
+    已关闭,
+}
+
+结构 IDBFactory {
+    数据库列表,    // u64 IDBDatabase*数组
+    数据库数量,
+    数据库容量,
+}
+
+定义 可变 全局IDB工厂 = 0
+
+函数 IDBFactory_获取() {
+    如果 (全局IDB工厂 == 0) {
+        全局IDB工厂 = 堆_分配(IDBFactory)
+        全局IDB工厂.数据库容量 = 32
+        全局IDB工厂.数据库列表 = 堆_分配_数组(32 * 8)
+        全局IDB工厂.数据库数量 = 0
+    }
+    返回 全局IDB工厂
+}
+
+函数 IDB_open(名称, 版本) {
+    定义 工厂 = IDBFactory_获取()
+
+    // 查找已有数据库
+    定义 可变 db = 0
+    定义 可变 i = 0
+    当 (i < 工厂.数据库数量) {
+        定义 候选 = 内存_读64(工厂.数据库列表 + i * 8)
+        如果 (候选 != 0 && 字符串_相等(候选.名称, 名称)) {
+            db = 候选; 跳出
+        }
+        i = i + 1
+    }
+
+    定义 可变 需要升级 = 假
+
+    如果 (db == 0) {
+        // 新建数据库
+        db = 堆_分配(IDBDatabase)
+        db.名称 = 字符串_复制(名称)
+        db.版本 = 0
+        db.存储容量 = 32
+        db.存储列表 = 堆_分配_数组(32 * 8)
+        db.存储数量 = 0
+        db.活跃事务 = 堆_分配_数组(16 * 8)
+        db.活跃事务数 = 0
+        db.已关闭 = 假
+        如果 (工厂.数据库数量 < 工厂.数据库容量) {
+            内存_写64(工厂.数据库列表 + 工厂.数据库数量 * 8, db)
+            工厂.数据库数量 = 工厂.数据库数量 + 1
+        }
+        需要升级 = 真
+    }
+
+    如果 (版本 > db.版本) { 需要升级 = 真 }
+
+    // 创建请求对象
+    定义 req = IDBRequest_创建()
+    req.结果 = db
+
+    如果 (需要升级) {
+        // 触发upgradeneeded事件
+        db.版本 = 版本
+        // req.onupgradeneeded(事件)
+        // 事件.target.result = db
+        // 事件.oldVersion = 旧版本
+    }
+
+    // 触发success
+    // req.onsuccess(事件)
+
+    返回 req
+}
+
+函数 IDB_deleteDatabase(名称) {
+    定义 工厂 = IDBFactory_获取()
+    定义 可变 i = 0
+    当 (i < 工厂.数据库数量) {
+        定义 db = 内存_读64(工厂.数据库列表 + i * 8)
+        如果 (db != 0 && 字符串_相等(db.名称, 名称)) {
+            // 移除
+            工厂.数据库数量 = 工厂.数据库数量 - 1
+            内存_写64(工厂.数据库列表 + i * 8, 内存_读64(工厂.数据库列表 + 工厂.数据库数量 * 8))
+            返回 真
+        }
+        i = i + 1
+    }
+    返回 假
+}

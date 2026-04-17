@@ -1,0 +1,120 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./包含解析.nova")
+导入("./内在大小占.nova")
+
+// §6 布局集成 — 在布局阶段检查containment
+
+函数 布局_应用Containment(布局对象) {
+    如果 (布局对象 == 0) { 返回 }
+    定义 样式 = 布局对象.计算样式
+    如果 (样式 == 0) { 返回 }
+
+    // 1. 检查contain属性
+    定义 contain = Containment_解析(样式.contain)
+    如果 (contain != CONTAIN_NONE) {
+        Containment_应用到布局(布局对象, contain)
+    }
+
+    // 2. 检查content-visibility
+    定义 cv = ContentVisibility_解析(样式.content_visibility)
+    如果 (cv != CV_VISIBLE) {
+        // content-visibility隐含 contain: layout style paint
+        // 且如果是auto/hidden还隐含 contain: size(当被锁定时)
+        如果 (contain == CONTAIN_NONE) {
+            Containment_应用布局(布局对象)
+            Containment_应用样式(布局对象)
+            Containment_应用绘制(布局对象)
+        }
+
+        // 获取或创建DisplayLock
+        定义 dl = 布局对象.display_lock
+        如果 (dl == 0) {
+            dl = DisplayLock_创建(布局对象.dom节点, cv)
+            布局对象.display_lock = dl
+        }
+
+        // 如果被锁定: 跳过子树布局
+        如果 (DisplayLock_应该跳过布局(dl)) {
+            // 使用contain-intrinsic-size作为替代大小
+            如果 (dl.intrinsic_size != 0) {
+                定义 w = ContainIntrinsicSize_获取宽(dl.intrinsic_size)
+                定义 h = ContainIntrinsicSize_获取高(dl.intrinsic_size)
+                如果 (w > 0) { 布局对象.宽 = w }
+                如果 (h > 0) { 布局对象.高 = h }
+            }
+            // 标记跳过子树
+            布局对象.跳过子树布局 = 真
+        }
+    }
+}
+
+// §7 绘制集成 — 在绘制阶段检查containment
+
+函数 绘制_应用Containment(布局对象, canvas) {
+    如果 (布局对象 == 0) { 返回 假 }
+
+    // content-visibility: hidden/auto(锁定)
+    定义 dl = 布局对象.display_lock
+    如果 (dl != 0 && DisplayLock_应该跳过绘制(dl)) {
+        // 跳过子树绘制,只绘制元素自身(背景/边框)
+        返回 真    // 跳过子树
+    }
+
+    // paint containment: 裁剪
+    如果 (布局对象.paint_contained) {
+        // save canvas → clip to 元素 bounds → paint children → restore
+        如果 (canvas != 0) {
+            Sk画布_save(canvas)
+            Sk画布_clipRect(canvas, 布局对象.x, 布局对象.y, 布局对象.宽, 布局对象.高)
+        }
+    }
+
+    返回 假    // 不跳过子树
+}
+
+函数 绘制_结束Containment(布局对象, canvas) {
+    如果 (布局对象 == 0) { 返回 }
+    如果 (布局对象.paint_contained && canvas != 0) {
+        Sk画布_restore(canvas)
+    }
+}
+
+// §8 content-visibility: auto 的IntersectionObserver集成
+// 浏览器自动为cv:auto元素创建IntersectionObserver
+
+函数 ContentVisibility_设置自动观察(布局对象) {
+    如果 (布局对象 == 0) { 返回 }
+    定义 dl = 布局对象.display_lock
+    如果 (dl == 0 || dl.content_visibility != CV_AUTO) { 返回 }
+
+    // 创建IntersectionObserver观察此元素
+    // 当元素进入/离开视口时更新锁状态
+    // 由帧循环中的视口检查驱动(IntersectionObserver)
+}
+
+函数 ContentVisibility_帧更新(视口x, 视口y, 视口宽, 视口高) {
+    定义 可变 i = 0
+    当 (i < CV_全局数量) {
+        定义 cv = 内存_读64(CV_全局列表 + i * 8)
+        如果 (cv != 0 && cv.元素 != 0) {
+            定义 el = cv.元素
+            定义 在视口 = (el.布局x + el.布局宽 > 视口x) &&
+                         (el.布局x < 视口x + 视口宽) &&
+                         (el.布局y + el.布局高 > 视口y) &&
+                         (el.布局y < 视口y + 视口高)
+            如果 (在视口 && cv.锁状态 == CV_锁定) {
+                cv.锁状态 = CV_解锁
+                el.需要重绘 = 真
+            } 否则 如果 (!在视口 && cv.锁状态 == CV_解锁) {
+                cv.锁状态 = CV_锁定
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 辅助存根
+函数 Sk画布_save(c) { 追加(c.状态栈, { 变换: c.当前变换, 裁剪: c.当前裁剪 }) }
+函数 Sk画布_restore(c) { 如果 (计数(c.状态栈) > 0) { 定义 s = 弹出(c.状态栈); c.当前变换 = s.变换; c.当前裁剪 = s.裁剪 } }
+函数 Sk画布_clipRect(c, x, y, w, h) { c.当前裁剪 = { x: x, y: y, w: w, h: h } }

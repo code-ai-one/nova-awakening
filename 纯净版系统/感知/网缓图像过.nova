@@ -1,0 +1,141 @@
+导入("../中枢/类型定义.nova")
+导入("../推理/智能渠道.nova")
+导入("./图位图像素缓.nova")
+导入("./内核直连层.nova")
+导入("../中枢/内存初始化.nova")
+导入("./内存管理纹.nova")
+
+// §7 Sk图像Filter — 图像滤镜链
+
+定义 IMG_FILTER_BLUR        = 0
+定义 IMG_FILTER_DROP_SHADOW = 1
+定义 IMG_FILTER_COLOR_MATRIX = 2
+定义 IMG_FILTER_OFFSET      = 3
+
+结构 Sk图像Filter {
+    类型,
+    // blur
+    sigma_x,    // i32 Q10
+    sigma_y,
+    // drop shadow
+    dx,    // i32, dy: i32
+    阴影颜色,
+    // color matrix
+    矩阵,    // [20]i32 4x5 颜色矩阵 Q10
+    // 链
+    输入,    // u64 Sk图像Filter* (可级联)
+}
+
+
+函数 Sk图像Filter_模糊(sigma_x, sigma_y) {
+    定义 f = 堆_分配(Sk图像Filter)
+    f.类型 = IMG_FILTER_BLUR
+    f.sigma_x = sigma_x; f.sigma_y = sigma_y
+    f.输入 = 0
+    返回 f
+}
+
+函数 Sk图像Filter_阴影(dx, dy, sigma, 颜色) {
+    定义 f = 堆_分配(Sk图像Filter)
+    f.类型 = IMG_FILTER_DROP_SHADOW
+    f.dx = dx; f.dy = dy; f.sigma_x = sigma; f.sigma_y = sigma
+    f.阴影颜色 = 颜色
+    f.输入 = 0
+    返回 f
+}
+
+// 高斯模糊应用
+函数 Sk图像Filter_应用模糊(bm, sigma_x, sigma_y) {
+    如果 (bm == 0 || sigma_x <= 0) { 返回 }
+    // 两遍分离式高斯模糊
+    // 核半径 = ceil(3*sigma)
+    定义 半径x = sigma_x * 3 / 1024 + 1
+    如果 (半径x > 64) { 半径x = 64 }
+    定义 半径y = sigma_y * 3 / 1024 + 1
+    如果 (半径y > 64) { 半径y = 64 }
+
+    // 生成高斯核(Q10)
+    定义 核x = 堆_分配_数组((半径x * 2 + 1) * 4)
+    定义 可变 总和 = 0
+    定义 可变 k = -半径x
+    当 (k <= 半径x) {
+        // exp(-k²/(2σ²)) → Q10近似
+        定义 d = k * 1024 / (sigma_x + 1)    // 归一化
+        定义 v = 1024 - d * d / 2048          // Taylor近似
+        如果 (v < 0) { v = 0 }
+        内存_写32(核x + (k + 半径x) * 4, v)
+        总和 = 总和 + v
+        k = k + 1
+    }
+    // 归一化
+    如果 (总和 > 0) {
+        k = 0
+        当 (k < 半径x * 2 + 1) {
+            定义 v = 内存_读32(核x + k * 4) * 1024 / 总和
+            内存_写32(核x + k * 4, v)
+            k = k + 1
+        }
+    }
+
+    // 水平pass
+    定义 临时 = Nova缓冲itmap_创建(bm.宽, bm.高, bm.颜色类型)
+    定义 可变 y = 0
+    当 (y < bm.高) {
+        定义 可变 x = 0
+        当 (x < bm.宽) {
+            定义 可变 sumR = 0; 定义 可变 sumG = 0
+            定义 可变 sumB = 0; 定义 可变 sumA = 0
+            k = -半径x
+            当 (k <= 半径x) {
+                定义 sx = x + k
+                如果 (sx < 0) { sx = 0 }
+                如果 (sx >= bm.宽) { sx = bm.宽 - 1 }
+                定义 像素 = Nova缓冲itmap_读像素(bm, sx, y)
+                定义 权重 = 内存_读32(核x + (k + 半径x) * 4)
+                sumA = sumA + ((像素 >> 24) & 0xFF) * 权重
+                sumR = sumR + ((像素 >> 16) & 0xFF) * 权重
+                sumG = sumG + ((像素 >> 8) & 0xFF) * 权重
+                sumB = sumB + (像素 & 0xFF) * 权重
+                k = k + 1
+            }
+            sumA = sumA / 1024; sumR = sumR / 1024; sumG = sumG / 1024; sumB = sumB / 1024
+            如果 (sumA > 255) { sumA = 255 }; 如果 (sumR > 255) { sumR = 255 }
+            如果 (sumG > 255) { sumG = 255 }; 如果 (sumB > 255) { sumB = 255 }
+            Nova缓冲itmap_写像素(临时, x, y, (sumA << 24) | (sumR << 16) | (sumG << 8) | sumB)
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    // 垂直pass(从临时→bm)
+    y = 0
+    当 (y < bm.高) {
+        定义 可变 x = 0
+        当 (x < bm.宽) {
+            定义 可变 sumR = 0; 定义 可变 sumG = 0
+            定义 可变 sumB = 0; 定义 可变 sumA = 0
+            k = -半径y
+            当 (k <= 半径y) {
+                定义 sy = y + k
+                如果 (sy < 0) { sy = 0 }
+                如果 (sy >= bm.高) { sy = bm.高 - 1 }
+                定义 像素 = Nova缓冲itmap_读像素(临时, x, sy)
+                定义 权重 = 内存_读32(核x + (k + 半径y) * 4)    // 复用同一核
+                sumA = sumA + ((像素 >> 24) & 0xFF) * 权重
+                sumR = sumR + ((像素 >> 16) & 0xFF) * 权重
+                sumG = sumG + ((像素 >> 8) & 0xFF) * 权重
+                sumB = sumB + (像素 & 0xFF) * 权重
+                k = k + 1
+            }
+            sumA = sumA / 1024; sumR = sumR / 1024; sumG = sumG / 1024; sumB = sumB / 1024
+            如果 (sumA > 255) { sumA = 255 }; 如果 (sumR > 255) { sumR = 255 }
+            如果 (sumG > 255) { sumG = 255 }; 如果 (sumB > 255) { sumB = 255 }
+            Nova缓冲itmap_写像素(bm, x, y, (sumA << 24) | (sumR << 16) | (sumG << 8) | sumB)
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    堆_释放(核x)
+    Nova缓冲itmap_释放(临时)
+}

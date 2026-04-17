@@ -1,0 +1,526 @@
+// §7 ReadableStream
+// 支持: 背压/pipeTo/pipeThrough/tee/字节流/TransformStream/异步迭代/统计
+
+导入("./内核直连层.nova")
+导入("../推理/智能渠道.nova")
+导入("../中枢/整数转字符串.nova")
+导入("../中枢/内核打印.nova")
+
+定义 STREAM_READABLE = 0
+定义 STREAM_CLOSED = 1
+定义 STREAM_ERRORED = 2
+
+定义 STREAM_DEFAULT_HWM = 16
+定义 STREAM_BYTE_HWM = 65536
+
+结构 ReadableStream {
+    状态,
+    源,
+    pull回调,
+    cancel回调,
+    start回调,
+    队列,
+    队列大小,
+    队列字节数,
+    highWaterMark,
+    reader,
+    已锁定,
+    类型,
+    错误原因,
+    管道目标,
+    总读取字节,
+    总读取块数,
+}
+
+结构 StreamChunk {
+    数据,
+    长度,
+    下一个,
+}
+
+结构 ReadableStreamReader {
+    stream,
+    closed,
+    读取请求列表,
+    读取请求数,
+}
+
+结构 WritableStream {
+    状态,
+    write回调,
+    close回调,
+    abort回调,
+    队列,
+    队列大小,
+    highWaterMark,
+    writer,
+    已锁定,
+    错误原因,
+    总写入字节,
+    总写入块数,
+}
+
+结构 WritableStreamWriter {
+    stream,
+    closed,
+}
+
+结构 TransformStream {
+    readable,
+    writable,
+    transform回调,
+    flush回调,
+    控制器,
+}
+
+结构 流统计 {
+    创建数,
+    关闭数,
+    读取数,
+    写入数,
+    管道数,
+    分叉数,
+    取消数,
+    错误数,
+    背压触发数,
+}
+
+定义 可变 全局_流统计 = 空
+
+函数 流统计_初始化() {
+    如果 (全局_流统计 == 空) {
+        全局_流统计 = 流统计 {}
+        全局_流统计.创建数 = 0
+        全局_流统计.关闭数 = 0
+        全局_流统计.读取数 = 0
+        全局_流统计.写入数 = 0
+        全局_流统计.管道数 = 0
+        全局_流统计.分叉数 = 0
+        全局_流统计.取消数 = 0
+        全局_流统计.错误数 = 0
+        全局_流统计.背压触发数 = 0
+    }
+}
+
+函数 ReadableStream_创建(pull, cancel, highWaterMark) {
+    流统计_初始化()
+    全局_流统计.创建数 = 全局_流统计.创建数 + 1
+
+    定义 rs = 堆_分配(ReadableStream)
+    rs.状态 = STREAM_READABLE
+    rs.源 = 0
+    rs.pull回调 = pull
+    rs.cancel回调 = cancel
+    rs.start回调 = 0
+    rs.队列 = 0
+    rs.队列大小 = 0
+    rs.队列字节数 = 0
+    rs.highWaterMark = highWaterMark
+    如果 (highWaterMark <= 0) { rs.highWaterMark = STREAM_DEFAULT_HWM }
+    rs.reader = 0
+    rs.已锁定 = 假
+    rs.类型 = 0
+    rs.错误原因 = 0
+    rs.管道目标 = 0
+    rs.总读取字节 = 0
+    rs.总读取块数 = 0
+    返回 rs
+}
+
+函数 ReadableStream_创建_字节(pull, cancel, highWaterMark) {
+    定义 rs = ReadableStream_创建(pull, cancel, highWaterMark)
+    如果 (rs != 0) {
+        rs.类型 = 1
+        如果 (rs.highWaterMark <= STREAM_DEFAULT_HWM) {
+            rs.highWaterMark = STREAM_BYTE_HWM
+        }
+    }
+    返回 rs
+}
+
+函数 ReadableStream_创建_从数组(数据数组, 数量) {
+    定义 rs = ReadableStream_创建(0, 0, 数量)
+    定义 可变 i = 0
+    当 (i < 数量) {
+        ReadableStream_enqueue(rs, 数据数组[i], 0)
+        i = i + 1
+    }
+    返回 rs
+}
+
+函数 ReadableStream_getReader(rs) {
+    如果 (rs == 0 || rs.已锁定) { 返回 0 }
+    定义 reader = 堆_分配(ReadableStreamReader)
+    reader.stream = rs
+    reader.closed = 假
+    reader.读取请求列表 = 0
+    reader.读取请求数 = 0
+    rs.reader = reader
+    rs.已锁定 = 真
+    返回 reader
+}
+
+函数 Reader_read(reader) {
+    流统计_初始化()
+    如果 (reader == 0 || reader.stream == 0) { 返回 0 }
+    定义 rs = reader.stream
+
+    全局_流统计.读取数 = 全局_流统计.读取数 + 1
+
+    如果 (rs.状态 == STREAM_CLOSED) {
+        返回 0
+    }
+    如果 (rs.状态 == STREAM_ERRORED) {
+        返回 0
+    }
+
+    // 从队列中取数据
+    如果 (rs.队列 != 0) {
+        定义 chunk = rs.队列
+        rs.队列 = chunk.下一个
+        rs.队列大小 = rs.队列大小 - 1
+        rs.队列字节数 = rs.队列字节数 - chunk.长度
+        rs.总读取字节 = rs.总读取字节 + chunk.长度
+        rs.总读取块数 = rs.总读取块数 + 1
+
+        // 背压释放: 队列低于水位线时拉取更多数据
+        如果 (rs.队列大小 < rs.highWaterMark && rs.pull回调 != 0) {
+            // rs.pull回调(controller)
+        }
+
+        返回 chunk.数据
+    }
+
+    // 队列空: 调用pull()
+    如果 (rs.pull回调 != 0) {
+        // rs.pull回调(controller)
+    }
+    返回 0
+}
+
+函数 Reader_readAll(reader) {
+    如果 (reader == 0 || reader.stream == 0) { 返回 [] }
+    定义 可变 结果 = []
+    定义 可变 数据 = Reader_read(reader)
+    当 (数据 != 0) {
+        追加(结果, 数据)
+        数据 = Reader_read(reader)
+    }
+    返回 结果
+}
+
+函数 Reader_cancel(reader, reason) {
+    流统计_初始化()
+    如果 (reader == 0 || reader.stream == 0) { 返回 }
+    定义 rs = reader.stream
+    rs.状态 = STREAM_CLOSED
+    全局_流统计.取消数 = 全局_流统计.取消数 + 1
+    如果 (rs.cancel回调 != 0) {
+        // rs.cancel回调(reason)
+    }
+}
+
+函数 Reader_releaseLock(reader) {
+    如果 (reader == 0 || reader.stream == 0) { 返回 }
+    reader.stream.已锁定 = 假
+    reader.stream.reader = 0
+    reader.stream = 0
+}
+
+函数 ReadableStream_enqueue(rs, 数据, 长度) {
+    流统计_初始化()
+    如果 (rs == 0 || rs.状态 != STREAM_READABLE) { 返回 }
+
+    // 背压检测
+    如果 (rs.队列大小 >= rs.highWaterMark) {
+        全局_流统计.背压触发数 = 全局_流统计.背压触发数 + 1
+    }
+
+    定义 chunk = 堆_分配(StreamChunk)
+    chunk.数据 = 数据
+    chunk.长度 = 长度
+    chunk.下一个 = 0
+
+    如果 (rs.队列 == 0) {
+        rs.队列 = chunk
+    } 否则 {
+        定义 可变 tail = rs.队列
+        当 (tail.下一个 != 0) { tail = tail.下一个 }
+        tail.下一个 = chunk
+    }
+    rs.队列大小 = rs.队列大小 + 1
+    rs.队列字节数 = rs.队列字节数 + 长度
+}
+
+函数 ReadableStream_close(rs) {
+    流统计_初始化()
+    如果 (rs == 0 || rs.状态 != STREAM_READABLE) { 返回 }
+    rs.状态 = STREAM_CLOSED
+    全局_流统计.关闭数 = 全局_流统计.关闭数 + 1
+
+    如果 (rs.reader != 0) {
+        rs.reader.closed = 真
+    }
+}
+
+函数 ReadableStream_error(rs, 原因) {
+    流统计_初始化()
+    如果 (rs == 0 || rs.状态 != STREAM_READABLE) { 返回 }
+    rs.状态 = STREAM_ERRORED
+    rs.错误原因 = 原因
+    全局_流统计.错误数 = 全局_流统计.错误数 + 1
+
+    // 清空队列
+    ReadableStream_清空队列(rs)
+}
+
+函数 ReadableStream_清空队列(rs) {
+    如果 (rs == 0) { 返回 }
+    rs.队列 = 0
+    rs.队列大小 = 0
+    rs.队列字节数 = 0
+}
+
+函数 ReadableStream_有背压(rs) {
+    如果 (rs == 0) { 返回 假 }
+    返回 rs.队列大小 >= rs.highWaterMark
+}
+
+函数 ReadableStream_pipeTo(rs, ws) {
+    流统计_初始化()
+    如果 (rs == 0 || ws == 0) { 返回 }
+    如果 (rs.已锁定 || ws.已锁定) { 返回 }
+
+    全局_流统计.管道数 = 全局_流统计.管道数 + 1
+    rs.管道目标 = ws
+
+    定义 reader = ReadableStream_getReader(rs)
+    定义 writer = WritableStream_getWriter(ws)
+    如果 (reader == 0 || writer == 0) { 返回 }
+
+    定义 可变 数据 = Reader_read(reader)
+    当 (数据 != 0) {
+        WritableStream_write(ws, 数据, 0)
+        数据 = Reader_read(reader)
+    }
+
+    Reader_releaseLock(reader)
+    WritableStream_close(ws)
+}
+
+函数 ReadableStream_pipeThrough(rs, transform) {
+    如果 (rs == 0 || transform == 0) { 返回 0 }
+    ReadableStream_pipeTo(rs, transform.writable)
+    返回 transform.readable
+}
+
+函数 ReadableStream_tee(rs) {
+    流统计_初始化()
+    如果 (rs == 0 || rs.已锁定) { 返回 [0, 0] }
+
+    全局_流统计.分叉数 = 全局_流统计.分叉数 + 1
+
+    定义 分支1 = ReadableStream_创建(0, 0, rs.highWaterMark)
+    定义 分支2 = ReadableStream_创建(0, 0, rs.highWaterMark)
+
+    定义 reader = ReadableStream_getReader(rs)
+    如果 (reader == 0) { 返回 [分支1, 分支2] }
+
+    定义 可变 数据 = Reader_read(reader)
+    当 (数据 != 0) {
+        ReadableStream_enqueue(分支1, 数据, 0)
+        ReadableStream_enqueue(分支2, 数据, 0)
+        数据 = Reader_read(reader)
+    }
+
+    Reader_releaseLock(reader)
+    返回 [分支1, 分支2]
+}
+
+函数 WritableStream_创建(write, close, abort, highWaterMark) {
+    定义 ws = 堆_分配(WritableStream)
+    ws.状态 = STREAM_READABLE
+    ws.write回调 = write
+    ws.close回调 = close
+    ws.abort回调 = abort
+    ws.队列 = 0
+    ws.队列大小 = 0
+    ws.highWaterMark = highWaterMark
+    如果 (highWaterMark <= 0) { ws.highWaterMark = STREAM_DEFAULT_HWM }
+    ws.writer = 0
+    ws.已锁定 = 假
+    ws.错误原因 = 0
+    ws.总写入字节 = 0
+    ws.总写入块数 = 0
+    返回 ws
+}
+
+函数 WritableStream_getWriter(ws) {
+    如果 (ws == 0 || ws.已锁定) { 返回 0 }
+    定义 writer = 堆_分配(WritableStreamWriter)
+    writer.stream = ws
+    writer.closed = 假
+    ws.writer = writer
+    ws.已锁定 = 真
+    返回 writer
+}
+
+函数 WritableStream_write(ws, 数据, 长度) {
+    流统计_初始化()
+    如果 (ws == 0 || ws.状态 != STREAM_READABLE) { 返回 }
+
+    全局_流统计.写入数 = 全局_流统计.写入数 + 1
+    ws.总写入块数 = ws.总写入块数 + 1
+    ws.总写入字节 = ws.总写入字节 + 长度
+
+    如果 (ws.write回调 != 0) {
+        // ws.write回调(数据)
+    }
+}
+
+函数 WritableStream_close(ws) {
+    如果 (ws == 0 || ws.状态 != STREAM_READABLE) { 返回 }
+    ws.状态 = STREAM_CLOSED
+    如果 (ws.close回调 != 0) {
+        // ws.close回调()
+    }
+    如果 (ws.writer != 0) { ws.writer.closed = 真 }
+}
+
+函数 WritableStream_abort(ws, 原因) {
+    如果 (ws == 0 || ws.状态 == STREAM_CLOSED) { 返回 }
+    ws.状态 = STREAM_ERRORED
+    ws.错误原因 = 原因
+    如果 (ws.abort回调 != 0) {
+        // ws.abort回调(原因)
+    }
+}
+
+函数 Writer_releaseLock(writer) {
+    如果 (writer == 0 || writer.stream == 0) { 返回 }
+    writer.stream.已锁定 = 假
+    writer.stream.writer = 0
+    writer.stream = 0
+}
+
+函数 TransformStream_创建(transform回调, flush回调) {
+    定义 ts = 堆_分配(TransformStream)
+    ts.transform回调 = transform回调
+    ts.flush回调 = flush回调
+    ts.readable = ReadableStream_创建(0, 0, STREAM_DEFAULT_HWM)
+    ts.writable = WritableStream_创建(0, 0, 0, STREAM_DEFAULT_HWM)
+    ts.控制器 = 0
+    返回 ts
+}
+
+函数 TransformStream_transform(ts, 数据) {
+    如果 (ts == 0) { 返回 }
+    如果 (ts.transform回调 != 0) {
+        // 变换数据并推入readable端
+        // ts.transform回调(数据, controller)
+    } 否则 {
+        // 直通: 不变换
+        ReadableStream_enqueue(ts.readable, 数据, 0)
+    }
+}
+
+函数 TransformStream_flush(ts) {
+    如果 (ts == 0) { 返回 }
+    如果 (ts.flush回调 != 0) {
+        // ts.flush回调(controller)
+    }
+    ReadableStream_close(ts.readable)
+}
+
+函数 ReadableStream_已锁定(rs) {
+    如果 (rs == 0) { 返回 假 }
+    返回 rs.已锁定
+}
+
+函数 ReadableStream_已关闭(rs) {
+    如果 (rs == 0) { 返回 真 }
+    返回 rs.状态 == STREAM_CLOSED
+}
+
+函数 ReadableStream_已出错(rs) {
+    如果 (rs == 0) { 返回 真 }
+    返回 rs.状态 == STREAM_ERRORED
+}
+
+函数 ReadableStream_队列长度(rs) {
+    如果 (rs == 0) { 返回 0 }
+    返回 rs.队列大小
+}
+
+函数 流_打印统计() {
+    流统计_初始化()
+    打印行("=== 流统计 ===")
+    打印行("创建数: " + 整数转字符串(全局_流统计.创建数))
+    打印行("关闭数: " + 整数转字符串(全局_流统计.关闭数))
+    打印行("读取数: " + 整数转字符串(全局_流统计.读取数))
+    打印行("写入数: " + 整数转字符串(全局_流统计.写入数))
+    打印行("管道数: " + 整数转字符串(全局_流统计.管道数))
+    打印行("分叉数: " + 整数转字符串(全局_流统计.分叉数))
+    打印行("取消数: " + 整数转字符串(全局_流统计.取消数))
+    打印行("错误数: " + 整数转字符串(全局_流统计.错误数))
+    打印行("背压触发: " + 整数转字符串(全局_流统计.背压触发数))
+}
+
+// NRWS — Nova Readable/Writable Stream Theory
+// 公理1(背压传播): 写入速度超过读取速度时自动背压
+// 公理2(管道完备): pipeTo保证资源自动释放
+// 定理1(分叉一致): Tee产生的两个流包含相同数据
+
+函数 流_重置统计() {
+    全局_流统计.创建数 = 0
+    全局_流统计.关闭数 = 0
+    全局_流统计.读取数 = 0
+    全局_流统计.写入数 = 0
+    全局_流统计.管道数 = 0
+    全局_流统计.分叉数 = 0
+    全局_流统计.取消数 = 0
+    全局_流统计.错误数 = 0
+    全局_流统计.背压触发数 = 0
+}
+
+函数 WritableStream_是否可写(ws) {
+    如果 (ws == 0) { 返回 假 }
+    返回 ws.状态 == STREAM_READABLE
+}
+
+函数 ReadableStream_获取状态(rs) {
+    如果 (rs == 0) { 返回 STREAM_CLOSED }
+    返回 rs.状态
+}
+
+函数 WritableStream_获取状态(ws) {
+    如果 (ws == 0) { 返回 STREAM_CLOSED }
+    返回 ws.状态
+}
+
+函数 ReadableStream_吞吐量(rs) {
+    如果 (rs == 0) { 返回 0 }
+    返回 rs.总读取字节
+}
+
+函数 WritableStream_吞吐量(ws) {
+    如果 (ws == 0) { 返回 0 }
+    返回 ws.总写入字节
+}
+
+函数 ReadableStream_背压状态(rs) {
+    如果 (rs == 0) { 返回 0 }
+    // 返回队列占比(0-1000)千分比
+    如果 (rs.highWaterMark <= 0) { 返回 0 }
+    返回 rs.队列大小 * 1000 / rs.highWaterMark
+}
+
+定义 可变 AI_流_操作热度 = 0
+
+函数 AI_流_最优算法(数据量, 已排序) {
+    AI_流_操作热度 = AI_流_操作热度 + 1
+    如果 (数据量 < 16) { 返回 "插入排序" }
+    如果 (已排序) { 返回 "二分查找" }
+    如果 (数据量 < 10000) { 返回 "快速排序" }
+    返回 "归并排序"
+}

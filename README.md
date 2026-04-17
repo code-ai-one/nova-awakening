@@ -8,6 +8,8 @@
 [![Project](https://img.shields.io/badge/项目-原生编译器%20%2B%20纯净版系统-brightgreen.svg)]()
 [![Language](https://img.shields.io/badge/语言-中文原生-red.svg)]()
 
+**🇨🇳 中文** | [🇬🇧 English](README.en.md)
+
 </div>
 
 ## 🌟 项目简介
